@@ -1,0 +1,19 @@
+[
+  {
+    "op": "A5FullBlockDump",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "hbm_k_rope", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+      {"name": "hbm_kv_cache", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+      {"name": "dram_k_rope", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+      {"name": "dram_kv_cache", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+      {"name": "src_block_ids", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+      {"name": "dst_block_ids", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+    ],
+    "output_desc": [
+      {"name": "dram_k_rope_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+      {"name": "dram_kv_cache_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]}
+    ],
+    "attr": []
+  }
+]

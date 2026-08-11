@@ -1,0 +1,16 @@
+[
+  {
+    "op": "A5PackedFullBlockDump",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "hbm_packed_kv", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+      {"name": "dram_packed_kv", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+      {"name": "src_block_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "dst_block_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "dram_packed_kv_out", "param_type": "required", "format": ["ND"], "type": ["int8"]}
+    ],
+    "attr": []
+  }
+]
