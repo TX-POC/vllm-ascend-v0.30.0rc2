@@ -5,6 +5,10 @@
 # 修改“用户配置”后直接执行：
 #
 #   bash examples/dsa_demo/serve_dsa.sh
+#
+# For the Ascend 950 W4A4C8 two-card request-limit profile, use
+# ``serve_dsa_w4a4c8_tp2.sh`` instead.  It enables both C8 data-plane flags
+# and sizes HBM/DRAM from the request limits without a KV-block override.
 
 set -euo pipefail
 

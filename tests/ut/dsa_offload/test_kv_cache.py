@@ -17,6 +17,8 @@ from vllm_ascend.dsa_offload.kv_cache import (
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
+    get_dsa_request_limit_base_blocks,
+    get_dsa_request_limit_blocks,
     validate_dsa_kv_cache_config,
 )
 from vllm_ascend.dsa_offload.kv_cache_coordinator import (
@@ -56,16 +58,35 @@ def _make_specs(
 def _make_vllm_config(
     *,
     max_model_len: int = 32768,
+    max_num_seqs: int = 1,
     override: int | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         cache_config=SimpleNamespace(num_gpu_blocks_override=override),
         model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def _mock_dsa_offload_config(monkeypatch) -> SimpleNamespace:
+    """Keep capacity-planning unit tests independent of global config state."""
+
+    dsa_config = SimpleNamespace(
+        capacity_mode="auto",
+        capacity_guard_blocks=0,
+        indexer_mla_block_ratio=3,
+        keep_decode_kv_in_hbm=False,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.ascend_config.get_ascend_config",
+        lambda: SimpleNamespace(dsa_offload_config=dsa_config),
+    )
+    return dsa_config
 
 
 def test_indexer_spec_accounts_for_one_vector_per_token() -> None:
@@ -173,6 +194,202 @@ def test_num_gpu_blocks_override_keeps_base_block_semantics(
     assert get_dsa_group_num_blocks(config, groups[1]) == 320
 
 
+@pytest.mark.parametrize(
+    ("max_num_seqs", "max_model_len", "block_size", "guard", "expected"),
+    [
+        (1, 131072, 128, 0, 1024),
+        (1, 131073, 128, 0, 1025),
+        (2, 129, 128, 7, 11),
+        (4, 1, 128, 0, 4),
+    ],
+)
+def test_request_limit_blocks_follow_scheduler_limits(
+    _mock_dsa_offload_config,
+    max_num_seqs: int,
+    max_model_len: int,
+    block_size: int,
+    guard: int,
+    expected: int,
+) -> None:
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    _mock_dsa_offload_config.capacity_guard_blocks = guard
+
+    assert get_dsa_request_limit_blocks(
+        _make_vllm_config(
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+        ),
+        block_size=block_size,
+    ) == expected
+
+    # BlockPool block 0 is a null mapping and is not allocatable to a request.
+    assert get_dsa_request_limit_base_blocks(
+        _make_vllm_config(
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+        ),
+        block_size=block_size,
+    ) == expected + 1
+
+
+def test_auto_capacity_mode_does_not_impose_a_request_limit(
+    _mock_dsa_offload_config,
+) -> None:
+    assert get_dsa_request_limit_blocks(
+        _make_vllm_config(max_num_seqs=1, max_model_len=131072),
+        block_size=128,
+    ) is None
+
+
+def test_request_limit_capacity_sets_base_and_indexer_planes(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    """HBM needs one extra physical block for BlockPool's null mapping."""
+
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    _mock_dsa_offload_config.capacity_guard_blocks = 128
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+
+    config = build_dsa_kv_cache_config(
+        _make_vllm_config(max_num_seqs=1, max_model_len=131072),
+        groups,
+        available_memory=dsa_pool_bytes_per_base_block(groups) * 4096,
+    )
+
+    # 1024 request blocks + 128 guard + BlockPool null block.
+    assert config.num_blocks == 1153
+    assert get_dsa_group_num_blocks(config, groups[0]) == 3459
+    assert get_dsa_group_num_blocks(config, groups[1]) == 1153
+
+
+def test_request_limit_capacity_rejects_insufficient_hbm(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+
+    with pytest.raises(ValueError, match="Insufficient HBM"):
+        build_dsa_kv_cache_config(
+            _make_vllm_config(max_num_seqs=1, max_model_len=131072),
+            groups,
+            available_memory=dsa_pool_bytes_per_base_block(groups) * 1024,
+        )
+
+
+def test_request_limit_base_includes_block_pool_null_block(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    """1024 physical blocks expose only 1023 request-allocatable blocks."""
+
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 1)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+
+    config = build_dsa_kv_cache_config(
+        _make_vllm_config(max_num_seqs=1, max_model_len=131072),
+        groups,
+        available_memory=dsa_pool_bytes_per_base_block(groups) * 1025,
+    )
+
+    assert config.num_blocks == 1025
+    assert get_dsa_group_num_blocks(config, groups[0]) == 1025
+    assert get_dsa_group_num_blocks(config, groups[1]) == 1025
+
+
+def test_request_limit_rejects_mixed_group_block_sizes(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 1)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    groups[1].kv_cache_spec = DSAResidentMLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        sparse_head_dim=(512, 64, 0),
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+    )
+
+    with pytest.raises(ValueError, match="one shared block_size"):
+        build_dsa_kv_cache_config(
+            _make_vllm_config(max_num_seqs=1, max_model_len=131072),
+            groups,
+            available_memory=dsa_pool_bytes_per_base_block(groups) * 4096,
+        )
+
+
+def test_request_limit_accepts_exact_non_aligned_hbm_capacity(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    """Request-limit planning must not discard usable tail blocks."""
+
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+
+    config = build_dsa_kv_cache_config(
+        _make_vllm_config(max_num_seqs=1, max_model_len=131073),
+        groups,
+        available_memory=dsa_pool_bytes_per_base_block(groups) * 1026,
+    )
+
+    assert config.num_blocks == 1026
+    assert get_dsa_group_num_blocks(config, groups[0]) == 3078
+    assert get_dsa_group_num_blocks(config, groups[1]) == 1026
+
+
+def test_request_limit_override_must_cover_target_capacity(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    vllm_config = _make_vllm_config(
+        max_num_seqs=1,
+        max_model_len=131072,
+        override=1024,
+    )
+
+    with pytest.raises(ValueError, match="below DSA request-limit"):
+        build_dsa_kv_cache_config(
+            vllm_config,
+            groups,
+            available_memory=dsa_pool_bytes_per_base_block(groups) * 4096,
+        )
+
+
+def test_request_limit_override_above_target_remains_base_semantic(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+
+    config = build_dsa_kv_cache_config(
+        _make_vllm_config(
+            max_num_seqs=1,
+            max_model_len=131072,
+            override=1280,
+        ),
+        groups,
+        available_memory=dsa_pool_bytes_per_base_block(groups) * 4096,
+    )
+
+    assert config.num_blocks == 1280
+    assert get_dsa_group_num_blocks(config, groups[0]) == 3840
+    assert get_dsa_group_num_blocks(config, groups[1]) == 1280
+
+
 def test_cross_rank_base_capacity_shrink_preserves_plane_ratio(
     monkeypatch,
 ) -> None:
@@ -205,6 +422,23 @@ def test_prefill_admission_uses_weighted_base_block_cost(
         vllm_config,
         groups,
     ) == 16 * dsa_pool_bytes_per_base_block(groups)
+
+
+def test_request_limit_raises_startup_hbm_precheck(
+    monkeypatch,
+    _mock_dsa_offload_config,
+) -> None:
+    """Profiling must reserve the same request-limit base target as build."""
+
+    _mock_dsa_offload_config.capacity_mode = "request_limit"
+    _mock_dsa_offload_config.capacity_guard_blocks = 8
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    groups = build_dsa_kv_cache_groups(_make_specs())
+
+    assert dsa_max_memory_usage_bytes(
+        _make_vllm_config(max_num_seqs=2, max_model_len=131072),
+        groups,
+    ) == 2057 * dsa_pool_bytes_per_base_block(groups)
 
 
 def test_split_groups_reject_missing_per_layer_indexer() -> None:

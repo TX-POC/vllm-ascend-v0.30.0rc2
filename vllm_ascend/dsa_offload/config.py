@@ -34,6 +34,12 @@ from vllm_ascend.dsa_offload.model_support import (
 DSA_SPARSE_CONFIG_KEY = "dsa_sparse_config"
 DSA_TRACE_POINT_FIRST_SAMPLE = "first_sample"
 DSA_TRACE_POINTS = frozenset({DSA_TRACE_POINT_FIRST_SAMPLE})
+DSA_CAPACITY_MODE_AUTO = "auto"
+DSA_CAPACITY_MODE_REQUEST_LIMIT = "request_limit"
+DSA_CAPACITY_MODES = (
+    DSA_CAPACITY_MODE_AUTO,
+    DSA_CAPACITY_MODE_REQUEST_LIMIT,
+)
 
 _PUBLIC_CONFIG_KEYS = frozenset(
     {
@@ -45,6 +51,8 @@ _PUBLIC_CONFIG_KEYS = frozenset(
         "resident_budget_tokens",
         "max_active_reqs",
         "hot_cpu_block_multiple",
+        "capacity_mode",
+        "capacity_guard_blocks",
         "enable_row_mode_decode_graph",
         "enable_prefill_full_kv_offload",
         "keep_decode_kv_in_hbm",
@@ -74,6 +82,14 @@ def _positive_int(value: Any, *, field_name: str) -> int:
         raise TypeError(f"{DSA_SPARSE_CONFIG_KEY}[{field_name!r}] must be an integer, got {type(value).__name__}")
     if value <= 0:
         raise ValueError(f"{DSA_SPARSE_CONFIG_KEY}[{field_name!r}] must be positive, got {value}")
+    return value
+
+
+def _non_negative_int(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{DSA_SPARSE_CONFIG_KEY}[{field_name!r}] must be an integer, got {type(value).__name__}")
+    if value < 0:
+        raise ValueError(f"{DSA_SPARSE_CONFIG_KEY}[{field_name!r}] must be non-negative, got {value}")
     return value
 
 
@@ -174,6 +190,8 @@ class DSAOffloadConfig:
     resident_budget_tokens: tuple[int, ...] = (6144, 10240, 12288)
     max_active_reqs: int = 256
     hot_cpu_block_multiple: float = 3.0
+    capacity_mode: str = DSA_CAPACITY_MODE_AUTO
+    capacity_guard_blocks: int = 0
     enable_row_mode_decode_graph: bool = False
     enable_prefill_full_kv_offload: bool = False
     keep_decode_kv_in_hbm: bool = False
@@ -261,6 +279,15 @@ class DSAOffloadConfig:
             hot_cpu_block_multiple=_positive_float(
                 raw_config.get("hot_cpu_block_multiple", 3.0),
                 field_name="hot_cpu_block_multiple",
+            ),
+            capacity_mode=_str_choice(
+                raw_config.get("capacity_mode", DSA_CAPACITY_MODE_AUTO),
+                field_name="capacity_mode",
+                choices=DSA_CAPACITY_MODES,
+            ),
+            capacity_guard_blocks=_non_negative_int(
+                raw_config.get("capacity_guard_blocks", 0),
+                field_name="capacity_guard_blocks",
             ),
             enable_row_mode_decode_graph=_strict_bool(
                 raw_config.get("enable_row_mode_decode_graph", False),

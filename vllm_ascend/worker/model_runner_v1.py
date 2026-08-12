@@ -195,6 +195,9 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.dsa_offload.contracts import (
+    DSA_OP_BACKEND_NANOVLLM_A5,
+)
 from vllm_ascend.dsa_offload.dram_store import (
     DSAHotDRAMStore,
     calculate_dram_usable_blocks,
@@ -214,6 +217,7 @@ from vllm_ascend.dsa_offload.kv_cache import (
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
+    get_dsa_request_limit_blocks,
 )
 from vllm_ascend.dsa_offload.ops import require_dsa_offload_ops
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
@@ -4727,14 +4731,38 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config,
             indexer_group,
         )
-        store = DSAHotDRAMStore(
-            usable_blocks=calculate_dram_usable_blocks(
+        request_limit_blocks = get_dsa_request_limit_blocks(
+            self.vllm_config,
+            block_size=runtime.block_size,
+        )
+        usable_blocks = (
+            request_limit_blocks
+            if request_limit_blocks is not None
+            else calculate_dram_usable_blocks(
                 indexer_num_blocks,
                 self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
-            ),
+            )
+        )
+        use_packed_c8_dram = (
+            runtime.op_backend == DSA_OP_BACKEND_NANOVLLM_A5
+            and runtime.is_c8
+            and self.ascend_config.enable_sparse_sfa_c8
+            and self.ascend_config.enable_sparse_li_c8
+        )
+        store = DSAHotDRAMStore(
+            usable_blocks=usable_blocks,
             storage_rows=resident_pool.storage_rows,
             max_logical_blocks=runtime.max_logical_blocks,
             device=self.device,
+        )
+        logger.info(
+            "[DSA_DRAM_CAPACITY] usable_blocks=%d arena_blocks=%d "
+            "indexer_blocks=%d source=%s packed_c8=%s",
+            store.usable_blocks,
+            store.arena_capacity,
+            indexer_num_blocks,
+            "request_limit" if request_limit_blocks is not None else "hot_multiple",
+            use_packed_c8_dram,
         )
 
         ordered_layer_indices = sorted(resident_names)
@@ -4783,7 +4811,10 @@ class NPUModelRunner(GPUModelRunner):
             store.add_layer(
                 layer_id=runtime_layer_id,
                 resident_nope_cache=resident_cache[0],
-                resident_rope_cache=resident_cache[1],
+                resident_rope_cache=(
+                    None if use_packed_c8_dram else resident_cache[1]
+                ),
+                dram_nope_dtype=(torch.int8 if use_packed_c8_dram else None),
             )
             runtime.bind_resident_layer_cache(
                 layer_id=runtime_layer_id,
@@ -5883,6 +5914,10 @@ class NPUModelRunner(GPUModelRunner):
                             self.model_config.hf_text_config.qk_rope_head_dim,
                             0,
                         )
+                        # A5 C8 intentionally retains this legacy BF16
+                        # backing.  The installed A5 split-cache policy
+                        # reinterprets it as packed C8 after reshape, keeping
+                        # the DSA two-plane scheduler and binder unchanged.
                         kv_cache_spec[layer_name] = (
                             DSAResidentMLAAttentionSpec(
                                 block_size=self.block_size,

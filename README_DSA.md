@@ -56,6 +56,43 @@ additional_config = {
 | `enable_sparse_sfa_c8` | `False` | C8 packed KV cache 开关 |
 | `enable_sparse_li_c8` | `False` | C8 量化 Indexer 开关 |
 
+### 按请求上限定容（阶段二）
+
+默认 `capacity_mode="auto"` 保持 vLLM 的原有行为：根据可用 HBM 尽可能
+多地分配 KV block。对于 DSA，这会间接放大 swapped-DRAM arena，因此长上下文
+低并发服务应使用 `request_limit`：
+
+```python
+"dsa_sparse_config": {
+    "capacity_mode": "request_limit",
+    "capacity_guard_blocks": 0,
+    "indexer_mla_block_ratio": 1,
+}
+```
+
+启动时按以下规则固定容量（`B` 是 `--block-size`）：
+
+```text
+request_blocks = MAX_NUM_SEQS * ceil(MAX_MODEL_LEN / B) + capacity_guard_blocks
+resident HBM base blocks = request_blocks + 1  # BlockPool block 0 是空映射
+Indexer HBM blocks       = resident_base_blocks * indexer_mla_block_ratio
+DDR usable blocks        = request_blocks
+DDR arena blocks         = request_blocks + 1  # block 0 是空映射
+```
+
+因此 `MAX_NUM_SEQS=1`、`MAX_MODEL_LEN=131072`、`B=128`、guard 为 `0` 时，
+请求/DDR usable 均为 `1024`，而 resident base 和 Indexer（ratio=1）均为
+`1025`（其中 block 0 不可分配）；无需设置
+`--num-gpu-blocks-override`。如果可用 HBM 无法容纳请求上限，服务会在启动期
+明确失败，而不是分配过小的 cache。`--num-gpu-blocks-override` 仍可作为显式
+运维覆盖，但在 `request_limit` 模式不得小于计算出的 base 下限。
+`capacity_guard_blocks` 是额外的完整 block 余量；严格按上限做容量验收可设为
+`0`，在线服务若希望保留调度余量可设为 `128`。
+
+`enable_prefill_full_kv_offload=true` 会在最后一个 prefill chunk 后 dump 所有
+已经完整的 block；`keep_decode_kv_in_hbm=true` 则让 decode 新生成 KV 和不足一个
+block 的尾部继续留在 HBM。这两个策略不能表示“decode 全量 KV 都落 DDR”。
+
 ## 算子安装
 
 ### 前置条件

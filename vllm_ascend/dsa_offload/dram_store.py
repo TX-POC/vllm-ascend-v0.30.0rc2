@@ -35,7 +35,7 @@ class DSALayerDRAMArenas:
     """同一 transformer layer 的两张 NPU 可寻址 DRAM arena。"""
 
     nope: torch.Tensor
-    rope: torch.Tensor
+    rope: torch.Tensor | None
 
 
 class DSADRAMReservation(NamedTuple):
@@ -144,32 +144,47 @@ class DSAHotDRAMStore:
         *,
         layer_id: int,
         resident_nope_cache: torch.Tensor,
-        resident_rope_cache: torch.Tensor,
+        resident_rope_cache: torch.Tensor | None,
+        dram_nope_dtype: torch.dtype | None = None,
     ) -> None:
-        """按 resident cache 的真实 block shape 建立该层 arena。"""
+        """按 resident cache 的真实 block shape 建立该层 arena。
+
+        A5 packed C8 uses the NOPE arena as a raw byte ABI.  Its compatibility
+        ROPE plane exists in HBM only for the shared binder and is not read by
+        packed dump/KSC/SFA operators, so it is intentionally omitted from
+        swapped DRAM.
+        """
 
         layer_id = int(layer_id)
         if layer_id in self._layer_arenas:
             raise RuntimeError(
                 f"DSA DRAM layer {layer_id} was initialized twice"
             )
-        if resident_nope_cache.shape[0] <= 0 or resident_rope_cache.shape[0] <= 0:
+        if resident_nope_cache.shape[0] <= 0:
             raise ValueError("DSA resident cache must contain physical blocks")
         nope = self._arena_factory(
             tuple(resident_nope_cache.shape[1:]),
-            resident_nope_cache.dtype,
-            self.arena_capacity,
-            self.device,
-        )
-        rope = self._arena_factory(
-            tuple(resident_rope_cache.shape[1:]),
-            resident_rope_cache.dtype,
+            (
+                dram_nope_dtype
+                if dram_nope_dtype is not None
+                else resident_nope_cache.dtype
+            ),
             self.arena_capacity,
             self.device,
         )
         # block 0 是空映射。只清这一块，不触碰大块有效 arena。
         nope[DSA_DRAM_NULL_BLOCK_ID].zero_()
-        rope[DSA_DRAM_NULL_BLOCK_ID].zero_()
+        rope = None
+        if resident_rope_cache is not None:
+            if resident_rope_cache.shape[0] <= 0:
+                raise ValueError("DSA resident cache must contain physical blocks")
+            rope = self._arena_factory(
+                tuple(resident_rope_cache.shape[1:]),
+                resident_rope_cache.dtype,
+                self.arena_capacity,
+                self.device,
+            )
+            rope[DSA_DRAM_NULL_BLOCK_ID].zero_()
         self._layer_arenas[layer_id] = DSALayerDRAMArenas(
             nope=nope,
             rope=rope,

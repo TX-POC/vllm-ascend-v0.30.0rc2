@@ -55,6 +55,26 @@ def test_layer_arenas_follow_resident_cache_block_shapes() -> None:
     assert torch.count_nonzero(arenas.rope[0]).item() == 0
 
 
+def test_packed_c8_layer_uses_only_byte_nope_dram_arena() -> None:
+    """A5 C8 dump/KSC consumes packed NOPE bytes and no DRAM ROPE plane."""
+
+    store = _make_store()
+    resident_nope = torch.empty(4, 128, 1, 656, dtype=torch.bfloat16)
+
+    store.add_layer(
+        layer_id=0,
+        resident_nope_cache=resident_nope,
+        resident_rope_cache=None,
+        dram_nope_dtype=torch.int8,
+    )
+    arenas = store.get_layer_arenas(0)
+
+    assert arenas.nope.shape == (9, 128, 1, 656)
+    assert arenas.nope.dtype is torch.int8
+    assert arenas.rope is None
+    assert torch.count_nonzero(arenas.nope[0]).item() == 0
+
+
 def test_reservation_is_idempotent_and_release_reclaims_whole_row() -> None:
     store = _make_store()
     pool_rows = np.array([0, 0, 1], dtype=np.intp)

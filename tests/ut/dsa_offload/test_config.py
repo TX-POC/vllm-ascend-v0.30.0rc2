@@ -88,6 +88,8 @@ def test_disabled_config_uses_typed_defaults() -> None:
 
     assert config.enabled is False
     assert config.split_indexer_cache is False
+    assert config.capacity_mode == "auto"
+    assert config.capacity_guard_blocks == 0
     assert config.resident_budget_tokens == (6144, 10240, 12288)
     assert config.max_resident_budget_tokens == 12288
 
@@ -106,6 +108,20 @@ def test_enabled_config_keeps_fractional_dram_multiplier() -> None:
     assert config.hot_cpu_block_multiple == 1.5
     assert config.model_capabilities is not None
     assert config.model_capabilities.architecture == "GlmMoeDsaForCausalLM"
+
+
+def test_request_limit_capacity_config_is_typed() -> None:
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "capacity_mode": "request_limit",
+            "capacity_guard_blocks": 16,
+        },
+        vllm_config=_vllm_config(),
+    )
+
+    assert config.capacity_mode == "request_limit"
+    assert config.capacity_guard_blocks == 16
 
 
 def test_enabled_config_rejects_non_split_layout() -> None:
@@ -136,6 +152,10 @@ def test_enabled_config_rejects_non_split_layout() -> None:
         ({"max_active_reqs": 0}, "must be positive"),
         ({"hot_cpu_block_multiple": float("nan")}, "positive and finite"),
         ({"hot_cpu_block_multiple": float("inf")}, "positive and finite"),
+        ({"capacity_mode": "invalid"}, "capacity_mode"),
+        ({"capacity_mode": 1}, "capacity_mode"),
+        ({"capacity_guard_blocks": -1}, "capacity_guard_blocks"),
+        ({"capacity_guard_blocks": 1.5}, "capacity_guard_blocks"),
     ],
 )
 def test_invalid_static_config_is_rejected(

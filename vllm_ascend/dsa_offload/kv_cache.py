@@ -24,16 +24,75 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.dsa_offload.config import DSA_CAPACITY_MODE_REQUEST_LIMIT
 
 DSA_KV_BLOCK_COUNT_ALIGNMENT = 128
 
 
-def _may_override_num_blocks(
+def get_dsa_request_limit_blocks(
     vllm_config: VllmConfig,
-    num_blocks: int,
-) -> int:
-    override = vllm_config.cache_config.num_gpu_blocks_override
-    return int(override) if override is not None else num_blocks
+    *,
+    block_size: int,
+) -> int | None:
+    """Return allocatable blocks required by request-limit capacity mode.
+
+    ``request_limit`` reserves enough *usable* blocks for every configured
+    concurrent request to reach ``max_model_len`` without sharing full KV
+    blocks.  This is also the exact usable-block target for the swapped DRAM
+    ledger.  A physical HBM ``BlockPool`` separately reserves block 0 as its
+    null mapping; use :func:`get_dsa_request_limit_base_blocks` when sizing
+    the physical HBM pools.
+
+    The default ``auto`` mode retains vLLM's available-HBM based planner.
+    """
+
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(
+            "DSA request-limit sizing requires a positive block_size, got "
+            f"{block_size}"
+        )
+
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    dsa_config = get_ascend_config().dsa_offload_config
+    if dsa_config.capacity_mode != DSA_CAPACITY_MODE_REQUEST_LIMIT:
+        return None
+
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    if max_num_seqs <= 0 or max_model_len <= 0:
+        raise ValueError(
+            "DSA request-limit sizing requires positive scheduler limits: "
+            f"max_num_seqs={max_num_seqs}, max_model_len={max_model_len}"
+        )
+    blocks_per_request = cdiv(max_model_len, block_size)
+    return (
+        max_num_seqs * blocks_per_request
+        + int(dsa_config.capacity_guard_blocks)
+    )
+
+
+def get_dsa_request_limit_base_blocks(
+    vllm_config: VllmConfig,
+    *,
+    block_size: int,
+) -> int | None:
+    """Return physical resident-HBM blocks needed in request-limit mode.
+
+    DSA target pools are vLLM ``BlockPool`` objects.  Each such pool uses
+    physical block 0 as a null block, so N blocks usable by requests require
+    N + 1 physical resident blocks.  The physical Indexer pool is derived from
+    this base count via ``indexer_mla_block_ratio``.
+    """
+
+    usable_blocks = get_dsa_request_limit_blocks(
+        vllm_config,
+        block_size=block_size,
+    )
+    if usable_blocks is None:
+        return None
+    return usable_blocks + 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -246,12 +305,55 @@ def build_dsa_kv_cache_config(
 
     ratio = _get_dsa_ratio()
     bytes_per_base_block = dsa_pool_bytes_per_base_block(kv_cache_groups)
-    num_base_blocks = available_memory // bytes_per_base_block
-    num_base_blocks = num_base_blocks // DSA_KV_BLOCK_COUNT_ALIGNMENT * DSA_KV_BLOCK_COUNT_ALIGNMENT
-    num_base_blocks = _may_override_num_blocks(
-        vllm_config,
-        num_base_blocks,
+    available_num_base_blocks = available_memory // bytes_per_base_block
+    auto_num_base_blocks = (
+        available_num_base_blocks
+        // DSA_KV_BLOCK_COUNT_ALIGNMENT
+        * DSA_KV_BLOCK_COUNT_ALIGNMENT
     )
+    request_limit_usable_blocks = get_dsa_request_limit_blocks(
+        vllm_config,
+        block_size=int(kv_cache_groups[0].kv_cache_spec.block_size),
+    )
+    request_limit_base_blocks = get_dsa_request_limit_base_blocks(
+        vllm_config,
+        block_size=int(kv_cache_groups[0].kv_cache_spec.block_size),
+    )
+    if request_limit_usable_blocks is not None:
+        block_sizes = {
+            int(group.kv_cache_spec.block_size) for group in kv_cache_groups
+        }
+        if len(block_sizes) != 1:
+            raise ValueError(
+                "DSA request-limit capacity requires one shared block_size "
+                "across target and draft KV-cache groups, got "
+                f"{sorted(block_sizes)}"
+            )
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        num_base_blocks = int(override)
+        if (
+            request_limit_base_blocks is not None
+            and num_base_blocks < request_limit_base_blocks
+        ):
+            raise ValueError(
+                "num_gpu_blocks_override is below DSA request-limit "
+                "capacity: "
+                f"override={num_base_blocks}, "
+                f"required_base_blocks={request_limit_base_blocks}"
+            )
+    elif request_limit_base_blocks is not None:
+        if available_num_base_blocks < request_limit_base_blocks:
+            raise ValueError(
+                "Insufficient HBM for DSA request-limit capacity: "
+                f"available_base_blocks={available_num_base_blocks}, "
+                f"required_base_blocks={request_limit_base_blocks}, "
+                f"available_memory={available_memory}, "
+                f"bytes_per_base_block={bytes_per_base_block}"
+            )
+        num_base_blocks = request_limit_base_blocks
+    else:
+        num_base_blocks = auto_num_base_blocks
     if num_base_blocks <= 0:
         raise ValueError(
             "No KV-cache blocks fit in the DSA split layout: "
@@ -280,6 +382,23 @@ def build_dsa_kv_cache_config(
         kv_cache_groups=kv_cache_groups,
     )
     validate_dsa_kv_cache_config(config)
+    if request_limit_usable_blocks is not None:
+        logger.info(
+            "[DSA_CAPACITY_PLAN] mode=request_limit "
+            "request_usable_blocks=%d base_blocks=%d "
+            "resident_usable_blocks=%d indexer_blocks=%d "
+            "indexer_usable_blocks=%d dram_usable_blocks=%d "
+            "max_num_seqs=%d max_model_len=%d block_size=%d",
+            request_limit_usable_blocks,
+            num_base_blocks,
+            num_base_blocks - 1,
+            num_base_blocks * ratio,
+            num_base_blocks * ratio - 1,
+            request_limit_usable_blocks,
+            int(vllm_config.scheduler_config.max_num_seqs),
+            int(vllm_config.model_config.max_model_len),
+            int(kv_cache_groups[0].kv_cache_spec.block_size),
+        )
     return config
 
 
@@ -293,6 +412,20 @@ def dsa_max_memory_usage_bytes(
     if len(resident_groups) != 1:
         raise RuntimeError("DSA memory admission requires exactly one resident MLA group")
     resident_group = resident_groups[0]
+    request_limit_base_blocks = get_dsa_request_limit_base_blocks(
+        vllm_config,
+        block_size=int(resident_group.kv_cache_spec.block_size),
+    )
+    if request_limit_base_blocks is not None:
+        # request_limit models the maximum complete context for every running
+        # request.  The post-prefill resident budget is reused from those
+        # full-context blocks, rather than being an additional HBM allocation.
+        # Return the exact physical BlockPool target here so the startup
+        # precheck and the final allocator use the same bound.
+        return request_limit_base_blocks * dsa_pool_bytes_per_base_block(
+            kv_cache_groups
+        )
+
     resident_page_size = resident_group.kv_cache_spec.page_size_bytes
     resident_bytes_per_layer = resident_group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
     if resident_bytes_per_layer % resident_page_size != 0:
@@ -447,8 +580,15 @@ def report_dsa_kv_cache_config(
     resident_group = kv_cache_config.kv_cache_groups[group_ids.resident_mla]
     indexer_blocks = get_dsa_group_num_blocks(kv_cache_config, indexer_group)
     resident_blocks = get_dsa_group_num_blocks(kv_cache_config, resident_group)
-    indexer_tokens = indexer_blocks * indexer_group.kv_cache_spec.block_size
-    resident_tokens = resident_blocks * resident_group.kv_cache_spec.block_size
+    # Physical block 0 is the shared null mapping in every BlockPool.
+    indexer_usable_blocks = max(0, indexer_blocks - 1)
+    resident_usable_blocks = max(0, resident_blocks - 1)
+    indexer_tokens = (
+        indexer_usable_blocks * indexer_group.kv_cache_spec.block_size
+    )
+    resident_tokens = (
+        resident_usable_blocks * resident_group.kv_cache_spec.block_size
+    )
     max_model_len = int(vllm_config.model_config.max_model_len)
     max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     block_size = int(resident_group.kv_cache_spec.block_size)
@@ -459,7 +599,7 @@ def report_dsa_kv_cache_config(
     resident_slots_per_request = cdiv(dsa_config.max_resident_budget_tokens, block_size) * block_size + block_size
     decode_by_mla = resident_tokens // resident_slots_per_request
     indexer_blocks_per_request = cdiv(max_model_len, indexer_group.kv_cache_spec.block_size)
-    decode_by_indexer = indexer_blocks // indexer_blocks_per_request
+    decode_by_indexer = indexer_usable_blocks // indexer_blocks_per_request
     configured_decode_limit = min(
         decode_by_mla,
         decode_by_indexer,
@@ -477,10 +617,11 @@ def report_dsa_kv_cache_config(
     logger.info_once(
         "\n"
         "================ DSA HBM CACHE CAPACITY REPORT ================\n"
-        "  Split ratio             : indexer:mla = %d:1; base blocks = %s\n"
+        "  Split ratio             : indexer:mla = %d:1; physical base blocks = %s\n"
+        "  BlockPool null mapping  : 1 per pool; resident/indexer usable = %s/%s\n"
         "  Allocated HBM KV bytes  : %s bytes (%s GiB)\n"
-        "  MLA resident plane      : %s tokens (%s blocks x %s tokens)\n"
-        "  Indexer dense plane     : %s tokens (%s blocks x %s tokens)\n"
+        "  MLA resident plane      : %s tokens (%s usable blocks x %s tokens)\n"
+        "  Indexer dense plane     : %s tokens (%s usable blocks x %s tokens)\n"
         "  MTP draft groups        : %s\n"
         "  Batched prefill limit   : %s tokens (dense cache required in both planes)\n"
         "  Sparse decode MLA limit : %s requests (%s resident slots/request)\n"
@@ -489,13 +630,15 @@ def report_dsa_kv_cache_config(
         "=================================================================",
         _get_dsa_ratio(),
         f"{resident_blocks:,}",
+        f"{resident_usable_blocks:,}",
+        f"{indexer_usable_blocks:,}",
         f"{total_bytes:,}",
         format_gib(total_bytes),
         f"{resident_tokens:,}",
-        f"{resident_blocks:,}",
+        f"{resident_usable_blocks:,}",
         f"{block_size:,}",
         f"{indexer_tokens:,}",
-        f"{indexer_blocks:,}",
+        f"{indexer_usable_blocks:,}",
         f"{indexer_group.kv_cache_spec.block_size:,}",
         str(draft_capacities),
         f"{min(resident_tokens, indexer_tokens):,}",
