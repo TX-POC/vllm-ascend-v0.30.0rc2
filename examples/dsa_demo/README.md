@@ -9,7 +9,9 @@
 | `qa_dataset_test.py` | LongBench 风格数据集精度回归，可切 disabled/eager/graph |
 | `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
 | `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
+| `serve_dsa_w4a4c8_tp2.sh` | W4A4C8、TP=2、卡 6/7 的在线服务 |
 | `stream_chat_client.py` | 交互式多轮流式客户端 |
+| `bench_serve_w4a4c8_tp2.sh` | 已拉起服务的单并发 SSE 性能基准 |
 | `online_long_context_dataset_test.py` | 在线长上下文数据集分桶回归 |
 
 当前架构和稳定 ABI 见
@@ -273,6 +275,44 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 - 长上下文请求能够进入 DSA 算子路径；
 - 连续多轮、`/clear` 后新请求以及请求结束后的 row 复用均无串扰；
 - eager 通过后再复测 graph，比较 token IDs、结束原因和服务日志。
+
+### 在线 SSE 性能基准
+
+交互式 `stream_chat_client.py` 用于确认流式协议和回答内容；性能验收应使用
+`bench_serve_w4a4c8_tp2.sh`。该脚本只向已经运行的服务发送请求，不会启动、
+停止或清理 NPU 进程。其底层 `vllm bench serve --backend openai-chat` 对每个
+请求固定发送 `stream=true`，并从 SSE 响应统计 TTFT（首 token 时延）、TPOT
+（首 token 之后的平均每 token 时延）、ITL（相邻 token 时延）和吞吐。
+
+当前 W4A4C8 TP2 服务的 `MAX_NUM_SEQS=1`，因此 benchmark 必须使用单并发。
+如果把客户端并发提高到 2 或以上，额外请求会在服务端排队，TTFT 会包含排队
+时间，不能代表单请求的 DSA 推理性能。
+
+在服务运行的 Docker 容器内另开一个终端执行：
+
+```bash
+cd /home/c00982601/vLLM-DSA
+bash examples/dsa_demo/bench_serve_w4a4c8_tp2.sh \
+  2>&1 | tee bench-sse-in8k-out128.log
+```
+
+默认是 8K 输入、128 输出、5 个请求和 1 个 warmup。8K 超过当前
+`sparse_activation_tokens=6144`，能覆盖 DSA sparse 路径。结果 JSON（含逐请求
+TTFT/TPOT/ITL）保存到 `benchmarks/results/dsa/`。
+
+通过环境变量改变长度和请求数，不需要改脚本：
+
+```bash
+INPUT_LEN=32768 OUTPUT_LEN=128 NUM_PROMPTS=5 \
+  bash examples/dsa_demo/bench_serve_w4a4c8_tp2.sh
+
+INPUT_LEN=65536 OUTPUT_LEN=128 NUM_PROMPTS=3 \
+  bash examples/dsa_demo/bench_serve_w4a4c8_tp2.sh
+```
+
+不要运行 `benchmarks/scripts/run-performance-benchmarks.sh` 来测试这个服务；
+它会自行拉起另一套服务并清理 NPU 进程。`--no-stream` 也不是 SSE 开关，它只
+控制部分数据集的加载方式，不能用于关闭或开启 HTTP 流式响应。
 
 ### 在线长上下文数据集
 
