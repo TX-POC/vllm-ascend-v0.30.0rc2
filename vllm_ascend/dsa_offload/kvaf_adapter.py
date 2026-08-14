@@ -15,8 +15,6 @@ class KvafAdapter:
     def __init__(
         self,
         runtime: object | None = None,
-        *,
-        ddr_bytes: int,
     ) -> None:
         try:
             import kvaf
@@ -32,23 +30,26 @@ class KvafAdapter:
                 "The external kvaf package does not provide a default runtime"
             )
         self.runtime = runtime
-        self.ddr_bytes = int(ddr_bytes)
-        if self.ddr_bytes <= 0:
-            raise ValueError(
-                f"ddr_bytes must be positive, got {self.ddr_bytes}"
-            )
+
+    @staticmethod
+    def slot_size(layout: PackedKvLayout) -> int:
+        return _align_up(
+            layout.tokens_per_logical_block * layout.packed_token_bytes,
+            layout.ddr_layer_alignment_bytes,
+        )
 
     def initialize_dsa_row_index(
         self,
         *,
         layout: PackedKvLayout,
+        ddr_bytes: int,
     ) -> None:
         """Register KVAF's region using DSA's packed layer slot size."""
 
-        slot_size = _align_up(
-            layout.tokens_per_logical_block * layout.packed_token_bytes,
-            layout.ddr_layer_alignment_bytes,
-        )
+        ddr_bytes = int(ddr_bytes)
+        if ddr_bytes <= 0:
+            raise ValueError(f"ddr_bytes must be positive, got {ddr_bytes}")
+        slot_size = self.slot_size(layout)
         initialized = getattr(self.runtime, "initialized", None)
         if initialized is not True:
             initialize = getattr(self.runtime, "initialize", None)
@@ -57,7 +58,7 @@ class KvafAdapter:
                     "The external kvaf.Runtime does not expose initialize()"
                 )
             initialize(
-                ddr_bytes=self.ddr_bytes,
+                ddr_bytes=ddr_bytes,
                 slot_size=slot_size,
             )
         self.validate_region(layout=layout)
@@ -70,16 +71,14 @@ class KvafAdapter:
             raise RuntimeError(
                 "The external kvaf.Runtime does not expose remote_region"
             )
-        expected_slot_size = _align_up(
-            layout.tokens_per_logical_block * layout.packed_token_bytes,
-            layout.ddr_layer_alignment_bytes,
-        )
+        expected_slot_size = self.slot_size(layout)
         actual_slot_size = int(region.get("slot_size", 0))
         if actual_slot_size != expected_slot_size:
             raise RuntimeError(
                 "KVAF region slot_size does not match DSA packed layout: "
                 f"kvaf={actual_slot_size}, expected={expected_slot_size}"
             )
+
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment

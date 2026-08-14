@@ -221,7 +221,6 @@ from vllm_ascend.dsa_offload.dsa_row import (
     M0_LAYOUT_ID,
     PackedKvLayout,
 )
-from vllm_ascend.dsa_offload.kvaf_adapter import KvafAdapter
 from vllm_ascend.dsa_offload.ops import require_dsa_offload_ops
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.dsa_offload.runtime import (
@@ -4727,6 +4726,18 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA runtime owners are missing during KV-cache binding"
             )
 
+        indexer_group = kv_cache_config.kv_cache_groups[
+            group_ids.indexer
+        ]
+        indexer_num_blocks = get_dsa_group_num_blocks(
+            kv_cache_config,
+            indexer_group,
+        )
+        dram_usable_blocks = calculate_dram_usable_blocks(
+            indexer_num_blocks,
+            self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
+        )
+
         dsa_row_layout = None
         if runtime.is_c8:
             dsa_row_layout = PackedKvLayout(
@@ -4735,27 +4746,12 @@ class NPUModelRunner(GPUModelRunner):
                 packed_token_bytes=DSA_PACKED_KV_DIM,
                 ddr_layer_alignment_bytes=M0_DDR_LAYER_ALIGNMENT_BYTES,
             )
-            runtime.register_packed_kv_layout(dsa_row_layout)
-            if runtime.kvaf_adapter is None:
-                runtime.initialize_dsa_row_index(
-                    layout=dsa_row_layout,
-                )
-            else:
-                runtime.initialize_dsa_row_index_from_kvaf(
-                    layout=dsa_row_layout,
-                )
-        indexer_group = kv_cache_config.kv_cache_groups[
-            group_ids.indexer
-        ]
-        indexer_num_blocks = get_dsa_group_num_blocks(
-            kv_cache_config,
-            indexer_group,
-        )
+            runtime.initialize_dsa_row_index(
+                layout=dsa_row_layout,
+                ddr_block_count=dram_usable_blocks,
+            )
         store = DSAHotDRAMStore(
-            usable_blocks=calculate_dram_usable_blocks(
-                indexer_num_blocks,
-                self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
-            ),
+            usable_blocks=dram_usable_blocks,
             storage_rows=resident_pool.storage_rows,
             max_logical_blocks=runtime.max_logical_blocks,
             device=self.device,
@@ -4837,17 +4833,6 @@ class NPUModelRunner(GPUModelRunner):
             runtime.release_pool_index
         )
         self.dsa_hot_dram_store = store
-
-    def bind_dsa_kvaf_adapter(
-        self,
-        kvaf_adapter: KvafAdapter,
-    ) -> None:
-        """Inject the external KVAF adapter before cache initialization."""
-
-        runtime = self.dsa_offload_runtime
-        if runtime is None:
-            raise RuntimeError("DSA KVAF requires DSA offload to be enabled")
-        runtime.bind_kvaf_adapter(kvaf_adapter)
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
