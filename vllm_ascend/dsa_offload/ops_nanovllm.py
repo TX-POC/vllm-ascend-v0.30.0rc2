@@ -673,6 +673,7 @@ def require_nanovllm_dsa_ops() -> None:
             "sparse_and_tail_attention",
             "lidu_cache_update_out",
             "packed_scatter_copy_out",
+            "kvaf_batch_get_prepare_out",
             "sparse_and_tail_attention_c8",
             "full_block_dump",
             "packed_full_block_dump",
@@ -1070,6 +1071,57 @@ def packed_kvcache_scatter_copy(
         copy_counts=copy_counts,
     )
     return attn_slots, res_lens
+
+
+def prepare_kvaf_batch_get_inputs(
+    *,
+    source_token_ids: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_count: torch.Tensor,
+    resident_pool_indices: torch.Tensor,
+    resident_block_table: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    logical_seq_lengths: torch.Tensor,
+    layer_id: int,
+    num_layers: int,
+    max_num_reqs: int,
+    qcap: int,
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    mask: torch.Tensor,
+    output_indices: torch.Tensor,
+    resident_seq_lengths: torch.Tensor,
+) -> None:
+    """Resolve LIDU's miss prefix into the current KVAF BatchGet ABI."""
+
+    source_ids_3d = _a5_topk_view(
+        source_token_ids, name="source_token_ids"
+    )
+    destination_slots_3d = _a5_topk_view(
+        destination_slots, name="destination_slots"
+    )
+    batch = int(source_ids_3d.shape[0])
+    request_capacity = batch * _SPARSE_COUNT
+    torch.ops.nanovllm_dsa.kvaf_batch_get_prepare_out(
+        source_ids_3d,
+        destination_slots_3d,
+        miss_count,
+        resident_pool_indices,
+        resident_block_table,
+        cache_tokens,
+        candidate_lens,
+        logical_seq_lengths,
+        indices[:request_capacity],
+        offsets[:request_capacity],
+        mask[:request_capacity],
+        output_indices[:request_capacity],
+        resident_seq_lengths[:batch],
+        int(layer_id),
+        int(num_layers),
+        int(max_num_reqs),
+        int(qcap),
+    )
 
 
 def packed_full_kv_cache_blocks(

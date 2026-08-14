@@ -60,6 +60,7 @@ OP_NAMES=(
     A5LiduCacheUpdate
     A5KvcacheScatterCopy
     A5PackedKvcacheScatterCopy
+    A5KvafBatchGetPrepare
     A5SparseAndTailAttention
     A5FullBlockDump
     A5PackedFullBlockDump

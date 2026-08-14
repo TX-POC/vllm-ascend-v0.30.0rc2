@@ -83,6 +83,38 @@
         "attr": []
     },
     {
+        "op": "A5KvafBatchGetPrepare",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "source_token_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "resident_pool_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "resident_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "logical_seq_lengths", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "indices_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "offsets_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "mask_buffer", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "output_indices_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "resident_seq_lengths_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "indices_out", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "offsets_out", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "mask_out", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "output_indices_out", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "resident_seq_lengths_out", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "attr": [
+            {"name": "layer_id", "param_type": "required", "type": "int"},
+            {"name": "num_layers", "param_type": "required", "type": "int"},
+            {"name": "max_num_reqs", "param_type": "required", "type": "int"},
+            {"name": "qcap", "param_type": "required", "type": "int"}
+        ]
+    },
+    {
         "op": "A5SparseAndTailAttention",
         "language": "cpp",
         "input_desc": [
