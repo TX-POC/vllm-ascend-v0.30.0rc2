@@ -4829,8 +4829,8 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         runtime.bind_dram_store(store)
-        cache_layout.set_pool_release_callback(
-            runtime.release_pool_index
+        cache_layout.set_request_release_callback(
+            runtime.finish_request
         )
         self.dsa_hot_dram_store = store
 

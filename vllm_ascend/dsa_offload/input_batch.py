@@ -121,6 +121,9 @@ class DSAInputBatchCacheLayout:
             dtype=np.bool_,
         )
         self._request_ids: tuple[str, ...] = ()
+        self._request_release_callback: (
+            Callable[[str, int], None] | None
+        ) = None
         self._pool_release_callback: Callable[[int], None] | None = None
         self.mapping_version = 0
         self.row_count = 0
@@ -191,15 +194,27 @@ class DSAInputBatchCacheLayout:
 
         self._pool_release_callback = callback
 
+    def set_request_release_callback(
+        self,
+        callback: Callable[[str, int], None],
+    ) -> None:
+        """Bind cleanup that must run before the pool row is released."""
+
+        self._request_release_callback = callback
+
     def release_request(self, request_id: str) -> None:
         """在请求真正结束时释放 resident 行及其 DRAM ledger。"""
 
-        released_index = self.resident_token_pool.release(request_id)
-        if (
-            released_index is not None
-            and self._pool_release_callback is not None
-        ):
-            self._pool_release_callback(released_index)
+        pool_index = self.resident_token_pool.get_index(request_id)
+        if pool_index is not None:
+            if self._request_release_callback is not None:
+                self._request_release_callback(request_id, pool_index)
+            released_index = self.resident_token_pool.release(request_id)
+            if (
+                released_index is not None
+                and self._pool_release_callback is not None
+            ):
+                self._pool_release_callback(released_index)
         if request_id in self._request_ids:
             self._request_ids = ()
 

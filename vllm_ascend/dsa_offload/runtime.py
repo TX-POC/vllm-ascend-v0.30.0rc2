@@ -436,6 +436,44 @@ class DSAOffloadRuntime:
         if store is not None:
             store.release_pool_index(pool_index)
 
+    def _kvaf_flat_indices_for_row(self, pool_row: int) -> list[int]:
+        store = self.dram_store
+        if store is not None:
+            block_qs = store.get_allocated_logical_block_indices(pool_row)
+            return self.row_index_geometry.flat_indices_for_block_qs(
+                pool_row=pool_row,
+                block_qs=block_qs,
+            )
+
+        directory = self.dsa_row_directory
+        if directory is None:
+            return []
+        pool_row = int(pool_row)
+        if not 0 <= pool_row < self.row_index_geometry.raw_row_capacity:
+            raise IndexError(
+                f"pool_row={pool_row} is outside DSA_ROW capacity"
+            )
+        row_start = pool_row * self.row_index_geometry.row_stride_cells
+        row_end = row_start + self.row_index_geometry.row_stride_cells
+        valid_cells = directory.valid[row_start:row_end]
+        valid_offsets = (
+            torch.nonzero(valid_cells, as_tuple=False)
+            .flatten()
+            .cpu()
+            .tolist()
+        )
+        return [row_start + int(offset) for offset in valid_offsets]
+
+    def finish_request(self, request_id: str, pool_row: int) -> None:
+        """Free all row-owned KVAF and DSA resources before row reuse."""
+
+        del request_id
+        if self.dsa_row_directory is not None:
+            self.kvaf_adapter.batch_free(
+                flat_indices=self._kvaf_flat_indices_for_row(pool_row),
+            )
+        self.release_pool_index(pool_row)
+
     def prepare_forward(
         self,
         *,

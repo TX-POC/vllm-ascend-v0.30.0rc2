@@ -283,6 +283,22 @@ class DSAHotDRAMStore:
         row.fill(DSA_DRAM_NULL_BLOCK_ID)
         self.table_version += 1
 
+    def get_allocated_logical_block_indices(
+        self,
+        pool_index: int,
+    ) -> np.ndarray:
+        """Return logical blocks currently owned by a resident row."""
+
+        pool_index = int(pool_index)
+        if not 0 <= pool_index < self.storage_rows:
+            raise IndexError(
+                f"DSA DRAM pool row {pool_index} is outside capacity"
+            )
+        return np.flatnonzero(
+            self.logical_block_table[pool_index]
+            != DSA_DRAM_NULL_BLOCK_ID
+        ).astype(np.int32, copy=False)
+
     def gather_rows(
         self,
         *,

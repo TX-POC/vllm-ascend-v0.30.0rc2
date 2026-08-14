@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -123,6 +124,25 @@ class DsaRowIndexGeometry:
             + local_layer_ordinal * self.q_capacity
             + block_q
         )
+
+    def flat_indices_for_block_qs(
+        self,
+        *,
+        pool_row: int,
+        block_qs: Sequence[int],
+    ) -> list[int]:
+        """Return layer-major flat indices for the selected blocks."""
+
+        block_qs = tuple(int(block_q) for block_q in block_qs)
+        return [
+            self.flat_index(
+                pool_row=pool_row,
+                local_layer_ordinal=local_layer_ordinal,
+                block_q=block_q,
+            )
+            for local_layer_ordinal in range(self.n_layers)
+            for block_q in block_qs
+        ]
 
 
 class DDRBlockTable:
