@@ -1072,6 +1072,72 @@ def packed_kvcache_scatter_copy(
     return attn_slots, res_lens
 
 
+def build_c8_attention_metadata(
+    *,
+    destination_slots: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    max_tail_tokens: int,
+    resident_seq_lengths: torch.Tensor,
+    attention_slots: torch.Tensor,
+) -> torch.Tensor:
+    """生成 C8 attention_slots 索引表；不搬 KV、不发 URMA、不读写 packed payload。
+
+    只写 ``attention_slots``；``resident_seq_lengths`` 为只读输入（唯一 writer 是
+    子图 C 的 resolver，本模块只读取）。
+
+    ``attention_slots`` 布局与旧 KSC 的 metadata 输出保持一致：
+      前 ``_SPARSE_COUNT`` 项 = LIDU 输出的 ``destination_slots``；
+      之后 ``tail_count`` 项 = 连续范围 ``[cache_count, cache_count + tail_count)``，
+      其中 ``tail_count = clamp(actual - candidate, 0, max_tail_tokens)``；
+      其余 tail 槽位填 ``-1``（无效 sentinel）。
+    """
+    num_reqs = int(destination_slots.shape[0])
+    tail_capacity = int(attention_slots.shape[-1]) - _SPARSE_COUNT
+    if int(attention_slots.shape[1]) != 1:
+        raise ValueError(
+            "C8 attention_slots must be [B,1,2048+tail], "
+            f"got shape={tuple(attention_slots.shape)}"
+        )
+
+    # 前 2048 项 = LIDU destination_slots
+    attention_slots[:, 0, :_SPARSE_COUNT].copy_(
+        destination_slots[:, 0, :_SPARSE_COUNT]
+    )
+
+    # tail 段：每行写 [cache_count, cache_count + tail_count)，
+    # 超出 tail_count 的槽位保持 -1（调用方预填充）。
+    tail_count = torch.clamp(
+        actual_seq_lengths_kv - candidate_lens,
+        min=0,
+        max=max_tail_tokens,
+    )
+    row_index = torch.arange(
+        num_reqs, dtype=torch.int32, device=attention_slots.device
+    )
+    max_tail = int(tail_count.max().item()) if num_reqs else 0
+    max_tail = min(max_tail, tail_capacity, max_tail_tokens)
+    if max_tail > 0:
+        col_offsets = torch.arange(
+            max_tail, dtype=torch.int32, device=attention_slots.device
+        ).expand(num_reqs, max_tail)
+        col = _SPARSE_COUNT + col_offsets
+        valid = col_offsets < tail_count.unsqueeze(1)
+        values = cache_tokens.unsqueeze(1) + col_offsets
+        attention_slots[
+            row_index.unsqueeze(1).expand(num_reqs, max_tail), 0, col
+        ] = torch.where(
+            valid,
+            values.to(torch.int32),
+            torch.full_like(values, -1, dtype=torch.int32),
+        )
+
+    # 本函数不同步、无 D2H/CRC 诊断；stream/event 依赖由
+    # DsaKvafAdapter::CompleteDirectGetAcrossRanks 在调用 QSFA 前建立。
+    return resident_seq_lengths
+
+
 def packed_full_kv_cache_blocks(
     *,
     hbm_packed_kv: torch.Tensor,
@@ -1244,28 +1310,31 @@ def sparse_flash_attention_for_offload_c8(
 ) -> torch.Tensor:
     """C8 SFA：对 packed KV 执行量化 sparse+tail attention。"""
 
-    packed_kv_input = packed_kv.clone(
-        memory_format=torch.contiguous_format
-    )
+    from vllm_ascend import envs
+
+    # 直接使用 allocator 提供的 canonical packed view，不 clone。
+    # stream/event 依赖（metadata->attention、Get->attention）由
+    # DsaKvafAdapter::CompleteDirectGetAcrossRanks 在调用本函数前建立，
+    # 因此这里不做 torch.npu.synchronize()。
     result = torch.ops.nanovllm_dsa.sparse_and_tail_attention_c8(
         query,
-        packed_kv_input,
+        packed_kv,
         attention_slots,
         block_table,
         actual_seq_lengths_query,
         resident_seq_lengths,
         float(scale_value),
     )
-    torch.npu.synchronize()
-    _log_packed_qsfa_io_once(
-        query=query,
-        packed_kv=packed_kv_input,
-        attention_slots=attention_slots,
-        block_table=block_table,
-        actual_seq_lengths_query=actual_seq_lengths_query,
-        resident_seq_lengths=resident_seq_lengths,
-        output=result,
-    )
+    if envs.VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG:  # 显式 debug 开关，默认关闭
+        _log_packed_qsfa_io_once(
+            query=query,
+            packed_kv=packed_kv,
+            attention_slots=attention_slots,
+            block_table=block_table,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            resident_seq_lengths=resident_seq_lengths,
+            output=result,
+        )
     return result
 
 

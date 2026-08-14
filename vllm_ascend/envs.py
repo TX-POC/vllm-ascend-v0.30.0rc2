@@ -110,6 +110,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Enable A5 C8 DSA metadata/attention D2H diagnostics and CRC validation.
+    # Debug only, off by default. The production hot path must keep this at 0.
+    "VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG": lambda: int(os.getenv("VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG", "0")),
 }
 
 # end-env-vars-definition

@@ -32,7 +32,6 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_DUMP_NOOP_DST_BLOCK_ID,
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_OP_BACKEND_NANOVLLM_A5,
-    DSA_PACKED_KV_DIM,
     DSA_REQUIRED_CACHE_BLOCK_SIZE,
     DSA_ROW_MODE_SPARSE,
     DSA_SFA_COMPUTE_TOPK,
@@ -991,7 +990,12 @@ class DSALayerOffloadContext:
             and self.runtime.is_c8
         ):
             from vllm_ascend.dsa_offload.ops_nanovllm import (
+                build_c8_attention_metadata,
+            )
+            from vllm_ascend.dsa_offload.ops_nanovllm import (
                 lightning_indexer_decode_update_c8 as lidu_c8,
+            )
+            from vllm_ascend.dsa_offload.ops_nanovllm import (
                 packed_kvcache_scatter_copy as ksc_c8,
             )
             cache_tokens = self.runtime._req_cache_tokens[:num_reqs]
@@ -1044,13 +1048,24 @@ class DSALayerOffloadContext:
                 attention_slots=attention_slots,
                 resident_seq_lengths=resident_seq_lengths,
             )
+            build_c8_attention_metadata(
+                destination_slots=outputs.topk_slots,
+                cache_tokens=cache_tokens,
+                candidate_lens=actual_seq_lengths_key,
+                actual_seq_lengths_kv=actual_seq_lengths_key,
+                max_tail_tokens=DSA_REQUIRED_CACHE_BLOCK_SIZE,
+                resident_seq_lengths=resident_seq_lengths,
+                attention_slots=attention_slots,
+            )
             return DSAOffloadSelectionOutput(
-                sparse_indices=attention_slots,
-                tail_info=resident_seq_lengths,
+                attention_slots=attention_slots,
+                resident_seq_lengths=resident_seq_lengths,
             )
         if self.runtime.op_backend == DSA_OP_BACKEND_NANOVLLM_A5:
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 kvcache_scatter_copy as ksc_nv,
+            )
+            from vllm_ascend.dsa_offload.ops_nanovllm import (
                 lightning_indexer_decode_update as lidu_nv,
             )
             cache_tokens = self.runtime._req_cache_tokens[:num_reqs]
@@ -1107,8 +1122,8 @@ class DSALayerOffloadContext:
                 copy_counts=outputs.miss_count,
             )
         return DSAOffloadSelectionOutput(
-            sparse_indices=outputs.topk_slots,
-            tail_info=outputs.tail_info,
+            attention_slots=outputs.topk_slots,
+            resident_seq_lengths=outputs.tail_info,
         )
 
     def execute_sparse_attention(
@@ -1135,10 +1150,10 @@ class DSALayerOffloadContext:
             return sfa_c8(
                 query=c8_query,
                 packed_kv=resident_nope_cache,
-                attention_slots=selection.sparse_indices,
+                attention_slots=selection.attention_slots,
                 block_table=resident_block_table,
                 actual_seq_lengths_query=actual_seq_lengths_query,
-                resident_seq_lengths=selection.tail_info,
+                resident_seq_lengths=selection.resident_seq_lengths,
                 scale_value=scale_value,
             )
         if self.runtime.op_backend == DSA_OP_BACKEND_NANOVLLM_A5:
@@ -1150,8 +1165,8 @@ class DSALayerOffloadContext:
             return sfa_nv(
                 query=query,
                 key=resident_nope_cache,
-                sparse_indices=selection.sparse_indices,
-                tail_info=selection.tail_info,
+                sparse_indices=selection.attention_slots,
+                tail_info=selection.resident_seq_lengths,
                 scale_value=scale_value,
                 block_table=resident_block_table,
                 actual_seq_lengths_query=actual_seq_lengths_query,
@@ -1163,8 +1178,8 @@ class DSALayerOffloadContext:
         return sparse_flash_attention_for_offload(
             query=query,
             key=resident_nope_cache,
-            sparse_indices=selection.sparse_indices,
-            tail_info=selection.tail_info,
+            sparse_indices=selection.attention_slots,
+            tail_info=selection.resident_seq_lengths,
             scale_value=scale_value,
             block_table=resident_block_table,
             actual_seq_lengths_query=actual_seq_lengths_query,

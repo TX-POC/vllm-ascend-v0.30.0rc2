@@ -123,10 +123,14 @@ class DSALightningIndexerOutputs(NamedTuple):
 
 
 class DSAOffloadSelectionOutput(NamedTuple):
-    """LIDU/KSC 完成后交给 SFA-Offload 的逐行 resident 视图。"""
+    """LIDU/KSC 完成后交给 SFA-Offload 的逐行 resident 视图。
 
-    sparse_indices: torch.Tensor
-    tail_info: torch.Tensor
+    ``attention_slots``：供 C8 Attention 的逻辑 slot 索引表。
+    ``resident_seq_lengths``：Resident 有效长度（子图 C resolver 写入）。
+    """
+
+    attention_slots: torch.Tensor
+    resident_seq_lengths: torch.Tensor
 
 
 _REQUIRED_OPS = (

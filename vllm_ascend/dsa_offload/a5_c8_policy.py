@@ -651,7 +651,12 @@ def install_a5_c8_runtime_policy() -> None:
             )
 
         from vllm_ascend.dsa_offload.ops_nanovllm import (
+            build_c8_attention_metadata,
+        )
+        from vllm_ascend.dsa_offload.ops_nanovllm import (
             lightning_indexer_decode_update_c8 as lidu_c8,
+        )
+        from vllm_ascend.dsa_offload.ops_nanovllm import (
             packed_kvcache_scatter_copy as ksc_c8,
         )
 
@@ -676,6 +681,9 @@ def install_a5_c8_runtime_policy() -> None:
         arenas = store.get_layer_arenas(self.layer_id)
         attention_slots = runtime._a5_c8_attention_slots[:num_reqs]
         resident_seq_lengths = runtime._a5_resident_seq_lengths.gpu[:num_reqs]
+        # KVAF 落地前：保留 KSC 做 Resident payload 回填（DDR->HBM）。
+        # metadata（attention_slots）改由 build_c8_attention_metadata 生成，
+        # 与 KSC 的 metadata 输出解耦；KVAF BatchGetSlice 落地后移除 KSC 调用。
         ksc_c8(
             hbm_packed_kv=kwargs["resident_nope_cache"],
             dram_packed_kv=arenas.nope,
@@ -691,9 +699,18 @@ def install_a5_c8_runtime_policy() -> None:
             attention_slots=attention_slots,
             resident_seq_lengths=resident_seq_lengths,
         )
+        build_c8_attention_metadata(
+            destination_slots=outputs.topk_slots,
+            cache_tokens=cache_tokens,
+            candidate_lens=candidate_lens,
+            actual_seq_lengths_kv=logical_seq_lengths,
+            max_tail_tokens=runtime._a5_c8_max_tail_tokens,
+            resident_seq_lengths=resident_seq_lengths,
+            attention_slots=attention_slots,
+        )
         return DSAOffloadSelectionOutput(
-            sparse_indices=attention_slots,
-            tail_info=resident_seq_lengths,
+            attention_slots=attention_slots,
+            resident_seq_lengths=resident_seq_lengths,
         )
 
     NPUModelRunner._reshape_kv_cache_tensors = reshape_kv_cache_tensors
