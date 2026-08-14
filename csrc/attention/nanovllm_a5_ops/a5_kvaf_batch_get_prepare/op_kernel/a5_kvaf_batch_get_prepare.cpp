@@ -12,6 +12,69 @@ constexpr uint32_t BLOCK_MASK = BLOCK_SIZE - 1U;
 constexpr uint32_t PACKED_ROW_BYTES = 656U;
 constexpr uint32_t MASK_CHUNK_BYTES = 2048U;
 constexpr uint32_t RESIDENT_LENGTH_CHUNK = 512U;
+constexpr uint32_t SIMT_BATCH_CHUNK = RESIDENT_LENGTH_CHUNK;
+constexpr uint32_t SIMT_THREADS = 2048U;
+constexpr uint32_t SIMT_MIN_WORK_ITEMS = 128U;
+constexpr uint32_t ROW_OFFSETS_BUFFER_BYTES =
+    ((SIMT_BATCH_CHUNK + 1U) * sizeof(uint32_t) + 31U) & ~31U;
+constexpr uint32_t LAYER_BASES_BUFFER_BYTES =
+    (SIMT_BATCH_CHUNK * sizeof(int32_t) + 31U) & ~31U;
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(2048)
+inline void GenerateKvafDescriptorsSimt(
+    __gm__ const int32_t* sourceTokenIds,
+    __gm__ const int32_t* destinationSlots,
+    __gm__ const int32_t* residentBlockTable,
+    __gm__ int32_t* indices,
+    __gm__ int32_t* offsets,
+    __gm__ int32_t* outputIndices,
+    __ubuf__ const uint32_t* rowOffsets,
+    __ubuf__ const int32_t* layerBases,
+    uint32_t batchBase,
+    uint32_t batchCount,
+    uint32_t requestCapacity,
+    uint32_t residentBlockCapacity,
+    uint32_t totalMissCount)
+{
+    for (uint32_t ordinal = threadIdx.x; ordinal < totalMissCount;
+         ordinal += SIMT_THREADS) {
+        uint32_t low = 0U;
+        uint32_t high = batchCount;
+        while (low < high) {
+            const uint32_t middle = (low + high) >> 1U;
+            if (rowOffsets[middle + 1U] <= ordinal) {
+                low = middle + 1U;
+            } else {
+                high = middle;
+            }
+        }
+
+        const uint32_t localBatch = low;
+        const uint32_t globalBatch = batchBase + localBatch;
+        const uint32_t column = ordinal - rowOffsets[localBatch];
+        const uint64_t flat =
+            static_cast<uint64_t>(globalBatch) * requestCapacity + column;
+        const int32_t sourceToken = sourceTokenIds[flat];
+        const int32_t destinationSlot = destinationSlots[flat];
+        const uint32_t logicalBlock =
+            static_cast<uint32_t>(sourceToken) >> BLOCK_SHIFT;
+        const uint32_t destinationBlock =
+            static_cast<uint32_t>(destinationSlot) >> BLOCK_SHIFT;
+        const uint64_t residentTableBase =
+            static_cast<uint64_t>(globalBatch) * residentBlockCapacity;
+        const int32_t physicalBlock =
+            residentBlockTable[residentTableBase + destinationBlock];
+
+        indices[flat] = static_cast<int32_t>(
+            static_cast<uint32_t>(layerBases[localBatch]) + logicalBlock);
+        offsets[flat] = static_cast<int32_t>(
+            (static_cast<uint32_t>(sourceToken) & BLOCK_MASK) *
+            PACKED_ROW_BYTES);
+        outputIndices[flat] = static_cast<int32_t>(
+            static_cast<uint64_t>(physicalBlock) * BLOCK_SIZE +
+            (static_cast<uint32_t>(destinationSlot) & BLOCK_MASK));
+    }
+}
 
 class A5KvafBatchGetPrepareKernel {
 public:
@@ -41,6 +104,14 @@ public:
         pipe_->InitBuffer(oneMaskBuf_, MASK_CHUNK_BYTES);
         pipe_->InitBuffer(
             residentLengthBuf_, RESIDENT_LENGTH_CHUNK * sizeof(int32_t));
+        pipe_->InitBuffer(rowOffsetsBuf_, ROW_OFFSETS_BUFFER_BYTES);
+        pipe_->InitBuffer(layerBasesBuf_, LAYER_BASES_BUFFER_BYTES);
+        sourceTokenIdsRaw_ = (__gm__ const int32_t*)sourceTokenIds;
+        destinationSlotsRaw_ = (__gm__ const int32_t*)destinationSlots;
+        residentBlockTableRaw_ = (__gm__ const int32_t*)residentBlockTable;
+        indicesRaw_ = (__gm__ int32_t*)indices;
+        offsetsRaw_ = (__gm__ int32_t*)offsets;
+        outputIndicesRaw_ = (__gm__ int32_t*)outputIndices;
         sourceTokenIdsGm_.SetGlobalBuffer((__gm__ int32_t*)sourceTokenIds);
         destinationSlotsGm_.SetGlobalBuffer((__gm__ int32_t*)destinationSlots);
         missCountsGm_.SetGlobalBuffer((__gm__ int32_t*)missCounts);
@@ -58,30 +129,40 @@ public:
 
     __aicore__ inline void Process()
     {
-        // Keep one AIV as the sole metadata writer. The uint8 mask and compact
-        // int32 length vector otherwise allow different cores to false-share
-        // one GM cache line on A5. This bring-up path favors a race-free ABI;
-        // resolver parallelization belongs to the later optimized variant.
+        // Keep one AIV as the sole metadata owner. Descriptor generation uses
+        // intra-core SIMT threads; it does not change the one-core tiling or
+        // introduce cross-core writes to compact metadata cache lines.
         if (coreIdx_ == 0U) {
             InitializeMaskTemplates();
             LocalTensor<int32_t> residentLengths =
                 residentLengthBuf_.Get<int32_t>();
-            uint32_t residentChunkBase = 0U;
-            uint32_t residentChunkCount = 0U;
-            for (uint32_t batch = 0; batch < tiling_->batchSize; ++batch) {
-                ProcessRow(batch);
-                residentLengths.SetValue(
-                    residentChunkCount, CalculateResidentLength(batch));
-                ++residentChunkCount;
-                if (residentChunkCount == RESIDENT_LENGTH_CHUNK ||
-                    batch + 1U == tiling_->batchSize) {
-                    WriteResidentLengths(
-                        residentChunkBase,
-                        residentChunkCount,
-                        residentLengths);
-                    residentChunkBase += residentChunkCount;
-                    residentChunkCount = 0U;
+            LocalTensor<uint32_t> rowOffsets =
+                rowOffsetsBuf_.Get<uint32_t>();
+            LocalTensor<int32_t> layerBases =
+                layerBasesBuf_.Get<int32_t>();
+            for (uint32_t batchBase = 0U; batchBase < tiling_->batchSize;
+                 batchBase += SIMT_BATCH_CHUNK) {
+                const uint32_t batchCount = MinU32(
+                    SIMT_BATCH_CHUNK, tiling_->batchSize - batchBase);
+                const uint32_t totalMissCount = PrepareBatchChunk(
+                    batchBase,
+                    batchCount,
+                    rowOffsets,
+                    layerBases,
+                    residentLengths);
+                if (totalMissCount < SIMT_MIN_WORK_ITEMS) {
+                    GenerateDescriptorsScalar(
+                        batchBase, batchCount, rowOffsets, layerBases);
+                } else {
+                    LaunchDescriptorSimt(
+                        batchBase,
+                        batchCount,
+                        totalMissCount,
+                        rowOffsets,
+                        layerBases);
                 }
+                WriteResidentLengths(
+                    batchBase, batchCount, residentLengths);
             }
         }
     }
@@ -136,54 +217,133 @@ private:
         }
     }
 
-    __aicore__ inline void ProcessRow(uint32_t batch)
+    __aicore__ inline uint32_t SanitizeMissCount(uint32_t batch)
     {
         const int32_t rawMissCount = missCountsGm_.GetValue(batch);
-        const uint32_t missCount =
-            rawMissCount > 0 &&
-                    rawMissCount <= static_cast<int32_t>(tiling_->requestCapacity)
-                ? static_cast<uint32_t>(rawMissCount)
-                : 0U;
+        return rawMissCount > 0 &&
+                rawMissCount <=
+                    static_cast<int32_t>(tiling_->requestCapacity)
+            ? static_cast<uint32_t>(rawMissCount)
+            : 0U;
+    }
+
+    __aicore__ inline int32_t CalculateLayerBase(uint32_t batch)
+    {
         const int32_t poolRow = residentPoolIndicesGm_.GetValue(batch);
-        const uint64_t flatBase =
-            static_cast<uint64_t>(batch) * tiling_->requestCapacity;
-        const uint64_t residentTableBase =
-            static_cast<uint64_t>(batch) * tiling_->residentBlockCapacity;
         // AccessTable is row-major [pool_row][layer][logical_block]. Keep all
         // layers of one request row adjacent so Put/Get share the same layout.
         const uint64_t requestBase =
             static_cast<uint64_t>(poolRow) * tiling_->numLayers * tiling_->qcap;
         const uint64_t layerBase =
             requestBase + static_cast<uint64_t>(tiling_->layerId) * tiling_->qcap;
+        return static_cast<int32_t>(layerBase);
+    }
 
-        WriteMask(flatBase, missCount);
-
-        // Only the miss prefix is consumed by BatchGet.  Leave the inactive
-        // descriptor suffix caller-owned instead of clearing three int32
-        // arrays for every request row.
-        for (uint32_t column = 0; column < missCount; ++column) {
-            const uint64_t flat = flatBase + column;
-            const int32_t sourceToken = sourceTokenIdsGm_.GetValue(flat);
-            const int32_t destinationSlot =
-                destinationSlotsGm_.GetValue(flat);
-            const uint32_t logicalBlock =
-                static_cast<uint32_t>(sourceToken) >> BLOCK_SHIFT;
-            const uint32_t destinationBlock =
-                static_cast<uint32_t>(destinationSlot) >> BLOCK_SHIFT;
-            const int32_t physicalBlock = residentBlockTableGm_.GetValue(
-                residentTableBase + destinationBlock);
-            const int32_t tableIndex =
-                static_cast<int32_t>(layerBase + logicalBlock);
-            const int32_t byteOffset = static_cast<int32_t>(
-                (static_cast<uint32_t>(sourceToken) & BLOCK_MASK) *
-                PACKED_ROW_BYTES);
-            const int32_t outputIndex = static_cast<int32_t>(
-                static_cast<uint64_t>(physicalBlock) * BLOCK_SIZE +
-                (static_cast<uint32_t>(destinationSlot) & BLOCK_MASK));
-            indicesGm_.SetValue(flat, tableIndex);
-            offsetsGm_.SetValue(flat, byteOffset);
-            outputIndicesGm_.SetValue(flat, outputIndex);
+    __aicore__ inline uint32_t PrepareBatchChunk(
+        uint32_t batchBase,
+        uint32_t batchCount,
+        LocalTensor<uint32_t> rowOffsets,
+        LocalTensor<int32_t> layerBases,
+        LocalTensor<int32_t> residentLengths)
+    {
+        uint32_t totalMissCount = 0U;
+        rowOffsets.SetValue(0U, 0U);
+        for (uint32_t localBatch = 0U; localBatch < batchCount;
+             ++localBatch) {
+            const uint32_t globalBatch = batchBase + localBatch;
+            const uint32_t missCount = SanitizeMissCount(globalBatch);
+            totalMissCount += missCount;
+            rowOffsets.SetValue(localBatch + 1U, totalMissCount);
+            layerBases.SetValue(
+                localBatch, CalculateLayerBase(globalBatch));
+            residentLengths.SetValue(
+                localBatch, CalculateResidentLength(globalBatch));
+            WriteMask(
+                static_cast<uint64_t>(globalBatch) *
+                    tiling_->requestCapacity,
+                missCount);
         }
+        return totalMissCount;
+    }
+
+    __aicore__ inline void GenerateDescriptorsScalar(
+        uint32_t batchBase,
+        uint32_t batchCount,
+        LocalTensor<uint32_t> rowOffsets,
+        LocalTensor<int32_t> layerBases)
+    {
+        for (uint32_t localBatch = 0U; localBatch < batchCount;
+             ++localBatch) {
+            const uint32_t globalBatch = batchBase + localBatch;
+            const uint32_t missCount =
+                rowOffsets.GetValue(localBatch + 1U) -
+                rowOffsets.GetValue(localBatch);
+            const int32_t layerBase = layerBases.GetValue(localBatch);
+            const uint64_t flatBase =
+                static_cast<uint64_t>(globalBatch) * tiling_->requestCapacity;
+            const uint64_t residentTableBase =
+                static_cast<uint64_t>(globalBatch) *
+                tiling_->residentBlockCapacity;
+
+            // Only the miss prefix is consumed by BatchGet. Leave inactive
+            // descriptor entries caller-owned.
+            for (uint32_t column = 0U; column < missCount; ++column) {
+                const uint64_t flat = flatBase + column;
+                const int32_t sourceToken = sourceTokenIdsGm_.GetValue(flat);
+                const int32_t destinationSlot =
+                    destinationSlotsGm_.GetValue(flat);
+                const uint32_t logicalBlock =
+                    static_cast<uint32_t>(sourceToken) >> BLOCK_SHIFT;
+                const uint32_t destinationBlock =
+                    static_cast<uint32_t>(destinationSlot) >> BLOCK_SHIFT;
+                const int32_t physicalBlock =
+                    residentBlockTableGm_.GetValue(
+                        residentTableBase + destinationBlock);
+                indicesGm_.SetValue(
+                    flat,
+                    static_cast<int32_t>(
+                        static_cast<uint32_t>(layerBase) + logicalBlock));
+                offsetsGm_.SetValue(
+                    flat,
+                    static_cast<int32_t>(
+                        (static_cast<uint32_t>(sourceToken) & BLOCK_MASK) *
+                        PACKED_ROW_BYTES));
+                outputIndicesGm_.SetValue(
+                    flat,
+                    static_cast<int32_t>(
+                        static_cast<uint64_t>(physicalBlock) * BLOCK_SIZE +
+                        (static_cast<uint32_t>(destinationSlot) &
+                         BLOCK_MASK)));
+            }
+        }
+    }
+
+    __aicore__ inline void LaunchDescriptorSimt(
+        uint32_t batchBase,
+        uint32_t batchCount,
+        uint32_t totalMissCount,
+        LocalTensor<uint32_t> rowOffsets,
+        LocalTensor<int32_t> layerBases)
+    {
+        SetFlag<HardEvent::S_V>(EVENT_ID1);
+        WaitFlag<HardEvent::S_V>(EVENT_ID1);
+        AscendC::Simt::VF_CALL<GenerateKvafDescriptorsSimt>(
+            AscendC::Simt::Dim3{SIMT_THREADS, 1U, 1U},
+            sourceTokenIdsRaw_,
+            destinationSlotsRaw_,
+            residentBlockTableRaw_,
+            indicesRaw_,
+            offsetsRaw_,
+            outputIndicesRaw_,
+            (__ubuf__ const uint32_t*)rowOffsets.GetPhyAddr(),
+            (__ubuf__ const int32_t*)layerBases.GetPhyAddr(),
+            batchBase,
+            batchCount,
+            tiling_->requestCapacity,
+            tiling_->residentBlockCapacity,
+            totalMissCount);
+        SetFlag<HardEvent::V_S>(EVENT_ID1);
+        WaitFlag<HardEvent::V_S>(EVENT_ID1);
     }
 
     __aicore__ inline int32_t CalculateResidentLength(uint32_t batch)
@@ -221,6 +381,12 @@ private:
     TPipe* pipe_;
     const A5KvafBatchGetPrepareTilingData* tiling_;
     uint32_t coreIdx_ = 0;
+    __gm__ const int32_t* sourceTokenIdsRaw_;
+    __gm__ const int32_t* destinationSlotsRaw_;
+    __gm__ const int32_t* residentBlockTableRaw_;
+    __gm__ int32_t* indicesRaw_;
+    __gm__ int32_t* offsetsRaw_;
+    __gm__ int32_t* outputIndicesRaw_;
     GlobalTensor<int32_t> sourceTokenIdsGm_;
     GlobalTensor<int32_t> destinationSlotsGm_;
     GlobalTensor<int32_t> missCountsGm_;
@@ -237,6 +403,8 @@ private:
     TBuf<TPosition::VECCALC> zeroMaskBuf_;
     TBuf<TPosition::VECCALC> oneMaskBuf_;
     TBuf<TPosition::VECCALC> residentLengthBuf_;
+    TBuf<TPosition::VECCALC> rowOffsetsBuf_;
+    TBuf<TPosition::VECCALC> layerBasesBuf_;
 };
 } // namespace
 
