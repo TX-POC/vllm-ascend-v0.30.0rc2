@@ -201,7 +201,7 @@ def test_kvaf_final_prefill_writes_layers_then_publishes_table(
     adapter = _FakeKvafAdapter()
     monkeypatch.setattr(
         "vllm_ascend.dsa_offload.runtime.KvafAdapter",
-        lambda: adapter,
+        lambda **_: adapter,
     )
     runtime = DSAOffloadRuntime(
         max_num_reqs=1,
@@ -213,6 +213,7 @@ def test_kvaf_final_prefill_writes_layers_then_publishes_table(
         device=torch.device("cpu"),
         pin_memory=False,
         enable_prefill_full_kv_offload=True,
+        is_c8=True,
     )
     store = DSAHotDRAMStore(
         usable_blocks=8,
@@ -233,8 +234,8 @@ def test_kvaf_final_prefill_writes_layers_then_publishes_table(
             packed_token_bytes=1,
             ddr_layer_alignment_bytes=128,
         ),
-        ddr_block_count=8,
     )
+    assert adapter.ddr_bytes == 8 * 128
     for layer_id in range(2):
         runtime.bind_resident_layer_cache(
             layer_id=layer_id,

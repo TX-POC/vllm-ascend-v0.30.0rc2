@@ -28,7 +28,7 @@ class _FakeKvafRuntime:
         self.released_handles: list[tuple[int, ...]] = []
         self.committed: dict[int, tuple[int, int]] = {}
 
-    def initialize(self, *, ddr_bytes: int, slot_size: int) -> None:
+    def initialize(self, ddr_bytes: int, slot_size: int) -> None:
         self.initialized = True
         self.remote_region = {
             "base": 4096,
@@ -114,15 +114,41 @@ def _make_adapter(
     DDRBlockTable,
     DsaRowIndexGeometry,
 ]:
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "kvaf",
-        SimpleNamespace(runtime=None),
-    )
     runtime = _FakeKvafRuntime(
         fail_batch_put_call=fail_batch_put_call,
     )
-    adapter = KvafAdapter(runtime=runtime)
+    constructor_args = []
+
+    def npu_runtime(*args):
+        constructor_args.append(args)
+        return runtime
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "kvaf",
+        SimpleNamespace(NpuRuntime=npu_runtime),
+    )
+    monkeypatch.setenv(
+        "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL",
+        "/tmp/kvaf_batch_get.o",
+    )
+    monkeypatch.setenv(
+        "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL",
+        "/tmp/kvaf_batch_put.o",
+    )
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_NPU_CORE_COUNT", "1")
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_JETTYS_PER_CORE", "2")
+    monkeypatch.setattr(torch.npu, "set_device", lambda _device_id: None)
+    adapter = KvafAdapter(device_id=3)
+    assert constructor_args == [
+        (
+            "/tmp/kvaf_batch_get.o",
+            3,
+            1,
+            "/tmp/kvaf_batch_put.o",
+            2,
+        )
+    ]
     layout = PackedKvLayout(
         layout_id="test",
         tokens_per_logical_block=2,

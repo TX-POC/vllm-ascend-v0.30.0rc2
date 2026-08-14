@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # KVAF Batch Put online-service smoke test.
+#
+# Required environment variables:
+#   VLLM_ASCEND_KVAF_BATCH_GET_KERNEL=/path/to/batch_get_kernel.o
+#   VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL=/path/to/batch_put_kernel.o
 
 set -euo pipefail
 
@@ -33,6 +37,8 @@ API_KEY="EMPTY"
 MAX_MODEL_LEN="16384"
 MAX_NUM_BATCHED_TOKENS="8192"
 PROMPT_REPEAT_COUNT="320"
+KVAF_BATCH_GET_KERNEL="${VLLM_ASCEND_KVAF_BATCH_GET_KERNEL:-${KVAF_BATCH_GET_KERNEL:-${KVAF_AIV_BATCH_GET_KERNEL:-}}}"
+KVAF_BATCH_PUT_KERNEL="${VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL:-${KVAF_BATCH_PUT_KERNEL:-}}"
 
 for value_name in TENSOR_PARALLEL_SIZE PORT STARTUP_TIMEOUT_SECONDS; do
     value="${!value_name}"
@@ -42,6 +48,17 @@ for value_name in TENSOR_PARALLEL_SIZE PORT STARTUP_TIMEOUT_SECONDS; do
     fi
 done
 
+for kernel_name in KVAF_BATCH_GET_KERNEL KVAF_BATCH_PUT_KERNEL; do
+    kernel_path="${!kernel_name}"
+    if [[ -z "${kernel_path}" || ! -f "${kernel_path}" ]]; then
+        echo "${kernel_name} must point to a built KVAF AIV kernel object." >&2
+        exit 2
+    fi
+done
+
+export VLLM_ASCEND_KVAF_BATCH_GET_KERNEL="${KVAF_BATCH_GET_KERNEL}"
+export VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL="${KVAF_BATCH_PUT_KERNEL}"
+
 for command_name in curl python3 vllm; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
         echo "Required command is unavailable: ${command_name}" >&2
@@ -49,8 +66,8 @@ for command_name in curl python3 vllm; do
     fi
 done
 
-if ! python3 -c "import kvaf" >/dev/null 2>&1; then
-    echo "The Python environment used by vLLM cannot import kvaf." >&2
+if ! python3 -c "import kvaf; assert hasattr(kvaf, 'NpuRuntime')" >/dev/null 2>&1; then
+    echo "KVAF must be importable and built with NpuRuntime support." >&2
     exit 2
 fi
 

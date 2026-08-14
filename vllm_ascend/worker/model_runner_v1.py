@@ -4748,7 +4748,6 @@ class NPUModelRunner(GPUModelRunner):
             )
             runtime.initialize_dsa_row_index(
                 layout=dsa_row_layout,
-                ddr_block_count=dram_usable_blocks,
             )
         store = DSAHotDRAMStore(
             usable_blocks=dram_usable_blocks,

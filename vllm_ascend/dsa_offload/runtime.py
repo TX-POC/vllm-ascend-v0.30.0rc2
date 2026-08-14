@@ -99,7 +99,13 @@ class DSAOffloadRuntime:
         self.keep_decode_kv_in_hbm = bool(keep_decode_kv_in_hbm)
         self.op_backend = str(op_backend)
         self.is_c8 = bool(is_c8)
-        self.kvaf_adapter = KvafAdapter()
+        self.kvaf_adapter: KvafAdapter | None = (
+            KvafAdapter(
+                device_id=self.device.index or 0,
+            )
+            if self.is_c8
+            else None
+        )
         if self.op_backend == DSA_OP_BACKEND_NANOVLLM_A5:
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 require_nanovllm_dsa_ops,
@@ -302,7 +308,6 @@ class DSAOffloadRuntime:
         self,
         *,
         layout: PackedKvLayout,
-        ddr_block_count: int,
     ) -> DDRBlockTable:
         """Initialize KVAF and create its DSA_ROW directory view."""
 
@@ -315,15 +320,15 @@ class DSAOffloadRuntime:
         self.register_packed_kv_layout(layout)
         if self.dsa_row_directory is not None:
             raise RuntimeError("DSA_ROW directory was initialized twice")
-        ddr_block_count = int(ddr_block_count)
-        if ddr_block_count <= 0:
-            raise ValueError(
-                f"ddr_block_count must be positive, got {ddr_block_count}"
+        if self.kvaf_adapter is None:
+            raise RuntimeError(
+                "DSA_ROW initialization requires the C8 KVAF runtime"
             )
+        directory_cell_count = self.row_index_geometry.directory_cell_count
         self.kvaf_adapter.initialize_dsa_row_index(
             layout=layout,
             ddr_bytes=(
-                ddr_block_count
+                directory_cell_count
                 * self.kvaf_adapter.slot_size(layout)
             ),
         )
@@ -337,6 +342,11 @@ class DSAOffloadRuntime:
         if self.dsa_row_directory is None:
             raise RuntimeError("DSA_ROW directory has not been initialized")
         return self.dsa_row_directory
+
+    def _require_kvaf_adapter(self) -> KvafAdapter:
+        if self.kvaf_adapter is None:
+            raise RuntimeError("DSA C8 KVAF runtime is not initialized")
+        return self.kvaf_adapter
 
     def bind_resident_layer_cache(
         self,
@@ -444,7 +454,7 @@ class DSAOffloadRuntime:
 
     def release_pool_index(self, pool_index: int) -> None:
         if self.dsa_row_directory is not None:
-            self.kvaf_adapter.release_pool_row(
+            self._require_kvaf_adapter().release_pool_row(
                 pool_index,
                 block_table=self._require_dsa_row_directory(),
             )
@@ -454,12 +464,12 @@ class DSAOffloadRuntime:
 
     def shutdown(self) -> None:
         if self.dsa_row_directory is not None:
-            self.kvaf_adapter.shutdown(
+            self._require_kvaf_adapter().shutdown(
                 block_table=self._require_dsa_row_directory(),
             )
 
     def _finalize_kvaf_batch_put(self) -> None:
-        adapter = self.kvaf_adapter
+        adapter = self._require_kvaf_adapter()
         if not adapter.active_batch_put:
             self._defer_prefill_layer_dump = False
             return
@@ -527,7 +537,8 @@ class DSAOffloadRuntime:
         self.dump_launch_count = 0
         self._defer_prefill_layer_dump = False
         self._req_cache_tokens = state.sparse_budget_tokens
-        if self.kvaf_adapter.active_batch_put:
+        adapter = self.kvaf_adapter
+        if adapter is not None and adapter.active_batch_put:
             raise RuntimeError(
                 "Previous DSA KVAF BatchPut was not finalized before the "
                 "next forward"
@@ -546,7 +557,7 @@ class DSAOffloadRuntime:
             validate_all_sparse=dram_table_refreshed,
         )
         if self.dsa_row_directory is not None and self.dump_job_count:
-            self.kvaf_adapter.prepare_batch_put(
+            self._require_kvaf_adapter().prepare_batch_put(
                 KvafBatchPutJobs(
                     pool_rows=self._dump_pool_indices[
                         : self.dump_job_count
@@ -1338,13 +1349,14 @@ class DSALayerOffloadContext:
                 return
             if self.runtime.dump_job_count == 0:
                 return
+            adapter = self.runtime._require_kvaf_adapter()
             try:
-                self.runtime.kvaf_adapter.write_batch_put_layer(
+                adapter.write_batch_put_layer(
                     local_layer_ordinal=self.layer_id,
                     packed_cache=resident_nope_cache,
                 )
             except Exception:
-                self.runtime.kvaf_adapter.abort_batch_put(
+                adapter.abort_batch_put(
                     block_table=self.runtime._require_dsa_row_directory(),
                 )
                 raise

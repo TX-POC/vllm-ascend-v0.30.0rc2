@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_ascend import envs
 from vllm_ascend.dsa_offload.dsa_row import (
     DDRBlockTable,
     DsaRowIndexGeometry,
@@ -68,7 +69,8 @@ class KvafAdapter:
 
     def __init__(
         self,
-        runtime: object | None = None,
+        *,
+        device_id: int = 0,
     ) -> None:
         try:
             import kvaf
@@ -77,13 +79,33 @@ class KvafAdapter:
                 "The external kvaf package is required for DSA offload"
             ) from error
 
-        if runtime is None:
-            runtime = getattr(kvaf, "runtime", None)
-        if runtime is None:
+        npu_runtime = getattr(kvaf, "NpuRuntime", None)
+        if npu_runtime is None:
             raise RuntimeError(
-                "The external kvaf package does not provide a default runtime"
+                "The external kvaf package does not provide NpuRuntime; "
+                "build KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON"
             )
-        self.runtime = runtime
+        batch_get_kernel = envs.VLLM_ASCEND_KVAF_BATCH_GET_KERNEL
+        if not batch_get_kernel:
+            raise RuntimeError(
+                "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL must point to the "
+                "external KVAF BatchGet kernel object"
+            )
+        batch_put_kernel = envs.VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL
+        if not batch_put_kernel:
+            raise RuntimeError(
+                "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL must point to the "
+                "external KVAF BatchPut kernel object"
+            )
+        device_id = int(device_id)
+        torch.npu.set_device(device_id)
+        self.runtime = npu_runtime(
+            batch_get_kernel,
+            device_id,
+            envs.VLLM_ASCEND_KVAF_NPU_CORE_COUNT,
+            batch_put_kernel,
+            envs.VLLM_ASCEND_KVAF_JETTYS_PER_CORE,
+        )
         self._layout: PackedKvLayout | None = None
         self._geometry: DsaRowIndexGeometry | None = None
         self._committed_block_counts: dict[int, int] = {}
@@ -119,10 +141,7 @@ class KvafAdapter:
                 raise RuntimeError(
                     "The external kvaf.Runtime does not expose initialize()"
                 )
-            initialize(
-                ddr_bytes=ddr_bytes,
-                slot_size=slot_size,
-            )
+            initialize(ddr_bytes, slot_size)
         self.validate_region(layout=layout)
         self._layout = layout
 
@@ -274,8 +293,8 @@ class KvafAdapter:
                 dtype=torch.int64,
                 device=device_addresses.device,
             )
-            device_addresses.index_copy_(
-                0,
+            self._index_copy_compat(
+                device_addresses,
                 device_keys,
                 addresses.to(dtype=device_addresses.dtype),
             )
@@ -283,12 +302,12 @@ class KvafAdapter:
                 self._require_layout().tokens_per_logical_block
                 * self._require_layout().packed_token_bytes
             )
-            block_table.lengths.index_fill_(
-                0,
+            self._index_fill_compat(
+                block_table.lengths,
                 device_keys,
                 expected_block_bytes,
             )
-            block_table.valid.index_copy_(0, device_keys, valid)
+            self._index_copy_compat(block_table.valid, device_keys, valid)
             self._synchronize_device(device_addresses.device)
         finally:
             self.runtime.release_access_table(handle)
@@ -474,10 +493,44 @@ class KvafAdapter:
             dtype=torch.int64,
             device=device_addresses.device,
         )
-        device_addresses.index_fill_(0, device_keys, 0)
-        block_table.lengths.index_fill_(0, device_keys, 0)
-        block_table.valid.index_fill_(0, device_keys, 0)
+        self._index_fill_compat(device_addresses, device_keys, 0)
+        self._index_fill_compat(block_table.lengths, device_keys, 0)
+        self._index_fill_compat(block_table.valid, device_keys, 0)
         self._synchronize_device(device_addresses.device)
+
+    @staticmethod
+    def _index_copy_compat(
+        target: torch.Tensor,
+        indices: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Update fixed metadata tensors across CPU and NPU backends.
+
+        CPU PyTorch does not implement ``index_copy`` for ``uint64``.  The
+        HBM path keeps the regular indexed kernel; the CPU fallback is used
+        by unit tests and host-side validation only.
+        """
+
+        if target.device.type == "cpu" and target.dtype == torch.uint64:
+            # CPU PyTorch has no UInt64 index_copy/index_put kernel.  The
+            # tensor is a host metadata buffer here, so update its NumPy view
+            # without allocating a second table.
+            target.detach().numpy()[
+                indices.detach().numpy()
+            ] = values.detach().numpy()
+            return
+        target.index_copy_(0, indices, values)
+
+    @staticmethod
+    def _index_fill_compat(
+        target: torch.Tensor,
+        indices: torch.Tensor,
+        value: int,
+    ) -> None:
+        if target.device.type == "cpu" and target.dtype == torch.uint64:
+            target.detach().numpy()[indices.detach().numpy()] = value
+            return
+        target.index_fill_(0, indices, value)
 
     def _require_layout(self) -> PackedKvLayout:
         if self._layout is None:
