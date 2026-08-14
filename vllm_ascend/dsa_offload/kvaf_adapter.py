@@ -46,6 +46,9 @@ class KvafAdapter:
         self.runtime = npu_runtime(
             batch_get_kernel,
             device_id,
+            envs.VLLM_ASCEND_KVAF_NPU_CORE_COUNT,
+            envs.VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL,
+            envs.VLLM_ASCEND_KVAF_JETTYS_PER_CORE,
         )
 
     @staticmethod
