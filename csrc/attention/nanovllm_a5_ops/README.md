@@ -289,8 +289,16 @@ python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode bench --he
 
 ### BatchGet Prepare / KVAF BatchGet 独立性能
 
-先按本文档上述步骤构建 nano-vLLM A5 算子，再于 KVAF 仓库构建
-NPU Runtime、BatchGet kernel 和 Python binding：
+正常 vLLM-Ascend 路径使用主扩展 `vllm_ascend_C` 注册 A5 DSA 算子，
+不需要 standalone `nanovllm_dsa_a5._C`。先从仓库根目录安装当前源码：
+
+```bash
+export VLLM_DSA_ROOT=/home/y00937180/vLLM-DSA
+cd "$VLLM_DSA_ROOT"
+bash csrc/attention/nanovllm_a5_ops/install_nanovllm_a5.sh
+```
+
+再于 KVAF 仓库构建 NPU Runtime、BatchGet kernel 和 Python binding：
 
 ```bash
 export KVAF_ROOT=/Users/heather/Documents/大月亮/KVAF
@@ -304,10 +312,13 @@ cmake -S "$KVAF_ROOT" -B "$KVAF_ROOT/build-aiv" \
 cmake --build "$KVAF_ROOT/build-aiv" -j
 ```
 
-然后从 `csrc/attention/nanovllm_a5_ops` 目录执行：
+然后从 `csrc/attention/nanovllm_a5_ops` 目录执行。`PYTHONPATH` 必须指向
+仓库根目录和 KVAF 构建产物，不要把未构建的 `torch_extension`
+源码目录放到最前面：
 
 ```bash
-export PYTHONPATH="$PWD/torch_extension:$KVAF_ROOT/build-aiv/python:$PYTHONPATH"
+cd "$VLLM_DSA_ROOT/csrc/attention/nanovllm_a5_ops"
+export PYTHONPATH="$VLLM_DSA_ROOT:$KVAF_ROOT/build-aiv/python:$PYTHONPATH"
 python3 tests/benchmark_kvaf_batch_get.py \
   --device npu:0 \
   --batch-get-kernel "$KVAF_ROOT/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
@@ -321,6 +332,11 @@ python3 tests/benchmark_kvaf_batch_get.py \
   --warmup 10 \
   --iters 100
 ```
+
+如果特意使用 standalone 算子开发模式，则需先在本目录执行
+`bash build_nanovllm_ops.sh`，确认 `torch_extension/nanovllm_dsa_a5/_C*.so`
+已生成后，才可把 `torch_extension` 加入 `PYTHONPATH`。性能脚本会优先
+加载 `vllm_ascend_C`，仅在主扩展不可用时回退到 standalone `_C`。
 
 `--miss-count` 是每行的 miss 数，可分别使用 `0/256/2048` 测空载、典型和
 全 miss 场景。默认使用不重复的随机 source token 和随机 destination slot，

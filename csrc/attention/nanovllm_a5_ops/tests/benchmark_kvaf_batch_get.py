@@ -8,6 +8,7 @@ input construction, and correctness checks are excluded from timed regions.
 from __future__ import annotations
 
 import argparse
+import importlib
 import statistics
 import time
 from dataclasses import dataclass
@@ -18,7 +19,6 @@ import torch
 import torch_npu  # type: ignore  # noqa: F401
 
 import kvaf
-import nanovllm_dsa_a5  # noqa: F401
 
 
 BLOCK_SIZE = 128
@@ -27,6 +27,30 @@ ENTRY_BYTES = BLOCK_SIZE * PACKED_TOKEN_BYTES
 TOPK = 2048
 DESTINATION_BLOCKS_PER_ROW = TOPK // BLOCK_SIZE
 SOURCE_FILL = 0x5A
+
+
+def load_dsa_registration() -> str:
+    """Load the Prepare registration from the normal or standalone build."""
+
+    failures: list[str] = []
+    for module_name, backend in (
+        ("vllm_ascend.dsa_offload.a5_extension", "vllm_ascend_C"),
+        ("nanovllm_dsa_a5", "nanovllm_dsa_a5._C"),
+    ):
+        try:
+            importlib.import_module(module_name)
+            getattr(torch.ops.nanovllm_dsa, "kvaf_batch_get_prepare_out")
+        except Exception as error:
+            failures.append(f"{backend}: {type(error).__name__}: {error}")
+            continue
+        return backend
+    raise RuntimeError(
+        "Unable to load kvaf_batch_get_prepare_out. For the normal repository "
+        "build, reinstall vLLM-Ascend from this source tree with custom kernels "
+        "enabled. For standalone operator development, run "
+        "build_nanovllm_ops.sh before adding torch_extension to PYTHONPATH. "
+        f"Load failures: {' | '.join(failures)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -394,6 +418,7 @@ def main() -> None:
     if device.type != "npu":
         raise ValueError("--device must select an NPU, for example npu:0")
     torch.npu.set_device(device)
+    dsa_registration_backend = load_dsa_registration()
     table_capacity = args.batch_size * args.num_layers * args.qcap
     ddr_bytes = table_capacity * ENTRY_BYTES
     ddr_gib = ddr_bytes / (1024.0**3)
@@ -430,7 +455,8 @@ def main() -> None:
             f"source_layout={args.source_layout} "
             f"active_tokens={active_tokens} warmup={args.warmup} "
             f"iters={args.iters} npu_cores={args.npu_cores} "
-            f"jettys_per_core={args.jettys_per_core}",
+            f"jettys_per_core={args.jettys_per_core} "
+            f"dsa_registration_backend={dsa_registration_backend}",
             flush=True,
         )
         runtime.initialize(ddr_bytes, ENTRY_BYTES)
