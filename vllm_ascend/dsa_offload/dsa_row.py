@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
+import torch
 
 _INT32_MAX = (1 << 31) - 1
 
@@ -126,15 +126,32 @@ class DsaRowIndexGeometry:
 
 
 class DDRBlockTable:
-    """Fixed-size table containing only address, length, and valid arrays."""
+    """Fixed-size tensor table containing address, length, and valid arrays."""
 
-    def __init__(self, cell_count: int) -> None:
+    def __init__(
+        self,
+        cell_count: int,
+        *,
+        device: torch.device | str,
+    ) -> None:
         cell_count = int(cell_count)
         if cell_count <= 0:
             raise ValueError(f"cell_count must be positive, got {cell_count}")
-        self.addresses = np.zeros(cell_count, dtype=np.uint64)
-        self.lengths = np.zeros(cell_count, dtype=np.uint64)
-        self.valid = np.zeros(cell_count, dtype=np.uint8)
+        self.addresses = torch.zeros(
+            cell_count,
+            dtype=torch.uint64,
+            device=device,
+        )
+        self.lengths = torch.zeros(
+            cell_count,
+            dtype=torch.uint64,
+            device=device,
+        )
+        self.valid = torch.zeros(
+            cell_count,
+            dtype=torch.uint8,
+            device=device,
+        )
 
 
 __all__ = [

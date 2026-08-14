@@ -325,7 +325,8 @@ class DSAOffloadRuntime:
             ),
         )
         self.dsa_row_directory = DDRBlockTable(
-            self.row_index_geometry.directory_cell_count
+            self.row_index_geometry.directory_cell_count,
+            device=self.device,
         )
         return self.dsa_row_directory
 
