@@ -195,6 +195,7 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.dsa_offload.contracts import DSA_PACKED_KV_DIM
 from vllm_ascend.dsa_offload.dram_store import (
     DSAHotDRAMStore,
     calculate_dram_usable_blocks,
@@ -215,6 +216,12 @@ from vllm_ascend.dsa_offload.kv_cache import (
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
 )
+from vllm_ascend.dsa_offload.dsa_row import (
+    M0_DDR_LAYER_ALIGNMENT_BYTES,
+    M0_LAYOUT_ID,
+    PackedKvLayout,
+)
+from vllm_ascend.dsa_offload.kvaf_adapter import KvafAdapter
 from vllm_ascend.dsa_offload.ops import require_dsa_offload_ops
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.dsa_offload.runtime import (
@@ -4720,6 +4727,23 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA runtime owners are missing during KV-cache binding"
             )
 
+        dsa_row_layout = None
+        if runtime.is_c8:
+            dsa_row_layout = PackedKvLayout(
+                layout_id=M0_LAYOUT_ID,
+                tokens_per_logical_block=runtime.block_size,
+                packed_token_bytes=DSA_PACKED_KV_DIM,
+                ddr_layer_alignment_bytes=M0_DDR_LAYER_ALIGNMENT_BYTES,
+            )
+            runtime.register_packed_kv_layout(dsa_row_layout)
+            if runtime.kvaf_adapter is None:
+                runtime.initialize_dsa_row_index(
+                    layout=dsa_row_layout,
+                )
+            else:
+                runtime.initialize_dsa_row_index_from_kvaf(
+                    layout=dsa_row_layout,
+                )
         indexer_group = kv_cache_config.kv_cache_groups[
             group_ids.indexer
         ]
@@ -4813,6 +4837,17 @@ class NPUModelRunner(GPUModelRunner):
             runtime.release_pool_index
         )
         self.dsa_hot_dram_store = store
+
+    def bind_dsa_kvaf_adapter(
+        self,
+        kvaf_adapter: KvafAdapter,
+    ) -> None:
+        """Inject the external KVAF adapter before cache initialization."""
+
+        runtime = self.dsa_offload_runtime
+        if runtime is None:
+            raise RuntimeError("DSA KVAF requires DSA offload to be enabled")
+        runtime.bind_kvaf_adapter(kvaf_adapter)
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}

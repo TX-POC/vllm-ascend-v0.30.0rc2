@@ -38,6 +38,12 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_SFA_COMPUTE_TOPK,
 )
 from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
+from vllm_ascend.dsa_offload.dsa_row import (
+    DDRBlockTable,
+    DsaRowIndexGeometry,
+    PackedKvLayout,
+)
+from vllm_ascend.dsa_offload.kvaf_adapter import KvafAdapter
 from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
@@ -76,6 +82,7 @@ class DSAOffloadRuntime:
         keep_decode_kv_in_hbm: bool = False,
         op_backend: str = "default",
         is_c8: bool = False,
+        kvaf_adapter: KvafAdapter | None = None,
     ) -> None:
         self.max_num_reqs = int(max_num_reqs)
         self.max_num_tokens = int(max_num_tokens)
@@ -90,6 +97,7 @@ class DSAOffloadRuntime:
         self.keep_decode_kv_in_hbm = bool(keep_decode_kv_in_hbm)
         self.op_backend = str(op_backend)
         self.is_c8 = bool(is_c8)
+        self.kvaf_adapter = kvaf_adapter
         if self.op_backend == DSA_OP_BACKEND_NANOVLLM_A5:
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 require_nanovllm_dsa_ops,
@@ -98,6 +106,12 @@ class DSAOffloadRuntime:
         self.max_logical_blocks = cdiv(
             self.max_model_len,
             self.block_size,
+        )
+        self.row_index_geometry = DsaRowIndexGeometry.from_runtime(
+            raw_row_capacity=self.max_num_reqs,
+            n_layers=self.num_layers,
+            max_sequence_tokens=self.max_model_len,
+            tokens_per_logical_block=self.block_size,
         )
 
         output_shape = (
@@ -228,6 +242,8 @@ class DSAOffloadRuntime:
         )
 
         self.dram_store: DSAHotDRAMStore | None = None
+        self.dsa_row_directory: DDRBlockTable | None = None
+        self.packed_kv_layout: PackedKvLayout | None = None
         self.active_num_reqs = 0
         self.execution_num_reqs = 0
         self.dump_job_count = 0
@@ -245,6 +261,17 @@ class DSAOffloadRuntime:
         self._c8_attention_slots: dict[int, torch.Tensor] = {}
         self._c8_resident_seq_lengths: dict[int, torch.Tensor] = {}
 
+    def bind_kvaf_adapter(self, kvaf_adapter: KvafAdapter) -> None:
+        """Bind the adapter for the external KVAF package."""
+
+        if self.dsa_row_directory is not None:
+            raise RuntimeError(
+                "KVAF adapter must be bound before DSA_ROW initialization"
+            )
+        if self.kvaf_adapter is not None:
+            raise RuntimeError("KVAF adapter was bound twice")
+        self.kvaf_adapter = kvaf_adapter
+
     def bind_dram_store(self, store: DSAHotDRAMStore) -> None:
         if self.dram_store is not None:
             raise RuntimeError("DSA offload runtime DRAM store was bound twice")
@@ -261,6 +288,60 @@ class DSAOffloadRuntime:
                 f"runtime={self.max_logical_blocks}"
             )
         self.dram_store = store
+
+    def register_packed_kv_layout(self, layout: PackedKvLayout) -> None:
+        """Freeze the worker-lifetime packed layout used by KVAF."""
+
+        if layout.tokens_per_logical_block != self.block_size:
+            raise ValueError(
+                "KVAF layout block size does not match DSA runtime: "
+                f"layout={layout.tokens_per_logical_block}, "
+                f"runtime={self.block_size}"
+            )
+        if self.packed_kv_layout is not None:
+            if self.packed_kv_layout != layout:
+                raise RuntimeError(
+                    "DSA packed KV layout changed after it was frozen: "
+                    f"old={self.packed_kv_layout}, new={layout}"
+                )
+            return
+        self.packed_kv_layout = layout
+
+    def initialize_dsa_row_index(
+        self,
+        *,
+        layout: PackedKvLayout,
+    ) -> DDRBlockTable:
+        """Create the fixed-size DSA_ROW table owned by the DSA side."""
+
+        if layout.tokens_per_logical_block != self.block_size:
+            raise ValueError(
+                "KVAF layout block size does not match DSA runtime: "
+                f"layout={layout.tokens_per_logical_block}, "
+                f"runtime={self.block_size}"
+            )
+        self.register_packed_kv_layout(layout)
+        if self.dsa_row_directory is not None:
+            raise RuntimeError("DSA_ROW directory was initialized twice")
+        self.dsa_row_directory = DDRBlockTable(
+            self.row_index_geometry.directory_cell_count
+        )
+        return self.dsa_row_directory
+
+    def initialize_dsa_row_index_from_kvaf(
+        self,
+        *,
+        layout: PackedKvLayout,
+    ) -> DDRBlockTable:
+        """Initialize the external KVAF region before creating the DSA table."""
+
+        adapter = self.kvaf_adapter
+        if adapter is None:
+            raise RuntimeError(
+                "A KVAF adapter is required for DSA_ROW initialization"
+            )
+        adapter.initialize_dsa_row_index(layout=layout)
+        return self.initialize_dsa_row_index(layout=layout)
 
     def bind_resident_layer_cache(
         self,

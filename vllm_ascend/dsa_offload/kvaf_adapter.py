@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Thin adapter for the external KVAF Python package."""
+
+from __future__ import annotations
+
+from vllm_ascend.dsa_offload.dsa_row import (
+    PackedKvLayout,
+)
+
+
+class KvafAdapter:
+    """Import and dispatch the external KVAF runtime without duplicating it."""
+
+    def __init__(
+        self,
+        runtime: object | None = None,
+        *,
+        ddr_bytes: int,
+    ) -> None:
+        try:
+            import kvaf
+        except ImportError as error:
+            raise RuntimeError(
+                "The external kvaf package is required for DSA offload"
+            ) from error
+
+        if runtime is None:
+            runtime = getattr(kvaf, "runtime", None)
+        if runtime is None:
+            raise RuntimeError(
+                "The external kvaf package does not provide a default runtime"
+            )
+        self.runtime = runtime
+        self.ddr_bytes = int(ddr_bytes)
+        if self.ddr_bytes <= 0:
+            raise ValueError(
+                f"ddr_bytes must be positive, got {self.ddr_bytes}"
+            )
+
+    def initialize_dsa_row_index(
+        self,
+        *,
+        layout: PackedKvLayout,
+    ) -> None:
+        """Register KVAF's region using DSA's packed layer slot size."""
+
+        slot_size = _align_up(
+            layout.tokens_per_logical_block * layout.packed_token_bytes,
+            layout.ddr_layer_alignment_bytes,
+        )
+        initialized = getattr(self.runtime, "initialized", None)
+        if initialized is not True:
+            initialize = getattr(self.runtime, "initialize", None)
+            if not callable(initialize):
+                raise RuntimeError(
+                    "The external kvaf.Runtime does not expose initialize()"
+                )
+            initialize(
+                ddr_bytes=self.ddr_bytes,
+                slot_size=slot_size,
+            )
+        self.validate_region(layout=layout)
+
+    def validate_region(self, *, layout: PackedKvLayout) -> None:
+        """Check that KVAF's registered fixed slot matches DSA's layer block."""
+
+        region = getattr(self.runtime, "remote_region", None)
+        if not isinstance(region, dict):
+            raise RuntimeError(
+                "The external kvaf.Runtime does not expose remote_region"
+            )
+        expected_slot_size = _align_up(
+            layout.tokens_per_logical_block * layout.packed_token_bytes,
+            layout.ddr_layer_alignment_bytes,
+        )
+        actual_slot_size = int(region.get("slot_size", 0))
+        if actual_slot_size != expected_slot_size:
+            raise RuntimeError(
+                "KVAF region slot_size does not match DSA packed layout: "
+                f"kvaf={actual_slot_size}, expected={expected_slot_size}"
+            )
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+__all__ = ["KvafAdapter"]
