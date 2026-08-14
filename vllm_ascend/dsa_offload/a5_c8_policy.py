@@ -403,6 +403,9 @@ def install_a5_c8_runtime_policy() -> None:
         )
 
     def dump_prefill_full_blocks(self: Any) -> None:
+        if self.dsa_row_directory is not None:
+            original_dump_prefill(self)
+            return
         if not _is_a5_c8(self):
             original_dump_prefill(self)
             return
@@ -516,6 +519,13 @@ def install_a5_c8_runtime_policy() -> None:
         resident_nope_cache: torch.Tensor,
         resident_rope_cache: torch.Tensor,
     ) -> None:
+        if self.runtime.dsa_row_directory is not None:
+            original_dump_full_blocks(
+                self,
+                resident_nope_cache=resident_nope_cache,
+                resident_rope_cache=resident_rope_cache,
+            )
+            return
         if not _is_a5_c8(self.runtime):
             original_dump_full_blocks(
                 self,
