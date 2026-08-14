@@ -14,6 +14,10 @@ import nanovllm_dsa_a5  # noqa: F401
 BLOCK_SIZE = 128
 PACKED_ROW_BYTES = 656
 TOPK = 2048
+INDICES_POISON = -101
+OFFSETS_POISON = -102
+OUTPUT_INDICES_POISON = -103
+MASK_POISON = 0xA5
 
 
 def main() -> None:
@@ -23,7 +27,7 @@ def main() -> None:
     device = torch.device(args.device)
     torch.npu.set_device(device)
 
-    batch = 3
+    batch = 4
     max_num_reqs = 8
     num_layers = 4
     layer_id = 2
@@ -32,14 +36,18 @@ def main() -> None:
 
     sources_cpu = torch.zeros((batch, 1, TOPK), dtype=torch.int32)
     destinations_cpu = torch.zeros_like(sources_cpu)
-    miss_cpu = torch.tensor([0, 3, 5], dtype=torch.int32)
-    pool_rows_cpu = torch.tensor([1, 6, 3], dtype=torch.int32)
+    miss_cpu = torch.tensor([0, 3, 5, TOPK], dtype=torch.int32)
+    pool_rows_cpu = torch.tensor([1, 6, 3, 2], dtype=torch.int32)
     resident_table_cpu = torch.arange(
         batch * resident_blocks_per_row, dtype=torch.int32
     ).view(batch, resident_blocks_per_row)
-    cache_tokens_cpu = torch.tensor([0, TOPK, 4096], dtype=torch.int32)
-    candidate_lens_cpu = torch.tensor([73, 8192, 12032], dtype=torch.int32)
-    logical_lens_cpu = torch.tensor([73, 8201, 12049], dtype=torch.int32)
+    cache_tokens_cpu = torch.tensor([0, TOPK, 4096, TOPK], dtype=torch.int32)
+    candidate_lens_cpu = torch.tensor(
+        [73, 8192, 12032, 4096], dtype=torch.int32
+    )
+    logical_lens_cpu = torch.tensor(
+        [73, 8201, 12049, 4100], dtype=torch.int32
+    )
 
     active_sources = ([257, 1023, 4096], [128, 255, 16384, 32767, 511])
     active_destinations = ([0, 129, 511], [128, 255, 1024, 2047, 17])
@@ -48,6 +56,8 @@ def main() -> None:
     ):
         sources_cpu[row, 0, : len(sources)] = torch.tensor(sources)
         destinations_cpu[row, 0, : len(destinations)] = torch.tensor(destinations)
+    sources_cpu[3, 0] = torch.arange(TOPK, dtype=torch.int32)
+    destinations_cpu[3, 0] = torch.arange(TOPK, dtype=torch.int32)
 
     request_capacity = batch * TOPK
     values = (
@@ -59,10 +69,21 @@ def main() -> None:
         cache_tokens_cpu.to(device),
         candidate_lens_cpu.to(device),
         logical_lens_cpu.to(device),
-        torch.empty(request_capacity, dtype=torch.int32, device=device),
-        torch.empty(request_capacity, dtype=torch.int32, device=device),
-        torch.empty(request_capacity, dtype=torch.uint8, device=device),
-        torch.empty(request_capacity, dtype=torch.int32, device=device),
+        torch.full(
+            (request_capacity,), INDICES_POISON, dtype=torch.int32, device=device
+        ),
+        torch.full(
+            (request_capacity,), OFFSETS_POISON, dtype=torch.int32, device=device
+        ),
+        torch.full(
+            (request_capacity,), MASK_POISON, dtype=torch.uint8, device=device
+        ),
+        torch.full(
+            (request_capacity,),
+            OUTPUT_INDICES_POISON,
+            dtype=torch.int32,
+            device=device,
+        ),
         torch.empty(batch, dtype=torch.int32, device=device),
     )
     result = torch.ops.nanovllm_dsa.kvaf_batch_get_prepare_out.default(
@@ -74,9 +95,15 @@ def main() -> None:
     )
 
     expected_mask = torch.zeros(request_capacity, dtype=torch.uint8)
-    expected_indices = torch.zeros(request_capacity, dtype=torch.int32)
-    expected_offsets = torch.zeros(request_capacity, dtype=torch.int32)
-    expected_outputs = torch.zeros(request_capacity, dtype=torch.int32)
+    expected_indices = torch.full(
+        (request_capacity,), INDICES_POISON, dtype=torch.int32
+    )
+    expected_offsets = torch.full(
+        (request_capacity,), OFFSETS_POISON, dtype=torch.int32
+    )
+    expected_outputs = torch.full(
+        (request_capacity,), OUTPUT_INDICES_POISON, dtype=torch.int32
+    )
     for row, count in enumerate(miss_cpu.tolist()):
         start = row * TOPK
         expected_mask[start : start + count] = 1
@@ -98,7 +125,9 @@ def main() -> None:
     torch.testing.assert_close(output_indices, expected_outputs)
     torch.testing.assert_close(
         resident_lengths,
-        torch.tensor([73, TOPK + 9, 4096 + 17], dtype=torch.int32),
+        torch.tensor(
+            [73, TOPK + 9, 4096 + 17, TOPK + 4], dtype=torch.int32
+        ),
     )
     assert num_layers * max_num_reqs * qcap > int(indices.max())
     print("KVAF_BATCH_GET_PREPARE_PASS")

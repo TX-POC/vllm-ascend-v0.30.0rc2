@@ -1093,7 +1093,12 @@ def prepare_kvaf_batch_get_inputs(
     output_indices: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
 ) -> None:
-    """Resolve LIDU's miss prefix into the current KVAF BatchGet ABI."""
+    """Resolve LIDU's miss prefix into the current KVAF BatchGet ABI.
+
+    The mask and resident lengths are fully defined. For the three descriptor
+    arrays, only the active prefix is written; inactive entries retain their
+    caller-provided values.
+    """
 
     source_ids_3d = _a5_topk_view(
         source_token_ids, name="source_token_ids"

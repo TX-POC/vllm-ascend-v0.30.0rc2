@@ -27,6 +27,10 @@ ENTRY_BYTES = BLOCK_SIZE * PACKED_TOKEN_BYTES
 TOPK = 2048
 DESTINATION_BLOCKS_PER_ROW = TOPK // BLOCK_SIZE
 SOURCE_FILL = 0x5A
+INDICES_POISON = -101
+OFFSETS_POISON = -102
+OUTPUT_INDICES_POISON = -103
+MASK_POISON = 0xA5
 
 
 def load_dsa_registration() -> str:
@@ -220,10 +224,21 @@ def make_prepare_case(
         logical_seq_lengths=logical_seq_lengths.to(device),
     )
     outputs = PrepareOutputs(
-        indices=torch.empty(request_count, dtype=torch.int32, device=device),
-        offsets=torch.empty(request_count, dtype=torch.int32, device=device),
-        mask=torch.empty(request_count, dtype=torch.uint8, device=device),
-        output_indices=torch.empty(request_count, dtype=torch.int32, device=device),
+        indices=torch.full(
+            (request_count,), INDICES_POISON, dtype=torch.int32, device=device
+        ),
+        offsets=torch.full(
+            (request_count,), OFFSETS_POISON, dtype=torch.int32, device=device
+        ),
+        mask=torch.full(
+            (request_count,), MASK_POISON, dtype=torch.uint8, device=device
+        ),
+        output_indices=torch.full(
+            (request_count,),
+            OUTPUT_INDICES_POISON,
+            dtype=torch.int32,
+            device=device,
+        ),
         resident_seq_lengths=torch.empty(
             args.batch_size, dtype=torch.int32, device=device
         ),
@@ -383,15 +398,21 @@ def validate_prepare(
         )
         torch.testing.assert_close(
             indices[row, args.miss_count :],
-            torch.zeros_like(indices[row, args.miss_count :]),
+            torch.full_like(
+                indices[row, args.miss_count :], INDICES_POISON
+            ),
         )
         torch.testing.assert_close(
             offsets[row, args.miss_count :],
-            torch.zeros_like(offsets[row, args.miss_count :]),
+            torch.full_like(
+                offsets[row, args.miss_count :], OFFSETS_POISON
+            ),
         )
         torch.testing.assert_close(
             output_indices[row, args.miss_count :],
-            torch.zeros_like(output_indices[row, args.miss_count :]),
+            torch.full_like(
+                output_indices[row, args.miss_count :], OUTPUT_INDICES_POISON
+            ),
         )
 
 
