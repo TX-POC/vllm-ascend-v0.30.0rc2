@@ -96,7 +96,13 @@ class DSAOffloadRuntime:
         self.keep_decode_kv_in_hbm = bool(keep_decode_kv_in_hbm)
         self.op_backend = str(op_backend)
         self.is_c8 = bool(is_c8)
-        self.kvaf_adapter = KvafAdapter()
+        self.kvaf_adapter: KvafAdapter | None = (
+            KvafAdapter(
+                device_id=self.device.index or 0,
+            )
+            if self.is_c8
+            else None
+        )
         if self.op_backend == DSA_OP_BACKEND_NANOVLLM_A5:
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 require_nanovllm_dsa_ops,
@@ -299,7 +305,6 @@ class DSAOffloadRuntime:
         self,
         *,
         layout: PackedKvLayout,
-        ddr_block_count: int,
     ) -> DDRBlockTable:
         """Initialize KVAF and create its DSA_ROW directory view."""
 
@@ -312,15 +317,15 @@ class DSAOffloadRuntime:
         self.register_packed_kv_layout(layout)
         if self.dsa_row_directory is not None:
             raise RuntimeError("DSA_ROW directory was initialized twice")
-        ddr_block_count = int(ddr_block_count)
-        if ddr_block_count <= 0:
-            raise ValueError(
-                f"ddr_block_count must be positive, got {ddr_block_count}"
+        if self.kvaf_adapter is None:
+            raise RuntimeError(
+                "DSA_ROW initialization requires the C8 KVAF runtime"
             )
+        directory_cell_count = self.row_index_geometry.directory_cell_count
         self.kvaf_adapter.initialize_dsa_row_index(
             layout=layout,
             ddr_bytes=(
-                ddr_block_count
+                directory_cell_count
                 * self.kvaf_adapter.slot_size(layout)
             ),
         )
