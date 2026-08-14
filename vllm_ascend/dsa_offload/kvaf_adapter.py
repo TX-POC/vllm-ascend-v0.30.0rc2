@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import torch
+
+from vllm_ascend import envs
 from vllm_ascend.dsa_offload.dsa_row import (
     PackedKvLayout,
 )
@@ -14,7 +17,8 @@ class KvafAdapter:
 
     def __init__(
         self,
-        runtime: object | None = None,
+        *,
+        device_id: int = 0,
     ) -> None:
         try:
             import kvaf
@@ -23,13 +27,27 @@ class KvafAdapter:
                 "The external kvaf package is required for DSA offload"
             ) from error
 
-        if runtime is None:
-            runtime = getattr(kvaf, "runtime", None)
-        if runtime is None:
+        npu_runtime = getattr(kvaf, "NpuRuntime", None)
+        if npu_runtime is None:
             raise RuntimeError(
-                "The external kvaf package does not provide a default runtime"
+                "The external kvaf package does not provide NpuRuntime; "
+                "build KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON"
             )
-        self.runtime = runtime
+        batch_get_kernel = envs.VLLM_ASCEND_KVAF_BATCH_GET_KERNEL
+        if not batch_get_kernel:
+            raise RuntimeError(
+                "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL must point to the "
+                "external KVAF BatchGet kernel object"
+            )
+        device_id = int(device_id)
+        torch.npu.set_device(device_id)
+        self.runtime = npu_runtime(
+            batch_get_kernel,
+            device_id,
+            envs.VLLM_ASCEND_KVAF_NPU_CORE_COUNT,
+            envs.VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL,
+            envs.VLLM_ASCEND_KVAF_JETTYS_PER_CORE,
+        )
 
     @staticmethod
     def slot_size(layout: PackedKvLayout) -> int:
@@ -57,10 +75,7 @@ class KvafAdapter:
                 raise RuntimeError(
                     "The external kvaf.Runtime does not expose initialize()"
                 )
-            initialize(
-                ddr_bytes=ddr_bytes,
-                slot_size=slot_size,
-            )
+            initialize(ddr_bytes, slot_size)
         self.validate_region(layout=layout)
 
     def validate_region(self, *, layout: PackedKvLayout) -> None:
