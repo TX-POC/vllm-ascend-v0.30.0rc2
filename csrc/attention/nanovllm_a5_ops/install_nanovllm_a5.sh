@@ -14,16 +14,17 @@ cd "${REPO_ROOT}"
 cd /tmp
 "${PYTHON_BIN}" - <<'PY'
 import torch
-from vllm_ascend.dsa_offload.ops_nanovllm import require_nanovllm_dsa_ops
+from vllm_ascend.a5_dsa_registration import require_a5_dsa_registration
 
-require_nanovllm_dsa_ops()
 required = (
+    "kvaf_batch_get_prepare_out",
     "lidu_decode_update_c8_out",
     "packed_scatter_copy_out",
     "sparse_and_tail_attention_c8",
     "full_block_dump",
     "packed_full_block_dump",
 )
+require_a5_dsa_registration(required)
 for name in required:
     ok = hasattr(torch.ops.nanovllm_dsa, name)
     print(name, ok)

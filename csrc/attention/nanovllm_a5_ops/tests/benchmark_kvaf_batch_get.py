@@ -34,7 +34,7 @@ def load_dsa_registration() -> str:
 
     failures: list[str] = []
     for module_name, backend in (
-        ("vllm_ascend.dsa_offload.a5_extension", "vllm_ascend_C"),
+        ("vllm_ascend.a5_dsa_registration", "vllm_ascend_C"),
         ("nanovllm_dsa_a5", "nanovllm_dsa_a5._C"),
     ):
         try:
