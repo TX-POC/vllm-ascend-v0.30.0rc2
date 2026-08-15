@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -16,7 +18,13 @@ import torch
 import vllm_ascend.ops  # noqa: F401
 
 from vllm_ascend.dsa_offload import ops_nanovllm as onv
-from vllm_ascend.dsa_offload.ops import _normalize_lidu_weights_layout
+from vllm_ascend.dsa_offload.contracts import DSA_OP_BACKEND_NANOVLLM_A5
+from vllm_ascend.dsa_offload.ops import (
+    DSALightningIndexerOutputs,
+    DSAOffloadSelectionOutput,
+    _normalize_lidu_weights_layout,
+)
+from vllm_ascend.dsa_offload.runtime import DSALayerOffloadContext
 # isort: on
 
 _SPARSE_COUNT = onv._SPARSE_COUNT
@@ -153,6 +161,155 @@ def test_build_c8_attention_metadata_tail_clamp(device="cpu") -> None:
     tail_slice = attention_slots[:, 0, _SPARSE_COUNT:]
     assert int(tail_slice[0, 0]) == 40  # 第 0 行 expected [40]
     assert int(tail_slice[3, 0]) == -1  # 第 3 行 tail=0 -> -1
+
+
+def test_kvaf_subgraph_c_materializes_subgraph_d_selection(
+    monkeypatch,
+) -> None:
+    """KVAF BatchGet 后必须物化 C8 slots，并返回新版 C→D 字段。"""
+
+    destination_slots = torch.arange(
+        _SPARSE_COUNT, dtype=torch.int32
+    ).view(1, 1, _SPARSE_COUNT)
+    outputs = DSALightningIndexerOutputs(
+        topk_index=torch.zeros_like(destination_slots),
+        topk_slots=destination_slots,
+        miss_count=torch.ones(1, dtype=torch.int32),
+        tail_info=torch.zeros((1, 2), dtype=torch.int32),
+    )
+    cache_tokens = torch.tensor([2048], dtype=torch.int32)
+    candidate_lens = torch.tensor([2048], dtype=torch.int32)
+    logical_seq_lengths = torch.tensor([2051], dtype=torch.int32)
+    resident_seq_lengths = torch.tensor([2051], dtype=torch.int32)
+    attention_slots = torch.full(
+        (1, 1, _SPARSE_COUNT + 8),
+        -1,
+        dtype=torch.int32,
+    )
+    kvaf_adapter = Mock()
+    runtime = SimpleNamespace(
+        op_backend=DSA_OP_BACKEND_NANOVLLM_A5,
+        is_c8=True,
+        max_num_reqs=1,
+        execution_num_reqs=1,
+        active_num_reqs=1,
+        _a5_c8_lidu_shape_logged=True,
+        _a5_candidate_lens=SimpleNamespace(gpu=candidate_lens),
+        _a5_logical_seq_lengths=SimpleNamespace(gpu=logical_seq_lengths),
+        _a5_resident_seq_lengths=SimpleNamespace(gpu=resident_seq_lengths),
+        _a5_c8_attention_slots=attention_slots,
+        _a5_c8_max_tail_tokens=8,
+        _req_cache_tokens=cache_tokens,
+        _c8_key_dequant_scales={0: torch.ones(1)},
+        kvaf_adapter=kvaf_adapter,
+        dsa_row_directory=SimpleNamespace(
+            addresses=torch.ones(1, dtype=torch.int64)
+        ),
+        resident_token_pool=SimpleNamespace(
+            get_cache_slots=lambda _layer_id: torch.zeros(
+                1, dtype=torch.int32
+            )
+        ),
+        get_lidu_outputs=lambda *, num_reqs: outputs,
+    )
+    context = DSALayerOffloadContext(
+        layer_id=0,
+        indexer_cache=torch.zeros(1),
+        runtime=runtime,
+    )
+    monkeypatch.setattr(
+        onv,
+        "lightning_indexer_decode_update_c8",
+        lambda **_kwargs: None,
+    )
+
+    selection = context.execute_decode_selection(
+        query=torch.zeros((1, 4)),
+        weights=torch.zeros((1, 1)),
+        row_modes=torch.zeros(1, dtype=torch.int32),
+        resident_pool_indices=torch.zeros(1, dtype=torch.int32),
+        actual_seq_lengths_key=logical_seq_lengths,
+        indexer_block_table=torch.zeros((1, 1), dtype=torch.int32),
+        resident_nope_cache=torch.zeros((1, 128, 1, 656), dtype=torch.int8),
+        resident_rope_cache=torch.zeros(1),
+        resident_block_table=torch.zeros((1, 1), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 1), dtype=torch.int32),
+        actual_seq_lengths_query=torch.ones(1, dtype=torch.int32),
+        query_dequant_scale=torch.ones(1),
+    )
+
+    kvaf_adapter.execute_batch_get.assert_called_once()
+    assert selection._fields == (
+        "attention_slots",
+        "resident_seq_lengths",
+    )
+    assert selection.attention_slots.data_ptr() == attention_slots.data_ptr()
+    assert (
+        selection.resident_seq_lengths.data_ptr()
+        == resident_seq_lengths.data_ptr()
+    )
+    torch.testing.assert_close(
+        selection.attention_slots[:, :, :_SPARSE_COUNT],
+        destination_slots,
+    )
+    torch.testing.assert_close(
+        selection.attention_slots[0, 0, _SPARSE_COUNT:_SPARSE_COUNT + 3],
+        torch.tensor([2048, 2049, 2050], dtype=torch.int32),
+    )
+
+
+def test_c8_kvaf_selection_reaches_sparse_attention(monkeypatch) -> None:
+    """已物化的 KVAF C8 selection 必须能直接进入 QSFA。"""
+
+    captured = {}
+    expected = torch.ones((1, 1, 512))
+
+    def fake_sfa_c8(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        onv,
+        "sparse_flash_attention_for_offload_c8",
+        fake_sfa_c8,
+    )
+    runtime = SimpleNamespace(
+        op_backend=DSA_OP_BACKEND_NANOVLLM_A5,
+        is_c8=True,
+        dsa_row_directory=object(),
+    )
+    context = DSALayerOffloadContext(
+        layer_id=0,
+        indexer_cache=torch.zeros(1),
+        runtime=runtime,
+    )
+    attention_slots = torch.zeros(
+        (1, 1, _SPARSE_COUNT + 8), dtype=torch.int32
+    )
+    resident_seq_lengths = torch.tensor([2051], dtype=torch.int32)
+    selection = DSAOffloadSelectionOutput(
+        attention_slots=attention_slots,
+        resident_seq_lengths=resident_seq_lengths,
+    )
+
+    result = context.execute_sparse_attention(
+        query=torch.zeros((1, 1, 512)),
+        resident_nope_cache=torch.zeros(
+            (1, 128, 1, 656), dtype=torch.int8
+        ),
+        selection=selection,
+        scale_value=1.0,
+        resident_block_table=torch.zeros((1, 1), dtype=torch.int32),
+        actual_seq_lengths_query=torch.ones(1, dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor([2051], dtype=torch.int32),
+        query_rope=torch.zeros((1, 1, 64)),
+        resident_rope_cache=torch.zeros(1),
+    )
+
+    assert result is expected
+    assert captured["attention_slots"] is attention_slots
+    assert captured["resident_seq_lengths"] is resident_seq_lengths
+    assert captured["query"].shape[-1] == 576
 
 
 def test_c8_sfa_no_clone_no_sync(monkeypatch) -> None:

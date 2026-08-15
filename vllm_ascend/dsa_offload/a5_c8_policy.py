@@ -648,7 +648,7 @@ def install_a5_c8_runtime_policy() -> None:
         if actual_seq_lengths_query is None or query_dequant_scale is None:
             raise RuntimeError(
                 "A5 C8 DSA requires query lengths and query dequant scales"
-            )
+        )
 
         from vllm_ascend.dsa_offload.ops_nanovllm import (
             build_c8_attention_metadata,
@@ -673,6 +673,7 @@ def install_a5_c8_runtime_policy() -> None:
         )
 
         resident_seq_lengths = runtime._a5_resident_seq_lengths.gpu[:num_reqs]
+        attention_slots = runtime._a5_c8_attention_slots[:num_reqs]
         kvaf_adapter = runtime.kvaf_adapter
         if kvaf_adapter is not None:
             directory = runtime.dsa_row_directory
@@ -692,11 +693,18 @@ def install_a5_c8_runtime_policy() -> None:
                 address_table=directory.addresses,
                 output=kwargs["resident_nope_cache"],
             )
-            # Subgraph C hands the raw LIDU selection and Resident length to
-            # subgraph D. C must not construct sparse+tail attention slots.
+            build_c8_attention_metadata(
+                destination_slots=outputs.topk_slots,
+                cache_tokens=cache_tokens,
+                candidate_lens=candidate_lens,
+                actual_seq_lengths_kv=logical_seq_lengths,
+                max_tail_tokens=runtime._a5_c8_max_tail_tokens,
+                resident_seq_lengths=resident_seq_lengths,
+                attention_slots=attention_slots,
+            )
             return DSAOffloadSelectionOutput(
-                sparse_indices=outputs.topk_slots,
-                tail_info=resident_seq_lengths,
+                attention_slots=attention_slots,
+                resident_seq_lengths=resident_seq_lengths,
             )
 
         from vllm_ascend.dsa_offload.ops_nanovllm import (
@@ -707,7 +715,6 @@ def install_a5_c8_runtime_policy() -> None:
         if store is None:
             raise RuntimeError("DSA layer has no bound DRAM store")
         arenas = store.get_layer_arenas(self.layer_id)
-        attention_slots = runtime._a5_c8_attention_slots[:num_reqs]
         ksc_c8(
             hbm_packed_kv=kwargs["resident_nope_cache"],
             dram_packed_kv=arenas.nope,
