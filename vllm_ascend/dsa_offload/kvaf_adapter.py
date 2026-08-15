@@ -18,50 +18,13 @@ from vllm_ascend.dsa_offload.dsa_row import (
 )
 
 
-@dataclass(frozen=True)
-class KvafBatchPutJobs:
-    """Logical blocks appended by one model forward."""
-
+@dataclass
+class _ActiveBatchPut:
     pool_rows: np.ndarray
     block_qs: np.ndarray
     source_block_ids: np.ndarray
-
-    def __post_init__(self) -> None:
-        pool_rows = np.asarray(self.pool_rows, dtype=np.int64)
-        block_qs = np.asarray(self.block_qs, dtype=np.int64)
-        source_block_ids = np.asarray(
-            self.source_block_ids,
-            dtype=np.int64,
-        )
-        if (
-            pool_rows.ndim != 1
-            or block_qs.ndim != 1
-            or source_block_ids.ndim != 1
-            or pool_rows.shape != block_qs.shape
-            or pool_rows.shape != source_block_ids.shape
-            or pool_rows.size == 0
-        ):
-            raise ValueError(
-                "KVAF BatchPut jobs must be non-empty equal-length 1D arrays"
-            )
-        if np.any(source_block_ids < 0):
-            raise IndexError("KVAF source block ids must be non-negative")
-        object.__setattr__(self, "pool_rows", pool_rows.copy())
-        object.__setattr__(self, "block_qs", block_qs.copy())
-        object.__setattr__(
-            self,
-            "source_block_ids",
-            source_block_ids.copy(),
-        )
-
-
-@dataclass
-class _ActiveBatchPut:
-    jobs: KvafBatchPutJobs
     geometry: DsaRowIndexGeometry
-    all_keys: np.ndarray
     written_layers: set[int] = field(default_factory=set)
-    committed_keys: list[np.ndarray] = field(default_factory=list)
 
 
 class KvafAdapter:
@@ -168,29 +131,45 @@ class KvafAdapter:
             raise IndexError("KVAF pool row is outside DSA_ROW")
         return self._committed_block_counts.get(pool_row, 0)
 
-    def prepare_batch_put(
+    def begin_batch_put(
         self,
-        jobs: KvafBatchPutJobs,
         *,
+        pool_rows: np.ndarray,
+        block_qs: np.ndarray,
+        source_block_ids: np.ndarray,
         geometry: DsaRowIndexGeometry,
     ) -> None:
-        """Validate one append and freeze all layer keys before writing."""
+        """Freeze one append before any layer is sent to KVAF."""
 
         if self._active_put is not None:
             raise RuntimeError("KVAF BatchPut already has active jobs")
+        pool_rows = np.asarray(pool_rows, dtype=np.int64)
+        block_qs = np.asarray(block_qs, dtype=np.int64)
+        source_block_ids = np.asarray(source_block_ids, dtype=np.int64)
+        if (
+            pool_rows.ndim != 1
+            or block_qs.ndim != 1
+            or source_block_ids.ndim != 1
+            or pool_rows.size == 0
+            or not (pool_rows.shape == block_qs.shape == source_block_ids.shape)
+        ):
+            raise ValueError("KVAF BatchPut arrays must be non-empty 1D arrays")
+        if (
+            np.any(pool_rows < 0)
+            or np.any(pool_rows >= geometry.raw_row_capacity)
+            or np.any(block_qs < 0)
+            or np.any(block_qs >= geometry.q_capacity)
+        ):
+            raise IndexError("KVAF BatchPut coordinates are outside DSA_ROW")
         if self._geometry is None:
             self._geometry = geometry
         elif self._geometry != geometry:
             raise RuntimeError("KVAF DSA_ROW geometry changed after first Put")
-        self._validate_job_coordinates(geometry, jobs)
-        self._validate_append_ranges(jobs)
-        all_keys = self._build_all_layer_keys(geometry, jobs)
-        if np.unique(all_keys).size != all_keys.size:
-            raise ValueError("KVAF BatchPut jobs contain duplicate keys")
         self._active_put = _ActiveBatchPut(
-            jobs=jobs,
+            pool_rows=pool_rows,
+            block_qs=block_qs,
+            source_block_ids=source_block_ids,
             geometry=geometry,
-            all_keys=all_keys,
         )
 
     def write_batch_put_layer(
@@ -213,7 +192,7 @@ class KvafAdapter:
             raise ValueError(
                 "KVAF BatchPut requires a contiguous packed block Tensor"
             )
-        max_source = int(active.jobs.source_block_ids.max())
+        max_source = int(active.source_block_ids.max())
         if max_source >= int(packed_cache.shape[0]):
             raise IndexError("KVAF source block is outside the packed cache")
 
@@ -235,9 +214,14 @@ class KvafAdapter:
         if block_stride_bytes < block_bytes:
             raise ValueError("KVAF packed cache has an invalid block stride")
 
-        keys = self._build_layer_keys(geometry, active.jobs, layer_id)
+        keys = self._build_layer_keys(
+            geometry,
+            active.pool_rows,
+            active.block_qs,
+            layer_id,
+        )
         input_offsets = (
-            active.jobs.source_block_ids.astype(np.uint64, copy=False)
+            active.source_block_ids.astype(np.uint64, copy=False)
             * np.uint64(block_stride_bytes)
         )
         lengths = np.full(keys.size, block_bytes, dtype=np.uint64)
@@ -249,7 +233,6 @@ class KvafAdapter:
             stream,
         )
         active.written_layers.add(layer_id)
-        active.committed_keys.append(keys)
 
     def finalize_batch_put(
         self,
@@ -271,10 +254,15 @@ class KvafAdapter:
                 f"missing={missing}"
             )
 
-        cpu_keys = torch.from_numpy(active.all_keys.copy())
+        all_keys = self._build_all_layer_keys(
+            geometry,
+            active.pool_rows,
+            active.block_qs,
+        )
+        cpu_keys = torch.from_numpy(all_keys.copy())
         handle = self.runtime.prepare_access_table(cpu_keys)
         try:
-            expected_size = active.all_keys.size
+            expected_size = all_keys.size
             device_view = self.runtime.access_table_view(
                 handle,
                 device="npu",
@@ -289,7 +277,7 @@ class KvafAdapter:
                 expected_device=device_addresses.device,
             )
             device_keys = torch.as_tensor(
-                active.all_keys,
+                all_keys,
                 dtype=torch.int64,
                 device=device_addresses.device,
             )
@@ -313,9 +301,9 @@ class KvafAdapter:
             self.runtime.release_access_table(handle)
 
         updated: dict[int, int] = {}
-        for pool_row in np.unique(active.jobs.pool_rows):
+        for pool_row in np.unique(active.pool_rows):
             row = int(pool_row)
-            appended = int(np.count_nonzero(active.jobs.pool_rows == row))
+            appended = int(np.count_nonzero(active.pool_rows == row))
             committed = self.committed_block_count(row) + appended
             self._committed_block_counts[row] = committed
             updated[row] = committed
@@ -333,11 +321,16 @@ class KvafAdapter:
         if active is None:
             return
         try:
+            written_keys = self._build_keys_for_layers(
+                active.geometry,
+                active.pool_rows,
+                active.block_qs,
+                active.written_layers,
+            )
             if block_table is not None:
-                self._clear_table(block_table, active.all_keys)
-            if active.committed_keys:
-                keys = np.concatenate(active.committed_keys)
-                self.runtime.batch_free(torch.from_numpy(keys.copy()))
+                self._clear_table(block_table, written_keys)
+            if written_keys.size:
+                self.runtime.batch_free(torch.from_numpy(written_keys.copy()))
         finally:
             self._active_put = None
 
@@ -351,7 +344,7 @@ class KvafAdapter:
 
         pool_row = int(pool_row)
         if self._active_put is not None and np.any(
-            self._active_put.jobs.pool_rows == pool_row
+            self._active_put.pool_rows == pool_row
         ):
             raise RuntimeError("Cannot release a row with an active KVAF BatchPut")
         committed = self._committed_block_counts.get(pool_row, 0)
@@ -360,11 +353,7 @@ class KvafAdapter:
         geometry = self._require_geometry()
         rows = np.full(committed, pool_row, dtype=np.int64)
         block_qs = np.arange(committed, dtype=np.int64)
-        keys = self._build_all_layer_keys_from_coordinates(
-            geometry,
-            rows,
-            block_qs,
-        )
+        keys = self._build_all_layer_keys(geometry, rows, block_qs)
         self._clear_table(block_table, keys)
         self.runtime.batch_free(torch.from_numpy(keys.copy()))
         self._committed_block_counts.pop(pool_row, None)
@@ -380,74 +369,53 @@ class KvafAdapter:
             shutdown()
 
     @staticmethod
-    def _validate_job_coordinates(
-        geometry: DsaRowIndexGeometry,
-        jobs: KvafBatchPutJobs,
-    ) -> None:
-        if np.any(jobs.pool_rows < 0) or np.any(
-            jobs.pool_rows >= geometry.raw_row_capacity
-        ):
-            raise IndexError("KVAF BatchPut pool row is outside DSA_ROW")
-        if np.any(jobs.block_qs < 0) or np.any(
-            jobs.block_qs >= geometry.q_capacity
-        ):
-            raise IndexError("KVAF BatchPut logical block is outside DSA_ROW")
-
-    def _validate_append_ranges(self, jobs: KvafBatchPutJobs) -> None:
-        for pool_row in np.unique(jobs.pool_rows):
-            row = int(pool_row)
-            blocks = np.sort(jobs.block_qs[jobs.pool_rows == row])
-            expected_start = self.committed_block_count(row)
-            expected = np.arange(
-                expected_start,
-                expected_start + blocks.size,
-                dtype=np.int64,
-            )
-            if not np.array_equal(blocks, expected):
-                raise ValueError(
-                    "KVAF BatchPut must append a contiguous block range: "
-                    f"pool_row={row}, expected={expected.tolist()}, "
-                    f"received={blocks.tolist()}"
-                )
-
-    @staticmethod
     def _build_layer_keys(
         geometry: DsaRowIndexGeometry,
-        jobs: KvafBatchPutJobs,
+        pool_rows: np.ndarray,
+        block_qs: np.ndarray,
         layer_id: int,
     ) -> np.ndarray:
         return (
-            jobs.pool_rows * np.int64(geometry.row_stride_cells)
+            pool_rows * np.int64(geometry.row_stride_cells)
             + np.int64(layer_id * geometry.q_capacity)
-            + jobs.block_qs
+            + block_qs
         )
 
     @classmethod
     def _build_all_layer_keys(
         cls,
         geometry: DsaRowIndexGeometry,
-        jobs: KvafBatchPutJobs,
-    ) -> np.ndarray:
-        return np.concatenate(
-            [
-                cls._build_layer_keys(geometry, jobs, layer_id)
-                for layer_id in range(geometry.n_layers)
-            ]
-        )
-
-    @staticmethod
-    def _build_all_layer_keys_from_coordinates(
-        geometry: DsaRowIndexGeometry,
         pool_rows: np.ndarray,
         block_qs: np.ndarray,
     ) -> np.ndarray:
-        return np.concatenate(
-            [
-                pool_rows * np.int64(geometry.row_stride_cells)
-                + np.int64(layer_id * geometry.q_capacity)
-                + block_qs
-                for layer_id in range(geometry.n_layers)
-            ]
+        return cls._build_keys_for_layers(
+            geometry,
+            pool_rows,
+            block_qs,
+            range(geometry.n_layers),
+        )
+
+    @classmethod
+    def _build_keys_for_layers(
+        cls,
+        geometry: DsaRowIndexGeometry,
+        pool_rows: np.ndarray,
+        block_qs: np.ndarray,
+        layer_ids: Any,
+    ) -> np.ndarray:
+        layer_keys = [
+            cls._build_layer_keys(
+                geometry,
+                pool_rows,
+                block_qs,
+                layer_id,
+            )
+            for layer_id in sorted(layer_ids)
+        ]
+        return (
+            np.concatenate(layer_keys)
+            if layer_keys
+            else np.empty(0, dtype=np.int64)
         )
 
     @staticmethod
@@ -600,4 +568,4 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-__all__ = ["KvafAdapter", "KvafBatchPutJobs"]
+__all__ = ["KvafAdapter"]

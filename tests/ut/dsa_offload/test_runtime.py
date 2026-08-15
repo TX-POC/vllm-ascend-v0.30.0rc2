@@ -53,8 +53,15 @@ class _FakeKvafAdapter:
         self.layout = layout
         self.ddr_bytes = ddr_bytes
 
-    def prepare_batch_put(self, jobs, *, geometry) -> None:
-        self.jobs = jobs
+    def begin_batch_put(
+        self,
+        *,
+        pool_rows,
+        block_qs,
+        source_block_ids,
+        geometry,
+    ) -> None:
+        self.jobs = (pool_rows, block_qs, source_block_ids)
         self.geometry = geometry
         self.active_batch_put = True
 
@@ -281,8 +288,8 @@ def test_kvaf_final_prefill_writes_layers_then_publishes_table(
     )
     runtime.dump_prefill_full_blocks()
 
-    assert adapter.jobs.pool_rows.tolist() == [0, 0]
-    assert adapter.jobs.block_qs.tolist() == [0, 1]
+    assert adapter.jobs[0].tolist() == [0, 0]
+    assert adapter.jobs[1].tolist() == [0, 1]
     assert adapter.written_layers == [0, 1]
     assert adapter.finalized_table is runtime.dsa_row_directory
     assert not np.any(store.logical_block_table)

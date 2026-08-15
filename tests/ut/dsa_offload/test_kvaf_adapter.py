@@ -14,7 +14,6 @@ from vllm_ascend.dsa_offload.dsa_row import (
 )
 from vllm_ascend.dsa_offload.kvaf_adapter import (
     KvafAdapter,
-    KvafBatchPutJobs,
 )
 
 
@@ -174,12 +173,12 @@ def _make_adapter(
     )
 
 
-def _jobs() -> KvafBatchPutJobs:
-    return KvafBatchPutJobs(
-        pool_rows=np.asarray([0, 0]),
-        block_qs=np.asarray([0, 1]),
-        source_block_ids=np.asarray([2, 3]),
-    )
+def _jobs() -> dict[str, np.ndarray]:
+    return {
+        "pool_rows": np.asarray([0, 0]),
+        "block_qs": np.asarray([0, 1]),
+        "source_block_ids": np.asarray([2, 3]),
+    }
 
 
 def test_batch_put_publishes_all_layers_into_fixed_tables(
@@ -188,7 +187,7 @@ def test_batch_put_publishes_all_layers_into_fixed_tables(
     adapter, runtime, block_table, geometry = _make_adapter(monkeypatch)
     packed_cache = torch.arange(32, dtype=torch.uint8).view(4, 2, 4)
 
-    adapter.prepare_batch_put(_jobs(), geometry=geometry)
+    adapter.begin_batch_put(**_jobs(), geometry=geometry)
     adapter.write_batch_put_layer(
         local_layer_ordinal=0,
         packed_cache=packed_cache,
@@ -222,7 +221,7 @@ def test_failed_layer_is_freed_without_publication(
     )
     packed_cache = torch.zeros((4, 2, 4), dtype=torch.uint8)
 
-    adapter.prepare_batch_put(_jobs(), geometry=geometry)
+    adapter.begin_batch_put(**_jobs(), geometry=geometry)
     adapter.write_batch_put_layer(
         local_layer_ordinal=0,
         packed_cache=packed_cache,
@@ -246,7 +245,7 @@ def test_release_pool_row_frees_every_layer_key(
 ) -> None:
     adapter, runtime, block_table, geometry = _make_adapter(monkeypatch)
     packed_cache = torch.zeros((4, 2, 4), dtype=torch.uint8)
-    adapter.prepare_batch_put(_jobs(), geometry=geometry)
+    adapter.begin_batch_put(**_jobs(), geometry=geometry)
     for layer_id in range(2):
         adapter.write_batch_put_layer(
             local_layer_ordinal=layer_id,
@@ -260,19 +259,3 @@ def test_release_pool_row_frees_every_layer_key(
     assert adapter.committed_block_count(0) == 0
     assert not block_table.valid.any()
     assert not block_table.addresses.any()
-
-
-def test_prepare_rejects_a_gap_after_committed_prefix(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter, _, _, geometry = _make_adapter(monkeypatch)
-
-    with pytest.raises(ValueError, match="contiguous block range"):
-        adapter.prepare_batch_put(
-            KvafBatchPutJobs(
-                pool_rows=np.asarray([0]),
-                block_qs=np.asarray([1]),
-                source_block_ids=np.asarray([0]),
-            ),
-            geometry=geometry,
-        )

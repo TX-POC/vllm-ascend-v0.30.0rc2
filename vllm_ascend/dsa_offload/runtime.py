@@ -43,10 +43,7 @@ from vllm_ascend.dsa_offload.dsa_row import (
     DsaRowIndexGeometry,
     PackedKvLayout,
 )
-from vllm_ascend.dsa_offload.kvaf_adapter import (
-    KvafAdapter,
-    KvafBatchPutJobs,
-)
+from vllm_ascend.dsa_offload.kvaf_adapter import KvafAdapter
 from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
@@ -557,18 +554,10 @@ class DSAOffloadRuntime:
             validate_all_sparse=dram_table_refreshed,
         )
         if self.dsa_row_directory is not None and self.dump_job_count:
-            self._require_kvaf_adapter().prepare_batch_put(
-                KvafBatchPutJobs(
-                    pool_rows=self._dump_pool_indices[
-                        : self.dump_job_count
-                    ],
-                    block_qs=self._dump_logical_indices[
-                        : self.dump_job_count
-                    ],
-                    source_block_ids=self._dump_source_blocks[
-                        : self.dump_job_count
-                    ],
-                ),
+            self._require_kvaf_adapter().begin_batch_put(
+                pool_rows=self._dump_pool_indices[: self.dump_job_count],
+                block_qs=self._dump_logical_indices[: self.dump_job_count],
+                source_block_ids=self._dump_source_blocks[: self.dump_job_count],
                 geometry=self.row_index_geometry,
             )
 
