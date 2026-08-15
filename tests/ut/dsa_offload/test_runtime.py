@@ -4,9 +4,11 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
+from vllm_ascend.dsa_offload.dsa_row import PackedKvLayout
 from vllm_ascend.dsa_offload.input_batch import DSAInputBatchCacheLayout
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
@@ -26,6 +28,58 @@ class _ResidentBlockTable:
 
     def get_numpy_array(self) -> np.ndarray:
         return self._rows
+
+
+class _FakeKvafAdapter:
+    def __init__(self) -> None:
+        self.active_batch_put = False
+        self.jobs = None
+        self.geometry = None
+        self.written_layers: list[int] = []
+        self.finalized_table = None
+
+    @staticmethod
+    def slot_size(layout: PackedKvLayout) -> int:
+        return (
+            layout.tokens_per_logical_block * layout.packed_token_bytes
+        )
+
+    def initialize_dsa_row_index(
+        self,
+        *,
+        layout: PackedKvLayout,
+        ddr_bytes: int,
+    ) -> None:
+        self.layout = layout
+        self.ddr_bytes = ddr_bytes
+
+    def begin_batch_put(
+        self,
+        *,
+        pool_rows,
+        block_qs,
+        source_block_ids,
+        geometry,
+    ) -> None:
+        self.jobs = (pool_rows, block_qs, source_block_ids)
+        self.geometry = geometry
+        self.active_batch_put = True
+
+    def write_batch_put_layer(
+        self,
+        *,
+        local_layer_ordinal: int,
+        packed_cache: torch.Tensor,
+    ) -> None:
+        assert packed_cache.is_contiguous()
+        self.written_layers.append(local_layer_ordinal)
+
+    def finalize_batch_put(self, *, block_table) -> None:
+        self.finalized_table = block_table
+        self.active_batch_put = False
+
+    def abort_batch_put(self, *, block_table) -> None:
+        self.active_batch_put = False
 
 
 def _make_runtime(
@@ -139,6 +193,106 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         resident_group_id=0,
     )
     assert runtime.dump_job_count == 0
+
+
+def test_kvaf_final_prefill_writes_layers_then_publishes_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resident_pool = DSAResidentTokenPool(
+        max_num_reqs=1,
+        num_layers=2,
+        max_model_len=512,
+        max_resident_budget_tokens=256,
+        device=torch.device("cpu"),
+    )
+    adapter = _FakeKvafAdapter()
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.KvafAdapter",
+        lambda **_: adapter,
+    )
+    runtime = DSAOffloadRuntime(
+        max_num_reqs=1,
+        max_num_tokens=512,
+        num_layers=2,
+        max_model_len=512,
+        block_size=128,
+        resident_token_pool=resident_pool,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        enable_prefill_full_kv_offload=True,
+        is_c8=True,
+    )
+    store = DSAHotDRAMStore(
+        usable_blocks=8,
+        storage_rows=resident_pool.storage_rows,
+        max_logical_blocks=runtime.max_logical_blocks,
+        device=torch.device("cpu"),
+        arena_factory=lambda shape, dtype, capacity, device: torch.zeros(
+            (capacity, *shape),
+            dtype=dtype,
+            device=device,
+        ),
+    )
+    runtime.bind_dram_store(store)
+    runtime.initialize_dsa_row_index(
+        layout=PackedKvLayout(
+            layout_id="test",
+            tokens_per_logical_block=128,
+            packed_token_bytes=1,
+            ddr_layer_alignment_bytes=128,
+        ),
+    )
+    assert adapter.ddr_bytes == 8 * 128
+    for layer_id in range(2):
+        runtime.bind_resident_layer_cache(
+            layer_id=layer_id,
+            resident_nope_cache=torch.zeros((3, 128), dtype=torch.uint8),
+            resident_rope_cache=torch.zeros((3, 128), dtype=torch.uint8),
+        )
+
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        num_computed_tokens_cpu=np.array([0], dtype=np.int32),
+        num_prompt_tokens=np.array([257], dtype=np.int32),
+        block_table=[_ResidentBlockTable()],
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",),
+            stages=(int(DSARequestCacheStage.PREFILL),),
+            target_resident_budget_tokens=(256,),
+            sparse_budget_tokens=(0,),
+            resident_valid_tokens=(-1,),
+            resident_block_table_replacements=(),
+        ),
+    )
+
+    runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([257], dtype=np.int32),
+        req_indices=torch.zeros(257, dtype=torch.int64),
+        positions=torch.arange(257, dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=257,
+        resident_group_id=0,
+    )
+    runtime.dump_prefill_full_blocks()
+
+    assert adapter.jobs[0].tolist() == [0, 0]
+    assert adapter.jobs[1].tolist() == [0, 1]
+    assert adapter.written_layers == [0, 1]
+    assert adapter.finalized_table is runtime.dsa_row_directory
+    assert not np.any(store.logical_block_table)
 
 
 def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:

@@ -335,6 +335,16 @@ class DSAOffloadRuntime:
         )
         return self.dsa_row_directory
 
+    def _require_dsa_row_directory(self) -> DDRBlockTable:
+        if self.dsa_row_directory is None:
+            raise RuntimeError("DSA_ROW directory has not been initialized")
+        return self.dsa_row_directory
+
+    def _require_kvaf_adapter(self) -> KvafAdapter:
+        if self.kvaf_adapter is None:
+            raise RuntimeError("DSA C8 KVAF runtime is not initialized")
+        return self.kvaf_adapter
+
     def bind_resident_layer_cache(
         self,
         *,
@@ -381,6 +391,9 @@ class DSAOffloadRuntime:
     def dump_prefill_full_blocks(self) -> None:
         """在完整 prefill model forward 结束后统一卸载所有层满块。"""
 
+        if self.dsa_row_directory is not None:
+            self._finalize_kvaf_batch_put()
+            return
         if not self._defer_prefill_layer_dump:
             return
         try:
@@ -437,6 +450,11 @@ class DSAOffloadRuntime:
             self._defer_prefill_layer_dump = False
 
     def release_pool_index(self, pool_index: int) -> None:
+        if self.dsa_row_directory is not None:
+            self._require_kvaf_adapter().release_pool_row(
+                pool_index,
+                block_table=self._require_dsa_row_directory(),
+            )
         store = self.dram_store
         if store is not None:
             store.release_pool_index(pool_index)
@@ -479,6 +497,46 @@ class DSAOffloadRuntime:
             )
         self.release_pool_index(pool_row)
 
+    def shutdown(self) -> None:
+        if self.dsa_row_directory is not None:
+            self._require_kvaf_adapter().shutdown(
+                block_table=self._require_dsa_row_directory(),
+            )
+
+    def _finalize_kvaf_batch_put(self) -> None:
+        adapter = self._require_kvaf_adapter()
+        if not adapter.active_batch_put:
+            self._defer_prefill_layer_dump = False
+            return
+        try:
+            if self._defer_prefill_layer_dump:
+                if len(self._resident_layer_caches) != self.num_layers:
+                    raise RuntimeError(
+                        "DSA KVAF Prefill cache binding is incomplete: "
+                        f"bound={len(self._resident_layer_caches)}, "
+                        f"expected={self.num_layers}"
+                    )
+                if self.device.type == "npu":
+                    torch.npu.synchronize(self.device)
+                for layer_id in sorted(self._resident_layer_caches):
+                    packed_cache, _unused_rope = (
+                        self._resident_layer_caches[layer_id]
+                    )
+                    adapter.write_batch_put_layer(
+                        local_layer_ordinal=layer_id,
+                        packed_cache=packed_cache,
+                    )
+            adapter.finalize_batch_put(
+                block_table=self._require_dsa_row_directory(),
+            )
+        except Exception:
+            adapter.abort_batch_put(
+                block_table=self._require_dsa_row_directory(),
+            )
+            raise
+        finally:
+            self._defer_prefill_layer_dump = False
+
     def prepare_forward(
         self,
         *,
@@ -514,6 +572,12 @@ class DSAOffloadRuntime:
         self.dump_launch_count = 0
         self._defer_prefill_layer_dump = False
         self._req_cache_tokens = state.sparse_budget_tokens
+        adapter = self.kvaf_adapter
+        if adapter is not None and adapter.active_batch_put:
+            raise RuntimeError(
+                "Previous DSA KVAF BatchPut was not finalized before the "
+                "next forward"
+            )
 
         self._prepare_dump_plan(
             input_batch=input_batch,
@@ -527,6 +591,13 @@ class DSAOffloadRuntime:
             state=state,
             validate_all_sparse=dram_table_refreshed,
         )
+        if self.dsa_row_directory is not None and self.dump_job_count:
+            self._require_kvaf_adapter().begin_batch_put(
+                pool_rows=self._dump_pool_indices[: self.dump_job_count],
+                block_qs=self._dump_logical_indices[: self.dump_job_count],
+                source_block_ids=self._dump_source_blocks[: self.dump_job_count],
+                geometry=self.row_index_geometry,
+            )
 
         active_modes = state.row_modes_cpu[:num_reqs]
         if not np.any(active_modes == DSA_ROW_MODE_SPARSE):
@@ -892,6 +963,16 @@ class DSAOffloadRuntime:
 
         if job_count == 0:
             self.dump_job_count = 0
+            return
+
+        if self.dsa_row_directory is not None:
+            self.dump_src_block_ids.np[:job_count] = (
+                self._dump_source_blocks[:job_count]
+            )
+            self.dump_dst_block_ids.np[:job_count] = (
+                DSA_DUMP_NOOP_DST_BLOCK_ID
+            )
+            self.dump_job_count = job_count
             return
 
         reservation = store.reserve_blocks(
@@ -1290,6 +1371,23 @@ class DSALayerOffloadContext:
         resident_nope_cache: torch.Tensor,
         resident_rope_cache: torch.Tensor,
     ) -> None:
+        if self.runtime.dsa_row_directory is not None:
+            if self.runtime.defer_prefill_layer_dump:
+                return
+            if self.runtime.dump_job_count == 0:
+                return
+            adapter = self.runtime._require_kvaf_adapter()
+            try:
+                adapter.write_batch_put_layer(
+                    local_layer_ordinal=self.layer_id,
+                    packed_cache=resident_nope_cache,
+                )
+            except Exception:
+                adapter.abort_batch_put(
+                    block_table=self.runtime._require_dsa_row_directory(),
+                )
+                raise
+            return
         if self.runtime.defer_prefill_layer_dump:
             return
         job_count = self.runtime.dump_launch_count
