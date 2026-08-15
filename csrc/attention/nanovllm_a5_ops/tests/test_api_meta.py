@@ -69,6 +69,17 @@ def tensors(device: str = "meta") -> dict[str, torch.Tensor]:
     resident_lengths = torch.empty(
         (batch,), dtype=torch.int32, device=device
     )
+    kvaf_indices = torch.empty(
+        (batch * TOPK,), dtype=torch.int32, device=device
+    )
+    kvaf_offsets = torch.empty_like(kvaf_indices)
+    kvaf_mask = torch.empty(
+        (batch * TOPK,), dtype=torch.uint8, device=device
+    )
+    kvaf_output_indices = torch.empty_like(kvaf_indices)
+    kvaf_resident_table = torch.empty(
+        (batch, 256), dtype=torch.int32, device=device
+    )
     c8_query = torch.empty(
         (batch, 8, 576), dtype=torch.bfloat16, device=device
     )
@@ -118,6 +129,11 @@ def tensors(device: str = "meta") -> dict[str, torch.Tensor]:
         "packed_dram": packed_dram,
         "packed_attention_slots": packed_attention_slots,
         "resident_lengths": resident_lengths,
+        "kvaf_indices": kvaf_indices,
+        "kvaf_offsets": kvaf_offsets,
+        "kvaf_mask": kvaf_mask,
+        "kvaf_output_indices": kvaf_output_indices,
+        "kvaf_resident_table": kvaf_resident_table,
         "c8_query": c8_query,
         "c8_index_query": c8_index_query,
         "c8_index_key": c8_index_key,
@@ -221,6 +237,37 @@ def run_api(values: dict[str, torch.Tensor]) -> None:
     for result, expected in zip(
         c8_lidu_out,
         (values["source_ids"], values["slots"], values["counts"], values["pool"]),
+    ):
+        assert same_tensor(result, expected)
+
+    kvaf_prepare = torch.ops.nanovllm_dsa.kvaf_batch_get_prepare_out.default(
+        values["source_ids"],
+        values["slots"],
+        values["counts"],
+        values["req"],
+        values["kvaf_resident_table"],
+        values["cache_tokens"],
+        values["lengths"],
+        values["actual_kv"],
+        values["kvaf_indices"],
+        values["kvaf_offsets"],
+        values["kvaf_mask"],
+        values["kvaf_output_indices"],
+        values["resident_lengths"],
+        2,
+        4,
+        16,
+        32,
+    )
+    for result, expected in zip(
+        kvaf_prepare,
+        (
+            values["kvaf_indices"],
+            values["kvaf_offsets"],
+            values["kvaf_mask"],
+            values["kvaf_output_indices"],
+            values["resident_lengths"],
+        ),
     ):
         assert same_tensor(result, expected)
 

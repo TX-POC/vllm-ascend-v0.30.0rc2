@@ -23,6 +23,7 @@ class _FakeKvafRuntime:
         self.remote_region: dict[str, int] = {}
         self.fail_batch_put_call = fail_batch_put_call
         self.batch_put_calls: list[dict[str, object]] = []
+        self.batch_get_calls: list[tuple[object, ...]] = []
         self.batch_free_calls: list[list[int]] = []
         self.released_handles: list[tuple[int, ...]] = []
         self.committed: dict[int, tuple[int, int]] = {}
@@ -57,6 +58,9 @@ class _FakeKvafRuntime:
         )
         for key, length in zip(keys, lengths):
             self.committed[key] = (0x100000 + key * 0x1000, length)
+
+    def batch_get(self, *args: object) -> None:
+        self.batch_get_calls.append(args)
 
     def prepare_access_table(
         self,
@@ -164,7 +168,12 @@ def _make_adapter(
         geometry.directory_cell_count,
         device=torch.device("cpu"),
     )
-    adapter.initialize_dsa_row_index(layout=layout, ddr_bytes=256)
+    adapter.initialize_dsa_row_index(
+        layout=layout,
+        ddr_bytes=256,
+        geometry=geometry,
+        device=torch.device("cpu"),
+    )
     return (
         adapter,
         runtime,

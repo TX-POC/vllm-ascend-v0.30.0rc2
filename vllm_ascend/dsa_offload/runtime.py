@@ -28,6 +28,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.dsa_offload.contracts import (
+    DSA_A5_LIDU_OUTPUT_CAPACITY,
     DSA_DRAM_NULL_BLOCK_ID,
     DSA_DUMP_NOOP_DST_BLOCK_ID,
     DSA_LIDU_OUTPUT_CAPACITY,
@@ -119,10 +120,15 @@ class DSAOffloadRuntime:
             tokens_per_logical_block=self.block_size,
         )
 
+        lidu_output_capacity = (
+            DSA_A5_LIDU_OUTPUT_CAPACITY
+            if self.op_backend == DSA_OP_BACKEND_NANOVLLM_A5
+            else DSA_LIDU_OUTPUT_CAPACITY
+        )
         output_shape = (
             self.max_num_reqs,
             1,
-            DSA_LIDU_OUTPUT_CAPACITY,
+            lidu_output_capacity,
         )
         self._lidu_topk_index = torch.empty(
             output_shape,
@@ -328,6 +334,8 @@ class DSAOffloadRuntime:
                 directory_cell_count
                 * self.kvaf_adapter.slot_size(layout)
             ),
+            geometry=self.row_index_geometry,
+            device=self.device,
         )
         self.dsa_row_directory = DDRBlockTable(
             self.row_index_geometry.directory_cell_count,
@@ -1184,7 +1192,6 @@ class DSALayerOffloadContext:
         ):
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 lightning_indexer_decode_update_c8 as lidu_c8,
-                packed_kvcache_scatter_copy as ksc_c8,
             )
             cache_tokens = self.runtime._req_cache_tokens[:num_reqs]
             key_dequant_scale = self.runtime._c8_key_dequant_scales.get(
@@ -1209,6 +1216,38 @@ class DSALayerOffloadContext:
                 block_table=indexer_block_table,
                 outputs=outputs,
             )
+            resident_seq_lengths = (
+                self.runtime._c8_resident_seq_lengths[self.layer_id][
+                    :num_reqs
+                ]
+            )
+            directory = self.runtime.dsa_row_directory
+            if directory is not None:
+                self.runtime._require_kvaf_adapter().execute_batch_get(
+                    layer_id=self.layer_id,
+                    source_token_ids=outputs.topk_index,
+                    destination_slots=outputs.topk_slots,
+                    miss_count=outputs.miss_count,
+                    resident_pool_indices=resident_pool_indices,
+                    resident_block_table=resident_block_table,
+                    cache_tokens=cache_tokens,
+                    candidate_lens=actual_seq_lengths_key,
+                    logical_seq_lengths=actual_seq_lengths_key,
+                    resident_seq_lengths=resident_seq_lengths,
+                    address_table=directory.addresses,
+                    output=resident_nope_cache,
+                )
+                # Subgraph C only materializes the resident KV and sequence
+                # lengths. Subgraph D will replace this placeholder with its
+                # final attention-slot mapping before C8 SFA is enabled.
+                return DSAOffloadSelectionOutput(
+                    sparse_indices=outputs.topk_slots,
+                    tail_info=resident_seq_lengths,
+                )
+
+            from vllm_ascend.dsa_offload.ops_nanovllm import (
+                packed_kvcache_scatter_copy as ksc_c8,
+            )
             store = self.runtime.dram_store
             if store is None:
                 raise RuntimeError("DSA layer has no bound DRAM store")
@@ -1216,11 +1255,6 @@ class DSALayerOffloadContext:
             attention_slots = self.runtime._c8_attention_slots[
                 self.layer_id
             ][:num_reqs]
-            resident_seq_lengths = (
-                self.runtime._c8_resident_seq_lengths[self.layer_id][
-                    :num_reqs
-                ]
-            )
             ksc_c8(
                 hbm_packed_kv=resident_nope_cache,
                 dram_packed_kv=arenas.nope,
@@ -1320,6 +1354,11 @@ class DSALayerOffloadContext:
             self.runtime.op_backend == DSA_OP_BACKEND_NANOVLLM_A5
             and self.runtime.is_c8
         ):
+            if self.runtime.dsa_row_directory is not None:
+                raise RuntimeError(
+                    "KVAF subgraph C completed, but subgraph D has not "
+                    "materialized C8 attention_slots yet"
+                )
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 sparse_flash_attention_for_offload_c8 as sfa_c8,
             )

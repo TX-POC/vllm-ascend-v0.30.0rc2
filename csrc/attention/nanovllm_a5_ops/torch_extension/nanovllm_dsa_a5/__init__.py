@@ -50,6 +50,9 @@ lidu_cache_update_out = torch.ops.nanovllm_dsa.lidu_cache_update_out
 scatter_copy = torch.ops.nanovllm_dsa.scatter_copy
 packed_scatter_copy = torch.ops.nanovllm_dsa.packed_scatter_copy
 packed_scatter_copy_out = torch.ops.nanovllm_dsa.packed_scatter_copy_out
+kvaf_batch_get_prepare_out = (
+    torch.ops.nanovllm_dsa.kvaf_batch_get_prepare_out
+)
 sparse_and_tail_attention = (
     torch.ops.nanovllm_dsa.sparse_and_tail_attention
 )
@@ -592,6 +595,7 @@ __all__ = [
     "scatter_copy",
     "packed_scatter_copy",
     "packed_scatter_copy_out",
+    "kvaf_batch_get_prepare_out",
     "packed_kvcache_scatter_copy",
     "sparse_and_tail_attention",
     "sparse_and_tail_attention_c8",

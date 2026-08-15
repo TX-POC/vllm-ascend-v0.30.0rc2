@@ -12,6 +12,11 @@ import numpy as np
 import torch
 
 from vllm_ascend import envs
+from vllm_ascend.dsa_offload.contracts import (
+    DSA_PACKED_KV_DIM,
+    DSA_REQUIRED_CACHE_BLOCK_SIZE,
+    DSA_SFA_COMPUTE_TOPK,
+)
 from vllm_ascend.dsa_offload.dsa_row import (
     DDRBlockTable,
     DsaRowIndexGeometry,
@@ -28,6 +33,16 @@ class _ActiveBatchPut:
     written_layers: set[int] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class KvafBatchGetBuffers:
+    """Fixed-address device buffers consumed by KVAF BatchGet."""
+
+    indices: torch.Tensor
+    offsets: torch.Tensor
+    mask: torch.Tensor
+    output_indices: torch.Tensor
+
+
 class KvafAdapter:
     """Import and dispatch the external KVAF runtime without duplicating it."""
 
@@ -35,6 +50,7 @@ class KvafAdapter:
         self,
         *,
         device_id: int = 0,
+        synchronize_batch_get: bool = False,
     ) -> None:
         try:
             import kvaf
@@ -72,6 +88,9 @@ class KvafAdapter:
         )
         self._layout: PackedKvLayout | None = None
         self._geometry: DsaRowIndexGeometry | None = None
+        self._device: torch.device | None = None
+        self.synchronize_batch_get = bool(synchronize_batch_get)
+        self.batch_get_buffers: KvafBatchGetBuffers | None = None
         self._committed_block_counts: dict[int, int] = {}
         self._active_put: _ActiveBatchPut | None = None
 
@@ -91,6 +110,8 @@ class KvafAdapter:
         *,
         layout: PackedKvLayout,
         ddr_bytes: int,
+        geometry: DsaRowIndexGeometry,
+        device: torch.device,
     ) -> None:
         """Register KVAF's region using DSA's packed layer slot size."""
 
@@ -108,6 +129,11 @@ class KvafAdapter:
             initialize(ddr_bytes, slot_size)
         self.validate_region(layout=layout)
         self._layout = layout
+        if self._geometry is not None and self._geometry != geometry:
+            raise RuntimeError("KVAF DSA_ROW geometry changed after initialization")
+        self._geometry = geometry
+        self._device = torch.device(device)
+        self._initialize_batch_get_buffers()
 
     def validate_region(self, *, layout: PackedKvLayout) -> None:
         """Check that KVAF's registered fixed slot matches DSA's layer block."""
@@ -125,6 +151,144 @@ class KvafAdapter:
                 f"kvaf={actual_slot_size}, expected={expected_slot_size}"
             )
 
+    def _initialize_batch_get_buffers(self) -> None:
+        geometry = self._require_geometry()
+        device = self._device
+        if device is None:
+            raise RuntimeError("KVAF BatchGet device has not been initialized")
+        if self.batch_get_buffers is not None:
+            raise RuntimeError("KVAF BatchGet buffers were initialized twice")
+
+        request_capacity = geometry.raw_row_capacity * DSA_SFA_COMPUTE_TOPK
+        self.batch_get_buffers = KvafBatchGetBuffers(
+            indices=torch.empty(
+                request_capacity,
+                dtype=torch.int32,
+                device=device,
+            ),
+            offsets=torch.empty(
+                request_capacity,
+                dtype=torch.int32,
+                device=device,
+            ),
+            mask=torch.empty(
+                request_capacity,
+                dtype=torch.uint8,
+                device=device,
+            ),
+            output_indices=torch.empty(
+                request_capacity,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+
+    @staticmethod
+    def _packed_output_rows(output: torch.Tensor) -> torch.Tensor:
+        """Expose canonical packed cache as KVAF's [physical_token, 656]."""
+
+        if (
+            output.ndim != 4
+            or int(output.shape[1]) != DSA_REQUIRED_CACHE_BLOCK_SIZE
+            or int(output.shape[2]) != 1
+            or int(output.shape[3]) != DSA_PACKED_KV_DIM
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "KVAF BatchGet output must be contiguous "
+                "[physical_blocks,128,1,656]"
+            )
+        return output.view(torch.int8).view(-1, DSA_PACKED_KV_DIM)
+
+    def execute_batch_get(
+        self,
+        *,
+        layer_id: int,
+        source_token_ids: torch.Tensor,
+        destination_slots: torch.Tensor,
+        miss_count: torch.Tensor,
+        resident_pool_indices: torch.Tensor,
+        resident_block_table: torch.Tensor,
+        cache_tokens: torch.Tensor,
+        candidate_lens: torch.Tensor,
+        logical_seq_lengths: torch.Tensor,
+        resident_seq_lengths: torch.Tensor,
+        address_table: torch.Tensor,
+        output: torch.Tensor,
+        stream: Any | None = None,
+    ) -> None:
+        """Resolve LIDU's miss prefix and submit mask-based KVAF BatchGet."""
+
+        geometry = self._require_geometry()
+        buffers = self.batch_get_buffers
+        device = self._device
+        if buffers is None or device is None:
+            raise RuntimeError("KVAF BatchGet is not initialized")
+        if (
+            not isinstance(address_table, torch.Tensor)
+            or address_table.device != device
+            or address_table.dtype != torch.int64
+            or address_table.numel() != geometry.directory_cell_count
+            or not address_table.is_contiguous()
+        ):
+            raise ValueError(
+                "KVAF address_table must be contiguous int64 on the DSA "
+                "device with geometry.directory_cell_count entries"
+            )
+        layer_id = int(layer_id)
+        if not 0 <= layer_id < geometry.n_layers:
+            raise ValueError(
+                f"KVAF layer_id {layer_id} is outside [0,{geometry.n_layers})"
+            )
+        batch = int(miss_count.numel())
+        if not 0 < batch <= geometry.raw_row_capacity:
+            raise ValueError(
+                "KVAF BatchGet row count "
+                f"{batch} exceeds {geometry.raw_row_capacity}"
+            )
+        request_count = batch * DSA_SFA_COMPUTE_TOPK
+        indices = buffers.indices[:request_count]
+        offsets = buffers.offsets[:request_count]
+        mask = buffers.mask[:request_count]
+        output_indices = buffers.output_indices[:request_count]
+
+        from vllm_ascend.dsa_offload.ops_nanovllm import (
+            prepare_kvaf_batch_get_inputs,
+        )
+
+        output_rows = self._packed_output_rows(output)
+        if stream is None:
+            stream = torch.npu.current_stream()
+        with torch.npu.stream(stream):
+            prepare_kvaf_batch_get_inputs(
+                source_token_ids=source_token_ids,
+                destination_slots=destination_slots,
+                miss_count=miss_count,
+                resident_pool_indices=resident_pool_indices,
+                resident_block_table=resident_block_table,
+                cache_tokens=cache_tokens,
+                candidate_lens=candidate_lens,
+                logical_seq_lengths=logical_seq_lengths,
+                layer_id=layer_id,
+                num_layers=geometry.n_layers,
+                max_num_reqs=geometry.raw_row_capacity,
+                qcap=geometry.q_capacity,
+                indices=indices,
+                offsets=offsets,
+                mask=mask,
+                output_indices=output_indices,
+                resident_seq_lengths=resident_seq_lengths,
+            )
+            self.runtime.batch_get(
+                address_table,
+                indices,
+                offsets,
+                mask,
+                output_indices,
+                output_rows,
+                stream,
+                self.synchronize_batch_get,
+            )
 
     def batch_free(
         self,
@@ -534,7 +698,7 @@ class KvafAdapter:
 
     def _require_geometry(self) -> DsaRowIndexGeometry:
         if self._geometry is None:
-            raise RuntimeError("KVAF BatchPut geometry has not been prepared")
+            raise RuntimeError("KVAF DSA_ROW geometry has not been initialized")
         return self._geometry
 
     @staticmethod
@@ -546,12 +710,12 @@ class KvafAdapter:
         addresses = block_table.addresses
         if (
             not isinstance(addresses, torch.Tensor)
-            or addresses.dtype != torch.uint64
+            or addresses.dtype != torch.int64
             or addresses.numel() != geometry.directory_cell_count
             or not addresses.is_contiguous()
         ):
             raise ValueError(
-                "DDRBlockTable addresses must be a contiguous uint64 Tensor "
+                "DDRBlockTable addresses must be a contiguous int64 Tensor "
                 "with DSA_ROW capacity"
             )
         lengths = block_table.lengths
@@ -595,4 +759,4 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-__all__ = ["KvafAdapter"]
+__all__ = ["KvafAdapter", "KvafBatchGetBuffers"]
