@@ -20,59 +20,70 @@ constexpr uint32_t ROW_OFFSETS_BUFFER_BYTES =
 constexpr uint32_t LAYER_BASES_BUFFER_BYTES =
     (SIMT_BATCH_CHUNK * sizeof(int32_t) + 31U) & ~31U;
 
+// A 2048-thread VF has only 16 registers per thread. Keep source- and
+// destination-derived descriptors in separate VFs, use the thread id as the
+// row-local column, and avoid binary-search/uint64 address state in SIMT.
 __simt_vf__ __aicore__ LAUNCH_BOUND(2048)
-inline void GenerateKvafDescriptorsSimt(
+inline void GenerateKvafSourceDescriptorsSimt(
     __gm__ const int32_t* sourceTokenIds,
-    __gm__ const int32_t* destinationSlots,
-    __gm__ const int32_t* residentBlockTable,
     __gm__ int32_t* indices,
     __gm__ int32_t* offsets,
-    __gm__ int32_t* outputIndices,
     __ubuf__ const uint32_t* rowOffsets,
     __ubuf__ const int32_t* layerBases,
-    uint32_t batchBase,
     uint32_t batchCount,
-    uint32_t requestCapacity,
-    uint32_t residentBlockCapacity,
-    uint32_t totalMissCount)
+    uint32_t requestCapacity)
 {
-    for (uint32_t ordinal = threadIdx.x; ordinal < totalMissCount;
-         ordinal += SIMT_THREADS) {
-        uint32_t low = 0U;
-        uint32_t high = batchCount;
-        while (low < high) {
-            const uint32_t middle = (low + high) >> 1U;
-            if (rowOffsets[middle + 1U] <= ordinal) {
-                low = middle + 1U;
-            } else {
-                high = middle;
+    for (uint32_t column = threadIdx.x; column < requestCapacity;
+         column += SIMT_THREADS) {
+        for (uint32_t localBatch = 0U; localBatch < batchCount;
+             ++localBatch) {
+            const uint32_t missCount =
+                rowOffsets[localBatch + 1U] - rowOffsets[localBatch];
+            if (column < missCount) {
+                const uint32_t flat =
+                    localBatch * requestCapacity + column;
+                const uint32_t sourceToken =
+                    static_cast<uint32_t>(sourceTokenIds[flat]);
+                indices[flat] = static_cast<int32_t>(
+                    static_cast<uint32_t>(layerBases[localBatch]) +
+                    (sourceToken >> BLOCK_SHIFT));
+                offsets[flat] = static_cast<int32_t>(
+                    (sourceToken & BLOCK_MASK) * PACKED_ROW_BYTES);
             }
         }
+    }
+}
 
-        const uint32_t localBatch = low;
-        const uint32_t globalBatch = batchBase + localBatch;
-        const uint32_t column = ordinal - rowOffsets[localBatch];
-        const uint64_t flat =
-            static_cast<uint64_t>(globalBatch) * requestCapacity + column;
-        const int32_t sourceToken = sourceTokenIds[flat];
-        const int32_t destinationSlot = destinationSlots[flat];
-        const uint32_t logicalBlock =
-            static_cast<uint32_t>(sourceToken) >> BLOCK_SHIFT;
-        const uint32_t destinationBlock =
-            static_cast<uint32_t>(destinationSlot) >> BLOCK_SHIFT;
-        const uint64_t residentTableBase =
-            static_cast<uint64_t>(globalBatch) * residentBlockCapacity;
-        const int32_t physicalBlock =
-            residentBlockTable[residentTableBase + destinationBlock];
-
-        indices[flat] = static_cast<int32_t>(
-            static_cast<uint32_t>(layerBases[localBatch]) + logicalBlock);
-        offsets[flat] = static_cast<int32_t>(
-            (static_cast<uint32_t>(sourceToken) & BLOCK_MASK) *
-            PACKED_ROW_BYTES);
-        outputIndices[flat] = static_cast<int32_t>(
-            static_cast<uint64_t>(physicalBlock) * BLOCK_SIZE +
-            (static_cast<uint32_t>(destinationSlot) & BLOCK_MASK));
+__simt_vf__ __aicore__ LAUNCH_BOUND(2048)
+inline void GenerateKvafDestinationDescriptorsSimt(
+    __gm__ const int32_t* destinationSlots,
+    __gm__ const int32_t* residentBlockTable,
+    __gm__ int32_t* outputIndices,
+    __ubuf__ const uint32_t* rowOffsets,
+    uint32_t batchCount,
+    uint32_t requestCapacity,
+    uint32_t residentBlockCapacity)
+{
+    for (uint32_t column = threadIdx.x; column < requestCapacity;
+         column += SIMT_THREADS) {
+        for (uint32_t localBatch = 0U; localBatch < batchCount;
+             ++localBatch) {
+            const uint32_t missCount =
+                rowOffsets[localBatch + 1U] - rowOffsets[localBatch];
+            if (column < missCount) {
+                const uint32_t flat =
+                    localBatch * requestCapacity + column;
+                const uint32_t destinationSlot =
+                    static_cast<uint32_t>(destinationSlots[flat]);
+                const uint32_t physicalBlock = static_cast<uint32_t>(
+                    residentBlockTable[
+                        localBatch * residentBlockCapacity +
+                        (destinationSlot >> BLOCK_SHIFT)]);
+                outputIndices[flat] = static_cast<int32_t>(
+                    physicalBlock * BLOCK_SIZE +
+                    (destinationSlot & BLOCK_MASK));
+            }
+        }
     }
 }
 
@@ -157,7 +168,6 @@ public:
                     LaunchDescriptorSimt(
                         batchBase,
                         batchCount,
-                        totalMissCount,
                         rowOffsets,
                         layerBases);
                 }
@@ -321,27 +331,34 @@ private:
     __aicore__ inline void LaunchDescriptorSimt(
         uint32_t batchBase,
         uint32_t batchCount,
-        uint32_t totalMissCount,
         LocalTensor<uint32_t> rowOffsets,
         LocalTensor<int32_t> layerBases)
     {
+        const uint64_t descriptorBase =
+            static_cast<uint64_t>(batchBase) * tiling_->requestCapacity;
+        const uint64_t residentTableBase =
+            static_cast<uint64_t>(batchBase) *
+            tiling_->residentBlockCapacity;
         SetFlag<HardEvent::S_V>(EVENT_ID1);
         WaitFlag<HardEvent::S_V>(EVENT_ID1);
-        AscendC::Simt::VF_CALL<GenerateKvafDescriptorsSimt>(
+        AscendC::Simt::VF_CALL<GenerateKvafSourceDescriptorsSimt>(
             AscendC::Simt::Dim3{SIMT_THREADS, 1U, 1U},
-            sourceTokenIdsRaw_,
-            destinationSlotsRaw_,
-            residentBlockTableRaw_,
-            indicesRaw_,
-            offsetsRaw_,
-            outputIndicesRaw_,
+            sourceTokenIdsRaw_ + descriptorBase,
+            indicesRaw_ + descriptorBase,
+            offsetsRaw_ + descriptorBase,
             (__ubuf__ const uint32_t*)rowOffsets.GetPhyAddr(),
             (__ubuf__ const int32_t*)layerBases.GetPhyAddr(),
-            batchBase,
+            batchCount,
+            tiling_->requestCapacity);
+        AscendC::Simt::VF_CALL<GenerateKvafDestinationDescriptorsSimt>(
+            AscendC::Simt::Dim3{SIMT_THREADS, 1U, 1U},
+            destinationSlotsRaw_ + descriptorBase,
+            residentBlockTableRaw_ + residentTableBase,
+            outputIndicesRaw_ + descriptorBase,
+            (__ubuf__ const uint32_t*)rowOffsets.GetPhyAddr(),
             batchCount,
             tiling_->requestCapacity,
-            tiling_->residentBlockCapacity,
-            totalMissCount);
+            tiling_->residentBlockCapacity);
         SetFlag<HardEvent::V_S>(EVENT_ID1);
         WaitFlag<HardEvent::V_S>(EVENT_ID1);
     }
