@@ -21,45 +21,40 @@ constexpr uint32_t ROW_OFFSETS_BUFFER_BYTES =
 constexpr uint32_t LAYER_BASES_BUFFER_BYTES =
     (SIMT_BATCH_CHUNK * sizeof(int32_t) + 31U) & ~31U;
 
-// A 2048-thread VF has only 16 registers per thread. Keep source- and
-// destination-derived descriptors in separate row-local VFs. Scalar code
-// resolves all UB metadata and GM row bases before launch, so SIMT neither
-// accesses UB nor carries binary-search/uint64 address state.
+// A 2048-thread VF has only 16 registers per thread. Scalar code resolves all
+// UB metadata and GM row bases before launching one row-local VF per request.
+// Keep source and destination temporaries in disjoint scopes so the compiler
+// can reuse registers while generating all descriptors in that single VF.
 __simt_vf__ __aicore__ LAUNCH_BOUND(2048)
-inline void GenerateKvafSourceDescriptorsSimt(
+inline void GenerateKvafDescriptorsSimt(
     __gm__ const int32_t* sourceTokenIds,
+    __gm__ const int32_t* destinationSlots,
+    __gm__ const int32_t* residentBlockTable,
     __gm__ int32_t* indices,
     __gm__ int32_t* offsets,
+    __gm__ int32_t* outputIndices,
     int32_t layerBase,
     uint32_t missCount)
 {
     for (uint32_t column = threadIdx.x; column < missCount;
          column += SIMT_THREADS) {
-        const uint32_t sourceToken =
-            static_cast<uint32_t>(sourceTokenIds[column]);
-        indices[column] = static_cast<int32_t>(
-            static_cast<uint32_t>(layerBase) +
-            (sourceToken >> BLOCK_SHIFT));
-        offsets[column] = static_cast<int32_t>(
-            (sourceToken & BLOCK_MASK) * PACKED_ROW_BYTES);
-    }
-}
-
-__simt_vf__ __aicore__ LAUNCH_BOUND(2048)
-inline void GenerateKvafDestinationDescriptorsSimt(
-    __gm__ const int32_t* destinationSlots,
-    __gm__ const int32_t* residentBlockTable,
-    __gm__ int32_t* outputIndices,
-    uint32_t missCount)
-{
-    for (uint32_t column = threadIdx.x; column < missCount;
-         column += SIMT_THREADS) {
-        const uint32_t destinationSlot =
-            static_cast<uint32_t>(destinationSlots[column]);
-        outputIndices[column] = static_cast<int32_t>(
-            static_cast<uint32_t>(residentBlockTable[
-                destinationSlot >> BLOCK_SHIFT]) * BLOCK_SIZE +
-            (destinationSlot & BLOCK_MASK));
+        {
+            const uint32_t sourceToken =
+                static_cast<uint32_t>(sourceTokenIds[column]);
+            indices[column] = static_cast<int32_t>(
+                static_cast<uint32_t>(layerBase) +
+                (sourceToken >> BLOCK_SHIFT));
+            offsets[column] = static_cast<int32_t>(
+                (sourceToken & BLOCK_MASK) * PACKED_ROW_BYTES);
+        }
+        {
+            const uint32_t destinationSlot =
+                static_cast<uint32_t>(destinationSlots[column]);
+            outputIndices[column] = static_cast<int32_t>(
+                static_cast<uint32_t>(residentBlockTable[
+                    destinationSlot >> BLOCK_SHIFT]) * BLOCK_SIZE +
+                (destinationSlot & BLOCK_MASK));
+        }
     }
 }
 
@@ -325,18 +320,15 @@ private:
             const uint64_t residentTableBase =
                 static_cast<uint64_t>(globalBatch) *
                 tiling_->residentBlockCapacity;
-            asc_vf_call<GenerateKvafSourceDescriptorsSimt>(
+            asc_vf_call<GenerateKvafDescriptorsSimt>(
                 dim3{SIMT_THREADS, 1U, 1U},
                 sourceTokenIdsRaw_ + descriptorBase,
-                indicesRaw_ + descriptorBase,
-                offsetsRaw_ + descriptorBase,
-                layerBases.GetValue(localBatch),
-                missCount);
-            asc_vf_call<GenerateKvafDestinationDescriptorsSimt>(
-                dim3{SIMT_THREADS, 1U, 1U},
                 destinationSlotsRaw_ + descriptorBase,
                 residentBlockTableRaw_ + residentTableBase,
+                indicesRaw_ + descriptorBase,
+                offsetsRaw_ + descriptorBase,
                 outputIndicesRaw_ + descriptorBase,
+                layerBases.GetValue(localBatch),
                 missCount);
         }
     }
