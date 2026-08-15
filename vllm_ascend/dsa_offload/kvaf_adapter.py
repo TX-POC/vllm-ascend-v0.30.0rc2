@@ -722,13 +722,13 @@ class KvafAdapter:
         valid = block_table.valid
         if (
             not isinstance(lengths, torch.Tensor)
-            or lengths.dtype != torch.uint64
+            or lengths.dtype != torch.int64
             or lengths.shape != addresses.shape
             or not lengths.is_contiguous()
             or lengths.device != addresses.device
         ):
             raise ValueError(
-                "DDRBlockTable lengths must be a contiguous uint64 Tensor "
+                "DDRBlockTable lengths must be a contiguous int64 Tensor "
                 "on the address-table device"
             )
         if (

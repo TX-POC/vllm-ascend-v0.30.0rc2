@@ -25,7 +25,7 @@ def test_directory_initializes_fixed_address_length_valid_tables() -> None:
     assert table.addresses.numel() == 8
     assert table.addresses.device == torch.device("cpu")
     assert table.addresses.dtype == torch.int64
-    assert table.lengths.dtype == torch.uint64
+    assert table.lengths.dtype == torch.int64
     assert table.valid.dtype == torch.uint8
     assert table.addresses.tolist() == [0] * 8
     assert table.lengths.tolist() == [0] * 8

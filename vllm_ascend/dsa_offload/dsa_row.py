@@ -162,9 +162,10 @@ class DDRBlockTable:
             dtype=torch.int64,
             device=device,
         )
+        # Ascend does not implement zero_/index_fill_ for uint64 tensors.
         self.lengths = torch.zeros(
             cell_count,
-            dtype=torch.uint64,
+            dtype=torch.int64,
             device=device,
         )
         self.valid = torch.zeros(
