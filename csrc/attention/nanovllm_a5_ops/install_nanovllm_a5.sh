@@ -13,18 +13,30 @@ cd "${REPO_ROOT}"
 
 cd /tmp
 "${PYTHON_BIN}" - <<'PY'
+import importlib
+
 import torch
 from vllm_ascend.a5_dsa_registration import require_a5_dsa_registration
 
-required = (
+native_required = (
     "kvaf_batch_get_prepare_out",
-    "lidu_decode_update_c8_out",
     "packed_scatter_copy_out",
-    "sparse_and_tail_attention_c8",
     "full_block_dump",
     "packed_full_block_dump",
 )
-require_a5_dsa_registration(required)
+require_a5_dsa_registration(native_required)
+
+# C8 LIDU implementations and sparse attention are registered by the Python
+# extension layer after the schemas embedded in vllm_ascend_C are available.
+# Keep them out of the native-only check above, then validate the complete
+# runtime registration surface below.
+importlib.import_module("vllm_ascend.dsa_offload.a5_extension")
+
+python_registered = (
+    "lidu_decode_update_c8_out",
+    "sparse_and_tail_attention_c8",
+)
+required = (*native_required, *python_registered)
 for name in required:
     ok = hasattr(torch.ops.nanovllm_dsa, name)
     print(name, ok)
