@@ -110,28 +110,23 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Path to the external KVAF NPU BatchGet kernel object. Required for C8
-    # DSA offload, defaults to the KVAF aliases, and is not sensitive.
+    # Path to the external KVAF NPU BatchGet kernel object.
     "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL": lambda: os.getenv(
         "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL",
         os.getenv("KVAF_BATCH_GET_KERNEL", os.getenv("KVAF_AIV_BATCH_GET_KERNEL", "")),
     ),
-    # Path to the external KVAF NPU BatchPut kernel object. Required for C8
-    # DSA offload, defaults to the KVAF alias, and is not sensitive.
+    # Optional external KVAF NPU BatchPut kernel object.
     "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL": lambda: os.getenv(
         "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL",
         os.getenv("KVAF_BATCH_PUT_KERNEL", ""),
     ),
-    # Number of AIV cores used by the external KVAF NPU Runtime. Valid range
-    # is 1-32, the default is 1, and this value is not sensitive.
+    # External KVAF NPU Runtime AIV configuration.
     "VLLM_ASCEND_KVAF_NPU_CORE_COUNT": lambda: int(
         os.getenv(
             "VLLM_ASCEND_KVAF_NPU_CORE_COUNT",
             os.getenv("KVAF_NPU_CORE_COUNT", "1"),
         )
     ),
-    # Number of Direct-HCCP Jettys per AIV core. Valid range is 1-2, the
-    # default is 2, and this value is not sensitive.
     "VLLM_ASCEND_KVAF_JETTYS_PER_CORE": lambda: int(
         os.getenv(
             "VLLM_ASCEND_KVAF_JETTYS_PER_CORE",

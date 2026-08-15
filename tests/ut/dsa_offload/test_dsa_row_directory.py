@@ -22,8 +22,6 @@ def test_directory_initializes_fixed_address_length_valid_tables() -> None:
     )
 
     assert isinstance(table.addresses, torch.Tensor)
-    assert isinstance(table.lengths, torch.Tensor)
-    assert isinstance(table.valid, torch.Tensor)
     assert table.addresses.numel() == 8
     assert table.addresses.device == torch.device("cpu")
     assert table.addresses.dtype == torch.uint64

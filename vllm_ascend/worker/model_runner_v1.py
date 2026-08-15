@@ -4833,16 +4833,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.dsa_hot_dram_store = store
 
-    def shutdown(self) -> None:
-        try:
-            runtime = getattr(self, "dsa_offload_runtime", None)
-            if runtime is not None:
-                runtime.shutdown()
-        finally:
-            parent_shutdown = getattr(super(), "shutdown", None)
-            if callable(parent_shutdown):
-                parent_shutdown()
-
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
         for group_kv_cache_spec in kv_cache_config.kv_cache_groups:
