@@ -159,7 +159,7 @@ class DDRBlockTable:
             raise ValueError(f"cell_count must be positive, got {cell_count}")
         self.addresses = torch.zeros(
             cell_count,
-            dtype=torch.uint64,
+            dtype=torch.int64,
             device=device,
         )
         self.lengths = torch.zeros(

@@ -7,6 +7,10 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_ascend.dsa_offload.contracts import (
+    DSA_OP_BACKEND_NANOVLLM_A5,
+    DSA_SFA_COMPUTE_TOPK,
+)
 from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
 from vllm_ascend.dsa_offload.dsa_row import PackedKvLayout
 from vllm_ascend.dsa_offload.input_batch import DSAInputBatchCacheLayout
@@ -49,9 +53,13 @@ class _FakeKvafAdapter:
         *,
         layout: PackedKvLayout,
         ddr_bytes: int,
+        geometry,
+        device: torch.device,
     ) -> None:
         self.layout = layout
         self.ddr_bytes = ddr_bytes
+        self.geometry = geometry
+        self.device = device
 
     def begin_batch_put(
         self,
@@ -134,6 +142,37 @@ def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
         resident_pool.get_cache_slots(0).data_ptr()
         != resident_pool.get_cache_slots(1).data_ptr()
     )
+
+
+def test_a5_lidu_scratch_uses_compact_topk_row_stride(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "vllm_ascend.dsa_offload.ops_nanovllm",
+        SimpleNamespace(require_nanovllm_dsa_ops=lambda: None),
+    )
+    resident_pool = DSAResidentTokenPool(
+        max_num_reqs=2,
+        num_layers=1,
+        max_model_len=512,
+        max_resident_budget_tokens=256,
+        device=torch.device("cpu"),
+    )
+    runtime = DSAOffloadRuntime(
+        max_num_reqs=2,
+        max_num_tokens=512,
+        num_layers=1,
+        max_model_len=512,
+        block_size=128,
+        resident_token_pool=resident_pool,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        op_backend=DSA_OP_BACKEND_NANOVLLM_A5,
+    )
+
+    assert runtime._lidu_topk_index.shape == (2, 1, DSA_SFA_COMPUTE_TOPK)
+    assert runtime._lidu_topk_index.stride(0) == DSA_SFA_COMPUTE_TOPK
 
 
 def test_dump_plan_is_compact_and_idempotent() -> None:
