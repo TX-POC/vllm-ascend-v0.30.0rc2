@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA worker-local、固定容量的热 DRAM block store。
+"""DSA 非 C8 legacy 路径的 worker-local 固定容量热 DRAM block store。
+
+C8 offload 的 DDR payload、地址目录和生命周期由 KVAF DSA_ROW 管理，
+不得创建或绑定本 store。
 
 该 store 只维护两类状态：
 

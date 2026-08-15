@@ -4726,35 +4726,34 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA runtime owners are missing during KV-cache binding"
             )
 
-        indexer_group = kv_cache_config.kv_cache_groups[
-            group_ids.indexer
-        ]
-        indexer_num_blocks = get_dsa_group_num_blocks(
-            kv_cache_config,
-            indexer_group,
-        )
-        dram_usable_blocks = calculate_dram_usable_blocks(
-            indexer_num_blocks,
-            self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
-        )
-
-        dsa_row_layout = None
+        store: DSAHotDRAMStore | None = None
         if runtime.is_c8:
-            dsa_row_layout = PackedKvLayout(
-                layout_id=M0_LAYOUT_ID,
-                tokens_per_logical_block=runtime.block_size,
-                packed_token_bytes=DSA_PACKED_KV_DIM,
-                ddr_layer_alignment_bytes=M0_DDR_LAYER_ALIGNMENT_BYTES,
-            )
             runtime.initialize_dsa_row_index(
-                layout=dsa_row_layout,
+                layout=PackedKvLayout(
+                    layout_id=M0_LAYOUT_ID,
+                    tokens_per_logical_block=runtime.block_size,
+                    packed_token_bytes=DSA_PACKED_KV_DIM,
+                    ddr_layer_alignment_bytes=M0_DDR_LAYER_ALIGNMENT_BYTES,
+                ),
             )
-        store = DSAHotDRAMStore(
-            usable_blocks=dram_usable_blocks,
-            storage_rows=resident_pool.storage_rows,
-            max_logical_blocks=runtime.max_logical_blocks,
-            device=self.device,
-        )
+        else:
+            indexer_group = kv_cache_config.kv_cache_groups[
+                group_ids.indexer
+            ]
+            indexer_num_blocks = get_dsa_group_num_blocks(
+                kv_cache_config,
+                indexer_group,
+            )
+            dram_usable_blocks = calculate_dram_usable_blocks(
+                indexer_num_blocks,
+                self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
+            )
+            store = DSAHotDRAMStore(
+                usable_blocks=dram_usable_blocks,
+                storage_rows=resident_pool.storage_rows,
+                max_logical_blocks=runtime.max_logical_blocks,
+                device=self.device,
+            )
 
         ordered_layer_indices = sorted(resident_names)
         if len(ordered_layer_indices) != runtime.num_layers:
@@ -4799,11 +4798,12 @@ class NPUModelRunner(GPUModelRunner):
                     f"impl={type(resident_impl).__name__}"
                 )
 
-            store.add_layer(
-                layer_id=runtime_layer_id,
-                resident_nope_cache=resident_cache[0],
-                resident_rope_cache=resident_cache[1],
-            )
+            if store is not None:
+                store.add_layer(
+                    layer_id=runtime_layer_id,
+                    resident_nope_cache=resident_cache[0],
+                    resident_rope_cache=resident_cache[1],
+                )
             runtime.bind_resident_layer_cache(
                 layer_id=runtime_layer_id,
                 resident_nope_cache=resident_cache[0],
@@ -4827,7 +4827,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
             )
 
-        runtime.bind_dram_store(store)
+        if store is not None:
+            runtime.bind_dram_store(store)
         cache_layout.set_request_release_callback(
             runtime.finish_request
         )

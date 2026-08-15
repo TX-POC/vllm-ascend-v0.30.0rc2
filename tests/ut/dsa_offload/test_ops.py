@@ -24,10 +24,22 @@ from vllm_ascend.dsa_offload.ops import (
     DSAOffloadSelectionOutput,
     _normalize_lidu_weights_layout,
 )
-from vllm_ascend.dsa_offload.runtime import DSALayerOffloadContext
+from vllm_ascend.dsa_offload.runtime import (
+    DSALayerOffloadContext,
+    DSAOffloadRuntime,
+)
 # isort: on
 
 _SPARSE_COUNT = onv._SPARSE_COUNT
+
+
+def test_a5_c8_policy_keeps_kvaf_dump_owners_unpatched() -> None:
+    assert DSAOffloadRuntime.dump_prefill_full_blocks.__module__ == (
+        "vllm_ascend.dsa_offload.runtime"
+    )
+    assert DSALayerOffloadContext.dump_full_blocks.__module__ == (
+        "vllm_ascend.dsa_offload.runtime"
+    )
 
 
 def test_lidu_weights_normalizes_fused_projection_suffix_view() -> None:
@@ -187,6 +199,9 @@ def test_kvaf_subgraph_c_materializes_subgraph_d_selection(
         dtype=torch.int32,
     )
     kvaf_adapter = Mock()
+    dsa_row_directory = SimpleNamespace(
+        addresses=torch.ones(1, dtype=torch.int64)
+    )
     runtime = SimpleNamespace(
         op_backend=DSA_OP_BACKEND_NANOVLLM_A5,
         is_c8=True,
@@ -202,9 +217,9 @@ def test_kvaf_subgraph_c_materializes_subgraph_d_selection(
         _req_cache_tokens=cache_tokens,
         _c8_key_dequant_scales={0: torch.ones(1)},
         kvaf_adapter=kvaf_adapter,
-        dsa_row_directory=SimpleNamespace(
-            addresses=torch.ones(1, dtype=torch.int64)
-        ),
+        dsa_row_directory=dsa_row_directory,
+        _require_kvaf_adapter=lambda: kvaf_adapter,
+        _require_dsa_row_directory=lambda: dsa_row_directory,
         resident_token_pool=SimpleNamespace(
             get_cache_slots=lambda _layer_id: torch.zeros(
                 1, dtype=torch.int32

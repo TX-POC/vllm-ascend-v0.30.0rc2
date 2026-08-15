@@ -41,6 +41,7 @@ class _FakeKvafAdapter:
         self.geometry = None
         self.written_layers: list[int] = []
         self.finalized_table = None
+        self.released_rows: list[int] = []
 
     @staticmethod
     def slot_size(layout: PackedKvLayout) -> int:
@@ -89,6 +90,9 @@ class _FakeKvafAdapter:
     def abort_batch_put(self, *, block_table) -> None:
         self.active_batch_put = False
 
+    def release_pool_row(self, pool_row: int, *, block_table) -> None:
+        self.released_rows.append(pool_row)
+
 
 def _make_runtime(
     max_num_reqs: int = 1,
@@ -127,6 +131,47 @@ def _make_runtime(
     )
     runtime.bind_dram_store(store)
     return resident_pool, runtime, store
+
+
+def _make_kvaf_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    num_layers: int = 1,
+    enable_prefill_full_kv_offload: bool = False,
+) -> tuple[DSAResidentTokenPool, DSAOffloadRuntime, _FakeKvafAdapter]:
+    resident_pool = DSAResidentTokenPool(
+        max_num_reqs=1,
+        num_layers=num_layers,
+        max_model_len=512,
+        max_resident_budget_tokens=256,
+        device=torch.device("cpu"),
+    )
+    adapter = _FakeKvafAdapter()
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.KvafAdapter",
+        lambda **_: adapter,
+    )
+    runtime = DSAOffloadRuntime(
+        max_num_reqs=1,
+        max_num_tokens=512,
+        num_layers=num_layers,
+        max_model_len=512,
+        block_size=128,
+        resident_token_pool=resident_pool,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        enable_prefill_full_kv_offload=enable_prefill_full_kv_offload,
+        is_c8=True,
+    )
+    runtime.initialize_dsa_row_index(
+        layout=PackedKvLayout(
+            layout_id="test",
+            tokens_per_logical_block=128,
+            packed_token_bytes=1,
+            ddr_layer_alignment_bytes=128,
+        ),
+    )
+    return resident_pool, runtime, adapter
 
 
 def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
@@ -237,50 +282,12 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
 def test_kvaf_final_prefill_writes_layers_then_publishes_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    resident_pool = DSAResidentTokenPool(
-        max_num_reqs=1,
+    resident_pool, runtime, adapter = _make_kvaf_runtime(
+        monkeypatch,
         num_layers=2,
-        max_model_len=512,
-        max_resident_budget_tokens=256,
-        device=torch.device("cpu"),
-    )
-    adapter = _FakeKvafAdapter()
-    monkeypatch.setattr(
-        "vllm_ascend.dsa_offload.runtime.KvafAdapter",
-        lambda **_: adapter,
-    )
-    runtime = DSAOffloadRuntime(
-        max_num_reqs=1,
-        max_num_tokens=512,
-        num_layers=2,
-        max_model_len=512,
-        block_size=128,
-        resident_token_pool=resident_pool,
-        device=torch.device("cpu"),
-        pin_memory=False,
         enable_prefill_full_kv_offload=True,
-        is_c8=True,
     )
-    store = DSAHotDRAMStore(
-        usable_blocks=8,
-        storage_rows=resident_pool.storage_rows,
-        max_logical_blocks=runtime.max_logical_blocks,
-        device=torch.device("cpu"),
-        arena_factory=lambda shape, dtype, capacity, device: torch.zeros(
-            (capacity, *shape),
-            dtype=dtype,
-            device=device,
-        ),
-    )
-    runtime.bind_dram_store(store)
-    runtime.initialize_dsa_row_index(
-        layout=PackedKvLayout(
-            layout_id="test",
-            tokens_per_logical_block=128,
-            packed_token_bytes=1,
-            ddr_layer_alignment_bytes=128,
-        ),
-    )
+    assert runtime.dram_store is None
     assert adapter.ddr_bytes == 8 * 128
     for layer_id in range(2):
         runtime.bind_resident_layer_cache(
@@ -331,7 +338,87 @@ def test_kvaf_final_prefill_writes_layers_then_publishes_table(
     assert adapter.jobs[1].tolist() == [0, 1]
     assert adapter.written_layers == [0, 1]
     assert adapter.finalized_table is runtime.dsa_row_directory
-    assert not np.any(store.logical_block_table)
+
+    runtime.finish_request("req-0", 0)
+    assert adapter.released_rows == [0]
+
+
+def test_kvaf_graph_capture_does_not_require_legacy_dram_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime, _ = _make_kvaf_runtime(monkeypatch)
+
+    runtime.prepare_graph_capture(row_count=1)
+
+    assert runtime.graph_capture_row_count == 1
+    assert runtime.dram_store is None
+
+
+def test_kvaf_sparse_forward_skips_legacy_dram_table_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resident_pool, runtime, _ = _make_kvaf_runtime(monkeypatch)
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        num_computed_tokens_cpu=np.array([256], dtype=np.int32),
+        block_table=[_ResidentBlockTable()],
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",),
+            stages=(int(DSARequestCacheStage.ENTER_SPARSE_DECODE),),
+            target_resident_budget_tokens=(256,),
+            sparse_budget_tokens=(256,),
+            resident_valid_tokens=(257,),
+            resident_block_table_replacements=(
+                DSAResidentBlockTableReplacement(
+                    request_id="req-0",
+                    block_ids=(10, 11, 12),
+                ),
+            ),
+        ),
+    )
+
+    positions = runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        req_indices=torch.zeros(1, dtype=torch.int64),
+        positions=torch.tensor([256], dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=1,
+        resident_group_id=0,
+    )
+
+    assert positions.numel() == 1
+    assert runtime.dram_store is None
+
+
+def test_c8_runtime_rejects_legacy_dram_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resident_pool, runtime, _ = _make_kvaf_runtime(monkeypatch)
+    store = DSAHotDRAMStore(
+        usable_blocks=1,
+        storage_rows=resident_pool.storage_rows,
+        max_logical_blocks=runtime.max_logical_blocks,
+        device=torch.device("cpu"),
+        arena_factory=lambda shape, dtype, capacity, device: torch.zeros(
+            (capacity, *shape), dtype=dtype, device=device
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot bind the legacy"):
+        runtime.bind_dram_store(store)
 
 
 def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:

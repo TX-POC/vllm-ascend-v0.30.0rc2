@@ -14,7 +14,7 @@ module only specializes the A5 C8 data plane:
   max-model-length allocation per transformer layer.
 * DSA resident MLA keeps the legacy 512+64 physical backing but exposes a
   zero-copy packed 656-byte FP8 view to every A5 C8 consumer.
-* all A5 C8 full-block dump paths use the packed 656-byte dump operator.
+* all A5 C8 full-block dump paths delegate to KVAF BatchPut.
 
 This is deliberately an adapter rather than a second scheduler/runtime.
 """
@@ -291,9 +291,7 @@ def install_a5_c8_runtime_policy() -> None:
     original_bind_resident = DSAOffloadRuntime.bind_resident_layer_cache
     original_prepare_forward = DSAOffloadRuntime.prepare_forward
     original_prepare_graph_capture = DSAOffloadRuntime.prepare_graph_capture
-    original_dump_prefill = DSAOffloadRuntime.dump_prefill_full_blocks
     original_execute_decode = DSALayerOffloadContext.execute_decode_selection
-    original_dump_full_blocks = DSALayerOffloadContext.dump_full_blocks
 
     def reshape_kv_cache_tensors(
         self: Any,
@@ -400,157 +398,6 @@ def install_a5_c8_runtime_policy() -> None:
             "candidate=budget logical=budget+1 resident=budget+1 "
             "dump_padding_dst=-1",
             row_count,
-        )
-
-    def dump_prefill_full_blocks(self: Any) -> None:
-        if not _is_a5_c8(self):
-            original_dump_prefill(self)
-            return
-        if not self._defer_prefill_layer_dump:
-            return
-
-        try:
-            job_count = int(self.dump_launch_count)
-            if job_count == 0:
-                logger.info(
-                    "[DSA_PREFILL_FULL_DUMP] SKIP_EMPTY_FINAL_PREFILL "
-                    "backend=nanovllm_a5 precision=W4A4C8"
-                )
-                return
-            store = self.dram_store
-            if store is None:
-                raise RuntimeError("DSA runtime has no bound DRAM store")
-            if len(self._resident_layer_caches) != self.num_layers:
-                raise RuntimeError(
-                    "DSA C8 prefill full-KV offload cache binding is "
-                    f"incomplete: bound={len(self._resident_layer_caches)}, "
-                    f"expected={self.num_layers}"
-                )
-
-            from vllm_ascend.dsa_offload.ops_nanovllm import (
-                packed_full_kv_cache_blocks,
-            )
-
-            src_block_ids = self.dump_src_block_ids.gpu[:job_count]
-            dst_block_ids = self.dump_dst_block_ids.gpu[:job_count]
-            src_block_ids_cpu = self.dump_src_block_ids.np[:job_count]
-            dst_block_ids_cpu = self.dump_dst_block_ids.np[:job_count]
-            if np.any(src_block_ids_cpu < 0):
-                raise RuntimeError(
-                    "A5 C8 prefill dump contains a negative resident source "
-                    "block id"
-                )
-            if np.any(dst_block_ids_cpu <= 0):
-                raise RuntimeError(
-                    "A5 C8 prefill dump contains an invalid DRAM destination "
-                    "block id; block 0 is reserved for the null mapping"
-                )
-
-            # _model_forward() is a host-side boundary. NPU work that writes
-            # the final Prefill KV may still be outstanding on another stream.
-            # Complete those writes before any dump kernel is allowed to read
-            # the resident cache. This is one barrier per final Prefill, not a
-            # per-layer or Decode-hot-path synchronization.
-            torch.npu.synchronize()
-
-            logger.info(
-                "[DSA_PREFILL_FULL_DUMP] BEGIN phase=after_model_forward "
-                "backend=nanovllm_a5 precision=W4A4C8 packed_bytes=%d "
-                "job_count=%d layers=%d",
-                DSA_PACKED_KV_DIM,
-                job_count,
-                self.num_layers,
-            )
-            max_src_block_id = int(src_block_ids_cpu.max())
-            max_dst_block_id = int(dst_block_ids_cpu.max())
-            for layer_id in sorted(self._resident_layer_caches):
-                resident_packed_cache, _unused_second_plane = (
-                    self._resident_layer_caches[layer_id]
-                )
-                arenas = store.get_layer_arenas(layer_id)
-                if max_src_block_id >= int(resident_packed_cache.shape[0]):
-                    raise RuntimeError(
-                        "A5 C8 prefill dump source block is outside the "
-                        "resident cache: "
-                        f"layer={layer_id}, max_src={max_src_block_id}, "
-                        f"resident_blocks={int(resident_packed_cache.shape[0])}"
-                    )
-                if max_dst_block_id >= int(arenas.nope.shape[0]):
-                    raise RuntimeError(
-                        "A5 C8 prefill dump destination block is outside the "
-                        "DRAM arena: "
-                        f"layer={layer_id}, max_dst={max_dst_block_id}, "
-                        f"dram_blocks={int(arenas.nope.shape[0])}"
-                    )
-                packed_full_kv_cache_blocks(
-                    hbm_packed_kv=resident_packed_cache,
-                    dram_packed_kv=arenas.nope,
-                    src_block_ids=src_block_ids,
-                    dst_block_ids=dst_block_ids,
-                )
-
-            # packed_full_block_dump is an asynchronous ACLNN launch. Commit
-            # every swapped-memory write before this worker returns; only after
-            # that return may the scheduler release full Prompt HBM blocks and
-            # sparse Decode/KSC start consuming the DRAM table.
-            torch.npu.synchronize()
-            logger.info(
-                "[DSA_PREFILL_FULL_DUMP] END phase=after_model_forward "
-                "backend=nanovllm_a5 precision=W4A4C8 job_count=%d "
-                "dumped_layers=%d",
-                job_count,
-                self.num_layers,
-            )
-        except Exception:
-            logger.exception(
-                "[DSA_PREFILL_FULL_DUMP] FAILED phase=after_model_forward "
-                "backend=nanovllm_a5 precision=W4A4C8"
-            )
-            raise
-        finally:
-            self._defer_prefill_layer_dump = False
-
-    def dump_full_blocks(
-        self: Any,
-        *,
-        resident_nope_cache: torch.Tensor,
-        resident_rope_cache: torch.Tensor,
-    ) -> None:
-        if not _is_a5_c8(self.runtime):
-            original_dump_full_blocks(
-                self,
-                resident_nope_cache=resident_nope_cache,
-                resident_rope_cache=resident_rope_cache,
-            )
-            return
-        if self.runtime.defer_prefill_layer_dump:
-            return
-        job_count = int(self.runtime.dump_launch_count)
-        if job_count == 0:
-            return
-        if (
-            resident_nope_cache.dtype != torch.float8_e4m3fn
-            or resident_nope_cache.ndim != 4
-            or int(resident_nope_cache.shape[-1]) != DSA_PACKED_KV_DIM
-        ):
-            raise RuntimeError(
-                "A5 C8 incremental dump requires packed resident KV: "
-                f"shape={tuple(resident_nope_cache.shape)}, "
-                f"dtype={resident_nope_cache.dtype}"
-            )
-        store = self.runtime.dram_store
-        if store is None:
-            raise RuntimeError("DSA layer has no bound DRAM store")
-        arenas = store.get_layer_arenas(self.layer_id)
-        from vllm_ascend.dsa_offload.ops_nanovllm import (
-            packed_full_kv_cache_blocks,
-        )
-
-        packed_full_kv_cache_blocks(
-            hbm_packed_kv=resident_nope_cache,
-            dram_packed_kv=arenas.nope,
-            src_block_ids=self.runtime.dump_src_block_ids.gpu[:job_count],
-            dst_block_ids=self.runtime.dump_dst_block_ids.gpu[:job_count],
         )
 
     def execute_decode_selection(self: Any, **kwargs: Any) -> Any:
@@ -674,61 +521,20 @@ def install_a5_c8_runtime_policy() -> None:
 
         resident_seq_lengths = runtime._a5_resident_seq_lengths.gpu[:num_reqs]
         attention_slots = runtime._a5_c8_attention_slots[:num_reqs]
-        kvaf_adapter = runtime.kvaf_adapter
-        if kvaf_adapter is not None:
-            directory = runtime.dsa_row_directory
-            if directory is None:
-                raise RuntimeError("DSA_ROW directory was not initialized")
-            kvaf_adapter.execute_batch_get(
-                layer_id=self.layer_id,
-                source_token_ids=outputs.topk_index,
-                destination_slots=outputs.topk_slots,
-                miss_count=outputs.miss_count,
-                resident_pool_indices=resident_pool_indices,
-                resident_block_table=kwargs["resident_block_table"],
-                cache_tokens=cache_tokens,
-                candidate_lens=candidate_lens,
-                logical_seq_lengths=logical_seq_lengths,
-                resident_seq_lengths=resident_seq_lengths,
-                address_table=directory.addresses,
-                output=kwargs["resident_nope_cache"],
-            )
-            build_c8_attention_metadata(
-                destination_slots=outputs.topk_slots,
-                cache_tokens=cache_tokens,
-                candidate_lens=candidate_lens,
-                actual_seq_lengths_kv=logical_seq_lengths,
-                max_tail_tokens=runtime._a5_c8_max_tail_tokens,
-                resident_seq_lengths=resident_seq_lengths,
-                attention_slots=attention_slots,
-            )
-            return DSAOffloadSelectionOutput(
-                attention_slots=attention_slots,
-                resident_seq_lengths=resident_seq_lengths,
-            )
-
-        from vllm_ascend.dsa_offload.ops_nanovllm import (
-            packed_kvcache_scatter_copy as ksc_c8,
-        )
-
-        store = runtime.dram_store
-        if store is None:
-            raise RuntimeError("DSA layer has no bound DRAM store")
-        arenas = store.get_layer_arenas(self.layer_id)
-        ksc_c8(
-            hbm_packed_kv=kwargs["resident_nope_cache"],
-            dram_packed_kv=arenas.nope,
-            hbm_block_table=kwargs["resident_block_table"],
-            dram_block_table=kwargs["dram_block_table"],
+        directory = runtime._require_dsa_row_directory()
+        runtime._require_kvaf_adapter().execute_batch_get(
+            layer_id=self.layer_id,
             source_token_ids=outputs.topk_index,
             destination_slots=outputs.topk_slots,
-            copy_counts=outputs.miss_count,
+            miss_count=outputs.miss_count,
+            resident_pool_indices=resident_pool_indices,
+            resident_block_table=kwargs["resident_block_table"],
             cache_tokens=cache_tokens,
             candidate_lens=candidate_lens,
-            actual_seq_lengths_kv=logical_seq_lengths,
-            max_tail_tokens=runtime._a5_c8_max_tail_tokens,
-            attention_slots=attention_slots,
+            logical_seq_lengths=logical_seq_lengths,
             resident_seq_lengths=resident_seq_lengths,
+            address_table=directory.addresses,
+            output=kwargs["resident_nope_cache"],
         )
         build_c8_attention_metadata(
             destination_slots=outputs.topk_slots,
@@ -748,7 +554,5 @@ def install_a5_c8_runtime_policy() -> None:
     DSAOffloadRuntime.bind_resident_layer_cache = bind_resident_layer_cache
     DSAOffloadRuntime.prepare_forward = prepare_forward
     DSAOffloadRuntime.prepare_graph_capture = prepare_graph_capture
-    DSAOffloadRuntime.dump_prefill_full_blocks = dump_prefill_full_blocks
     DSALayerOffloadContext.execute_decode_selection = execute_decode_selection
-    DSALayerOffloadContext.dump_full_blocks = dump_full_blocks
     _INSTALLED = True

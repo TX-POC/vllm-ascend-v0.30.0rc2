@@ -2,17 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSA 数据面的 worker-lifetime tensor owner 与逐层执行上下文。
 
-``DSAInputBatchCacheLayout`` 仍是请求行状态的唯一 worker 投影；本模块只把
-其 active-prefix 转成设备算子需要的固定地址 view：
+``DSAInputBatchCacheLayout`` 仍是请求行状态的唯一 worker 投影；C8 使用
+KVAF DSA_ROW 管理 DDR payload 和地址目录，非 C8 legacy 路径继续使用
+``DSAHotDRAMStore``。本模块把 active-prefix 转成设备算子需要的固定地址
+view：
 
 * resident slot-mapping position；
-* active DRAM block table；
+* legacy active DRAM block table 或 KVAF 固定 DSA_ROW directory；
 * 所有层串行复用的 caller-owned LIDU scratch 输出；
 * 本轮满块 dump 的紧凑 src/dst 列。
 
 所有大 tensor 在 model runner 初始化期预分配。steady step 只刷新 active
-prefix；DRAM 逻辑表未变化时不会重复 H2D。图模式复用这些 owner 的
-captured-prefix + PAD view，而不是另建一套 graph-only 语义。
+prefix；legacy DRAM 逻辑表未变化时不会重复 H2D。图模式复用这些 owner
+的 captured-prefix + PAD view，而不是另建一套 graph-only 语义。
 """
 
 from __future__ import annotations
@@ -272,6 +274,10 @@ class DSAOffloadRuntime:
         self._c8_resident_seq_lengths: dict[int, torch.Tensor] = {}
 
     def bind_dram_store(self, store: DSAHotDRAMStore) -> None:
+        if self.is_c8 or self.dsa_row_directory is not None:
+            raise RuntimeError(
+                "KVAF-backed C8 runtime cannot bind the legacy DRAM store"
+            )
         if self.dram_store is not None:
             raise RuntimeError("DSA offload runtime DRAM store was bound twice")
         if store.storage_rows != self.resident_token_pool.storage_rows:
@@ -322,6 +328,11 @@ class DSAOffloadRuntime:
         self.register_packed_kv_layout(layout)
         if self.dsa_row_directory is not None:
             raise RuntimeError("DSA_ROW directory was initialized twice")
+        if self.dram_store is not None:
+            raise RuntimeError(
+                "DSA_ROW KVAF storage cannot be combined with the legacy "
+                "DRAM store"
+            )
         if self.kvaf_adapter is None:
             raise RuntimeError(
                 "DSA_ROW initialization requires the C8 KVAF runtime"
@@ -462,46 +473,15 @@ class DSAOffloadRuntime:
                 pool_index,
                 block_table=self._require_dsa_row_directory(),
             )
+            return
         store = self.dram_store
         if store is not None:
             store.release_pool_index(pool_index)
-
-    def _kvaf_flat_indices_for_row(self, pool_row: int) -> list[int]:
-        store = self.dram_store
-        if store is not None:
-            block_qs = store.get_allocated_logical_block_indices(pool_row)
-            return self.row_index_geometry.flat_indices_for_block_qs(
-                pool_row=pool_row,
-                block_qs=block_qs,
-            )
-
-        directory = self.dsa_row_directory
-        if directory is None:
-            return []
-        pool_row = int(pool_row)
-        if not 0 <= pool_row < self.row_index_geometry.raw_row_capacity:
-            raise IndexError(
-                f"pool_row={pool_row} is outside DSA_ROW capacity"
-            )
-        row_start = pool_row * self.row_index_geometry.row_stride_cells
-        row_end = row_start + self.row_index_geometry.row_stride_cells
-        valid_cells = directory.valid[row_start:row_end]
-        valid_offsets = (
-            torch.nonzero(valid_cells, as_tuple=False)
-            .flatten()
-            .cpu()
-            .tolist()
-        )
-        return [row_start + int(offset) for offset in valid_offsets]
 
     def finish_request(self, request_id: str, pool_row: int) -> None:
         """Free all row-owned KVAF and DSA resources before row reuse."""
 
         del request_id
-        if self.dsa_row_directory is not None:
-            self.kvaf_adapter.batch_free(
-                flat_indices=self._kvaf_flat_indices_for_row(pool_row),
-            )
         self.release_pool_index(pool_row)
 
     def shutdown(self) -> None:
@@ -558,8 +538,8 @@ class DSAOffloadRuntime:
     ) -> torch.Tensor:
         """刷新本轮统一元数据并返回 resident slot-mapping positions。"""
 
-        if self.dram_store is None:
-            raise RuntimeError("DSA offload runtime has no DRAM store")
+        if self.dsa_row_directory is None and self.dram_store is None:
+            raise RuntimeError("DSA offload runtime has no storage backend")
         if not state.valid or state.row_count != num_reqs:
             raise RuntimeError(
                 "DSA InputBatch state is not ready for eager execution: "
@@ -592,12 +572,13 @@ class DSAOffloadRuntime:
             num_scheduled_tokens=num_scheduled_tokens,
             resident_group_id=resident_group_id,
         )
-        dram_table_refreshed = self._refresh_active_dram_table(state)
-        self._validate_sparse_dram_rows(
-            input_batch=input_batch,
-            state=state,
-            validate_all_sparse=dram_table_refreshed,
-        )
+        if self.dsa_row_directory is None:
+            dram_table_refreshed = self._refresh_active_dram_table(state)
+            self._validate_sparse_dram_rows(
+                input_batch=input_batch,
+                state=state,
+                validate_all_sparse=dram_table_refreshed,
+            )
         if self.dsa_row_directory is not None and self.dump_job_count:
             self._require_kvaf_adapter().begin_batch_put(
                 pool_rows=self._dump_pool_indices[: self.dump_job_count],
@@ -722,9 +703,9 @@ class DSAOffloadRuntime:
         row_count: int,
         cache_tokens: torch.Tensor | None = None,
     ) -> None:
-        if self.dram_store is None:
+        if self.dsa_row_directory is None and self.dram_store is None:
             raise RuntimeError(
-                "DSA graph capture requires an initialized DRAM store"
+                "DSA graph capture requires an initialized storage backend"
             )
         row_count = int(row_count)
         if self._graph_capture_row_count:
@@ -789,8 +770,6 @@ class DSAOffloadRuntime:
     ) -> None:
         """构造紧凑 dump jobs；keep 模式仅抑制 decode dump。"""
 
-        store = self.dram_store
-        assert store is not None
         num_reqs = self.active_num_reqs
         scheduled = self._scheduled_tokens_i64[:num_reqs]
         computed = self._computed_tokens_i64[:num_reqs]
@@ -982,6 +961,9 @@ class DSAOffloadRuntime:
             self.dump_job_count = job_count
             return
 
+        store = self.dram_store
+        if store is None:
+            raise RuntimeError("DSA dump planning requires a storage backend")
         reservation = store.reserve_blocks(
             pool_indices=self._dump_pool_indices[:job_count],
             logical_block_indices=self._dump_logical_indices[:job_count],
@@ -1226,57 +1208,20 @@ class DSALayerOffloadContext:
             attention_slots = self.runtime._c8_attention_slots[
                 self.layer_id
             ][:num_reqs]
-            directory = self.runtime.dsa_row_directory
-            if directory is not None:
-                self.runtime._require_kvaf_adapter().execute_batch_get(
-                    layer_id=self.layer_id,
-                    source_token_ids=outputs.topk_index,
-                    destination_slots=outputs.topk_slots,
-                    miss_count=outputs.miss_count,
-                    resident_pool_indices=resident_pool_indices,
-                    resident_block_table=resident_block_table,
-                    cache_tokens=cache_tokens,
-                    candidate_lens=actual_seq_lengths_key,
-                    logical_seq_lengths=actual_seq_lengths_key,
-                    resident_seq_lengths=resident_seq_lengths,
-                    address_table=directory.addresses,
-                    output=resident_nope_cache,
-                )
-                build_c8_attention_metadata(
-                    destination_slots=outputs.topk_slots,
-                    cache_tokens=cache_tokens,
-                    candidate_lens=actual_seq_lengths_key,
-                    actual_seq_lengths_kv=actual_seq_lengths_key,
-                    max_tail_tokens=DSA_REQUIRED_CACHE_BLOCK_SIZE,
-                    resident_seq_lengths=resident_seq_lengths,
-                    attention_slots=attention_slots,
-                )
-                return DSAOffloadSelectionOutput(
-                    attention_slots=attention_slots,
-                    resident_seq_lengths=resident_seq_lengths,
-                )
-
-            from vllm_ascend.dsa_offload.ops_nanovllm import (
-                packed_kvcache_scatter_copy as ksc_c8,
-            )
-            store = self.runtime.dram_store
-            if store is None:
-                raise RuntimeError("DSA layer has no bound DRAM store")
-            arenas = store.get_layer_arenas(self.layer_id)
-            ksc_c8(
-                hbm_packed_kv=resident_nope_cache,
-                dram_packed_kv=arenas.nope,
-                hbm_block_table=resident_block_table,
-                dram_block_table=dram_block_table,
+            directory = self.runtime._require_dsa_row_directory()
+            self.runtime._require_kvaf_adapter().execute_batch_get(
+                layer_id=self.layer_id,
                 source_token_ids=outputs.topk_index,
                 destination_slots=outputs.topk_slots,
-                copy_counts=outputs.miss_count,
+                miss_count=outputs.miss_count,
+                resident_pool_indices=resident_pool_indices,
+                resident_block_table=resident_block_table,
                 cache_tokens=cache_tokens,
                 candidate_lens=actual_seq_lengths_key,
-                actual_seq_lengths_kv=actual_seq_lengths_key,
-                max_tail_tokens=DSA_REQUIRED_CACHE_BLOCK_SIZE,
-                attention_slots=attention_slots,
+                logical_seq_lengths=actual_seq_lengths_key,
                 resident_seq_lengths=resident_seq_lengths,
+                address_table=directory.addresses,
+                output=resident_nope_cache,
             )
             build_c8_attention_metadata(
                 destination_slots=outputs.topk_slots,
