@@ -646,6 +646,163 @@ PackedScatterCopyOutMeta(
       hbm_kv_bytes, attention_slots, resident_seq_lengths);
 }
 
+void CheckKvafBatchGetPrepareInputs(
+    const at::Tensor& source_token_ids,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_counts,
+    const at::Tensor& resident_pool_indices,
+    const at::Tensor& resident_block_table,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& logical_seq_lengths,
+    const at::Tensor& indices,
+    const at::Tensor& offsets,
+    const at::Tensor& mask,
+    const at::Tensor& output_indices,
+    const at::Tensor& resident_seq_lengths,
+    int64_t layer_id,
+    int64_t num_layers,
+    int64_t max_num_reqs,
+    int64_t qcap) {
+  TORCH_CHECK(
+      source_token_ids.dim() == 3 && source_token_ids.size(0) > 0 &&
+          source_token_ids.size(1) == 1 &&
+          source_token_ids.size(2) == kSparseCount &&
+          destination_slots.sizes() == source_token_ids.sizes(),
+      "KVAF BatchGet source/destination must be int32 [B,1,2048].");
+  const int64_t batch = source_token_ids.size(0);
+  const int64_t request_capacity = batch * kSparseCount;
+  TORCH_CHECK(
+      miss_counts.dim() == 1 && miss_counts.size(0) == batch &&
+          resident_pool_indices.dim() == 1 &&
+          resident_pool_indices.size(0) == batch &&
+          cache_tokens.dim() == 1 && cache_tokens.size(0) == batch &&
+          candidate_lens.dim() == 1 && candidate_lens.size(0) == batch &&
+          logical_seq_lengths.dim() == 1 &&
+          logical_seq_lengths.size(0) == batch &&
+          resident_block_table.dim() == 2 &&
+          resident_block_table.size(0) == batch &&
+          resident_block_table.size(1) > 0,
+      "KVAF BatchGet request metadata shapes are inconsistent.");
+  TORCH_CHECK(
+      indices.dim() == 1 && indices.numel() == request_capacity &&
+          offsets.dim() == 1 && offsets.numel() == request_capacity &&
+          mask.dim() == 1 && mask.numel() == request_capacity &&
+          output_indices.dim() == 1 &&
+          output_indices.numel() == request_capacity &&
+          resident_seq_lengths.dim() == 1 &&
+          resident_seq_lengths.size(0) == batch,
+      "KVAF BatchGet output buffers must be flat [B*2048] plus lengths [B].");
+  for (const at::Tensor* tensor : {
+           &source_token_ids, &destination_slots, &miss_counts,
+           &resident_pool_indices, &resident_block_table, &cache_tokens,
+           &candidate_lens, &logical_seq_lengths, &indices, &offsets,
+           &output_indices, &resident_seq_lengths}) {
+    TORCH_CHECK(
+        tensor->scalar_type() == at::kInt,
+        "KVAF BatchGet integer metadata must use int32.");
+  }
+  TORCH_CHECK(mask.scalar_type() == at::kByte,
+              "KVAF BatchGet mask must use uint8.");
+  CheckOneDeviceAndContiguous(
+      source_token_ids,
+      {&source_token_ids, &destination_slots, &miss_counts,
+       &resident_pool_indices, &resident_block_table, &cache_tokens,
+       &candidate_lens, &logical_seq_lengths, &indices, &offsets, &mask,
+       &output_indices, &resident_seq_lengths},
+      "KVAF BatchGet prepare");
+  TORCH_CHECK(
+      layer_id >= 0 && num_layers > 0 && layer_id < num_layers &&
+          max_num_reqs >= batch && qcap > 0 &&
+          static_cast<uint64_t>(max_num_reqs) *
+                  static_cast<uint64_t>(num_layers) *
+                  static_cast<uint64_t>(qcap) <=
+              static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
+      "KVAF BatchGet AccessTable geometry is invalid.");
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+KvafBatchGetPrepareOutNpu(
+    const at::Tensor& source_token_ids,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_counts,
+    const at::Tensor& resident_pool_indices,
+    const at::Tensor& resident_block_table,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& logical_seq_lengths,
+    at::Tensor indices,
+    at::Tensor offsets,
+    at::Tensor mask,
+    at::Tensor output_indices,
+    at::Tensor resident_seq_lengths,
+    int64_t layer_id,
+    int64_t num_layers,
+    int64_t max_num_reqs,
+    int64_t qcap) {
+  CheckKvafBatchGetPrepareInputs(
+      source_token_ids, destination_slots, miss_counts,
+      resident_pool_indices, resident_block_table, cache_tokens,
+      candidate_lens, logical_seq_lengths, indices, offsets, mask,
+      output_indices, resident_seq_lengths, layer_id, num_layers,
+      max_num_reqs, qcap);
+  auto keepalive = std::make_tuple(
+      source_token_ids, destination_slots, miss_counts,
+      resident_pool_indices, resident_block_table, cache_tokens,
+      candidate_lens, logical_seq_lengths, indices, offsets, mask,
+      output_indices, resident_seq_lengths);
+  EXEC_NPU_CMD_ORDERED(
+      aclnnA5KvafBatchGetPrepare,
+      keepalive,
+      source_token_ids,
+      destination_slots,
+      miss_counts,
+      resident_pool_indices,
+      resident_block_table,
+      cache_tokens,
+      candidate_lens,
+      logical_seq_lengths,
+      indices,
+      offsets,
+      mask,
+      output_indices,
+      resident_seq_lengths,
+      layer_id,
+      num_layers,
+      max_num_reqs,
+      qcap,
+      indices,
+      offsets,
+      mask,
+      output_indices,
+      resident_seq_lengths);
+  return std::make_tuple(
+      indices, offsets, mask, output_indices, resident_seq_lengths);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+KvafBatchGetPrepareOutMeta(
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    at::Tensor indices,
+    at::Tensor offsets,
+    at::Tensor mask,
+    at::Tensor output_indices,
+    at::Tensor resident_seq_lengths,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t) {
+  return std::make_tuple(
+      indices, offsets, mask, output_indices, resident_seq_lengths);
+}
+
 void CheckAttentionInputs(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -845,6 +1002,16 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor(b!) attention_slots, Tensor(c!) resident_seq_lengths) "
       "-> (Tensor(a!), Tensor(b!), Tensor(c!))");
   m.def(
+      "kvaf_batch_get_prepare_out(Tensor source_token_ids, "
+      "Tensor destination_slots, Tensor miss_counts, "
+      "Tensor resident_pool_indices, Tensor resident_block_table, "
+      "Tensor cache_tokens, Tensor candidate_lens, "
+      "Tensor logical_seq_lengths, Tensor(a!) indices, "
+      "Tensor(b!) offsets, Tensor(c!) mask, Tensor(d!) output_indices, "
+      "Tensor(e!) resident_seq_lengths, int layer_id, "
+      "int num_layers, int max_num_reqs, int qcap) -> "
+      "(Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!))");
+  m.def(
       "sparse_and_tail_attention(Tensor query, Tensor key, Tensor value, "
       "Tensor sparse_slots, Tensor cache_tokens, Tensor block_table, "
       "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
@@ -859,6 +1026,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, m) {
   m.impl("scatter_copy", &ScatterCopyNpu);
   m.impl("packed_scatter_copy", &PackedScatterCopyNpu);
   m.impl("packed_scatter_copy_out", &PackedScatterCopyOutNpu);
+  m.impl("kvaf_batch_get_prepare_out", &KvafBatchGetPrepareOutNpu);
   m.impl("sparse_and_tail_attention", &SparseAndTailAttentionNpu);
 }
 
@@ -870,6 +1038,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, m) {
   m.impl("scatter_copy", &ScatterCopyMeta);
   m.impl("packed_scatter_copy", &PackedScatterCopyMeta);
   m.impl("packed_scatter_copy_out", &PackedScatterCopyOutMeta);
+  m.impl("kvaf_batch_get_prepare_out", &KvafBatchGetPrepareOutMeta);
   m.impl("sparse_and_tail_attention", &SparseAndTailAttentionMeta);
 }
 

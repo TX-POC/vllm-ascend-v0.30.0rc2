@@ -110,9 +110,30 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Enable A5 C8 DSA metadata/attention D2H diagnostics and CRC validation.
-    # Debug only, off by default. The production hot path must keep this at 0.
     "VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG": lambda: int(os.getenv("VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG", "0")),
+    # Path to the external KVAF NPU BatchGet kernel object.
+    "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL": lambda: os.getenv(
+        "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL",
+        os.getenv("KVAF_BATCH_GET_KERNEL", os.getenv("KVAF_AIV_BATCH_GET_KERNEL", "")),
+    ),
+    # Optional external KVAF NPU BatchPut kernel object.
+    "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL": lambda: os.getenv(
+        "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL",
+        os.getenv("KVAF_BATCH_PUT_KERNEL", ""),
+    ),
+    # External KVAF NPU Runtime AIV configuration.
+    "VLLM_ASCEND_KVAF_NPU_CORE_COUNT": lambda: int(
+        os.getenv(
+            "VLLM_ASCEND_KVAF_NPU_CORE_COUNT",
+            os.getenv("KVAF_NPU_CORE_COUNT", "1"),
+        )
+    ),
+    "VLLM_ASCEND_KVAF_JETTYS_PER_CORE": lambda: int(
+        os.getenv(
+            "VLLM_ASCEND_KVAF_JETTYS_PER_CORE",
+            os.getenv("KVAF_NPU_JETTYS_PER_CORE", "2"),
+        )
+    ),
 }
 
 # end-env-vars-definition

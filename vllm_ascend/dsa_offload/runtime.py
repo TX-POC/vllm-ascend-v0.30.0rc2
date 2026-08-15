@@ -28,6 +28,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.dsa_offload.contracts import (
+    DSA_A5_LIDU_OUTPUT_CAPACITY,
     DSA_DRAM_NULL_BLOCK_ID,
     DSA_DUMP_NOOP_DST_BLOCK_ID,
     DSA_LIDU_OUTPUT_CAPACITY,
@@ -37,6 +38,12 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_SFA_COMPUTE_TOPK,
 )
 from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
+from vllm_ascend.dsa_offload.dsa_row import (
+    DDRBlockTable,
+    DsaRowIndexGeometry,
+    PackedKvLayout,
+)
+from vllm_ascend.dsa_offload.kvaf_adapter import KvafAdapter
 from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
@@ -89,6 +96,13 @@ class DSAOffloadRuntime:
         self.keep_decode_kv_in_hbm = bool(keep_decode_kv_in_hbm)
         self.op_backend = str(op_backend)
         self.is_c8 = bool(is_c8)
+        self.kvaf_adapter: KvafAdapter | None = (
+            KvafAdapter(
+                device_id=self.device.index or 0,
+            )
+            if self.is_c8
+            else None
+        )
         if self.op_backend == DSA_OP_BACKEND_NANOVLLM_A5:
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 require_nanovllm_dsa_ops,
@@ -98,11 +112,22 @@ class DSAOffloadRuntime:
             self.max_model_len,
             self.block_size,
         )
+        self.row_index_geometry = DsaRowIndexGeometry.from_runtime(
+            raw_row_capacity=self.max_num_reqs,
+            n_layers=self.num_layers,
+            max_sequence_tokens=self.max_model_len,
+            tokens_per_logical_block=self.block_size,
+        )
 
+        lidu_output_capacity = (
+            DSA_A5_LIDU_OUTPUT_CAPACITY
+            if self.op_backend == DSA_OP_BACKEND_NANOVLLM_A5
+            else DSA_LIDU_OUTPUT_CAPACITY
+        )
         output_shape = (
             self.max_num_reqs,
             1,
-            DSA_LIDU_OUTPUT_CAPACITY,
+            lidu_output_capacity,
         )
         self._lidu_topk_index = torch.empty(
             output_shape,
@@ -227,6 +252,8 @@ class DSAOffloadRuntime:
         )
 
         self.dram_store: DSAHotDRAMStore | None = None
+        self.dsa_row_directory: DDRBlockTable | None = None
+        self.packed_kv_layout: PackedKvLayout | None = None
         self.active_num_reqs = 0
         self.execution_num_reqs = 0
         self.dump_job_count = 0
@@ -260,6 +287,70 @@ class DSAOffloadRuntime:
                 f"runtime={self.max_logical_blocks}"
             )
         self.dram_store = store
+
+    def register_packed_kv_layout(self, layout: PackedKvLayout) -> None:
+        """Freeze the worker-lifetime packed layout used by KVAF."""
+
+        if layout.tokens_per_logical_block != self.block_size:
+            raise ValueError(
+                "KVAF layout block size does not match DSA runtime: "
+                f"layout={layout.tokens_per_logical_block}, "
+                f"runtime={self.block_size}"
+            )
+        if self.packed_kv_layout is not None:
+            if self.packed_kv_layout != layout:
+                raise RuntimeError(
+                    "DSA packed KV layout changed after it was frozen: "
+                    f"old={self.packed_kv_layout}, new={layout}"
+                )
+            return
+        self.packed_kv_layout = layout
+
+    def initialize_dsa_row_index(
+        self,
+        *,
+        layout: PackedKvLayout,
+    ) -> DDRBlockTable:
+        """Initialize KVAF and create its DSA_ROW directory view."""
+
+        if layout.tokens_per_logical_block != self.block_size:
+            raise ValueError(
+                "KVAF layout block size does not match DSA runtime: "
+                f"layout={layout.tokens_per_logical_block}, "
+                f"runtime={self.block_size}"
+            )
+        self.register_packed_kv_layout(layout)
+        if self.dsa_row_directory is not None:
+            raise RuntimeError("DSA_ROW directory was initialized twice")
+        if self.kvaf_adapter is None:
+            raise RuntimeError(
+                "DSA_ROW initialization requires the C8 KVAF runtime"
+            )
+        directory_cell_count = self.row_index_geometry.directory_cell_count
+        self.kvaf_adapter.initialize_dsa_row_index(
+            layout=layout,
+            ddr_bytes=(
+                directory_cell_count
+                * self.kvaf_adapter.slot_size(layout)
+            ),
+            geometry=self.row_index_geometry,
+            device=self.device,
+        )
+        self.dsa_row_directory = DDRBlockTable(
+            self.row_index_geometry.directory_cell_count,
+            device=self.device,
+        )
+        return self.dsa_row_directory
+
+    def _require_dsa_row_directory(self) -> DDRBlockTable:
+        if self.dsa_row_directory is None:
+            raise RuntimeError("DSA_ROW directory has not been initialized")
+        return self.dsa_row_directory
+
+    def _require_kvaf_adapter(self) -> KvafAdapter:
+        if self.kvaf_adapter is None:
+            raise RuntimeError("DSA C8 KVAF runtime is not initialized")
+        return self.kvaf_adapter
 
     def bind_resident_layer_cache(
         self,
@@ -307,6 +398,9 @@ class DSAOffloadRuntime:
     def dump_prefill_full_blocks(self) -> None:
         """在完整 prefill model forward 结束后统一卸载所有层满块。"""
 
+        if self.dsa_row_directory is not None:
+            self._finalize_kvaf_batch_put()
+            return
         if not self._defer_prefill_layer_dump:
             return
         try:
@@ -363,9 +457,92 @@ class DSAOffloadRuntime:
             self._defer_prefill_layer_dump = False
 
     def release_pool_index(self, pool_index: int) -> None:
+        if self.dsa_row_directory is not None:
+            self._require_kvaf_adapter().release_pool_row(
+                pool_index,
+                block_table=self._require_dsa_row_directory(),
+            )
         store = self.dram_store
         if store is not None:
             store.release_pool_index(pool_index)
+
+    def _kvaf_flat_indices_for_row(self, pool_row: int) -> list[int]:
+        store = self.dram_store
+        if store is not None:
+            block_qs = store.get_allocated_logical_block_indices(pool_row)
+            return self.row_index_geometry.flat_indices_for_block_qs(
+                pool_row=pool_row,
+                block_qs=block_qs,
+            )
+
+        directory = self.dsa_row_directory
+        if directory is None:
+            return []
+        pool_row = int(pool_row)
+        if not 0 <= pool_row < self.row_index_geometry.raw_row_capacity:
+            raise IndexError(
+                f"pool_row={pool_row} is outside DSA_ROW capacity"
+            )
+        row_start = pool_row * self.row_index_geometry.row_stride_cells
+        row_end = row_start + self.row_index_geometry.row_stride_cells
+        valid_cells = directory.valid[row_start:row_end]
+        valid_offsets = (
+            torch.nonzero(valid_cells, as_tuple=False)
+            .flatten()
+            .cpu()
+            .tolist()
+        )
+        return [row_start + int(offset) for offset in valid_offsets]
+
+    def finish_request(self, request_id: str, pool_row: int) -> None:
+        """Free all row-owned KVAF and DSA resources before row reuse."""
+
+        del request_id
+        if self.dsa_row_directory is not None:
+            self.kvaf_adapter.batch_free(
+                flat_indices=self._kvaf_flat_indices_for_row(pool_row),
+            )
+        self.release_pool_index(pool_row)
+
+    def shutdown(self) -> None:
+        if self.dsa_row_directory is not None:
+            self._require_kvaf_adapter().shutdown(
+                block_table=self._require_dsa_row_directory(),
+            )
+
+    def _finalize_kvaf_batch_put(self) -> None:
+        adapter = self._require_kvaf_adapter()
+        if not adapter.active_batch_put:
+            self._defer_prefill_layer_dump = False
+            return
+        try:
+            if self._defer_prefill_layer_dump:
+                if len(self._resident_layer_caches) != self.num_layers:
+                    raise RuntimeError(
+                        "DSA KVAF Prefill cache binding is incomplete: "
+                        f"bound={len(self._resident_layer_caches)}, "
+                        f"expected={self.num_layers}"
+                    )
+                if self.device.type == "npu":
+                    torch.npu.synchronize(self.device)
+                for layer_id in sorted(self._resident_layer_caches):
+                    packed_cache, _unused_rope = (
+                        self._resident_layer_caches[layer_id]
+                    )
+                    adapter.write_batch_put_layer(
+                        local_layer_ordinal=layer_id,
+                        packed_cache=packed_cache,
+                    )
+            adapter.finalize_batch_put(
+                block_table=self._require_dsa_row_directory(),
+            )
+        except Exception:
+            adapter.abort_batch_put(
+                block_table=self._require_dsa_row_directory(),
+            )
+            raise
+        finally:
+            self._defer_prefill_layer_dump = False
 
     def prepare_forward(
         self,
@@ -402,6 +579,12 @@ class DSAOffloadRuntime:
         self.dump_launch_count = 0
         self._defer_prefill_layer_dump = False
         self._req_cache_tokens = state.sparse_budget_tokens
+        adapter = self.kvaf_adapter
+        if adapter is not None and adapter.active_batch_put:
+            raise RuntimeError(
+                "Previous DSA KVAF BatchPut was not finalized before the "
+                "next forward"
+            )
 
         self._prepare_dump_plan(
             input_batch=input_batch,
@@ -415,6 +598,13 @@ class DSAOffloadRuntime:
             state=state,
             validate_all_sparse=dram_table_refreshed,
         )
+        if self.dsa_row_directory is not None and self.dump_job_count:
+            self._require_kvaf_adapter().begin_batch_put(
+                pool_rows=self._dump_pool_indices[: self.dump_job_count],
+                block_qs=self._dump_logical_indices[: self.dump_job_count],
+                source_block_ids=self._dump_source_blocks[: self.dump_job_count],
+                geometry=self.row_index_geometry,
+            )
 
         active_modes = state.row_modes_cpu[:num_reqs]
         if not np.any(active_modes == DSA_ROW_MODE_SPARSE):
@@ -782,6 +972,16 @@ class DSAOffloadRuntime:
             self.dump_job_count = 0
             return
 
+        if self.dsa_row_directory is not None:
+            self.dump_src_block_ids.np[:job_count] = (
+                self._dump_source_blocks[:job_count]
+            )
+            self.dump_dst_block_ids.np[:job_count] = (
+                DSA_DUMP_NOOP_DST_BLOCK_ID
+            )
+            self.dump_job_count = job_count
+            return
+
         reservation = store.reserve_blocks(
             pool_indices=self._dump_pool_indices[:job_count],
             logical_block_indices=self._dump_logical_indices[:job_count],
@@ -995,9 +1195,6 @@ class DSALayerOffloadContext:
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 lightning_indexer_decode_update_c8 as lidu_c8,
             )
-            from vllm_ascend.dsa_offload.ops_nanovllm import (
-                packed_kvcache_scatter_copy as ksc_c8,
-            )
             cache_tokens = self.runtime._req_cache_tokens[:num_reqs]
             key_dequant_scale = self.runtime._c8_key_dequant_scales.get(
                 self.layer_id
@@ -1021,6 +1218,38 @@ class DSALayerOffloadContext:
                 block_table=indexer_block_table,
                 outputs=outputs,
             )
+            resident_seq_lengths = (
+                self.runtime._c8_resident_seq_lengths[self.layer_id][
+                    :num_reqs
+                ]
+            )
+            directory = self.runtime.dsa_row_directory
+            if directory is not None:
+                self.runtime._require_kvaf_adapter().execute_batch_get(
+                    layer_id=self.layer_id,
+                    source_token_ids=outputs.topk_index,
+                    destination_slots=outputs.topk_slots,
+                    miss_count=outputs.miss_count,
+                    resident_pool_indices=resident_pool_indices,
+                    resident_block_table=resident_block_table,
+                    cache_tokens=cache_tokens,
+                    candidate_lens=actual_seq_lengths_key,
+                    logical_seq_lengths=actual_seq_lengths_key,
+                    resident_seq_lengths=resident_seq_lengths,
+                    address_table=directory.addresses,
+                    output=resident_nope_cache,
+                )
+                # Subgraph C only materializes the resident KV and sequence
+                # lengths. Subgraph D will replace this placeholder with its
+                # final attention-slot mapping before C8 SFA is enabled.
+                return DSAOffloadSelectionOutput(
+                    sparse_indices=outputs.topk_slots,
+                    tail_info=resident_seq_lengths,
+                )
+
+            from vllm_ascend.dsa_offload.ops_nanovllm import (
+                packed_kvcache_scatter_copy as ksc_c8,
+            )
             store = self.runtime.dram_store
             if store is None:
                 raise RuntimeError("DSA layer has no bound DRAM store")
@@ -1028,11 +1257,6 @@ class DSALayerOffloadContext:
             attention_slots = self.runtime._c8_attention_slots[
                 self.layer_id
             ][:num_reqs]
-            resident_seq_lengths = (
-                self.runtime._c8_resident_seq_lengths[self.layer_id][
-                    :num_reqs
-                ]
-            )
             ksc_c8(
                 hbm_packed_kv=resident_nope_cache,
                 dram_packed_kv=arenas.nope,
@@ -1143,6 +1367,11 @@ class DSALayerOffloadContext:
             self.runtime.op_backend == DSA_OP_BACKEND_NANOVLLM_A5
             and self.runtime.is_c8
         ):
+            if self.runtime.dsa_row_directory is not None:
+                raise RuntimeError(
+                    "KVAF subgraph C completed, but subgraph D has not "
+                    "materialized C8 attention_slots yet"
+                )
             from vllm_ascend.dsa_offload.ops_nanovllm import (
                 sparse_flash_attention_for_offload_c8 as sfa_c8,
             )
@@ -1194,6 +1423,23 @@ class DSALayerOffloadContext:
         resident_nope_cache: torch.Tensor,
         resident_rope_cache: torch.Tensor,
     ) -> None:
+        if self.runtime.dsa_row_directory is not None:
+            if self.runtime.defer_prefill_layer_dump:
+                return
+            if self.runtime.dump_job_count == 0:
+                return
+            adapter = self.runtime._require_kvaf_adapter()
+            try:
+                adapter.write_batch_put_layer(
+                    local_layer_ordinal=self.layer_id,
+                    packed_cache=resident_nope_cache,
+                )
+            except Exception:
+                adapter.abort_batch_put(
+                    block_table=self.runtime._require_dsa_row_directory(),
+                )
+                raise
+            return
         if self.runtime.defer_prefill_layer_dump:
             return
         job_count = self.runtime.dump_launch_count

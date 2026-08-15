@@ -656,9 +656,6 @@ def install_a5_c8_runtime_policy() -> None:
         from vllm_ascend.dsa_offload.ops_nanovllm import (
             lightning_indexer_decode_update_c8 as lidu_c8,
         )
-        from vllm_ascend.dsa_offload.ops_nanovllm import (
-            packed_kvcache_scatter_copy as ksc_c8,
-        )
 
         lidu_c8(
             query=query,
@@ -675,15 +672,42 @@ def install_a5_c8_runtime_policy() -> None:
             outputs=outputs,
         )
 
+        resident_seq_lengths = runtime._a5_resident_seq_lengths.gpu[:num_reqs]
+        kvaf_adapter = runtime.kvaf_adapter
+        if kvaf_adapter is not None:
+            directory = runtime.dsa_row_directory
+            if directory is None:
+                raise RuntimeError("DSA_ROW directory was not initialized")
+            kvaf_adapter.execute_batch_get(
+                layer_id=self.layer_id,
+                source_token_ids=outputs.topk_index,
+                destination_slots=outputs.topk_slots,
+                miss_count=outputs.miss_count,
+                resident_pool_indices=resident_pool_indices,
+                resident_block_table=kwargs["resident_block_table"],
+                cache_tokens=cache_tokens,
+                candidate_lens=candidate_lens,
+                logical_seq_lengths=logical_seq_lengths,
+                resident_seq_lengths=resident_seq_lengths,
+                address_table=directory.addresses,
+                output=kwargs["resident_nope_cache"],
+            )
+            # Subgraph C hands the raw LIDU selection and Resident length to
+            # subgraph D. C must not construct sparse+tail attention slots.
+            return DSAOffloadSelectionOutput(
+                sparse_indices=outputs.topk_slots,
+                tail_info=resident_seq_lengths,
+            )
+
+        from vllm_ascend.dsa_offload.ops_nanovllm import (
+            packed_kvcache_scatter_copy as ksc_c8,
+        )
+
         store = runtime.dram_store
         if store is None:
             raise RuntimeError("DSA layer has no bound DRAM store")
         arenas = store.get_layer_arenas(self.layer_id)
         attention_slots = runtime._a5_c8_attention_slots[:num_reqs]
-        resident_seq_lengths = runtime._a5_resident_seq_lengths.gpu[:num_reqs]
-        # KVAF 落地前：保留 KSC 做 Resident payload 回填（DDR->HBM）。
-        # metadata（attention_slots）改由 build_c8_attention_metadata 生成，
-        # 与 KSC 的 metadata 输出解耦；KVAF BatchGetSlice 落地后移除 KSC 调用。
         ksc_c8(
             hbm_packed_kv=kwargs["resident_nope_cache"],
             dram_packed_kv=arenas.nope,

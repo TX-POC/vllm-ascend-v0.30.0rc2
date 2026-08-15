@@ -195,6 +195,7 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.dsa_offload.contracts import DSA_PACKED_KV_DIM
 from vllm_ascend.dsa_offload.dram_store import (
     DSAHotDRAMStore,
     calculate_dram_usable_blocks,
@@ -214,6 +215,11 @@ from vllm_ascend.dsa_offload.kv_cache import (
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
+)
+from vllm_ascend.dsa_offload.dsa_row import (
+    M0_DDR_LAYER_ALIGNMENT_BYTES,
+    M0_LAYOUT_ID,
+    PackedKvLayout,
 )
 from vllm_ascend.dsa_offload.ops import require_dsa_offload_ops
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
@@ -4727,11 +4733,24 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config,
             indexer_group,
         )
+        dram_usable_blocks = calculate_dram_usable_blocks(
+            indexer_num_blocks,
+            self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
+        )
+
+        dsa_row_layout = None
+        if runtime.is_c8:
+            dsa_row_layout = PackedKvLayout(
+                layout_id=M0_LAYOUT_ID,
+                tokens_per_logical_block=runtime.block_size,
+                packed_token_bytes=DSA_PACKED_KV_DIM,
+                ddr_layer_alignment_bytes=M0_DDR_LAYER_ALIGNMENT_BYTES,
+            )
+            runtime.initialize_dsa_row_index(
+                layout=dsa_row_layout,
+            )
         store = DSAHotDRAMStore(
-            usable_blocks=calculate_dram_usable_blocks(
-                indexer_num_blocks,
-                self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
-            ),
+            usable_blocks=dram_usable_blocks,
             storage_rows=resident_pool.storage_rows,
             max_logical_blocks=runtime.max_logical_blocks,
             device=self.device,
@@ -4809,8 +4828,8 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         runtime.bind_dram_store(store)
-        cache_layout.set_pool_release_callback(
-            runtime.release_pool_index
+        cache_layout.set_request_release_callback(
+            runtime.finish_request
         )
         self.dsa_hot_dram_store = store
 

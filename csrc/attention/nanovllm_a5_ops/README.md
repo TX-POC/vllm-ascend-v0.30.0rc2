@@ -287,6 +287,71 @@ SFA：
 python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode bench --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
 ```
 
+### BatchGet Prepare / KVAF BatchGet 独立性能
+
+正常 vLLM-Ascend 路径使用主扩展 `vllm_ascend_C` 注册 A5 DSA 算子，
+不需要 standalone `nanovllm_dsa_a5._C`。先从仓库根目录安装当前源码：
+
+```bash
+export VLLM_DSA_ROOT=/home/y00937180/vLLM-DSA
+cd "$VLLM_DSA_ROOT"
+bash csrc/attention/nanovllm_a5_ops/install_nanovllm_a5.sh
+```
+
+再于 KVAF 仓库构建 NPU Runtime、BatchGet kernel 和 Python binding：
+
+```bash
+export KVAF_ROOT=/Users/heather/Documents/大月亮/KVAF
+export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.1.0
+cmake -S "$KVAF_ROOT" -B "$KVAF_ROOT/build-aiv" \
+  -DBUILD_TESTING=ON \
+  -DKVAF_BUILD_PYTHON=ON \
+  -DKVAF_ENABLE_AIV_BATCH_GET=ON \
+  -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+  -DASCEND_CANN_PACKAGE_PATH="$ASCEND_CANN_PACKAGE_PATH"
+cmake --build "$KVAF_ROOT/build-aiv" -j
+```
+
+然后从 `csrc/attention/nanovllm_a5_ops` 目录执行。`PYTHONPATH` 必须指向
+仓库根目录和 KVAF 构建产物，不要把未构建的 `torch_extension`
+源码目录放到最前面：
+
+```bash
+cd "$VLLM_DSA_ROOT/csrc/attention/nanovllm_a5_ops"
+export PYTHONPATH="$VLLM_DSA_ROOT:$KVAF_ROOT/build-aiv/python:$PYTHONPATH"
+python3 tests/benchmark_kvaf_batch_get.py \
+  --device npu:0 \
+  --batch-get-kernel "$KVAF_ROOT/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
+  --batch-put-kernel "$KVAF_ROOT/build-aiv/bin/kvaf_execute_batch_put_kernels.o" \
+  --batch-size 4 \
+  --num-layers 1 \
+  --layer-id 0 \
+  --qcap 64 \
+  --miss-count 256 \
+  --source-layout random \
+  --warmup 10 \
+  --iters 100
+```
+
+如果特意使用 standalone 算子开发模式，则需先在本目录执行
+`bash build_nanovllm_ops.sh`，确认 `torch_extension/nanovllm_dsa_a5/_C*.so`
+已生成后，才可把 `torch_extension` 加入 `PYTHONPATH`。性能脚本会优先
+加载 `vllm_ascend_C`，仅在主扩展不可用时回退到 standalone `_C`。
+
+`--miss-count` 是每行的 miss 数，可分别使用 `0/256/2048` 测空载、典型和
+全 miss 场景。默认使用不重复的随机 source token 和随机 destination slot，
+更接近 LIDU 输出的离散访存；如需测连续上界，可改为
+`--source-layout sequential`。脚本会预先通过 BatchPut 填充全部 DDR block，
+物化 `B * num_layers * qcap` 的 `DeviceAccessTable`，并在计时前同时校验
+Prepare 的行主序 index 和 BatchGet 回写字节。`--batch-put-kernel` 可省略，
+此时仅一次性数据填充改用 KVAF ACL D2H mock，不影响计时区间。
+
+输出的 `PERF_RESULT` 包含：Prepare 和 BatchGet 各自的纯 NPU Event 时延、
+host submit、stream wait、从 Python 调用到 stream 完成的总时延，以及
+Prepare + BatchGet 串联总时延。BatchGet 总时延另外报告有效 payload
+GiB/s。Runtime 初始化、BatchPut、AccessTable 物化、tensor 分配和正确性检查
+全部排除在正式样本之外。
+
 ## Profile
 
 ```bash

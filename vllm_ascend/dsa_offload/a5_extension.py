@@ -12,81 +12,19 @@ root build flow.
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import torch
 import torch_npu
+
+from vllm_ascend.a5_dsa_registration import (
+    local_opapi_path as _registration_opapi_path,
+)
 
 BLOCK_SIZE = 128
 CKV_DIM = 512
 PACKED_KV_DIM = 656
 SPARSE_COUNT = 2048
 
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-_CUSTOM_OP_ROOT = _PACKAGE_ROOT / "_cann_ops_custom"
-_A5_OP_ROOT = _CUSTOM_OP_ROOT / "nanovllm_a5"
-
-
-def _prepend_env_path(name: str, path: Path) -> None:
-    value = str(path)
-    entries = [entry for entry in os.getenv(name, "").split(":") if entry]
-    if value not in entries:
-        os.environ[name] = ":".join([value, *entries])
-
-
-def _bootstrap_a5_opp() -> Path:
-    """Expose packaged custom-op vendors before importing vllm_ascend_C."""
-
-    vendor_dirs: list[Path] = []
-    standard_vendors = _CUSTOM_OP_ROOT / "vendors"
-    if standard_vendors.is_dir():
-        vendor_dirs.extend(
-            path
-            for path in sorted(standard_vendors.iterdir())
-            if path.is_dir()
-        )
-
-    a5_vendors = _A5_OP_ROOT / "vendors"
-    if a5_vendors.is_dir():
-        vendor_dirs.extend(
-            path
-            for path in sorted(a5_vendors.iterdir())
-            if path.is_dir()
-        )
-
-    a5_opapi = [
-        vendor / "op_api" / "lib" / "libcust_opapi.so"
-        for vendor in vendor_dirs
-        if vendor.parent == a5_vendors
-        and (vendor / "op_api" / "lib" / "libcust_opapi.so").is_file()
-    ]
-    if len(a5_opapi) != 1:
-        raise RuntimeError(
-            "A5 DSA requires exactly one packaged libcust_opapi.so under "
-            f"{a5_vendors}; found={len(a5_opapi)}. Reinstall vllm-ascend "
-            "with custom kernels enabled on Ascend 950."
-        )
-
-    # vLLM-Ascend's normal op-api resolver snapshots ASCEND_CUSTOM_OPP_PATH
-    # when vllm_ascend_C is loaded, so publish every packaged vendor first.
-    for vendor in reversed(vendor_dirs):
-        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor)
-
-    # Keep the exact A5 op-api location available for diagnostics and legacy
-    # standalone-development helpers. Embedded vllm_ascend_C bindings resolve
-    # custom ACLNN symbols through the normal ASCEND_CUSTOM_OPP_PATH adapter.
-    os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(a5_opapi[0])
-    os.environ["NANOVLLM_A5_INSTALL_OPP_PATH"] = str(_A5_OP_ROOT)
-    return a5_opapi[0]
-
-
-_OPAPI = _bootstrap_a5_opp()
-
-# Import the one normal vLLM-Ascend extension. The csrc/nanovllm_a5_* binding
-# translation units are part of the root CMake target and register the base
-# torch.ops.nanovllm_dsa schemas/implementations from this same shared object.
-import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: E402,F401
+_OPAPI = _registration_opapi_path()
 
 if not hasattr(torch.ops, "nanovllm_dsa"):
     raise RuntimeError(
@@ -601,7 +539,7 @@ def _sparse_and_tail_attention_c8_fake(
 
 
 def local_opapi_path() -> str:
-    return str(_OPAPI)
+    return _OPAPI
 
 
 from vllm_ascend.dsa_offload.a5_c8_precision_policy import (
