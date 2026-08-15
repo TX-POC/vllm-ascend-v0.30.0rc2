@@ -651,6 +651,9 @@ def install_a5_c8_runtime_policy() -> None:
             )
 
         from vllm_ascend.dsa_offload.ops_nanovllm import (
+            build_c8_attention_metadata,
+        )
+        from vllm_ascend.dsa_offload.ops_nanovllm import (
             lightning_indexer_decode_update_c8 as lidu_c8,
         )
 
@@ -720,9 +723,18 @@ def install_a5_c8_runtime_policy() -> None:
             attention_slots=attention_slots,
             resident_seq_lengths=resident_seq_lengths,
         )
+        build_c8_attention_metadata(
+            destination_slots=outputs.topk_slots,
+            cache_tokens=cache_tokens,
+            candidate_lens=candidate_lens,
+            actual_seq_lengths_kv=logical_seq_lengths,
+            max_tail_tokens=runtime._a5_c8_max_tail_tokens,
+            resident_seq_lengths=resident_seq_lengths,
+            attention_slots=attention_slots,
+        )
         return DSAOffloadSelectionOutput(
-            sparse_indices=attention_slots,
-            tail_info=resident_seq_lengths,
+            attention_slots=attention_slots,
+            resident_seq_lengths=resident_seq_lengths,
         )
 
     NPUModelRunner._reshape_kv_cache_tensors = reshape_kv_cache_tensors
