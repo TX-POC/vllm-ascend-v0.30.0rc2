@@ -1092,7 +1092,11 @@ def build_c8_attention_metadata(
       前 ``_SPARSE_COUNT`` 项 = LIDU 输出的 ``destination_slots``；
       之后 ``tail_count`` 项 = 连续范围 ``[cache_count, cache_count + tail_count)``，
       其中 ``tail_count = clamp(actual - candidate, 0, max_tail_tokens)``；
-      其余 tail 槽位填 ``-1``（无效 sentinel）。
+      其余槽位填 ``-1``（无效 sentinel）。
+
+    ``attention_slots`` 是跨 layer / Decode step 复用的 scratch。旧 KSC 内核
+    每轮都会先清空整行；在子图 D 中拆出 metadata 构建后，也必须在这里保持
+    这一契约，避免 QSFA 读取上一次调用或 ``torch.empty`` 遗留的索引。
     """
     num_reqs = int(destination_slots.shape[0])
     tail_capacity = int(attention_slots.shape[-1]) - _SPARSE_COUNT
@@ -1102,13 +1106,17 @@ def build_c8_attention_metadata(
             f"got shape={tuple(attention_slots.shape)}"
         )
 
+    # 对齐旧 KSC 的 ClearAttentionRow：每轮先清空完整 scratch，再写入有效
+    # TopK 与 tail。不能依赖调用方初始化，因为该 tensor 会跨 Decode 复用。
+    attention_slots.fill_(-1)
+
     # 前 2048 项 = LIDU destination_slots
     attention_slots[:, 0, :_SPARSE_COUNT].copy_(
         destination_slots[:, 0, :_SPARSE_COUNT]
     )
 
     # tail 段：每行写 [cache_count, cache_count + tail_count)，
-    # 超出 tail_count 的槽位保持 -1（调用方预填充）。
+    # 超出 tail_count 的槽位保持上面的 -1 sentinel。
     tail_count = torch.clamp(
         actual_seq_lengths_kv - candidate_lens,
         min=0,

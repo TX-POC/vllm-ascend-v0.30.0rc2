@@ -103,8 +103,10 @@ def test_build_c8_attention_metadata_writes_only_slots(device="cpu") -> None:
     batch = fx["destination_slots"].shape[0]
     max_tail_tokens = 8
     attention_capacity = _SPARSE_COUNT + max_tail_tokens
+    # 模拟跨 Decode step 复用的 scratch 中残留的旧索引；builder 必须自行
+    # 覆盖完整 buffer，不能依赖调用方预填 -1。
     attention_slots = torch.full(
-        (batch, 1, attention_capacity), -1, dtype=torch.int32, device=device
+        (batch, 1, attention_capacity), -123456789, dtype=torch.int32, device=device
     )
     sentinel = fx["resident_seq_lengths"].clone()
     out = onv.build_c8_attention_metadata(
@@ -138,6 +140,8 @@ def test_build_c8_attention_metadata_writes_only_slots(device="cpu") -> None:
             torch.testing.assert_close(tail_slice[row, :tc], expected)
         if tc < max_tail_tokens:
             assert bool((tail_slice[row, tc:] == -1).all())
+
+    assert not bool((attention_slots == -123456789).any())
 
     # 3) resident_seq_lengths 不被改写，且返回值为同一 tensor（透传）
     torch.testing.assert_close(fx["resident_seq_lengths"], sentinel)
