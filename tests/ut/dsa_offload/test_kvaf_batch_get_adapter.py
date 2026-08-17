@@ -106,7 +106,7 @@ def test_kvaf_adapter_rejects_noncanonical_output() -> None:
         raise AssertionError("noncanonical packed cache was accepted")
 
 
-def test_kvaf_adapter_uses_runtime_directory_addresses(
+def test_kvaf_adapter_uses_runtime_directory_tensors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter, kvaf_runtime = _make_adapter(monkeypatch)
@@ -142,8 +142,10 @@ def test_kvaf_adapter_uses_runtime_directory_addresses(
         logical_seq_lengths=row,
         resident_seq_lengths=row,
         address_table=directory.addresses,
+        valid_table=directory.valid,
         output=torch.empty((1, 128, 1, 656), dtype=torch.int8),
     )
 
     prepare.assert_called_once()
     assert kvaf_runtime.batch_get.call_args.args[0] is directory.addresses
+    assert kvaf_runtime.batch_get.call_args.args[1] is directory.valid

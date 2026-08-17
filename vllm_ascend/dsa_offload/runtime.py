@@ -1221,6 +1221,7 @@ class DSALayerOffloadContext:
                 logical_seq_lengths=actual_seq_lengths_key,
                 resident_seq_lengths=resident_seq_lengths,
                 address_table=directory.addresses,
+                valid_table=directory.valid,
                 output=resident_nope_cache,
             )
             build_c8_attention_metadata(

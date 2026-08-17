@@ -534,6 +534,7 @@ def install_a5_c8_runtime_policy() -> None:
             logical_seq_lengths=logical_seq_lengths,
             resident_seq_lengths=resident_seq_lengths,
             address_table=directory.addresses,
+            valid_table=directory.valid,
             output=kwargs["resident_nope_cache"],
         )
         build_c8_attention_metadata(

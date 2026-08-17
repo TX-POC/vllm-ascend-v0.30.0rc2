@@ -214,6 +214,7 @@ class KvafAdapter:
         logical_seq_lengths: torch.Tensor,
         resident_seq_lengths: torch.Tensor,
         address_table: torch.Tensor,
+        valid_table: torch.Tensor,
         output: torch.Tensor,
         stream: Any | None = None,
     ) -> None:
@@ -233,6 +234,17 @@ class KvafAdapter:
         ):
             raise ValueError(
                 "KVAF address_table must be contiguous int64 on the DSA "
+                "device with geometry.directory_cell_count entries"
+            )
+        if (
+            not isinstance(valid_table, torch.Tensor)
+            or valid_table.device != device
+            or valid_table.dtype != torch.uint8
+            or valid_table.numel() != geometry.directory_cell_count
+            or not valid_table.is_contiguous()
+        ):
+            raise ValueError(
+                "KVAF valid_table must be contiguous uint8 on the DSA "
                 "device with geometry.directory_cell_count entries"
             )
         layer_id = int(layer_id)
@@ -281,6 +293,7 @@ class KvafAdapter:
             )
             self.runtime.batch_get(
                 address_table,
+                valid_table,
                 indices,
                 offsets,
                 mask,
