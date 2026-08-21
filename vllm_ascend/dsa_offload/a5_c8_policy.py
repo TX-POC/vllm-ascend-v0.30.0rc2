@@ -181,6 +181,13 @@ def _ensure_fixed_metadata(runtime: Any) -> None:
         dtype=torch.int32,
         device=runtime.device,
     )
+    runtime._a5_c8_attention_widths = np.empty(
+        runtime.max_num_reqs,
+        dtype=np.int32,
+    )
+    runtime._a5_c8_active_attention_width = (
+        DSA_SFA_COMPUTE_TOPK + runtime._a5_c8_max_tail_tokens
+    )
     runtime._a5_c8_last_range_log: tuple[Any, ...] | None = None
 
     logger.info_once(
@@ -227,6 +234,37 @@ def _refresh_fixed_metadata(
         )
         resident[sparse_rows] = state.resident_valid_tokens_cpu[sparse_rows]
 
+    # Match the reference variable-tail ABI in eager mode. Dense/cacheless
+    # rows need one identity slot per logical token; sparse rows need the
+    # fixed TopK prefix plus their prompt-owned resident suffix.
+    attention_widths = runtime._a5_c8_attention_widths[:num_reqs]
+    np.copyto(attention_widths, logical)
+    if sparse_rows.size:
+        attention_widths[sparse_rows] = (
+            DSA_SFA_COMPUTE_TOPK
+            + logical[sparse_rows]
+            - candidate[sparse_rows]
+        )
+    np.maximum(
+        attention_widths,
+        DSA_SFA_COMPUTE_TOPK,
+        out=attention_widths,
+    )
+    active_attention_width = max(
+        DSA_SFA_COMPUTE_TOPK,
+        int(attention_widths.max()),
+    )
+    max_attention_width = (
+        DSA_SFA_COMPUTE_TOPK + runtime._a5_c8_max_tail_tokens
+    )
+    if active_attention_width > max_attention_width:
+        raise RuntimeError(
+            "A5 C8 attention metadata exceeds eager capacity: "
+            f"active_width={active_attention_width}, "
+            f"capacity={max_attention_width}"
+        )
+    runtime._a5_c8_active_attention_width = active_attention_width
+
     runtime._a5_candidate_lens.gpu[:num_reqs].copy_(
         runtime._a5_candidate_lens.cpu[:num_reqs],
         non_blocking=True,
@@ -269,6 +307,28 @@ def _refresh_fixed_metadata(
                     runtime.keep_decode_kv_in_hbm,
                 )
                 runtime._a5_c8_last_range_log = signature
+
+
+def _select_attention_slots(
+    runtime: Any,
+    *,
+    num_reqs: int,
+) -> tuple[torch.Tensor, int]:
+    """Return a contiguous metadata view for the active eager batch."""
+
+    num_reqs = int(num_reqs)
+    if int(getattr(runtime, "graph_capture_row_count", 0)):
+        slots = runtime._a5_c8_attention_slots[:num_reqs]
+        return slots, int(runtime._a5_c8_max_tail_tokens)
+
+    width = int(runtime._a5_c8_active_attention_width)
+    required = num_reqs * width
+    slots = runtime._a5_c8_attention_slots.view(-1)[:required].view(
+        num_reqs,
+        1,
+        width,
+    )
+    return slots, width - DSA_SFA_COMPUTE_TOPK
 
 
 def install_a5_c8_runtime_policy() -> None:
@@ -520,7 +580,10 @@ def install_a5_c8_runtime_policy() -> None:
         )
 
         resident_seq_lengths = runtime._a5_resident_seq_lengths.gpu[:num_reqs]
-        attention_slots = runtime._a5_c8_attention_slots[:num_reqs]
+        attention_slots, max_tail_tokens = _select_attention_slots(
+            runtime,
+            num_reqs=num_reqs,
+        )
         directory = runtime._require_dsa_row_directory()
         runtime._require_kvaf_adapter().execute_batch_get(
             layer_id=self.layer_id,
@@ -542,7 +605,7 @@ def install_a5_c8_runtime_policy() -> None:
             cache_tokens=cache_tokens,
             candidate_lens=candidate_lens,
             actual_seq_lengths_kv=logical_seq_lengths,
-            max_tail_tokens=runtime._a5_c8_max_tail_tokens,
+            max_tail_tokens=max_tail_tokens,
             resident_seq_lengths=resident_seq_lengths,
             attention_slots=attention_slots,
         )

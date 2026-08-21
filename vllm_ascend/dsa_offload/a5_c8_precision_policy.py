@@ -11,8 +11,8 @@ A5-only correctness hazards:
   weight path. For those layers use the existing native linear path and build
   the exact 656-byte packed KV row with ``custom_kv_rmsnorm_rope``.
 * The packed KV tensor uses an FP8 dtype as a byte container; the last 144
-  bytes contain BF16 RoPE and FP32 scales. Clone it through an int8 view
-  before QSFA so those payload bytes are copied bit-for-bit.
+  bytes contain BF16 RoPE and FP32 scales. QSFA receives the original storage
+  directly so those payload bytes remain bit-for-bit without a hot-path copy.
 """
 
 from __future__ import annotations
@@ -130,6 +130,35 @@ def _pack_c8_rows_as_bytes(
             f"shape={tuple(packed_bytes.shape)}, expected={_PACKED_KV_DIM}"
         )
     return packed_bytes
+
+
+def sparse_flash_attention_for_offload_c8(
+    *,
+    query: torch.Tensor,
+    packed_kv: torch.Tensor,
+    attention_slots: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    resident_seq_lengths: torch.Tensor,
+    scale_value: float,
+) -> torch.Tensor:
+    """Run C8 QSFA against the canonical byte-packed KV storage."""
+
+    if packed_kv.element_size() != 1:
+        raise RuntimeError(
+            "A5 C8 QSFA packed cache must be byte-addressable: "
+            f"dtype={packed_kv.dtype}"
+        )
+
+    return torch.ops.nanovllm_dsa.sparse_and_tail_attention_c8(
+        query,
+        packed_kv,
+        attention_slots,
+        block_table,
+        actual_seq_lengths_query,
+        resident_seq_lengths,
+        float(scale_value),
+    )
 
 
 def install_a5_c8_precision_policy() -> None:
@@ -258,46 +287,6 @@ def install_a5_c8_precision_policy() -> None:
             tuple(packed_cache.stride()),
         )
         return k_pe, k_nope, knope_scale
-
-    def sparse_flash_attention_for_offload_c8(
-        *,
-        query: torch.Tensor,
-        packed_kv: torch.Tensor,
-        attention_slots: torch.Tensor,
-        block_table: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        resident_seq_lengths: torch.Tensor,
-        scale_value: float,
-    ) -> torch.Tensor:
-        if packed_kv.element_size() != 1:
-            raise RuntimeError(
-                "A5 C8 QSFA packed cache must be byte-addressable: "
-                f"dtype={packed_kv.dtype}"
-            )
-
-        # Do not clone through FP8 value semantics. The suffix of each row is
-        # raw BF16/FP32 payload transported in an FP8-typed tensor.
-        packed_bytes = packed_kv.view(torch.int8).clone(
-            memory_format=torch.contiguous_format
-        )
-        packed_kv_input = packed_bytes.view(packed_kv.dtype).view_as(packed_kv)
-        result = torch.ops.nanovllm_dsa.sparse_and_tail_attention_c8(
-            query,
-            packed_kv_input,
-            attention_slots,
-            block_table,
-            actual_seq_lengths_query,
-            resident_seq_lengths,
-            float(scale_value),
-        )
-        torch.npu.synchronize()
-        logger.info_once(
-            "[DSA_A5_C8_PRECISION] qsfa_clone=raw_bytes packed_shape=%s "
-            "packed_dtype=%s",
-            tuple(packed_kv.shape),
-            packed_kv.dtype,
-        )
-        return result
 
     AscendSFAImpl.process_weights_after_loading = process_weights_after_loading
     AscendSFAImpl.exec_kv = exec_kv

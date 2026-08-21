@@ -16,6 +16,8 @@
 #ifndef KV_QUANT_SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
 #define KV_QUANT_SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
 
+#include <limits>
+
 namespace vllm_ascend {
 
 namespace {
@@ -163,6 +165,143 @@ npu_kv_quant_sparse_flash_attention(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(
         attention_output, softmax_max, softmax_sum);
 }
+
+at::Tensor npu_dsa_a5_sparse_tail_attention_c8(
+    const at::Tensor &query,
+    const at::Tensor &packed_kv,
+    const at::Tensor &sparse_and_tail_slots,
+    double scale_value,
+    const at::Tensor &block_table,
+    const at::Tensor &actual_seq_lengths_query,
+    const at::Tensor &resident_seq_lengths)
+{
+    constexpr int64_t C8_QUERY_DIM = 576;
+    constexpr int64_t C8_OUTPUT_DIM = 512;
+    constexpr int64_t C8_BLOCK_SIZE = 128;
+    constexpr int64_t C8_PACKED_KV_DIM = 656;
+    constexpr int64_t C8_SPARSE_COUNT = 2048;
+    constexpr int64_t C8_ROPE_HEAD_DIM = 64;
+
+    TORCH_CHECK(
+        query.dim() == 3 && query.size(0) > 0 && query.size(1) >= 1 &&
+            query.size(1) <= 64 && query.size(2) == C8_QUERY_DIM,
+        "C8 sparse+tail attention query must be TND [T,Q_HEAD,576] "
+        "with 1 <= Q_HEAD <= 64.");
+    TORCH_CHECK(
+        query.scalar_type() == at::kBFloat16 || query.scalar_type() == at::kHalf,
+        "C8 sparse+tail attention query must be BF16 or FP16.");
+    TORCH_CHECK(
+        packed_kv.dim() == 4 && packed_kv.size(0) > 0 &&
+            packed_kv.size(1) == C8_BLOCK_SIZE && packed_kv.size(2) == 1 &&
+            packed_kv.size(3) == C8_PACKED_KV_DIM && packed_kv.element_size() == 1,
+        "C8 sparse+tail attention packed KV must be a one-byte tensor "
+        "[blocks,128,1,656].");
+    TORCH_CHECK(
+        packed_kv.scalar_type() == at::ScalarType::Float8_e4m3fn ||
+            packed_kv.scalar_type() == at::kChar,
+        "C8 sparse+tail attention packed KV must be FP8 E4M3FN or INT8.");
+    TORCH_CHECK(
+        sparse_and_tail_slots.dim() == 3 &&
+            sparse_and_tail_slots.size(0) == query.size(0) &&
+            sparse_and_tail_slots.size(1) == 1 &&
+            sparse_and_tail_slots.size(2) >= C8_SPARSE_COUNT &&
+            sparse_and_tail_slots.scalar_type() == at::kInt,
+        "C8 sparse+tail slots must be int32 [T,1,2048+max_tail_tokens].");
+
+    const int64_t batch = actual_seq_lengths_query.numel();
+    TORCH_CHECK(
+        batch > 0 && actual_seq_lengths_query.dim() == 1 &&
+            resident_seq_lengths.dim() == 1 && resident_seq_lengths.numel() == batch &&
+            block_table.dim() == 2 && block_table.size(0) == batch && block_table.size(1) > 0,
+        "C8 sparse+tail attention batch metadata shapes are inconsistent.");
+    TORCH_CHECK(
+        block_table.scalar_type() == at::kInt &&
+            actual_seq_lengths_query.scalar_type() == at::kInt &&
+            resident_seq_lengths.scalar_type() == at::kInt,
+        "C8 sparse+tail attention metadata must be int32.");
+    TORCH_CHECK(
+        query.is_privateuseone() && packed_kv.device() == query.device() &&
+            sparse_and_tail_slots.device() == query.device() &&
+            block_table.device() == query.device() &&
+            actual_seq_lengths_query.device() == query.device() &&
+            resident_seq_lengths.device() == query.device(),
+        "C8 sparse+tail attention inputs must be on one NPU.");
+    TORCH_CHECK(
+        query.is_contiguous() && packed_kv.is_contiguous() &&
+            sparse_and_tail_slots.is_contiguous() && block_table.is_contiguous() &&
+            actual_seq_lengths_query.is_contiguous() && resident_seq_lengths.is_contiguous(),
+        "C8 sparse+tail attention inputs must be contiguous.");
+
+    at::Tensor attention_output = at::empty(
+        {query.size(0), query.size(1), C8_OUTPUT_DIM}, query.options());
+    at::Tensor softmax_max = at::empty({1}, query.options().dtype(at::kFloat));
+    at::Tensor softmax_sum = at::empty({1}, query.options().dtype(at::kFloat));
+
+    // Repository mode reads quant scales from packed_kv, but the A5 tiler
+    // still requires non-null external scale inputs. The kernel does not read
+    // these pointers in repository mode.
+    const at::Tensor dequant_scale_placeholder =
+        resident_seq_lengths.view(at::kFloat);
+    constexpr int64_t key_quant_mode = 2;
+    constexpr int64_t value_quant_mode = 2;
+    constexpr int64_t sparse_block_size = 1;
+    std::string layout_query = "TND";
+    std::string layout_kv = "PA_BSND";
+    char *layout_query_ptr = layout_query.data();
+    char *layout_kv_ptr = layout_kv.data();
+    constexpr int64_t sparse_mode = 3;
+    constexpr int64_t all_tokens = std::numeric_limits<int64_t>::max();
+    constexpr int64_t attention_mode = 2;
+    constexpr int64_t quant_scale_repo_mode = 1;
+    constexpr int64_t tile_size = 128;
+    constexpr bool return_softmax_lse = false;
+
+    EXEC_NPU_CMD(
+        aclnnA5SparseTailAttentionC8,
+        query,
+        packed_kv,
+        packed_kv,
+        sparse_and_tail_slots,
+        dequant_scale_placeholder,
+        dequant_scale_placeholder,
+        block_table,
+        actual_seq_lengths_query,
+        resident_seq_lengths,
+        scale_value,
+        key_quant_mode,
+        value_quant_mode,
+        sparse_block_size,
+        layout_query_ptr,
+        layout_kv_ptr,
+        sparse_mode,
+        all_tokens,
+        all_tokens,
+        attention_mode,
+        quant_scale_repo_mode,
+        tile_size,
+        C8_ROPE_HEAD_DIM,
+        return_softmax_lse,
+        attention_output,
+        softmax_max,
+        softmax_sum);
+    return attention_output;
+}
 }  // namespace vllm_ascend
+
+TORCH_LIBRARY_FRAGMENT(_C_ascend, dsa_a5_sparse_tail_attention_c8_ops)
+{
+    dsa_a5_sparse_tail_attention_c8_ops.def(
+        "npu_dsa_a5_sparse_tail_attention_c8("
+        "Tensor query, Tensor packed_kv, Tensor sparse_and_tail_slots, "
+        "float scale_value, Tensor block_table, "
+        "Tensor actual_seq_lengths_query, Tensor resident_seq_lengths) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(_C_ascend, PrivateUse1, dsa_a5_sparse_tail_attention_c8_impl)
+{
+    dsa_a5_sparse_tail_attention_c8_impl.impl(
+        "npu_dsa_a5_sparse_tail_attention_c8",
+        &vllm_ascend::npu_dsa_a5_sparse_tail_attention_c8);
+}
 
 #endif  // KV_QUANT_SPARSE_FLASH_ATTENTION_TORCH_ADPT_H

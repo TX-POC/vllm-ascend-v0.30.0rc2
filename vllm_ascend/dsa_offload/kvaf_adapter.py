@@ -429,9 +429,20 @@ class KvafAdapter:
             * np.uint64(block_stride_bytes)
         )
         lengths = np.full(keys.size, block_bytes, dtype=np.uint64)
+        # KVAF registers the complete Tensor byte range with Direct-HCCP. Only
+        # expose the prefix containing this batch's highest physical block;
+        # offsets remain relative to the same underlying storage.
+        source_cache = packed_cache[: max_source + 1]
+        source_bytes = int(source_cache.numel() * source_cache.element_size())
+        max_end = int((input_offsets + lengths).max())
+        if max_end > source_bytes:
+            raise ValueError(
+                "KVAF BatchPut source view does not cover requested blocks: "
+                f"source_bytes={source_bytes}, max_end={max_end}"
+            )
         self.runtime.batch_put(
             keys.tolist(),
-            packed_cache,
+            source_cache,
             input_offsets.tolist(),
             lengths.tolist(),
             stream,
@@ -500,7 +511,6 @@ class KvafAdapter:
                 expected_block_bytes,
             )
             self._index_copy_compat(block_table.valid, device_keys, valid)
-            self._synchronize_device(device_addresses.device)
         finally:
             self.runtime.release_access_table(handle)
 

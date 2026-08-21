@@ -438,19 +438,17 @@ def _check_c8_attention_inputs(
             raise TypeError(f"C8 QSFA {name} must be int32")
 
 
-def _native_qsfa():
-    """Return the version-matched torch_npu A5 QSFA binding.
+def _resident_c8_qsfa():
+    """Return the repository-pinned A5 resident C8 QSFA binding."""
 
-    Ascend 950 uses the CANN built-in KvQuantSparseFlashAttention operator. The
-    upstream A5 vLLM-Ascend adaptor calls torch_npu directly. Using the generic
-    _C_ascend wrapper here adds a second host-output ABI layer and has produced
-    NnopbaseAddOutput / null-output failures with the installed CANN runtime.
-    """
-
-    op = getattr(torch_npu, "npu_kv_quant_sparse_flash_attention", None)
+    op = getattr(
+        torch.ops._C_ascend,
+        "npu_dsa_a5_sparse_tail_attention_c8",
+        None,
+    )
     if op is None:
         raise RuntimeError(
-            "A5 torch_npu.npu_kv_quant_sparse_flash_attention is not registered"
+            "A5 _C_ascend.npu_dsa_a5_sparse_tail_attention_c8 is not registered"
         )
     return op
 
@@ -468,6 +466,9 @@ def _sparse_and_tail_attention_c8(
     resident_seq_lengths: torch.Tensor,
     scale_value: float,
 ) -> torch.Tensor:
+    # The A5 QSFA TND kernel reads query as a dense row-major tensor. Match
+    # the reference adaptor even when a caller passes a strided query view.
+    query = query.contiguous()
     _check_c8_attention_inputs(
         query,
         packed_kv,
@@ -477,37 +478,26 @@ def _sparse_and_tail_attention_c8(
         resident_seq_lengths,
     )
 
-    # Ascend 950 MLA-absorb QSFA requires KV_D=656 and attention_mode=2 means
-    # key/value are the same underlying packed KV tensor. This matches the
-    # upstream A5 DeviceAdaptor and the CANN operator contract.
-    op = _native_qsfa()
+    # Pin resident C8 decode to the repository kernel used by the reference
+    # implementation. Its eager ACLNN adapter owns the scale placeholders and
+    # the fixed A5 quant/attention attributes.
+    op = _resident_c8_qsfa()
     result = op(
-        query=query,
-        key=packed_kv,
-        value=packed_kv,
-        sparse_indices=sparse_and_tail_slots,
-        scale_value=float(scale_value),
-        key_quant_mode=2,
-        value_quant_mode=2,
-        block_table=block_table,
-        actual_seq_lengths_query=actual_seq_lengths_query,
-        actual_seq_lengths_kv=resident_seq_lengths,
-        sparse_block_size=1,
-        layout_query="TND",
-        layout_kv="PA_BSND",
-        sparse_mode=3,
-        attention_mode=2,
-        quant_scale_repo_mode=1,
-        tile_size=128,
-        rope_head_dim=64,
+        query,
+        packed_kv,
+        sparse_and_tail_slots,
+        float(scale_value),
+        block_table,
+        actual_seq_lengths_query,
+        resident_seq_lengths,
     )
     attention_out = result[0] if isinstance(result, tuple) else result
     if not isinstance(attention_out, torch.Tensor):
-        raise RuntimeError("A5 torch_npu QSFA returned no attention tensor")
+        raise RuntimeError("A5 resident C8 QSFA returned no attention tensor")
     expected_shape = (*query.shape[:-1], CKV_DIM)
     if tuple(attention_out.shape) != expected_shape:
         raise RuntimeError(
-            "A5 torch_npu QSFA returned unexpected attention shape: "
+            "A5 resident C8 QSFA returned unexpected attention shape: "
             f"shape={tuple(attention_out.shape)}, expected={expected_shape}"
         )
     return attention_out
