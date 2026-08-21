@@ -1,0 +1,38 @@
+{
+  "id": "chatcmpl-8a0d8950e97e553b",
+  "object": "chat.completion",
+  "created": 1787212303,
+  "model": "glm-5",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "refusal": null,
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "reasoning": "1. **分析输入：**\n    *   **文本：** “在平常而安静的日子里，人们总会从细微的变化中重新认识生活。清晨的光线慢慢越过屋檐，落在桌面、书页和尚未收拾的物品上，也落在每一个准备开始新一天的人身上。”\n    *   **含义：** 在平常而安静的日子里，人们总会从细微的变化中重新认识生活。清晨的光线慢慢越过屋檐，落在桌面、书页和尚未收拾的物品上，也落在每一个准备开始新一天的人身上。\n    *   **基调：** 诗意、沉思、温柔"
+      },
+      "logprobs": null,
+      "finish_reason": "length",
+      "stop_reason": null,
+      "token_ids": null,
+      "routed_experts": null
+    }
+  ],
+  "service_tier": null,
+  "system_fingerprint": "vllm-0.23.0-tp8-ep-899646b3",
+  "usage": {
+    "prompt_tokens": 51,
+    "total_tokens": 179,
+    "completion_tokens": 128,
+    "prompt_tokens_details": null,
+    "completion_tokens_details": null
+  },
+  "prompt_logprobs": null,
+  "prompt_token_ids": null,
+  "prompt_text": null,
+  "kv_transfer_params": null
+}

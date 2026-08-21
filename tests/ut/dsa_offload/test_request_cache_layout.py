@@ -128,7 +128,7 @@ def test_chunked_prefill_stays_prefill_until_the_next_decode_step() -> None:
     assert first_decode.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
 
 
-def test_short_prompt_stays_dense_until_exact_sparse_boundary() -> None:
+def test_short_prompt_bypasses_dsa_after_crossing_sparse_boundary() -> None:
     planner = _make_planner()
     request = _Request("req", 1000, 0, 0, 1000)
     prefill = planner.plan(
@@ -141,25 +141,25 @@ def test_short_prompt_stays_dense_until_exact_sparse_boundary() -> None:
     request.num_computed_tokens = 2047
     request.num_output_tokens = 1048
     request.num_tokens = 2048
-    dense = planner.plan(
+    bypass = planner.plan(
         request,
         num_new_tokens=1,
         max_model_len=16384,
     )
-    assert dense.stage == DSARequestCacheStage.DENSE_DECODE
-    planner.commit(dense)
+    assert bypass.stage == DSARequestCacheStage.BYPASS
+    planner.commit(bypass)
 
     request.num_computed_tokens = 2048
     request.num_output_tokens = 1049
     request.num_tokens = 2049
-    enter = planner.plan(
+    still_bypass = planner.plan(
         request,
         num_new_tokens=1,
         max_model_len=16384,
     )
-    assert enter.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
-    assert enter.tail_tokens == 1
-    assert enter.resident_valid_tokens == 2049
+    assert still_bypass.stage == DSARequestCacheStage.BYPASS
+    assert still_bypass.tail_tokens == 0
+    assert still_bypass.resident_valid_tokens == -1
 
 
 def test_plan_does_not_mutate_state_until_commit() -> None:
@@ -245,3 +245,104 @@ def test_sparse_request_cannot_move_back_to_dense() -> None:
             num_new_tokens=1,
             max_model_len=16384,
         )
+
+
+def test_keep_decode_kv_in_hbm_freezes_candidate_at_prompt_suffix() -> None:
+    planner = DSARequestCachePlanner(
+        block_size=128,
+        sparse_activation_tokens=6144,
+        prompt_budget_thresholds=(32768, 65536),
+        resident_budget_tokens=(6144, 10240, 12288),
+        keep_decode_kv_in_hbm=True,
+    )
+    request = _Request("req", 6145, 0, 0, 6145)
+    planner.commit(
+        planner.plan(
+            request,
+            num_new_tokens=request.num_prompt_tokens,
+            max_model_len=16384,
+        )
+    )
+
+    for logical_tokens in (6146, 6272, 6273, 6400, 8192):
+        request.num_computed_tokens = logical_tokens - 1
+        request.num_output_tokens = logical_tokens - request.num_prompt_tokens
+        request.num_tokens = logical_tokens
+        plan = planner.plan(
+            request,
+            num_new_tokens=1,
+            max_model_len=16384,
+        )
+
+        assert plan.stage.is_sparse_decode
+        assert plan.sparse_budget_tokens == 6144
+        assert plan.persistent_suffix_start_tokens == 6144
+        assert plan.persistent_suffix_valid_tokens == logical_tokens - 6144
+        assert plan.resident_valid_tokens == logical_tokens
+        planner.commit(plan)
+
+
+def test_keep_decode_kv_in_hbm_requires_prefix_to_cover_sparse_budget() -> None:
+    planner = DSARequestCachePlanner(
+        block_size=128,
+        sparse_activation_tokens=2048,
+        prompt_budget_thresholds=(4096,),
+        resident_budget_tokens=(4096, 4096),
+        keep_decode_kv_in_hbm=True,
+    )
+    request = _Request("req", 2050, 2050, 1, 4097)
+
+    plan = planner.plan(
+        request,
+        num_new_tokens=1,
+        max_model_len=16384,
+    )
+
+    assert plan.stage == DSARequestCacheStage.DENSE_DECODE
+    assert plan.sparse_budget_tokens == 0
+    assert plan.resident_valid_tokens == -1
+
+
+def test_keep_decode_kv_in_hbm_sizes_suffix_for_multi_token_forward() -> None:
+    planner = DSARequestCachePlanner(
+        block_size=128,
+        sparse_activation_tokens=2048,
+        prompt_budget_thresholds=(4096, 8192),
+        resident_budget_tokens=(2048, 4096, 6144),
+        keep_decode_kv_in_hbm=True,
+    )
+    request = _Request("req", 5000, 5000, 1, 5001)
+
+    plan = planner.plan(
+        request,
+        num_new_tokens=4,
+        max_model_len=16384,
+    )
+
+    assert plan.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
+    assert plan.persistent_suffix_start_tokens == 4992
+    assert plan.persistent_suffix_valid_tokens == 12
+    assert plan.resident_valid_tokens == 4108
+    assert plan.preserve_resident_tail_block
+
+
+def test_keep_decode_kv_in_hbm_preserves_prompt_tail_owner() -> None:
+    planner = DSARequestCachePlanner(
+        block_size=128,
+        sparse_activation_tokens=2048,
+        prompt_budget_thresholds=(),
+        resident_budget_tokens=(4096,),
+        keep_decode_kv_in_hbm=True,
+    )
+    request = _Request("req", 5001, 5120, 120, 5121)
+
+    plan = planner.plan(
+        request,
+        num_new_tokens=1,
+        max_model_len=16384,
+    )
+
+    assert plan.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
+    assert request.num_computed_tokens % 128 == 0
+    assert request.num_prompt_tokens % 128 != 0
+    assert plan.preserve_resident_tail_block

@@ -194,7 +194,13 @@ def test_batch_put_publishes_all_layers_into_fixed_tables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter, runtime, block_table, geometry = _make_adapter(monkeypatch)
-    packed_cache = torch.arange(32, dtype=torch.uint8).view(4, 2, 4)
+    packed_cache = torch.arange(64, dtype=torch.uint8).view(8, 2, 4)
+    synchronized_devices: list[torch.device] = []
+    monkeypatch.setattr(
+        adapter,
+        "_synchronize_device",
+        synchronized_devices.append,
+    )
 
     adapter.begin_batch_put(**_jobs(), geometry=geometry)
     adapter.write_batch_put_layer(
@@ -213,12 +219,21 @@ def test_batch_put_publishes_all_layers_into_fixed_tables(
     ]
     assert runtime.batch_put_calls[0]["input_offsets"] == [16, 24]
     assert runtime.batch_put_calls[0]["lengths"] == [8, 8]
+    source = runtime.batch_put_calls[0]["source"]
+    assert isinstance(source, torch.Tensor)
+    assert source.shape == (4, 2, 4)
+    assert source.data_ptr() == packed_cache.data_ptr()
+    assert (
+        source.untyped_storage().data_ptr()
+        == packed_cache.untyped_storage().data_ptr()
+    )
     assert updated == {0: 2}
     assert adapter.committed_block_count(0) == 2
     assert block_table.valid[[0, 1, 4, 5]].tolist() == [1, 1, 1, 1]
     assert block_table.lengths[[0, 1, 4, 5]].tolist() == [8, 8, 8, 8]
     assert block_table.addresses[0].item() == 0x100000
     assert runtime.released_handles == [(0, 1, 4, 5)]
+    assert synchronized_devices == []
 
 
 def test_failed_layer_is_freed_without_publication(

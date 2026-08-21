@@ -195,15 +195,35 @@ class DSARequestCachePlanner:
         if decode_ready and logical_context_tokens > self.sparse_activation_tokens:
             full_blocks_before_tail = (logical_context_tokens - 1) // self.block_size
             candidate_tokens = full_blocks_before_tail * self.block_size
-            if candidate_tokens >= target_budget:
+            persistent_suffix_start_tokens = (
+                (int(request.num_prompt_tokens) // self.block_size)
+                * self.block_size
+                if self.keep_decode_kv_in_hbm
+                else 0
+            )
+            can_enter_sparse = candidate_tokens >= target_budget
+            if self.keep_decode_kv_in_hbm:
+                # LIDU and KVAF own only the prompt-derived DRAM prefix in
+                # this mode. The growing HBM suffix must never be admitted as
+                # a sparse candidate just because decode has become long.
+                can_enter_sparse = (
+                    can_enter_sparse
+                    and persistent_suffix_start_tokens >= target_budget
+                )
+            if can_enter_sparse:
                 sparse_budget_tokens = target_budget
                 if self.keep_decode_kv_in_hbm:
-                    persistent_suffix_start_tokens = (
-                        int(request.num_prompt_tokens) // self.block_size
-                    ) * self.block_size
+                    # MTP may schedule more target tokens than are visible in
+                    # Request.num_tokens. Reserve the resident suffix through
+                    # the actual write horizon as well as logical context.
+                    resident_context_tokens = max(
+                        logical_context_tokens,
+                        indexer_tokens_need_slot,
+                    )
                     persistent_suffix_valid_tokens = max(
                         0,
-                        indexer_tokens_need_slot - persistent_suffix_start_tokens,
+                        resident_context_tokens
+                        - persistent_suffix_start_tokens,
                     )
                     resident_valid_tokens = (
                         sparse_budget_tokens + persistent_suffix_valid_tokens
@@ -231,7 +251,13 @@ class DSARequestCachePlanner:
 
         preserve_resident_tail_block = (
             next_stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
-            and int(request.num_computed_tokens) % self.block_size != 0
+            and (
+                int(request.num_prompt_tokens)
+                if self.keep_decode_kv_in_hbm
+                else int(request.num_computed_tokens)
+            )
+            % self.block_size
+            != 0
         )
         return DSARequestCachePlan(
             request_id=request.request_id,

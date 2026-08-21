@@ -1088,63 +1088,88 @@ def build_c8_attention_metadata(
     只写 ``attention_slots``；``resident_seq_lengths`` 为只读输入（唯一 writer 是
     子图 C 的 resolver，本模块只读取）。
 
-    ``attention_slots`` 布局与旧 KSC 的 metadata 输出保持一致：
-      前 ``_SPARSE_COUNT`` 项 = LIDU 输出的 ``destination_slots``；
-      之后 ``tail_count`` 项 = 连续范围 ``[cache_count, cache_count + tail_count)``，
-      其中 ``tail_count = clamp(actual - candidate, 0, max_tail_tokens)``；
+    ``attention_slots`` 支持旧 KSC 的两种 metadata 布局：
+      ``cache_tokens == 0`` 时，前 ``actual`` 项为全 resident 密集区间
+      ``[0, actual)``；否则前 ``_SPARSE_COUNT`` 项为 LIDU 输出的
+      ``destination_slots``，之后 ``tail_count`` 项为连续范围
+      ``[cache_count, cache_count + tail_count)``，其中
+      ``tail_count = clamp(actual - candidate, 0, max_tail_tokens)``；
       其余槽位填 ``-1``（无效 sentinel）。
 
-    ``attention_slots`` 是跨 layer / Decode step 复用的 scratch。旧 KSC 内核
-    每轮都会先清空整行；在子图 D 中拆出 metadata 构建后，也必须在这里保持
-    这一契约，避免 QSFA 读取上一次调用或 ``torch.empty`` 遗留的索引。
+    ``attention_slots`` 是跨 layer / Decode step 复用的 scratch。prefix 与
+    tail 每轮都会被完整覆盖，等价于旧 KSC 的 ClearAttentionRow + 有效值写入，
+    避免 QSFA 读取上一次调用或 ``torch.empty`` 遗留的索引。
     """
-    num_reqs = int(destination_slots.shape[0])
-    tail_capacity = int(attention_slots.shape[-1]) - _SPARSE_COUNT
-    if int(attention_slots.shape[1]) != 1:
+    attention_capacity = int(attention_slots.shape[-1])
+    tail_capacity = attention_capacity - _SPARSE_COUNT
+    if int(attention_slots.shape[1]) != 1 or tail_capacity < 0:
         raise ValueError(
             "C8 attention_slots must be [B,1,2048+tail], "
             f"got shape={tuple(attention_slots.shape)}"
         )
 
-    # 对齐旧 KSC 的 ClearAttentionRow：每轮先清空完整 scratch，再写入有效
-    # TopK 与 tail。不能依赖调用方初始化，因为该 tensor 会跨 Decode 复用。
-    attention_slots.fill_(-1)
-
-    # 前 2048 项 = LIDU destination_slots
-    attention_slots[:, 0, :_SPARSE_COUNT].copy_(
-        destination_slots[:, 0, :_SPARSE_COUNT]
+    attention_rows = attention_slots[:, 0, :]
+    cacheless_rows = cache_tokens.eq(0).unsqueeze(1)
+    dense_rows = (
+        cacheless_rows
+        & actual_seq_lengths_kv.ge(0).unsqueeze(1)
+        & actual_seq_lengths_kv.le(attention_capacity).unsqueeze(1)
     )
 
-    # tail 段：每行写 [cache_count, cache_count + tail_count)，
-    # 超出 tail_count 的槽位保持上面的 -1 sentinel。
-    tail_count = torch.clamp(
-        actual_seq_lengths_kv - candidate_lens,
-        min=0,
-        max=max_tail_tokens,
+    # cache_tokens == 0 时 LIDU 按契约输出全 -1；这里恢复旧 KSC 的
+    # 全 resident 回退。非 cacheless 行继续使用 LIDU sparse slots。
+    prefix_offsets = torch.arange(
+        _SPARSE_COUNT,
+        dtype=torch.int32,
+        device=attention_slots.device,
+    ).unsqueeze(0)
+    dense_prefix = dense_rows & (
+        prefix_offsets < actual_seq_lengths_kv.unsqueeze(1)
     )
-    row_index = torch.arange(
-        num_reqs, dtype=torch.int32, device=attention_slots.device
+    prefix_values = torch.where(
+        dense_prefix,
+        prefix_offsets,
+        torch.where(
+            cacheless_rows,
+            torch.full_like(prefix_offsets, -1),
+            destination_slots[:, 0, :_SPARSE_COUNT],
+        ),
     )
-    max_tail = int(tail_count.max().item()) if num_reqs else 0
-    max_tail = min(max_tail, tail_capacity, max_tail_tokens)
-    if max_tail > 0:
-        col_offsets = torch.arange(
-            max_tail, dtype=torch.int32, device=attention_slots.device
-        ).expand(num_reqs, max_tail)
-        col = _SPARSE_COUNT + col_offsets
-        valid = col_offsets < tail_count.unsqueeze(1)
-        values = cache_tokens.unsqueeze(1) + col_offsets
-        attention_slots[
-            row_index.unsqueeze(1).expand(num_reqs, max_tail), 0, col
-        ] = torch.where(
-            valid,
-            values.to(torch.int32),
-            torch.full_like(values, -1, dtype=torch.int32),
+    attention_rows[:, :_SPARSE_COUNT].copy_(prefix_values)
+
+    if tail_capacity > 0:
+        tail_offsets = torch.arange(
+            tail_capacity,
+            dtype=torch.int32,
+            device=attention_slots.device,
+        ).unsqueeze(0)
+        dense_tail = dense_rows & (
+            _SPARSE_COUNT + tail_offsets
+            < actual_seq_lengths_kv.unsqueeze(1)
         )
+        tail_count = torch.clamp(
+            actual_seq_lengths_kv - candidate_lens,
+            min=0,
+            max=max_tail_tokens,
+        )
+        sparse_tail = cache_tokens.ne(0).unsqueeze(1) & (
+            tail_offsets < tail_count.unsqueeze(1)
+        )
+        tail_values = torch.where(
+            dense_tail,
+            _SPARSE_COUNT + tail_offsets,
+            torch.where(
+                sparse_tail,
+                cache_tokens.unsqueeze(1) + tail_offsets,
+                torch.full_like(tail_offsets, -1),
+            ),
+        )
+        attention_rows[:, _SPARSE_COUNT:].copy_(tail_values)
 
     # 本函数不同步、无 D2H/CRC 诊断；stream/event 依赖由
     # DsaKvafAdapter::CompleteDirectGetAcrossRanks 在调用 QSFA 前建立。
     return resident_seq_lengths
+
 
 def prepare_kvaf_batch_get_inputs(
     *,
