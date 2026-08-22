@@ -121,6 +121,12 @@ env_variables: dict[str, Callable[[], Any]] = {
         "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL",
         os.getenv("KVAF_BATCH_PUT_KERNEL", ""),
     ),
+    # Remote KVAF CPU Runtime endpoint. KVAF 6abe must connect to this
+    # service before the NPU Runtime can initialize its remote DDR region.
+    "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR": lambda: os.getenv(
+        "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
+        os.getenv("KVAF_CPU_SERVICE_ADDR", ""),
+    ),
     # External KVAF NPU Runtime AIV configuration.
     "VLLM_ASCEND_KVAF_NPU_CORE_COUNT": lambda: int(
         os.getenv(

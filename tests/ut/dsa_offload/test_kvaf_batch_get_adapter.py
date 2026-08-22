@@ -53,10 +53,11 @@ def _make_adapter(
         }
 
     runtime.initialize = initialize
+    runtime.link_to = Mock()
     monkeypatch.setitem(
         sys.modules,
         "kvaf",
-        SimpleNamespace(NpuRuntime=lambda *_args: runtime),
+        SimpleNamespace(NpuRuntime=lambda *_args, **_kwargs: runtime),
     )
     monkeypatch.setenv(
         "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL",
@@ -68,8 +69,13 @@ def _make_adapter(
     )
     monkeypatch.setenv("VLLM_ASCEND_KVAF_NPU_CORE_COUNT", "1")
     monkeypatch.setenv("VLLM_ASCEND_KVAF_JETTYS_PER_CORE", "2")
+    monkeypatch.setenv(
+        "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
+        "192.0.2.1:28999",
+    )
     monkeypatch.setattr(torch.npu, "set_device", lambda _device_id: None)
     adapter = KvafAdapter(device_id=0)
+    runtime.link_to.assert_called_once_with("192.0.2.1:28999")
     adapter.initialize_dsa_row_index(
         layout=_layout(),
         ddr_bytes=1 << 20,

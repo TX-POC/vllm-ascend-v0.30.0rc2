@@ -77,15 +77,30 @@ class KvafAdapter:
                 "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL must point to the "
                 "external KVAF BatchPut kernel object"
             )
+        cpu_service_addr = envs.VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR.strip()
+        if not cpu_service_addr:
+            raise RuntimeError(
+                "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR must name the remote "
+                "KVAF CPU service, for example 141.61.92.77:28999"
+            )
         device_id = int(device_id)
         torch.npu.set_device(device_id)
         self.runtime = npu_runtime(
             batch_get_kernel,
+            DSA_PACKED_KV_DIM,
+            DSA_REQUIRED_CACHE_BLOCK_SIZE,
             device_id,
             envs.VLLM_ASCEND_KVAF_NPU_CORE_COUNT,
             batch_put_kernel,
             envs.VLLM_ASCEND_KVAF_JETTYS_PER_CORE,
         )
+        link_to = getattr(self.runtime, "link_to", None)
+        if not callable(link_to):
+            raise RuntimeError(
+                "The external kvaf.NpuRuntime must provide link_to(); "
+                "use KVAF 6abe076 or a compatible CPU-service runtime"
+            )
+        link_to(cpu_service_addr)
         self._layout: PackedKvLayout | None = None
         self._geometry: DsaRowIndexGeometry | None = None
         self._device: torch.device | None = None

@@ -21,12 +21,18 @@ class _FakeKvafRuntime:
     def __init__(self, *, fail_batch_put_call: int | None = None) -> None:
         self.initialized = False
         self.remote_region: dict[str, int] = {}
+        self.linked_to: list[str] = []
         self.fail_batch_put_call = fail_batch_put_call
         self.batch_put_calls: list[dict[str, object]] = []
         self.batch_get_calls: list[tuple[object, ...]] = []
         self.batch_free_calls: list[list[int]] = []
         self.released_handles: list[tuple[int, ...]] = []
         self.committed: dict[int, tuple[int, int]] = {}
+
+    def link_to(self, address: str) -> None:
+        if self.initialized:
+            raise RuntimeError("link_to must precede initialize")
+        self.linked_to.append(address)
 
     def initialize(self, ddr_bytes: int, slot_size: int) -> None:
         self.initialized = True
@@ -141,17 +147,24 @@ def _make_adapter(
     )
     monkeypatch.setenv("VLLM_ASCEND_KVAF_NPU_CORE_COUNT", "1")
     monkeypatch.setenv("VLLM_ASCEND_KVAF_JETTYS_PER_CORE", "2")
+    monkeypatch.setenv(
+        "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
+        "192.0.2.1:28999",
+    )
     monkeypatch.setattr(torch.npu, "set_device", lambda _device_id: None)
     adapter = KvafAdapter(device_id=3)
     assert constructor_args == [
         (
             "/tmp/kvaf_batch_get.o",
+            656,
+            128,
             3,
             1,
             "/tmp/kvaf_batch_put.o",
             2,
         )
     ]
+    assert runtime.linked_to == ["192.0.2.1:28999"]
     layout = PackedKvLayout(
         layout_id="test",
         tokens_per_logical_block=2,

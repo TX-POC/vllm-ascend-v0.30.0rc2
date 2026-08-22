@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -97,6 +98,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--put-batch-size", type=int, default=128)
     parser.add_argument("--npu-cores", type=int, default=32)
     parser.add_argument("--jettys-per-core", type=int, default=2)
+    parser.add_argument(
+        "--cpu-service-addr",
+        default=os.getenv(
+            "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
+            os.getenv("KVAF_CPU_SERVICE_ADDR", ""),
+        ),
+        help="KVAF CPU service endpoint, for example 141.61.92.77:28999",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--batch-get-kernel",
@@ -107,8 +116,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-put-kernel",
         type=Path,
-        default=None,
-        help="Optional kvaf_execute_batch_put_kernels.o; empty uses KVAF's mock Put backend",
+        required=True,
+        help="Built kvaf_execute_batch_put_kernels.o for real remote DDR population",
     )
     parser.add_argument(
         "--max-ddr-gib",
@@ -139,9 +148,14 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.max_ddr_gib <= 0:
         raise ValueError("max-ddr-gib must be positive")
+    if not args.cpu_service_addr:
+        raise ValueError(
+            "--cpu-service-addr or KVAF_CPU_SERVICE_ADDR must name the "
+            "remote KVAF CPU service"
+        )
     if not args.batch_get_kernel.is_file():
         raise FileNotFoundError(args.batch_get_kernel)
-    if args.batch_put_kernel is not None and not args.batch_put_kernel.is_file():
+    if not args.batch_put_kernel.is_file():
         raise FileNotFoundError(args.batch_put_kernel)
     if not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("KVAF was not built with KVAF_ENABLE_AIV_BATCH_GET=ON")
@@ -450,16 +464,23 @@ def main() -> None:
         )
 
     device_id = 0 if device.index is None else int(device.index)
-    batch_put_kernel = (
-        "" if args.batch_put_kernel is None else str(args.batch_put_kernel)
-    )
+    batch_put_kernel = str(args.batch_put_kernel)
     runtime = kvaf.NpuRuntime(
         str(args.batch_get_kernel),
+        PACKED_TOKEN_BYTES,
+        BLOCK_SIZE,
         device_id,
         args.npu_cores,
         batch_put_kernel,
         args.jettys_per_core,
     )
+    link_to = getattr(runtime, "link_to", None)
+    if not callable(link_to):
+        raise RuntimeError(
+            "KVAF NpuRuntime must provide link_to(); use KVAF 6abe076 or "
+            "a compatible CPU-service runtime"
+        )
+    link_to(str(args.cpu_service_addr))
     inputs, outputs, packed_output = make_prepare_case(args, device)
     handle = None
     device_table = None
@@ -474,6 +495,7 @@ def main() -> None:
             f"qcap={args.qcap} table_capacity={table_capacity} "
             f"ddr_gib={ddr_gib:.3f} miss_count={args.miss_count} "
             f"source_layout={args.source_layout} "
+            f"cpu_service_addr={args.cpu_service_addr} "
             f"active_tokens={active_tokens} warmup={args.warmup} "
             f"iters={args.iters} npu_cores={args.npu_cores} "
             f"jettys_per_core={args.jettys_per_core} "
