@@ -48,7 +48,9 @@ setup(
                 str(CSRC / "ops.cpp"),
                 str(CSRC / "full_block_dump.cpp"),
                 str(CSRC / "packed_full_block_dump.cpp"),
-                str(CSRC / "op_api_common.cpp"),
+                # op_api_common.h is the current self-contained ACLNN launcher.
+                # Its old .cpp companion targets a removed torch_npu-private ABI
+                # and is not referenced by any standalone registration source.
             ],
             extra_compile_args=[
                 f"-I{TORCH_NPU_ROOT / 'include' / 'third_party' / 'acl' / 'inc'}",
