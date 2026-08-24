@@ -16,11 +16,17 @@ producer if this overlap envelope is favourable.
 All one-time work (KVAF link/init, DDR population, access-table creation,
 official Top-K prelude, descriptor lowering, and correctness checks) is
 outside the timed regions.
+
+``--enable-stream-resource-slice`` is a separate eager capability probe.  It
+uses CANN's public per-stream Cube/Vector limits and verifies the limits seen
+by the submitting host thread.  It does not claim fixed physical core IDs;
+that requires a later device-side core-ID diagnostic.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib
 import math
 import os
@@ -82,6 +88,202 @@ class PrepareOutputs:
     resident_seq_lengths: torch.Tensor
 
 
+@dataclass(frozen=True)
+class StreamResourceState:
+    """CANN's configured or thread-bound resource view for one stream."""
+
+    label: str
+    stream_handle: int
+    cube_cores: int
+    vector_cores: int
+
+
+class AclStreamResourceApi:
+    """Small benchmark-only binding for CANN's public resource APIs."""
+
+    _CUBE_CORE = 0
+    _VECTOR_CORE = 1
+
+    def __init__(self) -> None:
+        self.library_name = "libascendcl.so"
+        try:
+            self._library = ctypes.CDLL(self.library_name)
+        except OSError as error:
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_UNAVAILABLE "
+                f"cannot_load={self.library_name} error={error}"
+            ) from error
+        self._set_stream_limit = self._require_symbol(
+            "aclrtSetStreamResLimit",
+            (ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32),
+        )
+        self._get_stream_limit = self._require_symbol(
+            "aclrtGetStreamResLimit",
+            (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint32)),
+        )
+        self._use_stream_in_current_thread = self._require_symbol(
+            "aclrtUseStreamResInCurrentThread",
+            (ctypes.c_void_p,),
+        )
+        self._get_current_thread_limit = self._require_symbol(
+            "aclrtGetResInCurrentThread",
+            (ctypes.c_int, ctypes.POINTER(ctypes.c_uint32)),
+        )
+
+    def _require_symbol(
+        self,
+        name: str,
+        argtypes: tuple[object, ...],
+    ) -> object:
+        try:
+            function = getattr(self._library, name)
+        except AttributeError as error:
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_UNAVAILABLE "
+                f"missing_symbol={name} library={self.library_name}"
+            ) from error
+        function.argtypes = list(argtypes)
+        function.restype = ctypes.c_int
+        return function
+
+    @staticmethod
+    def _stream_handle(stream: object) -> tuple[ctypes.c_void_p, int]:
+        raw_handle = getattr(stream, "npu_stream", None)
+        if raw_handle is None:
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_UNAVAILABLE stream has no npu_stream"
+            )
+        try:
+            handle = int(getattr(raw_handle, "value", raw_handle))
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_UNAVAILABLE cannot_convert_stream_handle"
+            ) from None
+        return ctypes.c_void_p(handle), handle
+
+    @staticmethod
+    def _check_status(operation: str, status: int, *, label: str) -> None:
+        if status != 0:
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_FAILED "
+                f"operation={operation} label={label} acl_error={status}"
+            )
+
+    def _read_value(
+        self,
+        function: object,
+        resource_type: int,
+        *,
+        label: str,
+        stream_handle: ctypes.c_void_p | None = None,
+    ) -> int:
+        value = ctypes.c_uint32()
+        if stream_handle is None:
+            status = int(function(resource_type, ctypes.byref(value)))
+            operation = "aclrtGetResInCurrentThread"
+        else:
+            status = int(function(stream_handle, resource_type, ctypes.byref(value)))
+            operation = "aclrtGetStreamResLimit"
+        self._check_status(operation, status, label=label)
+        return int(value.value)
+
+    def configure(
+        self,
+        stream: object,
+        *,
+        label: str,
+        cube_cores: int | None,
+        vector_cores: int | None,
+    ) -> StreamResourceState:
+        if cube_cores is None and vector_cores is None:
+            raise ValueError("at least one stream resource limit is required")
+        stream_handle, handle_value = self._stream_handle(stream)
+        for resource_type, requested in (
+            (self._CUBE_CORE, cube_cores),
+            (self._VECTOR_CORE, vector_cores),
+        ):
+            if requested is None:
+                continue
+            status = int(
+                self._set_stream_limit(
+                    stream_handle,
+                    resource_type,
+                    ctypes.c_uint32(requested),
+                )
+            )
+            self._check_status("aclrtSetStreamResLimit", status, label=label)
+        state = StreamResourceState(
+            label=label,
+            stream_handle=handle_value,
+            cube_cores=self._read_value(
+                self._get_stream_limit,
+                self._CUBE_CORE,
+                label=label,
+                stream_handle=stream_handle,
+            ),
+            vector_cores=self._read_value(
+                self._get_stream_limit,
+                self._VECTOR_CORE,
+                label=label,
+                stream_handle=stream_handle,
+            ),
+        )
+        if cube_cores is not None and state.cube_cores != cube_cores:
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_FAILED "
+                f"label={label} requested_cube={cube_cores} "
+                f"observed_cube={state.cube_cores}"
+            )
+        if vector_cores is not None and state.vector_cores != vector_cores:
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_FAILED "
+                f"label={label} requested_vector={vector_cores} "
+                f"observed_vector={state.vector_cores}"
+            )
+        return state
+
+    def bind_current_thread(
+        self,
+        stream: object,
+        *,
+        label: str,
+        expected_cube_cores: int | None,
+        expected_vector_cores: int | None,
+    ) -> StreamResourceState:
+        stream_handle, handle_value = self._stream_handle(stream)
+        status = int(self._use_stream_in_current_thread(stream_handle))
+        self._check_status("aclrtUseStreamResInCurrentThread", status, label=label)
+        state = StreamResourceState(
+            label=label,
+            stream_handle=handle_value,
+            cube_cores=self._read_value(
+                self._get_current_thread_limit, self._CUBE_CORE, label=label
+            ),
+            vector_cores=self._read_value(
+                self._get_current_thread_limit, self._VECTOR_CORE, label=label
+            ),
+        )
+        if (
+            expected_cube_cores is not None
+            and state.cube_cores != expected_cube_cores
+        ):
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_FAILED "
+                f"label={label} thread_cube={state.cube_cores} "
+                f"expected_cube={expected_cube_cores}"
+            )
+        if (
+            expected_vector_cores is not None
+            and state.vector_cores != expected_vector_cores
+        ):
+            raise RuntimeError(
+                "C8_KVAF_RESOURCE_SLICE_FAILED "
+                f"label={label} thread_vector={state.vector_cores} "
+                f"expected_vector={expected_vector_cores}"
+            )
+        return state
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
@@ -97,6 +299,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--put-batch-size", type=int, default=128)
     parser.add_argument("--npu-cores", type=int, default=32)
     parser.add_argument("--jettys-per-core", type=int, default=1)
+    parser.add_argument(
+        "--enable-stream-resource-slice",
+        action="store_true",
+        help=(
+            "Enable the eager CANN stream-resource capability probe. "
+            "This is not physical core-ID pinning."
+        ),
+    )
+    parser.add_argument(
+        "--li-cube-cores",
+        type=int,
+        default=31,
+        help="LI stream Cube-core limit when --enable-stream-resource-slice.",
+    )
+    parser.add_argument(
+        "--li-vector-cores",
+        type=int,
+        default=62,
+        help="LI stream Vector-core limit when --enable-stream-resource-slice.",
+    )
+    parser.add_argument(
+        "--get-vector-cores",
+        type=int,
+        default=2,
+        help="Get stream Vector-core limit when --enable-stream-resource-slice.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--batch-get-kernel",
@@ -144,6 +372,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--warmup must be non-negative; --iters and --put-batch-size positive")
     if args.npu_cores <= 0 or not 1 <= args.jettys_per_core <= 2:
         raise ValueError("--npu-cores must be positive and --jettys-per-core must be 1 or 2")
+    if args.enable_stream_resource_slice:
+        if min(
+            args.li_cube_cores,
+            args.li_vector_cores,
+            args.get_vector_cores,
+        ) <= 0:
+            raise ValueError("stream-resource limits must be positive")
+        if args.npu_cores != args.get_vector_cores:
+            raise ValueError(
+                "--npu-cores must equal --get-vector-cores when "
+                "--enable-stream-resource-slice is set; otherwise the Get "
+                "blockDim can exceed its Vector resource slice"
+            )
     if args.max_ddr_gib <= 0:
         raise ValueError("--max-ddr-gib must be positive")
     if not args.cpu_service_addr:
@@ -776,9 +1017,85 @@ def main() -> None:
     active_tokens = args.batch_size * args.miss_count
     c8_inputs = make_disjoint_c8_inputs(args, device)
     runtime = create_remote_runtime(args, device_id)
+    main_stream = torch.npu.current_stream()
+    copy_stream = torch.npu.Stream()
     handle = None
     keys: list[int] = []
     try:
+        resource_api: AclStreamResourceApi | None = None
+        printed_resource_binds: set[str] = set()
+        if args.enable_stream_resource_slice:
+            resource_api = AclStreamResourceApi()
+            li_resource_state = resource_api.configure(
+                main_stream,
+                label="li",
+                cube_cores=args.li_cube_cores,
+                vector_cores=args.li_vector_cores,
+            )
+            get_resource_state = resource_api.configure(
+                copy_stream,
+                label="get",
+                cube_cores=None,
+                vector_cores=args.get_vector_cores,
+            )
+            print(
+                "C8_KVAF_RESOURCE_SLICE_CONFIG "
+                f"library={resource_api.library_name} "
+                "physical_core_id_proof=0 "
+                f"li_stream=0x{li_resource_state.stream_handle:x} "
+                f"li_cube_limit={li_resource_state.cube_cores} "
+                f"li_vector_limit={li_resource_state.vector_cores} "
+                f"get_stream=0x{get_resource_state.stream_handle:x} "
+                f"get_cube_limit={get_resource_state.cube_cores} "
+                f"get_vector_limit={get_resource_state.vector_cores}",
+                flush=True,
+            )
+
+        def bind_resource_slice(
+            stream: object,
+            *,
+            label: str,
+            expected_cube_cores: int | None,
+            expected_vector_cores: int | None,
+        ) -> None:
+            if resource_api is None:
+                return
+            thread_state = resource_api.bind_current_thread(
+                stream,
+                label=label,
+                expected_cube_cores=expected_cube_cores,
+                expected_vector_cores=expected_vector_cores,
+            )
+            if label not in printed_resource_binds:
+                printed_resource_binds.add(label)
+                print(
+                    "C8_KVAF_RESOURCE_SLICE_BIND "
+                    f"label={label} stream=0x{thread_state.stream_handle:x} "
+                    f"thread_cube_limit={thread_state.cube_cores} "
+                    f"thread_vector_limit={thread_state.vector_cores}",
+                    flush=True,
+                )
+
+        def launch_li() -> torch.Tensor:
+            # Set + bind precede the first official LI invocation. This is
+            # deliberately before its host tiler can observe full-card cores.
+            with torch.npu.stream(main_stream):
+                bind_resource_slice(
+                    main_stream,
+                    label="li",
+                    expected_cube_cores=(
+                        args.li_cube_cores
+                        if args.enable_stream_resource_slice
+                        else None
+                    ),
+                    expected_vector_cores=(
+                        args.li_vector_cores
+                        if args.enable_stream_resource_slice
+                        else None
+                    ),
+                )
+                return official_c8_lightning_indexer(c8_inputs)
+
         print(
             "C8_KVAF_OVERLAP_CONFIG "
             f"device={device} device_name={device_name!r} "
@@ -790,13 +1107,15 @@ def main() -> None:
             f"cpu_service_addr={args.cpu_service_addr} "
             f"ddr_gib={ddr_gib:.3f} warmup={args.warmup} iters={args.iters} "
             f"npu_cores={args.npu_cores} jettys_per_core={args.jettys_per_core} "
+            "execution_mode="
+            f"{'stream_resource_slice' if args.enable_stream_resource_slice else 'baseline'} "
             f"dsa_registration_backend={dsa_registration_backend}",
             flush=True,
         )
 
         # This is deliberately outside timing: it makes a descriptor from
         # genuine C8 Top-K IDs, then gives the overlap experiment stable input.
-        exact_topk = official_c8_lightning_indexer(c8_inputs)
+        exact_topk = launch_li()
         validate_official_topk(exact_topk, args.source_len)
         inputs, outputs, packed_output = make_prepare_case(args, device, exact_topk)
         launch_prepare(args, inputs, outputs)
@@ -806,10 +1125,18 @@ def main() -> None:
         handle, addresses, valid, keys = populate_kvaf(
             args, runtime, device, table_capacity
         )
-        main_stream = torch.npu.current_stream()
-        copy_stream = torch.npu.Stream()
 
         def launch_get(stream: object) -> None:
+            bind_resource_slice(
+                stream,
+                label="get",
+                expected_cube_cores=None,
+                expected_vector_cores=(
+                    args.get_vector_cores
+                    if args.enable_stream_resource_slice
+                    else None
+                ),
+            )
             runtime.batch_get(
                 addresses,
                 valid,
@@ -822,8 +1149,9 @@ def main() -> None:
                 False,
             )
 
-        launch_get(main_stream)
-        main_stream.synchronize()
+        with torch.npu.stream(copy_stream):
+            launch_get(copy_stream)
+        copy_stream.synchronize()
         validate_batch_get(outputs, packed_output)
         print(
             "C8_KVAF_OVERLAP_CORRECTNESS "
@@ -831,7 +1159,6 @@ def main() -> None:
             flush=True,
         )
 
-        launch_li = lambda: official_c8_lightning_indexer(c8_inputs)
         li_samples = time_li_only(
             launch_li,
             main_stream,
@@ -905,6 +1232,16 @@ def main() -> None:
             f"{concurrent_p90 - per_stream_p90_reference:.3f}",
             flush=True,
         )
+        if args.enable_stream_resource_slice:
+            print(
+                "C8_KVAF_RESOURCE_SLICE_RESULT "
+                f"serial_p90_us={serial_p90:.3f} "
+                f"concurrent_p90_us={concurrent_p90:.3f} "
+                f"per_stream_p90_reference_us={per_stream_p90_reference:.3f} "
+                f"overlap_saved_p90_us={serial_p90 - concurrent_p90:.3f}",
+                flush=True,
+            )
+            print("C8_KVAF_RESOURCE_SLICE_PASS", flush=True)
         print("C8_KVAF_OVERLAP_PASS", flush=True)
     finally:
         if handle is not None:
