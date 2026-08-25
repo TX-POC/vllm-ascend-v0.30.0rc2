@@ -193,24 +193,28 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
         "${ASCEND_CANN_PACKAGE_PATH:-}" \
         "${ASCEND_HOME_PATH:-}" \
         "${CANN_INSTALL_PATH:-}"; do
-        if [[ -n "${candidate}" && \
-              -f "${candidate}/simt_api/device_atomic_functions.h" ]]; then
-            KVAF_SIMT_ROOT="${candidate}"
-            break
+        if [[ -z "${candidate}" ]]; then
+            continue
         fi
-        if [[ -n "${candidate}" && \
-              -f "${candidate}/include/simt_api/device_atomic_functions.h" ]]; then
-            KVAF_SIMT_ROOT="${candidate}/include"
-            break
-        fi
-        if [[ -n "${candidate}" && \
-              -f "${candidate}/include/ascendc/simt_api/device_atomic_functions.h" ]]; then
-            KVAF_SIMT_ROOT="${candidate}/include/ascendc"
-            break
-        fi
-        if [[ -n "${candidate}" && \
-              -f "${candidate}/tools/tikcpp/tikcfw/lib/simt_api/device_atomic_functions.h" ]]; then
-            KVAF_SIMT_ROOT="${candidate}/tools/tikcpp/tikcfw/lib"
+        # CANN packages use more than one toolkit layout.  In particular,
+        # the A5 9.1 image exposes SIMT under
+        # <cann>/aarch64-linux/asc/include/simt_api, while development
+        # toolkits commonly use either <cann>/include or
+        # <cann>/include/ascendc.  Every item below is the directory directly
+        # above simt_api, so the subsequent copy is layout-independent.
+        for simt_root in \
+            "${candidate}" \
+            "${candidate}/include" \
+            "${candidate}/include/ascendc" \
+            "${candidate}/aarch64-linux/asc/include" \
+            "${candidate}/aarch64-linux/asc/include/ascendc" \
+            "${candidate}/tools/tikcpp/tikcfw/lib"; do
+            if [[ -f "${simt_root}/simt_api/device_atomic_functions.h" ]]; then
+                KVAF_SIMT_ROOT="${simt_root}"
+                break
+            fi
+        done
+        if [[ -n "${KVAF_SIMT_ROOT}" ]]; then
             break
         fi
     done
