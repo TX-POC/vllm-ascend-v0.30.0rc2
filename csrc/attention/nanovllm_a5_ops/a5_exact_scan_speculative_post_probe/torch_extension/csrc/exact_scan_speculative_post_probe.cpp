@@ -97,3 +97,9 @@ TORCH_LIBRARY_IMPL(a5_exact_scan_probe, Meta, m)
 {
     m.impl("exact_scan_speculative_post_probe", &ProbeMeta);
 }
+
+// The TORCH_LIBRARY blocks register schemas during shared-library loading,
+// but Python still requires this extension-module entry point before it can
+// load ``nanovllm_exact_scan_probe._C``.  It intentionally exports no Python
+// methods: importing it is sufficient to run the Torch registrations above.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
