@@ -198,7 +198,9 @@ namespace ops {
 static ge::graphStatus InferA5ExactScanSpeculativeGetShape(
     gert::InferShapeContext* context)
 {
-    if (context == nullptr || context->GetInputShape(kLiScores) == nullptr) {
+    if (context == nullptr || context->GetInputShape(kLiScores) == nullptr ||
+        context->GetInputShape(kPackedOutput) == nullptr ||
+        context->GetInputShape(kPipelineState) == nullptr) {
         return ge::GRAPH_FAILED;
     }
     for (size_t output = 0; output <= kPipelineStateOut; ++output) {

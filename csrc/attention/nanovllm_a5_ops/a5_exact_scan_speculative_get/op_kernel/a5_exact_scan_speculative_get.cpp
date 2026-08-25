@@ -444,16 +444,21 @@ private:
 
     __aicore__ inline uint64_t ValidateControl(uint32_t lane) const
     {
-        const KvafFusedBatchGetControl& control = *fusedGetControl_;
-        if (control.magic != KVAF_FUSED_BATCH_GET_CONTROL_MAGIC ||
-            control.version != KVAF_FUSED_BATCH_GET_CONTROL_VERSION ||
-            control.channel_entity == 0U || control.queue_state == 0U ||
-            control.core_status == 0U || control.output == 0U ||
-            control.output != reinterpret_cast<uint64_t>(packedOutput_) ||
-            control.output_rows != tiling_->outputRows ||
-            control.block_count != kGetLaneCount ||
-            control.jettys_per_core != 1U ||
-            control.block_bytes != kPackedEntryBytes || lane >= kGetLaneCount) {
+        // fusedGetControl_ is an HBM (__gm__) object.  AscendC must load its
+        // scalar fields through the GM pointer; binding it to an ordinary C++
+        // reference would discard the address-space qualifier at compilation.
+        if (fusedGetControl_->magic != KVAF_FUSED_BATCH_GET_CONTROL_MAGIC ||
+            fusedGetControl_->version != KVAF_FUSED_BATCH_GET_CONTROL_VERSION ||
+            fusedGetControl_->channel_entity == 0U ||
+            fusedGetControl_->queue_state == 0U ||
+            fusedGetControl_->core_status == 0U ||
+            fusedGetControl_->output == 0U ||
+            fusedGetControl_->output != reinterpret_cast<uint64_t>(packedOutput_) ||
+            fusedGetControl_->output_rows != tiling_->outputRows ||
+            fusedGetControl_->block_count != kGetLaneCount ||
+            fusedGetControl_->jettys_per_core != 1U ||
+            fusedGetControl_->block_bytes != kPackedEntryBytes ||
+            lane >= kGetLaneCount) {
             return kGetResultProtocolError;
         }
         return 0U;
@@ -470,7 +475,14 @@ private:
         if (controlError != 0U) {
             return controlError;
         }
-        const KvafFusedBatchGetControl& control = *fusedGetControl_;
+        // The lifecycle contract freezes this control block for the whole
+        // graph replay.  Materialize only the scalar addresses needed below
+        // from GM into AIV-local registers; do not form a non-GM struct
+        // reference to HBM memory.
+        const uint64_t outputAddress = fusedGetControl_->output;
+        const uint64_t coreStatusAddress = fusedGetControl_->core_status;
+        const uint64_t channelEntityAddress = fusedGetControl_->channel_entity;
+        const uint64_t queueStateAddress = fusedGetControl_->queue_state;
         __gm__ int32_t* laneIndices =
             getIndices_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
         __gm__ int32_t* laneOffsets =
@@ -487,7 +499,7 @@ private:
 
         __gm__ KvafBatchGetCoreStatus* status =
             reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(
-                control.core_status +
+                coreStatusAddress +
                 static_cast<uint64_t>(lane) * sizeof(KvafBatchGetCoreStatus));
         // Retain the current KVAF profile layout. It yields an exact CQ wait
         // cycle count without introducing a host-side profiler in the hot path.
@@ -502,12 +514,12 @@ private:
         args.offsets = reinterpret_cast<uint64_t>(laneOffsets);
         args.mask = reinterpret_cast<uint64_t>(laneMask);
         args.output_indices = reinterpret_cast<uint64_t>(laneOutputIndices);
-        args.output = control.output;
+        args.output = outputAddress;
         args.core_status = reinterpret_cast<uint64_t>(status);
-        args.channel_entity = control.channel_entity +
+        args.channel_entity = channelEntityAddress +
                               static_cast<uint64_t>(lane) *
                                   sizeof(KvafBatchGetDirectUrmaEntity);
-        args.queue_state = control.queue_state +
+        args.queue_state = queueStateAddress +
                            static_cast<uint64_t>(lane) *
                                sizeof(KvafBatchGetQueueState);
         args.table_capacity = tiling_->tableCapacity;
