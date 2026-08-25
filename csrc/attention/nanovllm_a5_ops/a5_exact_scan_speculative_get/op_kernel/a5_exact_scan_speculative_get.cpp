@@ -2,10 +2,9 @@
  * Device-resident P1 ExactScan + full SpeculativeGet.
  *
  * Inputs `li_scores` are deliberately the upstream Lightning score seam, not
- * a replacement implementation of official C8 LI.  Each of the first 62 AIV
- * lanes performs the exact threshold/resident decision and publishes only
- * misses to two fixed SPSC rings.  The final two AIV lanes own one Direct-HCCP
- * queue each and execute the current full KVAF Get transaction:
+ * a replacement implementation of official C8 LI.  Task lanes 0 and 1 own
+ * the two Direct-HCCP queues.  Task lanes 2 through 63 perform the exact
+ * threshold/resident decision and publish misses to two fixed SPSC rings.
  *
  *   compacted miss descriptors -> WQE/SQ -> doorbell -> CQ terminal wait.
  *
@@ -26,7 +25,12 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kProducerCount = 62;
 constexpr uint32_t kGetLaneCount = 2;
-constexpr uint32_t kGetAivBegin = kProducerCount;
+// The Direct-HCCP entities are created by the existing KVAF two-worker
+// runtime.  Keep their device task lanes at 0 and 1, the same positions used
+// by the standalone AIV-only Get kernel.  The remaining task lanes are
+// disjoint ExactScan producers.  This is a task-lane partition, not an
+// unsupported claim about public physical-core affinity.
+constexpr uint32_t kProducerAivBegin = kGetLaneCount;
 constexpr uint32_t kRingSlots = 2;
 constexpr uint32_t kRecordsPerRingSlot = 32;
 constexpr uint32_t kRecordWords = 3;
@@ -159,14 +163,14 @@ public:
     __aicore__ inline void Process()
     {
         if ASCEND_IS_AIV {
-            const uint32_t logicalAiv = GetBlockIdx();
-            if (logicalAiv < tiling_->producerCount) {
-                ProcessExactScanProducer(logicalAiv);
-            } else {
-                const uint32_t lane = logicalAiv - kGetAivBegin;
-                if (lane < tiling_->getLaneCount) {
-                    ProcessFullGetLane(lane);
-                }
+            const uint32_t taskLane = GetBlockIdx();
+            if (taskLane < tiling_->getLaneCount) {
+                ProcessFullGetLane(taskLane);
+                return;
+            }
+            const uint32_t producer = taskLane - kProducerAivBegin;
+            if (producer < tiling_->producerCount) {
+                ProcessExactScanProducer(producer);
             }
         }
     }
@@ -248,8 +252,11 @@ private:
     __aicore__ inline void ProcessExactScanProducer(uint32_t producer)
     {
         const uint64_t epoch = static_cast<uint64_t>(frameEpoch_[0]);
-        roleTrace_[producer] = kRoleTraceExactScanBase +
-                               static_cast<int32_t>(producer);
+        // Keep roleTrace in task-lane order so the P1 test can prove the two
+        // Direct-HCCP workers occupy task lanes 0/1 rather than merely prove
+        // that two workers existed somewhere in the launch.
+        roleTrace_[kProducerAivBegin + producer] =
+            kRoleTraceExactScanBase + static_cast<int32_t>(producer);
         if (epoch == 0U) {
             WriteProducerStats(producer, 0U, 0U, 0U, 0U,
                                static_cast<uint64_t>(-1), 0U,
@@ -489,14 +496,6 @@ private:
             getOffsets_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
         __gm__ int32_t* laneOutputIndices =
             getOutputIndices_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
-        __gm__ uint8_t* laneMask =
-            getMask_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
-        for (uint32_t index = requestCount; index < kGetWaveRecords; ++index) {
-            laneMask[index] = 0U;
-        }
-        FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(laneMask),
-                     kGetWaveRecords * sizeof(uint8_t));
-
         __gm__ KvafBatchGetCoreStatus* status =
             reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(
                 coreStatusAddress +
@@ -512,7 +511,10 @@ private:
         args.valid_table = reinterpret_cast<uint64_t>(validTable_);
         args.indices = reinterpret_cast<uint64_t>(laneIndices);
         args.offsets = reinterpret_cast<uint64_t>(laneOffsets);
-        args.mask = reinterpret_cast<uint64_t>(laneMask);
+        // The dense helper consumes only [0, requestCount).  `getMask_` is
+        // retained as a debug output of the producer/consumer bridge, but it
+        // is deliberately not part of this Direct-HCCP submission path.
+        args.mask = 0U;
         args.output_indices = reinterpret_cast<uint64_t>(laneOutputIndices);
         args.output = outputAddress;
         args.core_status = reinterpret_cast<uint64_t>(status);
@@ -529,7 +531,8 @@ private:
         args.block_count = 1U;
         args.jettys_per_core = 1U;
 
-        kvaf_fused_get::RunKvafFullBatchGetCore(args, 0U);
+        kvaf_fused_get::RunKvafDenseBatchGetCore256(
+            args, requestCount, 0U);
         FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(status),
                      sizeof(KvafBatchGetCoreStatus));
         if (*firstDoorbell == 0U) {
@@ -542,8 +545,7 @@ private:
     __aicore__ inline void ProcessFullGetLane(uint32_t lane)
     {
         const uint64_t epoch = static_cast<uint64_t>(frameEpoch_[0]);
-        roleTrace_[kGetAivBegin + lane] =
-            kRoleTraceGetBase + static_cast<int32_t>(lane);
+        roleTrace_[lane] = kRoleTraceGetBase + static_cast<int32_t>(lane);
         __gm__ int64_t* stats = getStats_ +
                                 static_cast<uint64_t>(lane) * kGetStatColumns;
         uint64_t requested = 0U;
@@ -648,7 +650,10 @@ extern "C" __global__ __aicore__ void a5_exact_scan_speculative_get(
     // output parameters so CANN graph dataflow records both writes.
     (void)packedOutputOut;
     (void)pipelineStateOut;
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    // ExactScan and the full HCCP Get path are both AIV work.  A MIX task
+    // created 32 idle AIC lanes and moved the two KVAF workers away from the
+    // standalone AIV-only task positions they were created for.
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(A5ExactScanSpeculativeGetTilingData);
     GET_TILING_DATA(tilingData, tiling);
     A5ExactScanSpeculativeGetKernel op(&tilingData);

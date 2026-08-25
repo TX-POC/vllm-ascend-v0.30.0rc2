@@ -2,9 +2,9 @@
 """Validate one real ExactScan -> chunked full SpeculativeGet launch.
 
 This is intentionally a component test, not a vLLM end-to-end benchmark.  It
-cold-binds a fixed KVAF Direct-HCCP output, then launches one MIX kernel where
-62 AIVs threshold LI scores and publish 32-miss chunks while the last two AIVs
-run the current full Get protocol through CQ completion.
+cold-binds a fixed KVAF Direct-HCCP output, then launches one AIV-only kernel.
+Task lanes 0 and 1 run the two current full Get workers through CQ completion;
+task lanes 2 through 63 threshold LI scores and publish 32-miss chunks.
 
 The test supports both KVAF transport ABIs.  ``local`` is the default A5 CPU
 DDR path; ``remote`` is available once an A5+K5 pair has matching KVAF builds.
@@ -284,8 +284,8 @@ def validate_result(
         )
     expected_trace = torch.cat(
         (
-            torch.arange(1000, 1000 + PRODUCER_COUNT, dtype=torch.int32),
             torch.arange(2000, 2000 + GET_LANE_COUNT, dtype=torch.int32),
+            torch.arange(1000, 1000 + PRODUCER_COUNT, dtype=torch.int32),
         )
     )
     torch.testing.assert_close(trace, expected_trace)
@@ -333,6 +333,7 @@ def main() -> None:
             f"transport={args.transport} score_count={scores_cpu.numel()} "
             f"table_capacity={args.table_capacity} output_rows={output_rows} "
             f"producer_aiv=62 get_aiv=2 chunk_records=32 "
+            f"get_task_lanes=0,1 producer_task_lanes=2..63 "
             f"get_bootstrap_records=64 full_get_dma_cq_wait=1"
         )
         runtime.initialize(ddr_bytes, ENTRY_BYTES)

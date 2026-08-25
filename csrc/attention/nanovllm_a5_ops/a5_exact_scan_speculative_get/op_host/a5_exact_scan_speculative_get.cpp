@@ -1,13 +1,15 @@
 /**
  * Registration/tiling for the first real ExactScan + SpeculativeGet path.
  *
- * The 32 MIX groups are deliberately asymmetric:
+ * The P1 full-Get path contains no AIC work.  It therefore launches a single
+ * 64-lane AIV task:
  *
- *   groups 0..30: 31 AIC + 62 AIV ExactScan producers
- *   group 31:     AIC idle; its two AIV lanes run full Direct-HCCP Get
+ *   task lanes 0..1:  the two existing KVAF Direct-HCCP workers
+ *   task lanes 2..63: ExactScan producers
  *
- * This is a logical role layout inside one launch.  It does not claim that
- * GetBlockIdx is a public physical-AIV affinity guarantee.
+ * This preserves the task-lane positions used by the verified standalone
+ * two-worker Get launch.  It is stronger than the old MIX logical layout but
+ * is deliberately not described as a public physical-AIV affinity API.
  */
 
 #include <cstddef>
@@ -46,11 +48,9 @@ constexpr size_t kGetOutputIndices = 8;
 constexpr size_t kGetMask = 9;
 constexpr size_t kPipelineStateOut = 10;
 
-constexpr uint32_t kAicCount = 32;
 constexpr uint32_t kAivCount = 64;
-constexpr uint32_t kAivPerMixedGroup = 2;
-constexpr uint32_t kProducerCount = (kAicCount - 1) * kAivPerMixedGroup;
-constexpr uint32_t kGetLaneCount = kAivPerMixedGroup;
+constexpr uint32_t kGetLaneCount = 2;
+constexpr uint32_t kProducerCount = kAivCount - kGetLaneCount;
 constexpr uint32_t kRingSlots = 2;
 constexpr uint32_t kRecordsPerRingSlot = 32;
 constexpr uint32_t kRecordWords = 3;
@@ -158,15 +158,14 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     }
 
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
-    const uint32_t aicCount = platform.GetCoreNumAic();
     const uint32_t aivCount = platform.GetCoreNumAiv();
-    if (aicCount != kAicCount || aivCount != kAivCount) {
+    if (aivCount != kAivCount) {
         return ge::GRAPH_FAILED;
     }
 
-    const uint32_t mixedBlockDim =
-        platform.CalcTschBlockDim(aivCount, aicCount, aivCount);
-    if (mixedBlockDim != kAicCount) {
+    const uint32_t aivOnlyBlockDim =
+        platform.CalcTschBlockDim(aivCount, 0U, aivCount);
+    if (aivOnlyBlockDim != kAivCount) {
         return ge::GRAPH_FAILED;
     }
 
@@ -186,7 +185,7 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     tiling->getWaveRecords = kGetWaveRecords;
     tiling->pipelineWordsPerRing = kPipelineWordsPerRing;
     tiling->reserved = 0;
-    context->SetBlockDim(mixedBlockDim);
+    context->SetBlockDim(aivOnlyBlockDim);
     if (context->GetWorkspaceSizes(1) != nullptr) {
         context->GetWorkspaceSizes(1)[0] = 0;
     }
