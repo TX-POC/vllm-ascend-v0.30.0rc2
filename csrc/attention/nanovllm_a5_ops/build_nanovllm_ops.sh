@@ -72,6 +72,7 @@ ALL_OP_NAMES=(
     A5FullBlockDump
     A5PackedFullBlockDump
     A5ExactScanSpeculativePostProbe
+    A5ExactScanSpeculativeGet
 )
 
 # A prototype operator must be buildable without replacing the normal custom
@@ -138,6 +139,69 @@ done < <(
         ! -path "${BUILD_ROOT}/*" -print0
 )
 
+# ExactScanSpeculativeGet compiles the current KVAF device-side full Get
+# protocol into its two dedicated AIV lanes.  Keep KVAF as the source of
+# truth: stage the helper and ABI from the exact checkout selected for this
+# build instead of maintaining a divergent WQE/CQ copy under vLLM.
+if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
+    if [[ -z "${KVAF_FUSED_GET_SOURCE:-}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: A5ExactScanSpeculativeGet requires KVAF_FUSED_GET_SOURCE=<exact KVAF checkout>." >&2
+        exit 2
+    fi
+    KVAF_FUSED_HEADER="${KVAF_FUSED_GET_SOURCE}/access_operator/demo/aiv_batch_get/kernel/kvaf_fused_full_get_device.h"
+    KVAF_FUSED_SOURCE="${KVAF_FUSED_GET_SOURCE}/access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
+    KVAF_ABI_HEADER="${KVAF_FUSED_GET_SOURCE}/access_operator/demo/aiv_batch_get/include/batch_get_abi.h"
+    if [[ ! -f "${KVAF_FUSED_HEADER}" || ! -f "${KVAF_FUSED_SOURCE}" || ! -f "${KVAF_ABI_HEADER}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: KVAF_FUSED_GET_SOURCE does not expose the P1 device helper/ABI." >&2
+        echo "[nanovllm_a5_ops] helper=${KVAF_FUSED_HEADER}" >&2
+        echo "[nanovllm_a5_ops] abi=${KVAF_ABI_HEADER}" >&2
+        exit 2
+    fi
+    cp -f "${KVAF_FUSED_HEADER}" "${OP_DEV}/op_kernel/kvaf_fused_full_get_device.h"
+    cp -f "${KVAF_FUSED_SOURCE}" "${OP_DEV}/op_kernel/execute_batch_get_aiv.asc"
+    cp -f "${KVAF_ABI_HEADER}" "${OP_DEV}/op_kernel/batch_get_abi.h"
+    # The embedded KVAF implementation uses SIMT atomics.  msopgen's
+    # generated CCEC include list does not inherit KVAF's CMake discovery, so
+    # stage the exact CANN SIMT headers next to the fused kernel instead of
+    # relying on an ambient include path.
+    KVAF_SIMT_ROOT=""
+    for candidate in \
+        "${ASCEND_SIMT_API_DIR:-}" \
+        "${ASCEND_CANN_PACKAGE_PATH:-}" \
+        "${ASCEND_HOME_PATH:-}" \
+        "${CANN_INSTALL_PATH:-}"; do
+        if [[ -n "${candidate}" && \
+              -f "${candidate}/simt_api/device_atomic_functions.h" ]]; then
+            KVAF_SIMT_ROOT="${candidate}"
+            break
+        fi
+        if [[ -n "${candidate}" && \
+              -f "${candidate}/include/simt_api/device_atomic_functions.h" ]]; then
+            KVAF_SIMT_ROOT="${candidate}/include"
+            break
+        fi
+        if [[ -n "${candidate}" && \
+              -f "${candidate}/include/ascendc/simt_api/device_atomic_functions.h" ]]; then
+            KVAF_SIMT_ROOT="${candidate}/include/ascendc"
+            break
+        fi
+        if [[ -n "${candidate}" && \
+              -f "${candidate}/tools/tikcpp/tikcfw/lib/simt_api/device_atomic_functions.h" ]]; then
+            KVAF_SIMT_ROOT="${candidate}/tools/tikcpp/tikcfw/lib"
+            break
+        fi
+    done
+    if [[ -z "${KVAF_SIMT_ROOT}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: cannot find simt_api/device_atomic_functions.h." >&2
+        echo "[nanovllm_a5_ops] Set ASCEND_SIMT_API_DIR to its parent directory." >&2
+        exit 2
+    fi
+    rm -rf "${OP_DEV}/op_kernel/simt_api"
+    cp -a "${KVAF_SIMT_ROOT}/simt_api" "${OP_DEV}/op_kernel/simt_api"
+    echo "[nanovllm_a5_ops] ExactScanSpeculativeGet KVAF source: ${KVAF_FUSED_GET_SOURCE}"
+    echo "[nanovllm_a5_ops] ExactScanSpeculativeGet SIMT root: ${KVAF_SIMT_ROOT}"
+fi
+
 if find "${OP_DEV}/op_host" "${OP_DEV}/op_kernel" \
         -type f -name 'CMakeLists.txt' -print -quit | grep -q .; then
     echo "[nanovllm_a5_ops] ERROR: repository CMakeLists.txt leaked into staging." >&2
@@ -153,6 +217,8 @@ for index in "${!OP_NAMES[@]}"; do
         op_spec="${ROOT}/a5_packed_full_block_dump/ops.json"
     elif [[ "${op_name}" == "A5ExactScanSpeculativePostProbe" ]]; then
         op_spec="${ROOT}/a5_exact_scan_speculative_post_probe/ops.json"
+    elif [[ "${op_name}" == "A5ExactScanSpeculativeGet" ]]; then
+        op_spec="${ROOT}/a5_exact_scan_speculative_get/ops.json"
     fi
     echo "[nanovllm_a5_ops] generate operator: ${op_name}"
     msopgen_args=(

@@ -1,0 +1,34 @@
+[
+    {
+        "op": "A5ExactScanSpeculativeGet",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "li_scores", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "threshold", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "resident", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "table_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "offsets", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "output_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "address_table", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+            {"name": "valid_table", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "packed_output", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "fused_get_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+            {"name": "frame_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+            {"name": "pipeline_state", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+        ],
+        "output_desc": [
+            {"name": "packed_output_out", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "candidate_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "candidate_kind", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "producer_stats", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+            {"name": "get_stats", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+            {"name": "role_trace", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "get_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "get_offsets", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "get_output_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "get_mask", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "pipeline_state_out", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+        ],
+        "attr": []
+    }
+]
