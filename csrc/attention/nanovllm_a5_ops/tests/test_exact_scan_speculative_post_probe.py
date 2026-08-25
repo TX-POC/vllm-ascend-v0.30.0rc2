@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """P0 validation for the one-kernel ExactScan + SpeculativePost layout.
 
-This test validates logical MIX roles, not physical core affinity and not
-actual H2D.  The next prototype replaces the two post markers with KVAF
+This test validates logical MIX roles through the AIV half of a 1C2V launch;
+it does not claim physical core affinity, an AIC-side execution trace, or
+actual H2D. The next prototype replaces the two post markers with KVAF
 Direct-HCCP PostOnly after KVAF exposes a device-control view.
 """
 
@@ -59,13 +60,14 @@ def check_result(
     torch.testing.assert_close(
         post_markers.cpu(), post_seed ^ POST_MARKER_XOR
     )
-    expected_trace = torch.empty(ROLE_TRACE_COUNT, dtype=torch.int32)
+    # Only AIV directly writes this trace. The fixed 1C2V tiling establishes
+    # 31 LI groups plus one Post group; direct scalar AIC-to-GM stores are not
+    # used as an execution proof because they are not a stable trace path.
+    expected_trace = torch.zeros(ROLE_TRACE_COUNT, dtype=torch.int32)
     expected_trace[:LI_AIV_COUNT] = torch.arange(
         1000, 1000 + LI_AIV_COUNT, dtype=torch.int32
     )
     expected_trace[62:64] = torch.arange(2000, 2000 + POST_AIV_COUNT, dtype=torch.int32)
-    expected_trace[64:95] = torch.arange(3000, 3000 + 31, dtype=torch.int32)
-    expected_trace[95] = 4000
     torch.testing.assert_close(role_trace.cpu(), expected_trace)
 
 
@@ -112,7 +114,8 @@ def main() -> None:
     check_result(cpu_values, post_seed, *result)
     print(
         "A5_EXACT_SCAN_SPECULATIVE_POST_PROBE_CORRECTNESS "
-        "li_exact_partition=1 post_lanes=2 role_trace=1"
+        "li_exact_partition=1 post_lanes=2 aiv_role_trace=1 "
+        "aic_role=structural_only"
     )
     print("A5_EXACT_SCAN_SPECULATIVE_POST_PROBE_PASS")
 

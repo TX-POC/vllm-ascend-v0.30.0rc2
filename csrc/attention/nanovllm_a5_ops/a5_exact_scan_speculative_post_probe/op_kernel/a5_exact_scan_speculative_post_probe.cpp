@@ -23,11 +23,8 @@ constexpr uint32_t kLiAivCount = 62;
 constexpr uint32_t kPostAivBegin = kLiAivCount;
 constexpr uint32_t kPostAivCount = 2;
 constexpr uint32_t kAivTraceBase = 0;
-constexpr uint32_t kAicTraceBase = 64;
 constexpr int32_t kLiAivTraceBase = 1000;
 constexpr int32_t kPostAivTraceBase = 2000;
-constexpr int32_t kLiAicTraceBase = 3000;
-constexpr int32_t kIdleAicTrace = 4000;
 constexpr int32_t kPostMarkerXor = 0x5A5A5A5A;
 
 class A5ExactScanSpeculativePostProbeKernel {
@@ -56,8 +53,6 @@ public:
         const uint32_t logicalBlock = GetBlockIdx();
         if ASCEND_IS_AIV {
             ProcessAiv(logicalBlock);
-        } else {
-            ProcessAic(logicalBlock);
         }
     }
 
@@ -90,23 +85,6 @@ private:
             roleTraceGm_.SetValue(
                 kAivTraceBase + logicalAiv,
                 kPostAivTraceBase + static_cast<int32_t>(postLane));
-        }
-    }
-
-    __aicore__ inline void ProcessAic(uint32_t logicalAic)
-    {
-        if (logicalAic < tiling_->liGroupCount) {
-            roleTraceGm_.SetValue(
-                kAicTraceBase + logicalAic,
-                kLiAicTraceBase + static_cast<int32_t>(logicalAic));
-            return;
-        }
-        if (logicalAic == tiling_->liGroupCount) {
-            // Group 31 has no cube-side task in P0.  Keeping this explicit is
-            // important: it prevents a later LI integration from entering its
-            // 32-group cross-core protocol on the Post group by accident.
-            roleTraceGm_.SetValue(
-                kAicTraceBase + logicalAic, kIdleAicTrace);
         }
     }
 
