@@ -126,6 +126,20 @@ class ConcurrentTimingSamples:
     get_span_us: list[float]
 
 
+@dataclass(frozen=True)
+class SerialTimingSamples:
+    """The strict LI -> Get chain, split into its two device spans.
+
+    ``join_us`` remains the end-to-end reference.  The two inner spans make
+    it possible to tell whether an unexpected total comes from LI, Get, or
+    the stream-event handoff itself.
+    """
+
+    join_us: list[float]
+    li_span_us: list[float]
+    get_span_us: list[float]
+
+
 class AclStreamResourceApi:
     """Small benchmark-only binding for CANN's public resource APIs."""
 
@@ -395,9 +409,9 @@ def parse_args() -> argparse.Namespace:
         "--enable-kvaf-get-kernel-profile",
         action="store_true",
         help=(
-            "After timing, run one non-timed isolated Get and print the "
-            "KVAF per-logical-AIV-block timeline. This reports no physical "
-            "AIV ID or affinity."
+            "After timing, capture one isolated Get and one concurrent "
+            "LI+Get launch, then print the KVAF per-logical-AIV-block "
+            "timelines. This reports no physical AIV ID or affinity."
         ),
     )
     parser.add_argument("--seed", type=int, default=7)
@@ -920,6 +934,7 @@ def report(
     warmup: int,
     active_tokens: int,
     moves_payload: bool,
+    payload_metric: str = "payload_gibps",
 ) -> None:
     mean_us = statistics.mean(samples_us)
     payload = ""
@@ -932,7 +947,7 @@ def report(
             if mean_us > 0
             else 0.0
         )
-        payload = f" payload_gibps={gibps:.3f}"
+        payload = f" {payload_metric}={gibps:.3f}"
     print(
         "PERF_RESULT "
         f"operation={operation} samples={len(samples_us)} "
@@ -946,12 +961,76 @@ def report(
     )
 
 
-def capture_get_aiv_profile(
-    runtime: object,
+def require_matching_sample_count(
+    label: str,
+    *sample_sets: list[float],
+) -> None:
+    """Reject an accidental cross-run comparison before deriving a metric."""
+
+    counts = {len(samples) for samples in sample_sets}
+    if len(counts) != 1:
+        raise AssertionError(f"{label} sample counts differ: {sorted(counts)}")
+
+
+def serial_join_minus_sum(samples: SerialTimingSamples) -> list[float]:
+    """Return a same-iteration timing-chain diagnostic, not an overlap gain."""
+
+    require_matching_sample_count(
+        "serial timing",
+        samples.join_us,
+        samples.li_span_us,
+        samples.get_span_us,
+    )
+    return [
+        join_us - li_us - get_us
+        for join_us, li_us, get_us in zip(
+            samples.join_us,
+            samples.li_span_us,
+            samples.get_span_us,
+        )
+    ]
+
+
+def concurrent_join_minus_max_span(
+    samples: ConcurrentTimingSamples,
+) -> list[float]:
+    """Return a same-iteration join diagnostic for the two-stream launch."""
+
+    require_matching_sample_count(
+        "concurrent timing",
+        samples.join_us,
+        samples.li_span_us,
+        samples.get_span_us,
+    )
+    return [
+        join_us - max(li_us, get_us)
+        for join_us, li_us, get_us in zip(
+            samples.join_us,
+            samples.li_span_us,
+            samples.get_span_us,
+        )
+    ]
+
+
+def _launch_get_on_stream(
     launch_get: Callable[[object], None],
     copy_stream: object,
+) -> None:
+    """Submit one Get to its native copy stream for a non-timed probe."""
+
+    with torch.npu.stream(copy_stream):
+        launch_get(copy_stream)
+
+
+def capture_get_aiv_profile(
+    runtime: object,
+    launch: Callable[[], object],
 ) -> list[dict[str, object]]:
-    """Capture one non-timed Get profile without perturbing benchmark samples."""
+    """Capture one non-timed Get profile without perturbing timed samples.
+
+    ``launch`` owns the stream dependency graph.  This lets the same KVAF
+    counter snapshot describe an isolated Get or a Get issued alongside LI.
+    """
 
     start_profile = getattr(runtime, "start_batch_get_kernel_profile", None)
     stop_profile = getattr(runtime, "stop_batch_get_kernel_profile", None)
@@ -963,9 +1042,11 @@ def capture_get_aiv_profile(
 
     start_profile()
     try:
-        with torch.npu.stream(copy_stream):
-            launch_get(copy_stream)
-        copy_stream.synchronize()
+        retained = launch()
+        # Keep a tensor returned by the LI side alive until both streams have
+        # completed.  The value itself is intentionally not inspected here.
+        _ = retained
+        torch.npu.synchronize()
     except Exception:
         # Best effort only: disable the optional profile before propagating the
         # original benchmark failure.
@@ -1016,7 +1097,11 @@ def profile_jetty_pair(profile: dict[str, object], key: str) -> tuple[int, ...]:
         ) from error
 
 
-def report_get_aiv_profiles(profiles: list[dict[str, object]]) -> None:
+def report_get_aiv_profiles(
+    profiles: list[dict[str, object]],
+    *,
+    role: str,
+) -> None:
     """Emit logical Get-worker activity; the runtime exposes no physical ID."""
 
     for profile in profiles:
@@ -1033,7 +1118,7 @@ def report_get_aiv_profiles(profiles: list[dict[str, object]]) -> None:
         polls = profile_jetty_pair(profile, "jetty_completion_polls")
         print(
             "C8_KVAF_GET_AIV_PROFILE "
-            "role=isolated "
+            f"role={role} "
             f"logical_aiv_block={profile_scalar(profile, 'core')} "
             "physical_core_id=not_available "
             f"active_requests={profile_scalar(profile, 'active_requests')} "
@@ -1081,37 +1166,25 @@ def time_li_only(
 
 def time_get_only(
     launch_get: Callable[[object], None],
-    li_stream: object,
     copy_stream: object,
     *,
     warmup_count: int,
     iters: int,
 ) -> list[float]:
-    def launch_warmup() -> tuple[object, object]:
-        gate = torch.npu.Event()
-        done = torch.npu.Event()
-        gate.record(li_stream)
+    """Measure Get on its native stream, without a cross-stream join."""
+
+    def launch_warmup() -> None:
         with torch.npu.stream(copy_stream):
-            copy_stream.wait_event(gate)
             launch_get(copy_stream)
-            done.record(copy_stream)
-        li_stream.wait_event(done)
-        return gate, done
 
     warmup(launch_warmup, warmup_count)
     starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    gates = [torch.npu.Event() for _ in range(iters)]
-    dones = [torch.npu.Event() for _ in range(iters)]
-    for start, end, gate, done in zip(starts, ends, gates, dones):
-        start.record(li_stream)
-        gate.record(li_stream)
+    for start, end in zip(starts, ends):
         with torch.npu.stream(copy_stream):
-            copy_stream.wait_event(gate)
+            start.record(copy_stream)
             launch_get(copy_stream)
-            done.record(copy_stream)
-        li_stream.wait_event(done)
-        end.record(li_stream)
+            end.record(copy_stream)
     ends[-1].synchronize()
     return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
 
@@ -1124,7 +1197,9 @@ def time_serial(
     *,
     warmup_count: int,
     iters: int,
-) -> list[float]:
+) -> SerialTimingSamples:
+    """Measure a strict LI -> Get chain while preserving Get's own stream."""
+
     def launch_warmup() -> tuple[torch.Tensor, object, object]:
         li_done = torch.npu.Event()
         get_done = torch.npu.Event()
@@ -1138,23 +1213,62 @@ def time_serial(
         return result, li_done, get_done
 
     warmup(launch_warmup, warmup_count)
-    starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    join_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    join_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    li_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    li_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    get_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    get_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
     li_dones = [torch.npu.Event() for _ in range(iters)]
     get_dones = [torch.npu.Event() for _ in range(iters)]
     retained: list[torch.Tensor] = []
-    for start, end, li_done, get_done in zip(starts, ends, li_dones, get_dones):
-        start.record(li_stream)
+    for (
+        join_start,
+        join_end,
+        li_start,
+        li_end,
+        get_start,
+        get_end,
+        li_done,
+        get_done,
+    ) in zip(
+        join_starts,
+        join_ends,
+        li_starts,
+        li_ends,
+        get_starts,
+        get_ends,
+        li_dones,
+        get_dones,
+    ):
+        join_start.record(li_stream)
+        li_start.record(li_stream)
         retained.append(launch_li())
+        li_end.record(li_stream)
         li_done.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(li_done)
+            get_start.record(copy_stream)
             launch_get(copy_stream)
+            get_end.record(copy_stream)
             get_done.record(copy_stream)
         li_stream.wait_event(get_done)
-        end.record(li_stream)
-    ends[-1].synchronize()
-    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
+        join_end.record(li_stream)
+    join_ends[-1].synchronize()
+    return SerialTimingSamples(
+        join_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(join_starts, join_ends)
+        ],
+        li_span_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(li_starts, li_ends)
+        ],
+        get_span_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(get_starts, get_ends)
+        ],
+    )
 
 
 def time_concurrent_join(
@@ -1241,6 +1355,30 @@ def time_concurrent_join(
             for start, end in zip(get_starts, get_ends)
         ],
     )
+
+
+def capture_concurrent_get_aiv_profile(
+    runtime: object,
+    launch_li: Callable[[], torch.Tensor],
+    launch_get: Callable[[object], None],
+    li_stream: object,
+    copy_stream: object,
+) -> list[dict[str, object]]:
+    """Capture Get's kernel counters while the same LI/Get graph is in flight."""
+
+    def launch_pair() -> tuple[torch.Tensor, object, object]:
+        gate = torch.npu.Event()
+        get_done = torch.npu.Event()
+        gate.record(li_stream)
+        with torch.npu.stream(copy_stream):
+            copy_stream.wait_event(gate)
+            launch_get(copy_stream)
+            get_done.record(copy_stream)
+        result = launch_li()
+        li_stream.wait_event(get_done)
+        return result, gate, get_done
+
+    return capture_get_aiv_profile(runtime, launch_pair)
 
 
 def main() -> None:
@@ -1435,16 +1573,19 @@ def main() -> None:
             raise AssertionError("LI timing did not return samples")
         get_samples = time_get_only(
             launch_get,
-            li_stream,
             copy_stream,
             warmup_count=args.warmup,
             iters=args.iters,
         )
         if args.enable_kvaf_get_kernel_profile:
             report_get_aiv_profiles(
-                capture_get_aiv_profile(runtime, launch_get, copy_stream)
+                capture_get_aiv_profile(
+                    runtime,
+                    lambda: _launch_get_on_stream(launch_get, copy_stream),
+                ),
+                role="isolated",
             )
-        serial_samples = run_with_li_quota(
+        serial_timing = run_with_li_quota(
             lambda: time_serial(
                 launch_li,
                 launch_get,
@@ -1454,8 +1595,9 @@ def main() -> None:
                 iters=args.iters,
             )
         )
-        if not isinstance(serial_samples, list):
+        if not isinstance(serial_timing, SerialTimingSamples):
             raise AssertionError("serial timing did not return samples")
+        serial_samples = serial_timing.join_us
         concurrent_timing = run_with_li_quota(
             lambda: time_concurrent_join(
                 launch_li,
@@ -1469,6 +1611,19 @@ def main() -> None:
         if not isinstance(concurrent_timing, ConcurrentTimingSamples):
             raise AssertionError("concurrent timing did not return samples")
         concurrent_samples = concurrent_timing.join_us
+        if args.enable_kvaf_get_kernel_profile:
+            concurrent_profiles = run_with_li_quota(
+                lambda: capture_concurrent_get_aiv_profile(
+                    runtime,
+                    launch_li,
+                    launch_get,
+                    li_stream,
+                    copy_stream,
+                )
+            )
+            if not isinstance(concurrent_profiles, list):
+                raise AssertionError("concurrent Get profile did not return a list")
+            report_get_aiv_profiles(concurrent_profiles, role="concurrent")
 
         report(
             "c8_li_only",
@@ -1479,12 +1634,20 @@ def main() -> None:
         )
         get_label = f"{args.transport}_get_only"
         serial_label = f"c8_li_then_{args.transport}_get_serial"
+        serial_li_span_label = f"c8_li_then_{args.transport}_get_serial_li_span"
+        serial_get_span_label = f"c8_li_then_{args.transport}_get_serial_get_span"
+        serial_join_minus_sum_label = (
+            f"c8_li_then_{args.transport}_get_serial_join_minus_sum"
+        )
         concurrent_label = f"c8_li_with_{args.transport}_get_concurrent_join"
         concurrent_li_span_label = (
             f"c8_li_with_{args.transport}_get_concurrent_li_span"
         )
         concurrent_get_span_label = (
             f"c8_li_with_{args.transport}_get_concurrent_get_span"
+        )
+        concurrent_join_minus_max_label = (
+            f"c8_li_with_{args.transport}_get_concurrent_join_minus_max_span"
         )
         report(
             get_label,
@@ -1499,6 +1662,21 @@ def main() -> None:
             warmup=args.warmup,
             active_tokens=active_tokens,
             moves_payload=True,
+            payload_metric="effective_phase_payload_gibps",
+        )
+        report(
+            serial_li_span_label,
+            serial_timing.li_span_us,
+            warmup=args.warmup,
+            active_tokens=active_tokens,
+            moves_payload=False,
+        )
+        report(
+            serial_get_span_label,
+            serial_timing.get_span_us,
+            warmup=args.warmup,
+            active_tokens=active_tokens,
+            moves_payload=True,
         )
         report(
             concurrent_label,
@@ -1506,6 +1684,7 @@ def main() -> None:
             warmup=args.warmup,
             active_tokens=active_tokens,
             moves_payload=True,
+            payload_metric="effective_phase_payload_gibps",
         )
         report(
             concurrent_li_span_label,
@@ -1521,41 +1700,71 @@ def main() -> None:
             active_tokens=active_tokens,
             moves_payload=True,
         )
-        serial_p90 = percentile(serial_samples, 0.90)
-        concurrent_p90 = percentile(concurrent_samples, 0.90)
-        li_p90 = percentile(li_samples, 0.90)
-        get_p90 = percentile(get_samples, 0.90)
-        concurrent_li_span_p90 = percentile(concurrent_timing.li_span_us, 0.90)
-        concurrent_get_span_p90 = percentile(concurrent_timing.get_span_us, 0.90)
-        per_stream_p90_reference = max(li_p90, get_p90)
-        hide_budget_p90 = serial_p90 - per_stream_p90_reference
-        hidden_p90 = serial_p90 - concurrent_p90
-        overlap_efficiency = (
-            hidden_p90 / hide_budget_p90 if hide_budget_p90 > 0 else math.nan
+        serial_residuals = serial_join_minus_sum(serial_timing)
+        concurrent_residuals = concurrent_join_minus_max_span(concurrent_timing)
+        report(
+            serial_join_minus_sum_label,
+            serial_residuals,
+            warmup=args.warmup,
+            active_tokens=active_tokens,
+            moves_payload=False,
         )
-        contention_penalty_p90 = concurrent_p90 - per_stream_p90_reference
+        report(
+            concurrent_join_minus_max_label,
+            concurrent_residuals,
+            warmup=args.warmup,
+            active_tokens=active_tokens,
+            moves_payload=False,
+        )
+        serial_p50 = percentile(serial_samples, 0.50)
+        serial_p90 = percentile(serial_samples, 0.90)
+        serial_li_span_p50 = percentile(serial_timing.li_span_us, 0.50)
+        serial_li_span_p90 = percentile(serial_timing.li_span_us, 0.90)
+        serial_get_span_p50 = percentile(serial_timing.get_span_us, 0.50)
+        serial_get_span_p90 = percentile(serial_timing.get_span_us, 0.90)
+        serial_residual_p50 = percentile(serial_residuals, 0.50)
+        serial_residual_p90 = percentile(serial_residuals, 0.90)
+        concurrent_p50 = percentile(concurrent_samples, 0.50)
+        concurrent_p90 = percentile(concurrent_samples, 0.90)
+        concurrent_li_span_p50 = percentile(concurrent_timing.li_span_us, 0.50)
+        concurrent_li_span_p90 = percentile(concurrent_timing.li_span_us, 0.90)
+        concurrent_get_span_p50 = percentile(concurrent_timing.get_span_us, 0.50)
+        concurrent_get_span_p90 = percentile(concurrent_timing.get_span_us, 0.90)
+        concurrent_residual_p50 = percentile(concurrent_residuals, 0.50)
+        concurrent_residual_p90 = percentile(concurrent_residuals, 0.90)
+        print(
+            "C8_KVAF_TIMING_CONTRACT "
+            "serial_dependency=li_done_then_get_done_then_join "
+            "concurrent_dependency=common_gate_then_join "
+            "cross_run_p90_arithmetic=not_used",
+            flush=True,
+        )
         print(
             "C8_KVAF_OVERLAP_RESULT "
-            f"li_p90_us={li_p90:.3f} "
-            f"get_p90_us={get_p90:.3f} "
-            f"serial_p90_us={serial_p90:.3f} "
-            f"concurrent_p90_us={concurrent_p90:.3f} "
-            f"ideal_lower_bound_p90_us={per_stream_p90_reference:.3f} "
-            f"hide_budget_p90_us={hide_budget_p90:.3f} "
-            f"hidden_p90_us={hidden_p90:.3f} "
-            f"overlap_efficiency={overlap_efficiency:.3f} "
-            f"contention_penalty_p90_us={contention_penalty_p90:.3f} "
+            f"serial_join_p50_us={serial_p50:.3f} "
+            f"serial_join_p90_us={serial_p90:.3f} "
+            f"serial_li_span_p50_us={serial_li_span_p50:.3f} "
+            f"serial_li_span_p90_us={serial_li_span_p90:.3f} "
+            f"serial_get_span_p50_us={serial_get_span_p50:.3f} "
+            f"serial_get_span_p90_us={serial_get_span_p90:.3f} "
+            f"serial_join_minus_sum_p50_us={serial_residual_p50:.3f} "
+            f"serial_join_minus_sum_p90_us={serial_residual_p90:.3f} "
+            f"concurrent_join_p50_us={concurrent_p50:.3f} "
+            f"concurrent_join_p90_us={concurrent_p90:.3f} "
+            f"concurrent_li_span_p50_us={concurrent_li_span_p50:.3f} "
             f"concurrent_li_span_p90_us={concurrent_li_span_p90:.3f} "
-            f"concurrent_get_span_p90_us={concurrent_get_span_p90:.3f}",
+            f"concurrent_get_span_p50_us={concurrent_get_span_p50:.3f} "
+            f"concurrent_get_span_p90_us={concurrent_get_span_p90:.3f} "
+            f"concurrent_join_minus_max_span_p50_us={concurrent_residual_p50:.3f} "
+            f"concurrent_join_minus_max_span_p90_us={concurrent_residual_p90:.3f}",
             flush=True,
         )
         if args.enable_stream_resource_quota:
             print(
                 "C8_KVAF_RESOURCE_QUOTA_RESULT "
-                f"serial_p90_us={serial_p90:.3f} "
-                f"concurrent_p90_us={concurrent_p90:.3f} "
-                f"per_stream_p90_reference_us={per_stream_p90_reference:.3f} "
-                f"overlap_saved_p90_us={serial_p90 - concurrent_p90:.3f}",
+                f"serial_join_p90_us={serial_p90:.3f} "
+                f"concurrent_join_p90_us={concurrent_p90:.3f} "
+                "cross_run_p90_arithmetic=not_used",
                 flush=True,
             )
             print(
