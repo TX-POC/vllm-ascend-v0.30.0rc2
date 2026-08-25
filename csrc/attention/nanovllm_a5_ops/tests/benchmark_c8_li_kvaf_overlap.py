@@ -157,7 +157,9 @@ class NativeLaneTimingSamples:
     worker_issue_us: list[float]
     post_to_worker_issue_us: list[float]
     arm_wait_us: list[float]
-    reap_wait_us: list[float]
+    reap_terminal_sync_us: list[float]
+    reap_reclaim_wait_us: list[float]
+    reap_total_us: list[float]
     step_wall_us: list[float]
 
 
@@ -472,6 +474,16 @@ def parse_args() -> argparse.Namespace:
             "the Get copy stream. native_lane is local Direct-HCCP only."
         ),
     )
+    parser.add_argument(
+        "--native-worker-wait",
+        choices=("cv", "dedicated_spin"),
+        default="cv",
+        help=(
+            "Idle wait policy for the native C++ Get worker. "
+            "dedicated_spin keeps one host CPU busy and is an explicit "
+            "latency probe, not a default production policy."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--batch-get-kernel",
@@ -564,6 +576,10 @@ def validate_args(args: argparse.Namespace) -> None:
                 "native_lane does not yet expose worker-owned Get device timing; "
                 "run its host/join probe without --enable-kvaf-get-kernel-profile"
             )
+    elif args.native_worker_wait != "cv":
+        raise ValueError(
+            "--native-worker-wait is valid only with --get-submit-mode native_lane"
+        )
     if not args.batch_get_kernel.is_file():
         raise FileNotFoundError(args.batch_get_kernel)
     if not args.batch_put_kernel.is_file():
@@ -1611,7 +1627,7 @@ def time_concurrent_join_native_lane(
     post_get: Callable[[object], None],
     arm_get: Callable[[object], dict[str, float]],
     record_terminal: Callable[[object], None],
-    reap_get: Callable[[], None],
+    reap_get: Callable[[], dict[str, float]],
     li_stream: object,
     *,
     warmup_count: int,
@@ -1649,7 +1665,9 @@ def time_concurrent_join_native_lane(
     worker_issue_us: list[float] = []
     post_to_worker_issue_us: list[float] = []
     arm_wait_us: list[float] = []
-    reap_wait_us: list[float] = []
+    reap_terminal_sync_us: list[float] = []
+    reap_reclaim_wait_us: list[float] = []
+    reap_total_us: list[float] = []
     step_wall_us: list[float] = []
 
     for join_start, join_end, li_start, li_end in zip(
@@ -1668,8 +1686,7 @@ def time_concurrent_join_native_lane(
         record_terminal(li_stream)
         # Do not replace this with torch.npu.synchronize(): that does not
         # cover a job which is still sitting in the native worker queue.
-        reap_enter_ns = time.perf_counter_ns()
-        reap_get()
+        reap_metrics = reap_get()
         reap_return_ns = time.perf_counter_ns()
         try:
             post_to_worker_start = float(arm_metrics["post_to_worker_start_us"])
@@ -1680,6 +1697,14 @@ def time_concurrent_join_native_lane(
             raise RuntimeError(
                 "native Get lane returned an invalid arm timing dictionary"
             ) from error
+        try:
+            reap_terminal_sync = float(reap_metrics["terminal_sync_wait_us"])
+            reap_reclaim_wait = float(reap_metrics["event_reclaim_wait_us"])
+            reap_total = float(reap_metrics["total_us"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "native Get lane returned an invalid reap timing dictionary"
+            ) from error
         post_call_us.append((post_return_ns - post_enter_ns) / 1_000.0)
         post_return_to_li_enter_us.append(
             (li_enter_ns - post_return_ns) / 1_000.0
@@ -1688,7 +1713,9 @@ def time_concurrent_join_native_lane(
         worker_issue_us.append(worker_issue)
         post_to_worker_issue_us.append(post_to_issue)
         arm_wait_us.append(arm_wait)
-        reap_wait_us.append((reap_return_ns - reap_enter_ns) / 1_000.0)
+        reap_terminal_sync_us.append(reap_terminal_sync)
+        reap_reclaim_wait_us.append(reap_reclaim_wait)
+        reap_total_us.append(reap_total)
         step_wall_us.append((reap_return_ns - post_enter_ns) / 1_000.0)
 
     return NativeLaneTimingSamples(
@@ -1706,7 +1733,9 @@ def time_concurrent_join_native_lane(
         worker_issue_us=worker_issue_us,
         post_to_worker_issue_us=post_to_worker_issue_us,
         arm_wait_us=arm_wait_us,
-        reap_wait_us=reap_wait_us,
+        reap_terminal_sync_us=reap_terminal_sync_us,
+        reap_reclaim_wait_us=reap_reclaim_wait_us,
+        reap_total_us=reap_total_us,
         step_wall_us=step_wall_us,
     )
 
@@ -2056,6 +2085,7 @@ def main() -> None:
                 copy_stream,
                 args.enable_stream_resource_quota,
                 args.get_vector_cores if args.enable_stream_resource_quota else 0,
+                args.native_worker_wait,
             )
             native_lane_created = True
             runtime.bind_native_get_output(packed_output)
@@ -2081,8 +2111,13 @@ def main() -> None:
             def record_native_terminal(terminal_stream: object) -> None:
                 runtime.record_native_get_terminal(terminal_stream)
 
-            def reap_native_get() -> None:
-                runtime.reap_native_get()
+            def reap_native_get() -> dict[str, float]:
+                raw = runtime.reap_native_get()
+                if not isinstance(raw, dict):
+                    raise RuntimeError(
+                        "KVAF native Get reap did not return a dictionary"
+                    )
+                return {str(key): float(value) for key, value in raw.items()}
 
             # A separate native-only correctness pass matters: the eager
             # baseline above already populated packed_output with valid bytes.
@@ -2106,6 +2141,8 @@ def main() -> None:
                 "slot_count=1 mode=eager_only "
                 "copy_stream_submitter=cxx_worker "
                 "prepared_descriptor=1 "
+                f"worker_wait={args.native_worker_wait} "
+                "worker_cpu_affinity=not_pinned "
                 f"worker_stream_resource_quota={int(args.enable_stream_resource_quota)} "
                 "worker_vector_limit_verified="
                 f"{args.get_vector_cores if args.enable_stream_resource_quota else 'not_requested'} "
@@ -2297,8 +2334,18 @@ def main() -> None:
                 warmup=args.warmup,
             )
             report_host_submit(
-                "native_lane_reap_wait",
-                native_lane_timing.reap_wait_us,
+                "native_lane_reap_terminal_sync",
+                native_lane_timing.reap_terminal_sync_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_reap_reclaim_wait",
+                native_lane_timing.reap_reclaim_wait_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_reap_total",
+                native_lane_timing.reap_total_us,
                 warmup=args.warmup,
             )
             report_host_submit(
@@ -2359,7 +2406,8 @@ def main() -> None:
                 "native_join_includes_arm_gate=1 "
                 "native_join_excludes_reap_wait=1 "
                 "worker_issue_scope=cpu_wait_event_plus_batch_get_launch_plus_record_event "
-                "slot_reap=terminal_event_completed",
+                "slot_reap=terminal_sync_plus_worker_event_reset_plus_copy_stream_completion "
+                "worker_wait_policy=reported_in_config",
                 flush=True,
             )
         print(
@@ -2409,7 +2457,15 @@ def main() -> None:
                 native_lane_timing.post_to_worker_issue_us, 0.90
             )
             native_arm_wait_p90 = percentile(native_lane_timing.arm_wait_us, 0.90)
-            native_reap_wait_p90 = percentile(native_lane_timing.reap_wait_us, 0.90)
+            native_reap_terminal_sync_p90 = percentile(
+                native_lane_timing.reap_terminal_sync_us, 0.90
+            )
+            native_reap_reclaim_wait_p90 = percentile(
+                native_lane_timing.reap_reclaim_wait_us, 0.90
+            )
+            native_reap_total_p90 = percentile(
+                native_lane_timing.reap_total_us, 0.90
+            )
             native_step_wall_p50 = percentile(native_lane_timing.step_wall_us, 0.50)
             native_step_wall_p90 = percentile(native_lane_timing.step_wall_us, 0.90)
             print(
@@ -2427,7 +2483,9 @@ def main() -> None:
                 f"native_worker_issue_p90_us={native_worker_issue_only_p90:.3f} "
                 f"native_post_to_worker_issue_p90_us={native_worker_issue_p90:.3f} "
                 f"native_arm_wait_p90_us={native_arm_wait_p90:.3f} "
-                f"native_reap_wait_p90_us={native_reap_wait_p90:.3f} "
+                f"native_reap_terminal_sync_p90_us={native_reap_terminal_sync_p90:.3f} "
+                f"native_reap_reclaim_wait_p90_us={native_reap_reclaim_wait_p90:.3f} "
+                f"native_reap_total_p90_us={native_reap_total_p90:.3f} "
                 f"native_step_wall_p50_us={native_step_wall_p50:.3f} "
                 f"native_step_wall_p90_us={native_step_wall_p90:.3f} "
                 "native_get_device_span=not_reported_worker_owns_copy_stream "
