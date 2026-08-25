@@ -1,0 +1,16 @@
+[
+    {
+        "op": "A5ExactScanSpeculativePostProbe",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "scan_values", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "post_seed", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "li_checksums", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+            {"name": "post_markers", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "role_trace", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "attr": []
+    }
+]

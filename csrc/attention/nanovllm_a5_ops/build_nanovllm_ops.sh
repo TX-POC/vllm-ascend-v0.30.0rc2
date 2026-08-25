@@ -2,10 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_ROOT="${ROOT}/build"
+BUILD_ROOT="${NANOVLLM_A5_OPS_BUILD_ROOT:-${ROOT}/build}"
 OP_DEV="${BUILD_ROOT}/op_dev_staging"
 GENERATED="${BUILD_ROOT}/custom_op"
-LOCAL_OPP="${ROOT}/_custom_opp"
+LOCAL_OPP="${NANOVLLM_A5_LOCAL_OPP:-${ROOT}/_custom_opp}"
 TORCH_EXTENSION="${ROOT}/torch_extension"
 
 PYTHON_BIN="${NANOVLLM_A5_OPS_PYTHON:-python3}"
@@ -38,6 +38,13 @@ case "${GENERATED}" in
         exit 2
         ;;
 esac
+case "${BUILD_ROOT}" in
+    "${ROOT}"/build|"${ROOT}"/build/*) ;;
+    *)
+        echo "[nanovllm_a5_ops] ERROR: build root must stay below ${ROOT}/build: ${BUILD_ROOT}." >&2
+        exit 2
+        ;;
+esac
 case "${LOCAL_OPP}" in
     "${ROOT}"/*) ;;
     *)
@@ -55,7 +62,7 @@ if [[ "${A5_SOC_VERSION_RAW,,}" != "${A5_SOC_VERSION}" ]]; then
 fi
 echo "[nanovllm_a5_ops] jobs: ${BUILD_JOBS}"
 
-OP_NAMES=(
+ALL_OP_NAMES=(
     LightningIndexerDecodeUpdateA5
     A5LiduCacheUpdate
     A5KvcacheScatterCopy
@@ -64,7 +71,36 @@ OP_NAMES=(
     A5SparseAndTailAttention
     A5FullBlockDump
     A5PackedFullBlockDump
+    A5ExactScanSpeculativePostProbe
 )
+
+# A prototype operator must be buildable without replacing the normal custom
+# OPP package or compiling the full vLLM-Ascend extension.  A comma-separated
+# allow-list keeps generated artifacts in caller-selected, isolated paths.
+OP_NAMES=("${ALL_OP_NAMES[@]}")
+if [[ -n "${NANOVLLM_A5_OPS_ONLY:-}" ]]; then
+    IFS=',' read -r -a REQUESTED_OP_NAMES <<< "${NANOVLLM_A5_OPS_ONLY}"
+    OP_NAMES=()
+    for requested_name in "${REQUESTED_OP_NAMES[@]}"; do
+        found=0
+        for known_name in "${ALL_OP_NAMES[@]}"; do
+            if [[ "${requested_name}" == "${known_name}" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ "${found}" != "1" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: unknown operator in NANOVLLM_A5_OPS_ONLY: ${requested_name}." >&2
+            exit 2
+        fi
+        OP_NAMES+=("${requested_name}")
+    done
+    if [[ "${#OP_NAMES[@]}" == "0" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_OPS_ONLY selected no operators." >&2
+        exit 2
+    fi
+fi
+echo "[nanovllm_a5_ops] selected operators: ${OP_NAMES[*]}"
 
 # The repository stores each operator in its own directory. Build a temporary
 # flat *operator collection* for msopgen, but preserve the relative directory
@@ -115,6 +151,8 @@ for index in "${!OP_NAMES[@]}"; do
         op_spec="${ROOT}/a5_full_block_dump/ops.json"
     elif [[ "${op_name}" == "A5PackedFullBlockDump" ]]; then
         op_spec="${ROOT}/a5_packed_full_block_dump/ops.json"
+    elif [[ "${op_name}" == "A5ExactScanSpeculativePostProbe" ]]; then
+        op_spec="${ROOT}/a5_exact_scan_speculative_post_probe/ops.json"
     fi
     echo "[nanovllm_a5_ops] generate operator: ${op_name}"
     msopgen_args=(
