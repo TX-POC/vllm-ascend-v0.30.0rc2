@@ -18,11 +18,12 @@ official Top-K prelude, descriptor lowering, and correctness checks) is
 outside the timed regions.
 
 ``--enable-stream-resource-quota`` is a separate eager capability probe.  It
-uses CANN's public per-stream Cube/Vector *count* limits.  The probe gives LI
-and Get their own explicit streams, binds the LI quota once per measured
-phase while LI's host tiler runs, and leaves KVAF Get as its native explicit
-two-AIV-block launch.  This avoids putting resource-TLS driver work in each
-timed submit path.  It
+uses CANN's public per-stream Cube/Vector *count* limits to form the only
+geometry that is safe with the current official C8 LI tiler: LI gets
+31 Cube + 62 Vector cores, and Get gets the remaining 2 Vector cores.  Each
+quota is bound only while its own host-side operator submission runs.  This
+is necessary because the LI tiler reads the current thread's core view, while
+the explicit KVAF Get launch must see its own two-Vector-core view.  The probe
 does not claim fixed physical core IDs; that requires a later device-side
 core-ID diagnostic.
 
@@ -67,6 +68,9 @@ OFFSETS_POISON = -102
 OUTPUT_INDICES_POISON = -103
 MASK_POISON = 0xA5
 MAX_SOURCE_CAPACITY = 1 << 18
+PARTITIONED_LI_CUBE_CORES = 31
+PARTITIONED_LI_VECTOR_CORES = 62
+PARTITIONED_GET_VECTOR_CORES = 2
 
 
 @dataclass(frozen=True)
@@ -303,35 +307,42 @@ class AclStreamResourceApi:
         stream_handle, handle_value = self._stream_handle(stream)
         status = int(self._use_stream_in_current_thread(stream_handle))
         self._check_status("aclrtUseStreamResInCurrentThread", status, label=label)
-        state = StreamResourceState(
-            label=label,
-            stream_handle=handle_value,
-            cube_cores=self._read_value(
-                self._get_current_thread_limit, self._CUBE_CORE, label=label
-            ),
-            vector_cores=self._read_value(
-                self._get_current_thread_limit, self._VECTOR_CORE, label=label
-            ),
-        )
-        if (
-            expected_cube_cores is not None
-            and state.cube_cores != expected_cube_cores
-        ):
-            raise RuntimeError(
-                "C8_KVAF_RESOURCE_QUOTA_FAILED "
-                f"label={label} thread_cube={state.cube_cores} "
-                f"expected_cube={expected_cube_cores}"
+        try:
+            state = StreamResourceState(
+                label=label,
+                stream_handle=handle_value,
+                cube_cores=self._read_value(
+                    self._get_current_thread_limit, self._CUBE_CORE, label=label
+                ),
+                vector_cores=self._read_value(
+                    self._get_current_thread_limit, self._VECTOR_CORE, label=label
+                ),
             )
-        if (
-            expected_vector_cores is not None
-            and state.vector_cores != expected_vector_cores
-        ):
-            raise RuntimeError(
-                "C8_KVAF_RESOURCE_QUOTA_FAILED "
-                f"label={label} thread_vector={state.vector_cores} "
-                f"expected_vector={expected_vector_cores}"
-            )
-        return state
+            if (
+                expected_cube_cores is not None
+                and state.cube_cores != expected_cube_cores
+            ):
+                raise RuntimeError(
+                    "C8_KVAF_RESOURCE_QUOTA_FAILED "
+                    f"label={label} thread_cube={state.cube_cores} "
+                    f"expected_cube={expected_cube_cores}"
+                )
+            if (
+                expected_vector_cores is not None
+                and state.vector_cores != expected_vector_cores
+            ):
+                raise RuntimeError(
+                    "C8_KVAF_RESOURCE_QUOTA_FAILED "
+                    f"label={label} thread_vector={state.vector_cores} "
+                    f"expected_vector={expected_vector_cores}"
+                )
+            return state
+        except BaseException:
+            try:
+                self.unbind_current_thread(stream, label=label)
+            except Exception:
+                pass
+            raise
 
     def unbind_current_thread(self, stream: object, *, label: str) -> None:
         stream_handle, _ = self._stream_handle(stream)
@@ -387,22 +398,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--li-cube-cores",
         type=int,
-        default=31,
-        help="LI stream Cube-core limit when resource quota is enabled.",
+        default=PARTITIONED_LI_CUBE_CORES,
+        help=(
+            "LI stream Cube-core limit for the supported partitioned C8 "
+            "probe; current official tiling requires 31."
+        ),
     )
     parser.add_argument(
         "--li-vector-cores",
         type=int,
-        default=62,
-        help="LI stream Vector-core limit when resource quota is enabled.",
+        default=PARTITIONED_LI_VECTOR_CORES,
+        help=(
+            "LI stream Vector-core limit for the supported partitioned C8 "
+            "probe; current official tiling requires 62."
+        ),
     )
     parser.add_argument(
         "--get-vector-cores",
         type=int,
-        default=None,
+        default=PARTITIONED_GET_VECTOR_CORES,
         help=(
-            "Deprecated compatibility argument. KVAF Get uses --npu-cores "
-            "as its direct AIV launch block count; no CANN Get quota is set."
+            "Get stream Vector-core limit for the supported partitioned C8 "
+            "probe; current split reserves 2 AIV cores for Get."
         ),
     )
     parser.add_argument(
@@ -462,16 +479,32 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.npu_cores <= 0 or not 1 <= args.jettys_per_core <= 2:
         raise ValueError("--npu-cores must be positive and --jettys-per-core must be 1 or 2")
     if args.enable_stream_resource_quota:
-        if min(args.li_cube_cores, args.li_vector_cores) <= 0:
+        if min(
+            args.li_cube_cores,
+            args.li_vector_cores,
+            args.get_vector_cores,
+        ) <= 0:
             raise ValueError("stream-resource limits must be positive")
         if (
-            args.get_vector_cores is not None
-            and args.npu_cores != args.get_vector_cores
+            args.li_cube_cores != PARTITIONED_LI_CUBE_CORES
+            or args.li_vector_cores != PARTITIONED_LI_VECTOR_CORES
+            or args.get_vector_cores != PARTITIONED_GET_VECTOR_CORES
         ):
             raise ValueError(
-                "--npu-cores must equal --get-vector-cores when "
-                "--get-vector-cores is supplied; KVAF Get has no separate "
-                "CANN quota and uses --npu-cores as its launch block count"
+                "C8_KVAF_RESOURCE_QUOTA_UNSUPPORTED "
+                "reason=official_c8_tiling_geometry "
+                f"li_cube={args.li_cube_cores} "
+                f"li_vector={args.li_vector_cores} "
+                f"get_vector={args.get_vector_cores} "
+                f"required_li_cube={PARTITIONED_LI_CUBE_CORES} "
+                f"required_li_vector={PARTITIONED_LI_VECTOR_CORES} "
+                f"required_get_vector={PARTITIONED_GET_VECTOR_CORES}"
+            )
+        if args.npu_cores > args.get_vector_cores:
+            raise ValueError(
+                "--npu-cores must not exceed --get-vector-cores for the "
+                "partitioned probe; otherwise Get can exceed its reserved "
+                "Vector-core budget"
             )
     if args.max_ddr_gib <= 0:
         raise ValueError("--max-ddr-gib must be positive")
@@ -1427,66 +1460,84 @@ def main() -> None:
                 cube_cores=args.li_cube_cores,
                 vector_cores=args.li_vector_cores,
             )
-            limited_streams = [("li", li_stream)]
+            get_resource_state = resource_api.configure(
+                copy_stream,
+                label="get",
+                cube_cores=None,
+                vector_cores=args.get_vector_cores,
+            )
+            limited_streams = [("li", li_stream), ("get", copy_stream)]
             print(
                 "C8_KVAF_RESOURCE_QUOTA_CONFIG "
                 f"library={resource_api.library_name} "
+                "capability=stream_limit_and_submit_tls_only "
                 "physical_core_id_proof=0 "
+                "li_tiler_callback_thread_proof=0 "
                 "li_stream_explicit=1 get_stream_explicit=1 "
                 f"li_stream=0x{li_resource_state.stream_handle:x} "
                 f"li_cube_limit={li_resource_state.cube_cores} "
                 f"li_vector_limit={li_resource_state.vector_cores} "
-                f"get_stream=0x{AclStreamResourceApi._stream_handle(copy_stream)[1]:x} "
+                f"get_stream=0x{get_resource_state.stream_handle:x} "
+                f"get_cube_observed={get_resource_state.cube_cores} "
+                f"get_vector_limit={get_resource_state.vector_cores} "
                 f"get_aiv_launch_blocks={args.npu_cores}",
                 flush=True,
             )
-            print(
-                "C8_KVAF_RESOURCE_QUOTA_GET "
-                f"stream=0x{AclStreamResourceApi._stream_handle(copy_stream)[1]:x} "
-                "submit_tls=not_used "
-                "cann_quota=not_set "
-                "reason=kvaf_direct_aiv_grid_is_explicit",
-                flush=True,
-            )
+        quota_binding_printed: set[str] = set()
 
-        li_binding_printed = False
+        def submit_with_stream_quota(
+            stream: object,
+            *,
+            label: str,
+            expected_cube_cores: int | None,
+            expected_vector_cores: int | None,
+            submit: Callable[[], object],
+        ) -> object:
+            """Bind one stream only for its host-side operator submission."""
 
-        def run_with_li_quota(operation: Callable[[], object]) -> object:
-            """Expose LI's configured quota only while its host tiler submits."""
-            nonlocal li_binding_printed
             if resource_api is None:
-                return operation()
-            with torch.npu.stream(li_stream):
-                li_thread_state = resource_api.bind_current_thread(
-                    li_stream,
-                    label="li",
-                    expected_cube_cores=args.li_cube_cores,
-                    expected_vector_cores=args.li_vector_cores,
+                with torch.npu.stream(stream):
+                    return submit()
+            with torch.npu.stream(stream):
+                thread_state = resource_api.bind_current_thread(
+                    stream,
+                    label=label,
+                    expected_cube_cores=expected_cube_cores,
+                    expected_vector_cores=expected_vector_cores,
                 )
-            if not li_binding_printed:
-                li_binding_printed = True
-                print(
-                    "C8_KVAF_RESOURCE_QUOTA_BIND "
-                    f"label=li stream=0x{li_thread_state.stream_handle:x} "
-                    "submit_scope=one_measured_phase "
-                    f"thread_cube_limit={li_thread_state.cube_cores} "
-                    f"thread_vector_limit={li_thread_state.vector_cores}",
-                    flush=True,
-                )
-            try:
-                return operation()
-            finally:
-                with torch.npu.stream(li_stream):
-                    resource_api.unbind_current_thread(li_stream, label="li")
+                if label not in quota_binding_printed:
+                    quota_binding_printed.add(label)
+                    print(
+                        "C8_KVAF_RESOURCE_QUOTA_BIND "
+                        f"label={label} stream=0x{thread_state.stream_handle:x} "
+                        "submit_scope=per_operator "
+                        f"thread_cube_limit={thread_state.cube_cores} "
+                        f"thread_vector_limit={thread_state.vector_cores}",
+                        flush=True,
+                    )
+                try:
+                    return submit()
+                finally:
+                    resource_api.unbind_current_thread(stream, label=label)
 
         li_input_wait_enqueued = False
+
         def launch_li() -> torch.Tensor:
             nonlocal li_input_wait_enqueued
             with torch.npu.stream(li_stream):
                 if not li_input_wait_enqueued:
                     li_stream.wait_event(li_inputs_ready)
                     li_input_wait_enqueued = True
-                return official_c8_lightning_indexer(c8_inputs)
+                result = submit_with_stream_quota(
+                    li_stream,
+                    label="li",
+                    expected_cube_cores=args.li_cube_cores,
+                    expected_vector_cores=args.li_vector_cores,
+                    submit=lambda: official_c8_lightning_indexer(c8_inputs),
+                )
+            if not isinstance(result, torch.Tensor):
+                raise AssertionError("official LI did not return an NPU Tensor")
+            return result
 
         print(
             "KVAF_TRANSPORT "
@@ -1521,7 +1572,7 @@ def main() -> None:
 
         # This is deliberately outside timing: it makes a descriptor from
         # genuine C8 Top-K IDs, then gives the overlap experiment stable input.
-        exact_topk = run_with_li_quota(launch_li)
+        exact_topk = launch_li()
         if not isinstance(exact_topk, torch.Tensor):
             raise AssertionError("LI prelude did not return an NPU Tensor")
         li_stream.synchronize()
@@ -1538,16 +1589,24 @@ def main() -> None:
         get_inputs_ready.record(control_stream)
 
         def launch_get(stream: object) -> None:
-            runtime.batch_get(
-                addresses,
-                valid,
-                outputs.indices,
-                outputs.offsets,
-                outputs.mask,
-                outputs.output_indices,
-                packed_output,
-                stream,
-                False,
+            if stream is not copy_stream:
+                raise AssertionError("KVAF Get must use its configured copy stream")
+            submit_with_stream_quota(
+                copy_stream,
+                label="get",
+                expected_cube_cores=None,
+                expected_vector_cores=args.get_vector_cores,
+                submit=lambda: runtime.batch_get(
+                    addresses,
+                    valid,
+                    outputs.indices,
+                    outputs.offsets,
+                    outputs.mask,
+                    outputs.output_indices,
+                    packed_output,
+                    stream,
+                    False,
+                ),
             )
 
         with torch.npu.stream(copy_stream):
@@ -1561,13 +1620,11 @@ def main() -> None:
             flush=True,
         )
 
-        li_samples = run_with_li_quota(
-            lambda: time_li_only(
-                launch_li,
-                li_stream,
-                warmup_count=args.warmup,
-                iters=args.iters,
-            )
+        li_samples = time_li_only(
+            launch_li,
+            li_stream,
+            warmup_count=args.warmup,
+            iters=args.iters,
         )
         if not isinstance(li_samples, list):
             raise AssertionError("LI timing did not return samples")
@@ -1585,41 +1642,35 @@ def main() -> None:
                 ),
                 role="isolated",
             )
-        serial_timing = run_with_li_quota(
-            lambda: time_serial(
-                launch_li,
-                launch_get,
-                li_stream,
-                copy_stream,
-                warmup_count=args.warmup,
-                iters=args.iters,
-            )
+        serial_timing = time_serial(
+            launch_li,
+            launch_get,
+            li_stream,
+            copy_stream,
+            warmup_count=args.warmup,
+            iters=args.iters,
         )
         if not isinstance(serial_timing, SerialTimingSamples):
             raise AssertionError("serial timing did not return samples")
         serial_samples = serial_timing.join_us
-        concurrent_timing = run_with_li_quota(
-            lambda: time_concurrent_join(
-                launch_li,
-                launch_get,
-                li_stream,
-                copy_stream,
-                warmup_count=args.warmup,
-                iters=args.iters,
-            )
+        concurrent_timing = time_concurrent_join(
+            launch_li,
+            launch_get,
+            li_stream,
+            copy_stream,
+            warmup_count=args.warmup,
+            iters=args.iters,
         )
         if not isinstance(concurrent_timing, ConcurrentTimingSamples):
             raise AssertionError("concurrent timing did not return samples")
         concurrent_samples = concurrent_timing.join_us
         if args.enable_kvaf_get_kernel_profile:
-            concurrent_profiles = run_with_li_quota(
-                lambda: capture_concurrent_get_aiv_profile(
-                    runtime,
-                    launch_li,
-                    launch_get,
-                    li_stream,
-                    copy_stream,
-                )
+            concurrent_profiles = capture_concurrent_get_aiv_profile(
+                runtime,
+                launch_li,
+                launch_get,
+                li_stream,
+                copy_stream,
             )
             if not isinstance(concurrent_profiles, list):
                 raise AssertionError("concurrent Get profile did not return a list")
@@ -1769,7 +1820,9 @@ def main() -> None:
             )
             print(
                 "C8_KVAF_RESOURCE_QUOTA_CAPABILITY_PASS "
-                "physical_core_id_proof=0",
+                "scope=stream_limit_and_submit_tls "
+                "physical_core_id_proof=0 "
+                "li_tiler_callback_thread_proof=0",
                 flush=True,
             )
         print("C8_KVAF_OVERLAP_CORRECTNESS_PASS", flush=True)
