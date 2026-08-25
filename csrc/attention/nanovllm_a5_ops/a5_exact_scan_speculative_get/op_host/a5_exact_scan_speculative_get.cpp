@@ -206,12 +206,13 @@ static ge::graphStatus InferA5ExactScanSpeculativeGetShape(
             return ge::GRAPH_FAILED;
         }
     }
-    const gert::Shape scores =
-        context->GetInputShape(kLiScores)->GetStorageShape();
-    const gert::Shape packedOutput =
-        context->GetInputShape(kPackedOutput)->GetStorageShape();
-    const gert::Shape pipelineState =
-        context->GetInputShape(kPipelineState)->GetStorageShape();
+    // InferShapeContext exposes gert::Shape directly on CANN 9.1.  The
+    // GetStorageShape() wrapper exists on TilingContext's storage-shape view,
+    // but not here; copying the Shape keeps this callback compatible with the
+    // generated CANN 9.1 operator host ABI.
+    const gert::Shape scores = *context->GetInputShape(kLiScores);
+    const gert::Shape packedOutput = *context->GetInputShape(kPackedOutput);
+    const gert::Shape pipelineState = *context->GetInputShape(kPipelineState);
     if (!IsVectorWithPositiveLength(scores)) {
         return ge::GRAPH_FAILED;
     }
