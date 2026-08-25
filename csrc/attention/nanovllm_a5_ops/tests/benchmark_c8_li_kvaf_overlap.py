@@ -950,7 +950,7 @@ def capture_get_aiv_profile(
     runtime: object,
     launch_get: Callable[[object], None],
     copy_stream: object,
-) -> list[dict[str, int]]:
+) -> list[dict[str, object]]:
     """Capture one non-timed Get profile without perturbing benchmark samples."""
 
     start_profile = getattr(runtime, "start_batch_get_kernel_profile", None)
@@ -976,35 +976,79 @@ def capture_get_aiv_profile(
         raise
 
     raw_profiles = stop_profile()
-    profiles: list[dict[str, int]] = []
+    # pybind converts the two per-Jetty std::array fields into Python lists.
+    # Keep those lists intact: flattening every value to ``int`` loses the
+    # two-Jetty split and, more importantly, raises before the timing result
+    # can be reported.
+    profiles: list[dict[str, object]] = []
     for raw_profile in raw_profiles:
         if not isinstance(raw_profile, dict):
             raise RuntimeError("KVAF BatchGet profile item is not a dictionary")
-        profiles.append({str(key): int(value) for key, value in raw_profile.items()})
+        profiles.append({str(key): value for key, value in raw_profile.items()})
     return profiles
 
 
-def report_get_aiv_profiles(profiles: list[dict[str, int]]) -> None:
+def profile_scalar(profile: dict[str, object], key: str) -> int:
+    """Read one scalar counter from the KVAF pybind profile contract."""
+
+    value = profile.get(key, 0)
+    if isinstance(value, (list, tuple)):
+        raise RuntimeError(f"KVAF BatchGet profile field {key} must be scalar")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"KVAF BatchGet profile field {key} is not an integer: {value!r}"
+        ) from error
+
+
+def profile_jetty_pair(profile: dict[str, object], key: str) -> tuple[int, ...]:
+    """Read the per-Jetty counters without pretending they are scalars."""
+
+    value = profile.get(key, ())
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError(f"KVAF BatchGet profile field {key} must be a list")
+    try:
+        return tuple(int(item) for item in value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"KVAF BatchGet profile field {key} has a non-integer item: {value!r}"
+        ) from error
+
+
+def report_get_aiv_profiles(profiles: list[dict[str, object]]) -> None:
     """Emit logical Get-worker activity; the runtime exposes no physical ID."""
 
     for profile in profiles:
-        start = profile.get("kernel_start_cycle", 0)
-        finish = profile.get("kernel_finish_cycle", 0)
+        start = profile_scalar(profile, "kernel_start_cycle")
+        setup_done = profile_scalar(profile, "setup_done_cycle")
+        compact_done = profile_scalar(profile, "compact_done_cycle")
+        first_doorbell = profile_scalar(profile, "first_doorbell_cycle")
+        post_done = profile_scalar(profile, "post_done_cycle")
+        completion_done = profile_scalar(profile, "completion_done_cycle")
+        finish = profile_scalar(profile, "kernel_finish_cycle")
+        wait_cycles = profile_jetty_pair(
+            profile, "jetty_completion_wait_cycles"
+        )
+        polls = profile_jetty_pair(profile, "jetty_completion_polls")
         print(
             "C8_KVAF_GET_AIV_PROFILE "
             "role=isolated "
-            f"logical_aiv_block={profile.get('core', -1)} "
+            f"logical_aiv_block={profile_scalar(profile, 'core')} "
             "physical_core_id=not_available "
-            f"active_requests={profile.get('active_requests', 0)} "
-            f"total_posts={profile.get('total_posts', 0)} "
+            f"active_requests={profile_scalar(profile, 'active_requests')} "
+            f"total_posts={profile_scalar(profile, 'total_posts')} "
             f"kernel_cycles={max(0, finish - start)} "
-            f"setup_done_cycle={profile.get('setup_done_cycle', 0)} "
-            f"compact_done_cycle={profile.get('compact_done_cycle', 0)} "
-            f"first_doorbell_cycle={profile.get('first_doorbell_cycle', 0)} "
-            f"completion_done_cycle={profile.get('completion_done_cycle', 0)} "
+            f"setup_cycles={max(0, setup_done - start)} "
+            f"compact_cycles={max(0, compact_done - setup_done)} "
+            f"post_cycles={max(0, post_done - compact_done)} "
+            f"completion_cycles={max(0, completion_done - post_done)} "
+            f"finalize_cycles={max(0, finish - completion_done)} "
+            f"first_doorbell_cycle={first_doorbell} "
             "jetty_completion_wait_cycles="
-            f"{profile.get('jetty_completion_wait_cycles', 0)} "
-            f"jetty_completion_polls={profile.get('jetty_completion_polls', 0)}",
+            f"[{','.join(str(value) for value in wait_cycles)}] "
+            "jetty_completion_polls="
+            f"[{','.join(str(value) for value in polls)}]",
             flush=True,
         )
 
