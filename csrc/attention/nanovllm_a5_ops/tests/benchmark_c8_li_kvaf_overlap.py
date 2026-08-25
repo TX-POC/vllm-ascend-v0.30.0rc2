@@ -20,12 +20,12 @@ outside the timed regions.
 ``--enable-stream-resource-quota`` is a separate eager capability probe.  It
 uses CANN's public per-stream Cube/Vector *count* limits to form the only
 geometry that is safe with the current official C8 LI tiler: LI gets
-31 Cube + 62 Vector cores, and Get gets the remaining 2 Vector cores.  Each
-quota is bound only while its own host-side operator submission runs.  This
-is necessary because the LI tiler reads the current thread's core view, while
-the explicit KVAF Get launch must see its own two-Vector-core view.  The probe
-does not claim fixed physical core IDs; that requires a later device-side
-core-ID diagnostic.
+31 Cube + 62 Vector cores, and Get gets the remaining 2 Vector cores. In the
+legacy path each quota is bound only for its own host-side submission. In the
+native-worker path, the worker binds the already-configured Get stream once
+and verifies that its own thread sees the requested two-Vector-core limit.
+The probe does not claim fixed physical core IDs; that requires a later
+device-side core-ID diagnostic.
 
 The selected KVAF data plane is explicit. ``--transport local`` uses A5 HBM
 and the same A5 host DDR through the dsa-direct-get Direct-HCCP backend;
@@ -136,6 +136,29 @@ class ConcurrentTimingSamples:
     li_host_submit_us: list[float]
     get_return_to_li_enter_us: list[float]
     pair_host_submit_us: list[float]
+
+
+@dataclass(frozen=True)
+class NativeLaneTimingSamples:
+    """One-slot native worker measurements for the eager LI/Get probe.
+
+    The native lane deliberately reports no Python-recorded Get stream span:
+    only its C++ worker writes the copy stream, so a main-thread Torch event
+    would violate that ownership contract.  The joint LI-stream time and the
+    three host hand-off windows are enough to isolate the old Python submit
+    bubble from remaining device/HCCP/HBM contention.
+    """
+
+    join_us: list[float]
+    li_span_us: list[float]
+    post_call_us: list[float]
+    post_return_to_li_enter_us: list[float]
+    post_to_worker_start_us: list[float]
+    worker_issue_us: list[float]
+    post_to_worker_issue_us: list[float]
+    arm_wait_us: list[float]
+    reap_wait_us: list[float]
+    step_wall_us: list[float]
 
 
 @dataclass(frozen=True)
@@ -439,6 +462,16 @@ def parse_args() -> argparse.Namespace:
             "timelines. This reports no physical AIV ID or affinity."
         ),
     )
+    parser.add_argument(
+        "--get-submit-mode",
+        choices=("eager_python", "native_lane"),
+        default="eager_python",
+        help=(
+            "eager_python keeps the legacy Python runtime.batch_get submit; "
+            "native_lane additionally measures a single C++ worker that owns "
+            "the Get copy stream. native_lane is local Direct-HCCP only."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--batch-get-kernel",
@@ -520,6 +553,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--cpu-service-addr is required when --transport remote"
         )
+    if args.get_submit_mode == "native_lane":
+        if args.transport != "local":
+            raise ValueError(
+                "--get-submit-mode native_lane currently supports only "
+                "--transport local; it never silently falls back to remote"
+            )
+        if args.enable_kvaf_get_kernel_profile:
+            raise ValueError(
+                "native_lane does not yet expose worker-owned Get device timing; "
+                "run its host/join probe without --enable-kvaf-get-kernel-profile"
+            )
     if not args.batch_get_kernel.is_file():
         raise FileNotFoundError(args.batch_get_kernel)
     if not args.batch_put_kernel.is_file():
@@ -1459,6 +1503,214 @@ def time_concurrent_join(
     )
 
 
+def time_concurrent_join_step_paced(
+    launch_li: Callable[[], torch.Tensor],
+    launch_get: Callable[[object], None],
+    li_stream: object,
+    copy_stream: object,
+    *,
+    warmup_count: int,
+    iters: int,
+) -> ConcurrentTimingSamples:
+    """Measure the legacy Python Get-first path with one slot per step.
+
+    The native lane can only reuse its fixed HBM output after a terminal
+    event has completed, so it necessarily advances one decode step at a
+    time. This reference gives the eager launcher exactly the same pacing:
+    submit Get, submit LI, join the two streams, then wait before beginning
+    the next sample. It is the valid host-submit comparison for a one-slot
+    lane; the existing batched ``time_concurrent_join`` remains the queued
+    throughput envelope and is intentionally reported separately.
+    """
+
+    def launch_once() -> tuple[
+        float, float, float, float, float, float, float, torch.Tensor
+    ]:
+        join_start = torch.npu.Event(enable_timing=True)
+        join_end = torch.npu.Event(enable_timing=True)
+        li_start = torch.npu.Event(enable_timing=True)
+        li_end = torch.npu.Event(enable_timing=True)
+        get_start = torch.npu.Event(enable_timing=True)
+        get_end = torch.npu.Event(enable_timing=True)
+        gate = torch.npu.Event()
+        get_done = torch.npu.Event()
+
+        join_start.record(li_stream)
+        gate.record(li_stream)
+        with torch.npu.stream(copy_stream):
+            copy_stream.wait_event(gate)
+            get_start.record(copy_stream)
+            get_submit_enter_ns = time.perf_counter_ns()
+            launch_get(copy_stream)
+            get_submit_return_ns = time.perf_counter_ns()
+            get_end.record(copy_stream)
+            get_done.record(copy_stream)
+        li_start.record(li_stream)
+        li_submit_enter_ns = time.perf_counter_ns()
+        result = launch_li()
+        li_submit_return_ns = time.perf_counter_ns()
+        li_end.record(li_stream)
+        li_stream.wait_event(get_done)
+        join_end.record(li_stream)
+        join_end.synchronize()
+        return (
+            join_start.elapsed_time(join_end) * 1000.0,
+            li_start.elapsed_time(li_end) * 1000.0,
+            get_start.elapsed_time(get_end) * 1000.0,
+            (get_submit_return_ns - get_submit_enter_ns) / 1_000.0,
+            (li_submit_return_ns - li_submit_enter_ns) / 1_000.0,
+            (li_submit_enter_ns - get_submit_return_ns) / 1_000.0,
+            (li_submit_return_ns - get_submit_enter_ns) / 1_000.0,
+            result,
+        )
+
+    retained: list[torch.Tensor] = []
+    for _ in range(warmup_count):
+        retained.append(launch_once()[-1])
+
+    join_us: list[float] = []
+    li_span_us: list[float] = []
+    get_span_us: list[float] = []
+    get_host_submit_us: list[float] = []
+    li_host_submit_us: list[float] = []
+    get_return_to_li_enter_us: list[float] = []
+    pair_host_submit_us: list[float] = []
+    for _ in range(iters):
+        (
+            join,
+            li_span,
+            get_span,
+            get_submit,
+            li_submit,
+            get_to_li,
+            pair_submit,
+            result,
+        ) = launch_once()
+        retained.append(result)
+        join_us.append(join)
+        li_span_us.append(li_span)
+        get_span_us.append(get_span)
+        get_host_submit_us.append(get_submit)
+        li_host_submit_us.append(li_submit)
+        get_return_to_li_enter_us.append(get_to_li)
+        pair_host_submit_us.append(pair_submit)
+
+    return ConcurrentTimingSamples(
+        join_us=join_us,
+        li_span_us=li_span_us,
+        get_span_us=get_span_us,
+        get_host_submit_us=get_host_submit_us,
+        li_host_submit_us=li_host_submit_us,
+        get_return_to_li_enter_us=get_return_to_li_enter_us,
+        pair_host_submit_us=pair_host_submit_us,
+    )
+
+
+def time_concurrent_join_native_lane(
+    launch_li: Callable[[], torch.Tensor],
+    post_get: Callable[[object], None],
+    arm_get: Callable[[object], dict[str, float]],
+    record_terminal: Callable[[object], None],
+    reap_get: Callable[[], None],
+    li_stream: object,
+    *,
+    warmup_count: int,
+    iters: int,
+) -> NativeLaneTimingSamples:
+    """Measure native C++ Get issue without submitting on copy_stream here.
+
+    ``post_get(li_stream)`` records the native producer event on LI's stream;
+    the C++ worker alone waits on it and writes to the copy stream.  Python
+    immediately submits LI, then calls ``arm_get`` only after LI host submit
+    has returned.  A fixed one-slot lane is deliberately reaped per iteration:
+    this is an exact decode-step/lifetime probe, not a speculative depth-N
+    throughput claim.
+    """
+
+    def launch_warmup() -> torch.Tensor:
+        post_get(li_stream)
+        result = launch_li()
+        arm_get(li_stream)
+        record_terminal(li_stream)
+        reap_get()
+        return result
+
+    retained: list[torch.Tensor] = []
+    for _ in range(warmup_count):
+        retained.append(launch_warmup())
+
+    join_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    join_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    li_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    li_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    post_call_us: list[float] = []
+    post_return_to_li_enter_us: list[float] = []
+    post_to_worker_start_us: list[float] = []
+    worker_issue_us: list[float] = []
+    post_to_worker_issue_us: list[float] = []
+    arm_wait_us: list[float] = []
+    reap_wait_us: list[float] = []
+    step_wall_us: list[float] = []
+
+    for join_start, join_end, li_start, li_end in zip(
+        join_starts, join_ends, li_starts, li_ends
+    ):
+        join_start.record(li_stream)
+        post_enter_ns = time.perf_counter_ns()
+        post_get(li_stream)
+        post_return_ns = time.perf_counter_ns()
+        li_start.record(li_stream)
+        li_enter_ns = time.perf_counter_ns()
+        retained.append(launch_li())
+        li_end.record(li_stream)
+        arm_metrics = arm_get(li_stream)
+        join_end.record(li_stream)
+        record_terminal(li_stream)
+        # Do not replace this with torch.npu.synchronize(): that does not
+        # cover a job which is still sitting in the native worker queue.
+        reap_enter_ns = time.perf_counter_ns()
+        reap_get()
+        reap_return_ns = time.perf_counter_ns()
+        try:
+            post_to_worker_start = float(arm_metrics["post_to_worker_start_us"])
+            worker_issue = float(arm_metrics["worker_issue_us"])
+            post_to_issue = float(arm_metrics["post_to_worker_issue_us"])
+            arm_wait = float(arm_metrics["arm_wait_us"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "native Get lane returned an invalid arm timing dictionary"
+            ) from error
+        post_call_us.append((post_return_ns - post_enter_ns) / 1_000.0)
+        post_return_to_li_enter_us.append(
+            (li_enter_ns - post_return_ns) / 1_000.0
+        )
+        post_to_worker_start_us.append(post_to_worker_start)
+        worker_issue_us.append(worker_issue)
+        post_to_worker_issue_us.append(post_to_issue)
+        arm_wait_us.append(arm_wait)
+        reap_wait_us.append((reap_return_ns - reap_enter_ns) / 1_000.0)
+        step_wall_us.append((reap_return_ns - post_enter_ns) / 1_000.0)
+
+    return NativeLaneTimingSamples(
+        join_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(join_starts, join_ends)
+        ],
+        li_span_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(li_starts, li_ends)
+        ],
+        post_call_us=post_call_us,
+        post_return_to_li_enter_us=post_return_to_li_enter_us,
+        post_to_worker_start_us=post_to_worker_start_us,
+        worker_issue_us=worker_issue_us,
+        post_to_worker_issue_us=post_to_worker_issue_us,
+        arm_wait_us=arm_wait_us,
+        reap_wait_us=reap_wait_us,
+        step_wall_us=step_wall_us,
+    )
+
+
 def capture_concurrent_get_aiv_profile(
     runtime: object,
     launch_li: Callable[[], torch.Tensor],
@@ -1520,6 +1772,9 @@ def main() -> None:
     keys: list[int] = []
     resource_api: AclStreamResourceApi | None = None
     limited_streams: list[tuple[str, object]] = []
+    native_lane_created = False
+    resource_limits_reset = False
+    runtime_shutdown = False
     try:
         if args.enable_stream_resource_quota:
             resource_api = AclStreamResourceApi()
@@ -1633,7 +1888,8 @@ def main() -> None:
             f"npu_cores={args.npu_cores} jettys_per_core={args.jettys_per_core} "
             "kvaf_get_kernel_profile="
             f"{int(args.enable_kvaf_get_kernel_profile)} "
-            "concurrent_host_submit_order=get_first "
+            f"get_submit_mode={args.get_submit_mode} "
+            "eager_concurrent_host_submit_order=get_first "
             "execution_mode="
             f"{'stream_resource_quota' if args.enable_stream_resource_quota else 'baseline'} "
             f"dsa_registration_backend={dsa_registration_backend}",
@@ -1746,6 +2002,130 @@ def main() -> None:
                 raise AssertionError("concurrent Get profile did not return a list")
             report_get_aiv_profiles(concurrent_profiles, role="concurrent")
 
+        native_lane_timing: NativeLaneTimingSamples | None = None
+        eager_step_paced_timing: ConcurrentTimingSamples | None = None
+        if args.get_submit_mode == "native_lane":
+            required_native_lane_methods = (
+                "create_native_get_submit_lane",
+                "bind_native_get_output",
+                "prepare_native_get",
+                "post_native_get",
+                "arm_native_get",
+                "record_native_get_terminal",
+                "reap_native_get",
+                "destroy_native_get_submit_lane",
+            )
+            missing_native_lane_methods = [
+                name
+                for name in required_native_lane_methods
+                if not callable(getattr(runtime, name, None))
+            ]
+            if missing_native_lane_methods:
+                raise RuntimeError(
+                    "KVAF native Get lane is unavailable; rebuild the selected "
+                    "local Direct-HCCP KVAF binding from kip_demo_cs_native_enqueue. "
+                    f"missing={','.join(missing_native_lane_methods)}"
+                )
+
+            # A fair one-slot reference is needed because the native lane
+            # retires its fixed output before starting the next decode step.
+            # The older queued baseline above remains useful, but it is not a
+            # direct before/after comparison for this lifecycle.
+            eager_step_paced_timing = time_concurrent_join_step_paced(
+                launch_li,
+                launch_get,
+                li_stream,
+                copy_stream,
+                warmup_count=args.warmup,
+                iters=args.iters,
+            )
+
+            # The native lane has no general concurrent Runtime contract.
+            # Explicitly drain the legacy streams while Python still owns
+            # copy_stream, then enqueue and complete its one input-ready gate
+            # before the C++ worker becomes the sole copy-stream submitter.
+            li_stream.synchronize()
+            with torch.npu.stream(copy_stream):
+                copy_stream.wait_event(get_inputs_ready)
+            copy_stream.synchronize()
+
+            # All legacy eager work has completed. From here until destroy, the
+            # C++ worker is the only BatchGet issuer and the only host thread
+            # that writes copy_stream.
+            runtime.create_native_get_submit_lane(
+                copy_stream,
+                args.enable_stream_resource_quota,
+                args.get_vector_cores if args.enable_stream_resource_quota else 0,
+            )
+            native_lane_created = True
+            runtime.bind_native_get_output(packed_output)
+            runtime.prepare_native_get(
+                addresses,
+                valid,
+                outputs.indices,
+                outputs.offsets,
+                outputs.mask,
+                outputs.output_indices,
+                packed_output,
+            )
+
+            def post_native_get(producer_stream: object) -> None:
+                runtime.post_native_get(producer_stream)
+
+            def arm_native_get(consumer_stream: object) -> dict[str, float]:
+                raw = runtime.arm_native_get(consumer_stream)
+                if not isinstance(raw, dict):
+                    raise RuntimeError("KVAF native Get arm did not return a dictionary")
+                return {str(key): float(value) for key, value in raw.items()}
+
+            def record_native_terminal(terminal_stream: object) -> None:
+                runtime.record_native_get_terminal(terminal_stream)
+
+            def reap_native_get() -> None:
+                runtime.reap_native_get()
+
+            # A separate native-only correctness pass matters: the eager
+            # baseline above already populated packed_output with valid bytes.
+            packed_output.zero_()
+            torch.npu.synchronize()
+            post_native_get(li_stream)
+            native_correctness_topk = launch_li()
+            arm_native_get(li_stream)
+            record_native_terminal(li_stream)
+            reap_native_get()
+            validate_batch_get(outputs, packed_output)
+            validate_official_topk(native_correctness_topk, args.source_len)
+            print(
+                "C8_KVAF_NATIVE_LANE_CORRECTNESS "
+                "cold_bound_output=1 worker_owned_copy_stream=1 "
+                "li_get_join=1 payload=1 topk=1",
+                flush=True,
+            )
+            print(
+                "C8_KVAF_NATIVE_LANE_CONFIG "
+                "slot_count=1 mode=eager_only "
+                "copy_stream_submitter=cxx_worker "
+                "prepared_descriptor=1 "
+                f"worker_stream_resource_quota={int(args.enable_stream_resource_quota)} "
+                "worker_vector_limit_verified="
+                f"{args.get_vector_cores if args.enable_stream_resource_quota else 'not_requested'} "
+                "event_contract=post_then_li_then_arm_then_terminal_then_reap "
+                "physical_core_id_proof=0",
+                flush=True,
+            )
+            native_lane_timing = time_concurrent_join_native_lane(
+                launch_li,
+                post_native_get,
+                arm_native_get,
+                record_native_terminal,
+                reap_native_get,
+                li_stream,
+                warmup_count=args.warmup,
+                iters=args.iters,
+            )
+            if not isinstance(native_lane_timing, NativeLaneTimingSamples):
+                raise AssertionError("native Get lane timing did not return samples")
+
         report(
             "c8_li_only",
             li_samples,
@@ -1841,6 +2221,91 @@ def main() -> None:
             concurrent_timing.pair_host_submit_us,
             warmup=args.warmup,
         )
+        if native_lane_timing is not None:
+            if eager_step_paced_timing is None:
+                raise AssertionError("native lane has no step-paced eager reference")
+            eager_step_paced_label = (
+                f"c8_li_with_{args.transport}_get_eager_step_paced_join"
+            )
+            native_label = (
+                f"c8_li_with_{args.transport}_get_native_lane_concurrent_join"
+            )
+            native_li_span_label = (
+                f"c8_li_with_{args.transport}_get_native_lane_li_span"
+            )
+            report(
+                eager_step_paced_label,
+                eager_step_paced_timing.join_us,
+                warmup=args.warmup,
+                active_tokens=active_tokens,
+                moves_payload=True,
+                payload_metric="effective_phase_payload_gibps",
+            )
+            report(
+                native_label,
+                native_lane_timing.join_us,
+                warmup=args.warmup,
+                active_tokens=active_tokens,
+                moves_payload=True,
+                payload_metric="effective_phase_payload_gibps",
+            )
+            report(
+                native_li_span_label,
+                native_lane_timing.li_span_us,
+                warmup=args.warmup,
+                active_tokens=active_tokens,
+                moves_payload=False,
+            )
+            report_host_submit(
+                "eager_step_paced_get_call",
+                eager_step_paced_timing.get_host_submit_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "eager_step_paced_get_return_to_li_enter",
+                eager_step_paced_timing.get_return_to_li_enter_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_post_call",
+                native_lane_timing.post_call_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_post_return_to_li_enter",
+                native_lane_timing.post_return_to_li_enter_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_post_to_worker_start",
+                native_lane_timing.post_to_worker_start_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_worker_issue",
+                native_lane_timing.worker_issue_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_post_to_worker_issue",
+                native_lane_timing.post_to_worker_issue_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_arm_wait",
+                native_lane_timing.arm_wait_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_reap_wait",
+                native_lane_timing.reap_wait_us,
+                warmup=args.warmup,
+            )
+            report_host_submit(
+                "native_lane_step_wall",
+                native_lane_timing.step_wall_us,
+                warmup=args.warmup,
+            )
         serial_residuals = serial_join_minus_sum(serial_timing)
         concurrent_residuals = concurrent_join_minus_max_span(concurrent_timing)
         report(
@@ -1883,6 +2348,20 @@ def main() -> None:
             "cross_run_p90_arithmetic=not_used",
             flush=True,
         )
+        if native_lane_timing is not None:
+            print(
+                "C8_KVAF_NATIVE_LANE_TIMING_CONTRACT "
+                "dependency=post_descriptor_event_then_li_then_arm_get_done_then_terminal "
+                "python_copy_stream_submit=0 "
+                "worker_is_only_get_submitter=1 "
+                "hot_post_scope=prepared_request_event_record_and_worker_notify "
+                "host_arm_required=1 "
+                "native_join_includes_arm_gate=1 "
+                "native_join_excludes_reap_wait=1 "
+                "worker_issue_scope=cpu_wait_event_plus_batch_get_launch_plus_record_event "
+                "slot_reap=terminal_event_completed",
+                flush=True,
+            )
         print(
             "C8_KVAF_OVERLAP_RESULT "
             f"serial_join_p50_us={serial_p50:.3f} "
@@ -1903,6 +2382,59 @@ def main() -> None:
             f"concurrent_join_minus_max_span_p90_us={concurrent_residual_p90:.3f}",
             flush=True,
         )
+        if native_lane_timing is not None:
+            if eager_step_paced_timing is None:
+                raise AssertionError("native lane has no step-paced eager reference")
+            native_join_p50 = percentile(native_lane_timing.join_us, 0.50)
+            native_join_p90 = percentile(native_lane_timing.join_us, 0.90)
+            native_li_p50 = percentile(native_lane_timing.li_span_us, 0.50)
+            native_li_p90 = percentile(native_lane_timing.li_span_us, 0.90)
+            eager_step_paced_join_p50 = percentile(
+                eager_step_paced_timing.join_us, 0.50
+            )
+            eager_step_paced_join_p90 = percentile(
+                eager_step_paced_timing.join_us, 0.90
+            )
+            native_post_p90 = percentile(native_lane_timing.post_call_us, 0.90)
+            native_post_to_li_p90 = percentile(
+                native_lane_timing.post_return_to_li_enter_us, 0.90
+            )
+            native_worker_start_p90 = percentile(
+                native_lane_timing.post_to_worker_start_us, 0.90
+            )
+            native_worker_issue_only_p90 = percentile(
+                native_lane_timing.worker_issue_us, 0.90
+            )
+            native_worker_issue_p90 = percentile(
+                native_lane_timing.post_to_worker_issue_us, 0.90
+            )
+            native_arm_wait_p90 = percentile(native_lane_timing.arm_wait_us, 0.90)
+            native_reap_wait_p90 = percentile(native_lane_timing.reap_wait_us, 0.90)
+            native_step_wall_p50 = percentile(native_lane_timing.step_wall_us, 0.50)
+            native_step_wall_p90 = percentile(native_lane_timing.step_wall_us, 0.90)
+            print(
+                "C8_KVAF_NATIVE_LANE_RESULT "
+                f"eager_queued_join_p90_us={concurrent_p90:.3f} "
+                f"eager_step_paced_join_p50_us={eager_step_paced_join_p50:.3f} "
+                f"eager_step_paced_join_p90_us={eager_step_paced_join_p90:.3f} "
+                f"native_join_p50_us={native_join_p50:.3f} "
+                f"native_join_p90_us={native_join_p90:.3f} "
+                f"native_li_span_p50_us={native_li_p50:.3f} "
+                f"native_li_span_p90_us={native_li_p90:.3f} "
+                f"native_post_call_p90_us={native_post_p90:.3f} "
+                f"native_post_return_to_li_enter_p90_us={native_post_to_li_p90:.3f} "
+                f"native_post_to_worker_start_p90_us={native_worker_start_p90:.3f} "
+                f"native_worker_issue_p90_us={native_worker_issue_only_p90:.3f} "
+                f"native_post_to_worker_issue_p90_us={native_worker_issue_p90:.3f} "
+                f"native_arm_wait_p90_us={native_arm_wait_p90:.3f} "
+                f"native_reap_wait_p90_us={native_reap_wait_p90:.3f} "
+                f"native_step_wall_p50_us={native_step_wall_p50:.3f} "
+                f"native_step_wall_p90_us={native_step_wall_p90:.3f} "
+                "native_get_device_span=not_reported_worker_owns_copy_stream "
+                "comparison_scope=one_slot_step_paced_eager_vs_native "
+                "queued_eager_is_throughput_envelope_not_direct_comparison",
+                flush=True,
+            )
         if args.enable_stream_resource_quota:
             print(
                 "C8_KVAF_RESOURCE_QUOTA_RESULT "
@@ -1918,9 +2450,64 @@ def main() -> None:
                 "li_tiler_callback_thread_proof=0",
                 flush=True,
             )
+        if native_lane_created:
+            # A PASS must mean the worker stopped and its cold HBM binding was
+            # released after every terminal event, not merely that the timing
+            # loop printed numbers. Any close failure is a real test failure.
+            runtime.destroy_native_get_submit_lane()
+            native_lane_created = False
+            print(
+                "C8_KVAF_NATIVE_LANE_CLEANUP lane=destroyed_after_terminal_reap",
+                flush=True,
+            )
+
+        # Successful-path cleanup is intentionally strict. A final PASS means
+        # not only correct payloads but also that resource quotas, KVAF table
+        # state, and Runtime-owned DDR have all been released. The finally
+        # block below is only an exception-path safety net.
+        if resource_api is not None:
+            torch.npu.synchronize()
+            for label, stream in limited_streams:
+                resource_api.reset_stream_limit(stream, label=label)
+                print(
+                    "C8_KVAF_RESOURCE_QUOTA_CLEANUP "
+                    f"label={label} stream_limit=reset",
+                    flush=True,
+                )
+            resource_limits_reset = True
+        if handle is not None:
+            runtime.release_access_table(handle)
+            handle = None
+        if keys:
+            for start in range(0, len(keys), args.put_batch_size):
+                runtime.batch_free(keys[start : start + args.put_batch_size])
+            keys = []
+        runtime.shutdown()
+        runtime_shutdown = True
         print("C8_KVAF_OVERLAP_CORRECTNESS_PASS", flush=True)
     finally:
-        if resource_api is not None:
+        if native_lane_created:
+            try:
+                runtime.destroy_native_get_submit_lane()
+                native_lane_created = False
+                print(
+                    "C8_KVAF_NATIVE_LANE_CLEANUP lane=destroyed_after_terminal_reap",
+                    flush=True,
+                )
+            except Exception as error:
+                # Do not pretend torch.npu.synchronize() can repair a job that
+                # may still be queued in the native worker. Keep subsequent
+                # Runtime mutation out of this unsafe state.
+                print(
+                    "C8_KVAF_NATIVE_LANE_CLEANUP "
+                    f"lane_destroy_error={error}",
+                    flush=True,
+                )
+        if (
+            resource_api is not None
+            and not resource_limits_reset
+            and not native_lane_created
+        ):
             try:
                 torch.npu.synchronize()
             except Exception as error:
@@ -1943,7 +2530,19 @@ def main() -> None:
                         f"label={label} stream_limit_reset_error={error}",
                         flush=True,
                     )
-        if handle is not None:
+        elif resource_api is not None and not resource_limits_reset:
+            print(
+                "C8_KVAF_RESOURCE_QUOTA_CLEANUP "
+                "stream_limit_reset_skipped=native_lane_not_destroyed",
+                flush=True,
+            )
+        if native_lane_created:
+            print(
+                "C8_KVAF_OVERLAP_CLEANUP "
+                "runtime_mutation_skipped=native_lane_not_destroyed",
+                flush=True,
+            )
+        elif handle is not None:
             try:
                 runtime.release_access_table(handle)
             except Exception as error:
@@ -1951,7 +2550,7 @@ def main() -> None:
                     f"C8_KVAF_OVERLAP_CLEANUP release_access_table_error={error}",
                     flush=True,
                 )
-        if keys:
+        if not native_lane_created and keys:
             try:
                 for start in range(0, len(keys), args.put_batch_size):
                     runtime.batch_free(keys[start : start + args.put_batch_size])
@@ -1960,12 +2559,13 @@ def main() -> None:
                     f"C8_KVAF_OVERLAP_CLEANUP batch_free_error={error}",
                     flush=True,
                 )
-        try:
-            runtime.shutdown()
-        except Exception as error:
-            print(
-                f"C8_KVAF_OVERLAP_CLEANUP shutdown_error={error}", flush=True
-            )
+        if not native_lane_created and not runtime_shutdown:
+            try:
+                runtime.shutdown()
+            except Exception as error:
+                print(
+                    f"C8_KVAF_OVERLAP_CLEANUP shutdown_error={error}", flush=True
+                )
 
 
 if __name__ == "__main__":
