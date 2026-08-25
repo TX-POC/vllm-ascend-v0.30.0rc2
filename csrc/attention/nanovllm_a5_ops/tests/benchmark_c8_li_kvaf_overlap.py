@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Measure the eager overlap envelope of official C8 LI and remote KVAF Get.
+"""Measure the eager overlap envelope of official C8 LI and KVAF Get.
 
 This is deliberately not a Stage-5 prefetch implementation.  It answers one
 narrow prerequisite question without running vLLM end-to-end: after a valid
 BatchGet descriptor already exists, can a real A5 C8 Lightning Indexer scan
-and a real A5->K5 KVAF BatchGet make progress on different NPU streams?
+and a real KVAF BatchGet make progress on different NPU streams?
 
 The descriptor source is intentionally honest.  Before timing, the script
 runs the official C8 Lightning Indexer over the same B=32 / 128K-shaped input
@@ -28,8 +28,13 @@ core-ID diagnostic.
 
 The selected KVAF data plane is explicit. ``--transport local`` uses A5 HBM
 and the same A5 host DDR through the dsa-direct-get Direct-HCCP backend;
-``--transport remote`` uses the existing A5<->K5 CPU-service backend.  The
+``--transport remote`` uses the existing A5<->K5 CPU-service backend. The
 benchmark never retries the other backend after a failure.
+
+This is a prebuilt-descriptor overlap upper bound: Get deliberately does not
+depend on the LI output in the timed region. It therefore cannot establish a
+full Stage-5 producer/consumer pipeline, but it can rule out an overlap plan
+whose best-case dependency graph already fails to overlap.
 """
 
 from __future__ import annotations
@@ -105,6 +110,20 @@ class StreamResourceState:
     stream_handle: int
     cube_cores: int
     vector_cores: int
+
+
+@dataclass(frozen=True)
+class ConcurrentTimingSamples:
+    """Per-stream spans and their joint completion for one overlap run.
+
+    The spans make the source of a bad join observable: LI may slow down,
+    Get may slow down, or both can contend for shared resources.  All values
+    are NPU-event durations in microseconds.
+    """
+
+    join_us: list[float]
+    li_span_us: list[float]
+    get_span_us: list[float]
 
 
 class AclStreamResourceApi:
@@ -370,6 +389,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Deprecated compatibility argument. KVAF Get uses --npu-cores "
             "as its direct AIV launch block count; no CANN Get quota is set."
+        ),
+    )
+    parser.add_argument(
+        "--enable-kvaf-get-kernel-profile",
+        action="store_true",
+        help=(
+            "After timing, run one non-timed isolated Get and print the "
+            "KVAF per-logical-AIV-block timeline. This reports no physical "
+            "AIV ID or affinity."
         ),
     )
     parser.add_argument("--seed", type=int, default=7)
@@ -847,7 +875,7 @@ def populate_kvaf(
     valid = getattr(device_table, "valid", None)
     if not isinstance(addresses, torch.Tensor) or not isinstance(valid, torch.Tensor):
         raise RuntimeError(
-            "KVAF 6abe access_table_view(device='npu') did not return "
+            "KVAF access_table_view(device='npu') did not return "
             "a DeviceAccessTable with addresses and valid tensors"
         )
     if (
@@ -872,7 +900,9 @@ def validate_batch_get(
     actual = packed_output.index_select(0, destination_rows)
     torch.npu.synchronize()
     if not bool(torch.all(actual == SOURCE_FILL).cpu()):
-        raise AssertionError("remote BatchGet output payload does not match BatchPut data")
+        raise AssertionError(
+            "KVAF BatchGet output payload does not match BatchPut data"
+        )
 
 
 def percentile(samples: list[float], fraction: float) -> float:
@@ -916,6 +946,69 @@ def report(
     )
 
 
+def capture_get_aiv_profile(
+    runtime: object,
+    launch_get: Callable[[object], None],
+    copy_stream: object,
+) -> list[dict[str, int]]:
+    """Capture one non-timed Get profile without perturbing benchmark samples."""
+
+    start_profile = getattr(runtime, "start_batch_get_kernel_profile", None)
+    stop_profile = getattr(runtime, "stop_batch_get_kernel_profile", None)
+    if not callable(start_profile) or not callable(stop_profile):
+        raise RuntimeError(
+            "KVAF binding has no BatchGet kernel profile API; rebuild the "
+            "selected KVAF source with its current NPU Runtime binding"
+        )
+
+    start_profile()
+    try:
+        with torch.npu.stream(copy_stream):
+            launch_get(copy_stream)
+        copy_stream.synchronize()
+    except Exception:
+        # Best effort only: disable the optional profile before propagating the
+        # original benchmark failure.
+        try:
+            stop_profile()
+        except Exception:
+            pass
+        raise
+
+    raw_profiles = stop_profile()
+    profiles: list[dict[str, int]] = []
+    for raw_profile in raw_profiles:
+        if not isinstance(raw_profile, dict):
+            raise RuntimeError("KVAF BatchGet profile item is not a dictionary")
+        profiles.append({str(key): int(value) for key, value in raw_profile.items()})
+    return profiles
+
+
+def report_get_aiv_profiles(profiles: list[dict[str, int]]) -> None:
+    """Emit logical Get-worker activity; the runtime exposes no physical ID."""
+
+    for profile in profiles:
+        start = profile.get("kernel_start_cycle", 0)
+        finish = profile.get("kernel_finish_cycle", 0)
+        print(
+            "C8_KVAF_GET_AIV_PROFILE "
+            "role=isolated "
+            f"logical_aiv_block={profile.get('core', -1)} "
+            "physical_core_id=not_available "
+            f"active_requests={profile.get('active_requests', 0)} "
+            f"total_posts={profile.get('total_posts', 0)} "
+            f"kernel_cycles={max(0, finish - start)} "
+            f"setup_done_cycle={profile.get('setup_done_cycle', 0)} "
+            f"compact_done_cycle={profile.get('compact_done_cycle', 0)} "
+            f"first_doorbell_cycle={profile.get('first_doorbell_cycle', 0)} "
+            f"completion_done_cycle={profile.get('completion_done_cycle', 0)} "
+            "jetty_completion_wait_cycles="
+            f"{profile.get('jetty_completion_wait_cycles', 0)} "
+            f"jetty_completion_polls={profile.get('jetty_completion_polls', 0)}",
+            flush=True,
+        )
+
+
 def warmup(launch: Callable[[], object], count: int) -> None:
     retained: list[object] = []
     for _ in range(count):
@@ -925,7 +1018,7 @@ def warmup(launch: Callable[[], object], count: int) -> None:
 
 def time_li_only(
     launch_li: Callable[[], torch.Tensor],
-    main_stream: object,
+    li_stream: object,
     *,
     warmup_count: int,
     iters: int,
@@ -935,16 +1028,16 @@ def time_li_only(
     ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
     retained: list[torch.Tensor] = []
     for start, end in zip(starts, ends):
-        start.record(main_stream)
+        start.record(li_stream)
         retained.append(launch_li())
-        end.record(main_stream)
+        end.record(li_stream)
     ends[-1].synchronize()
     return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
 
 
 def time_get_only(
     launch_get: Callable[[object], None],
-    main_stream: object,
+    li_stream: object,
     copy_stream: object,
     *,
     warmup_count: int,
@@ -953,12 +1046,12 @@ def time_get_only(
     def launch_warmup() -> tuple[object, object]:
         gate = torch.npu.Event()
         done = torch.npu.Event()
-        gate.record(main_stream)
+        gate.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(gate)
             launch_get(copy_stream)
             done.record(copy_stream)
-        main_stream.wait_event(done)
+        li_stream.wait_event(done)
         return gate, done
 
     warmup(launch_warmup, warmup_count)
@@ -967,14 +1060,14 @@ def time_get_only(
     gates = [torch.npu.Event() for _ in range(iters)]
     dones = [torch.npu.Event() for _ in range(iters)]
     for start, end, gate, done in zip(starts, ends, gates, dones):
-        start.record(main_stream)
-        gate.record(main_stream)
+        start.record(li_stream)
+        gate.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(gate)
             launch_get(copy_stream)
             done.record(copy_stream)
-        main_stream.wait_event(done)
-        end.record(main_stream)
+        li_stream.wait_event(done)
+        end.record(li_stream)
     ends[-1].synchronize()
     return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
 
@@ -982,7 +1075,7 @@ def time_get_only(
 def time_serial(
     launch_li: Callable[[], torch.Tensor],
     launch_get: Callable[[object], None],
-    main_stream: object,
+    li_stream: object,
     copy_stream: object,
     *,
     warmup_count: int,
@@ -992,12 +1085,12 @@ def time_serial(
         li_done = torch.npu.Event()
         get_done = torch.npu.Event()
         result = launch_li()
-        li_done.record(main_stream)
+        li_done.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(li_done)
             launch_get(copy_stream)
             get_done.record(copy_stream)
-        main_stream.wait_event(get_done)
+        li_stream.wait_event(get_done)
         return result, li_done, get_done
 
     warmup(launch_warmup, warmup_count)
@@ -1007,15 +1100,15 @@ def time_serial(
     get_dones = [torch.npu.Event() for _ in range(iters)]
     retained: list[torch.Tensor] = []
     for start, end, li_done, get_done in zip(starts, ends, li_dones, get_dones):
-        start.record(main_stream)
+        start.record(li_stream)
         retained.append(launch_li())
-        li_done.record(main_stream)
+        li_done.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(li_done)
             launch_get(copy_stream)
             get_done.record(copy_stream)
-        main_stream.wait_event(get_done)
-        end.record(main_stream)
+        li_stream.wait_event(get_done)
+        end.record(li_stream)
     ends[-1].synchronize()
     return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
 
@@ -1023,44 +1116,87 @@ def time_serial(
 def time_concurrent_join(
     launch_li: Callable[[], torch.Tensor],
     launch_get: Callable[[object], None],
-    main_stream: object,
+    li_stream: object,
     copy_stream: object,
     *,
     warmup_count: int,
     iters: int,
-) -> list[float]:
+) -> ConcurrentTimingSamples:
     def launch_warmup() -> tuple[torch.Tensor, object, object]:
         gate = torch.npu.Event()
         get_done = torch.npu.Event()
-        gate.record(main_stream)
+        gate.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(gate)
             launch_get(copy_stream)
             get_done.record(copy_stream)
         result = launch_li()
-        main_stream.wait_event(get_done)
+        # li_stream is also the LI execution stream. Its in-stream ordering
+        # already includes LI; this wait makes the following join include Get.
+        li_stream.wait_event(get_done)
         return result, gate, get_done
 
     warmup(launch_warmup, warmup_count)
-    starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    join_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    join_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    li_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    li_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    get_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    get_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
     gates = [torch.npu.Event() for _ in range(iters)]
     get_dones = [torch.npu.Event() for _ in range(iters)]
     retained: list[torch.Tensor] = []
-    for start, end, gate, get_done in zip(starts, ends, gates, get_dones):
-        # The gate makes the timing interval include both streams without
-        # creating a LI -> Get dependency.  It precedes only a marker.
-        start.record(main_stream)
-        gate.record(main_stream)
+    for (
+        join_start,
+        join_end,
+        li_start,
+        li_end,
+        get_start,
+        get_end,
+        gate,
+        get_done,
+    ) in zip(
+        join_starts,
+        join_ends,
+        li_starts,
+        li_ends,
+        get_starts,
+        get_ends,
+        gates,
+        get_dones,
+    ):
+        # The common gate makes both streams start after the same LI-stream
+        # marker. LI and Get have no dependency on each other here.
+        join_start.record(li_stream)
+        gate.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(gate)
+            get_start.record(copy_stream)
             launch_get(copy_stream)
+            get_end.record(copy_stream)
             get_done.record(copy_stream)
+        li_start.record(li_stream)
         retained.append(launch_li())
-        main_stream.wait_event(get_done)
-        end.record(main_stream)
-    ends[-1].synchronize()
-    return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
+        li_end.record(li_stream)
+        # join_end is recorded on the LI stream after LI's in-stream work and
+        # after the Get completion dependency, so it is a true two-stream join.
+        li_stream.wait_event(get_done)
+        join_end.record(li_stream)
+    join_ends[-1].synchronize()
+    return ConcurrentTimingSamples(
+        join_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(join_starts, join_ends)
+        ],
+        li_span_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(li_starts, li_ends)
+        ],
+        get_span_us=[
+            start.elapsed_time(end) * 1000.0
+            for start, end in zip(get_starts, get_ends)
+        ],
+    )
 
 
 def main() -> None:
@@ -1187,11 +1323,14 @@ def main() -> None:
             "key_layout=disjoint_physical_blocks_per_row_shuffled "
             f"miss_count={args.miss_count} active_tokens={active_tokens} "
             "descriptor_source=official_c8_topk_known_miss_prefix "
+            "overlap_scope=prebuilt_descriptor_upper_bound "
             f"transport={args.transport} "
             "cpu_service_addr="
             f"{args.cpu_service_addr if args.transport == 'remote' else 'not_used'} "
             f"ddr_gib={ddr_gib:.3f} warmup={args.warmup} iters={args.iters} "
             f"npu_cores={args.npu_cores} jettys_per_core={args.jettys_per_core} "
+            "kvaf_get_kernel_profile="
+            f"{int(args.enable_kvaf_get_kernel_profile)} "
             "execution_mode="
             f"{'stream_resource_quota' if args.enable_stream_resource_quota else 'baseline'} "
             f"dsa_registration_backend={dsa_registration_backend}",
@@ -1257,6 +1396,10 @@ def main() -> None:
             warmup_count=args.warmup,
             iters=args.iters,
         )
+        if args.enable_kvaf_get_kernel_profile:
+            report_get_aiv_profiles(
+                capture_get_aiv_profile(runtime, launch_get, copy_stream)
+            )
         serial_samples = run_with_li_quota(
             lambda: time_serial(
                 launch_li,
@@ -1269,7 +1412,7 @@ def main() -> None:
         )
         if not isinstance(serial_samples, list):
             raise AssertionError("serial timing did not return samples")
-        concurrent_samples = run_with_li_quota(
+        concurrent_timing = run_with_li_quota(
             lambda: time_concurrent_join(
                 launch_li,
                 launch_get,
@@ -1279,8 +1422,9 @@ def main() -> None:
                 iters=args.iters,
             )
         )
-        if not isinstance(concurrent_samples, list):
+        if not isinstance(concurrent_timing, ConcurrentTimingSamples):
             raise AssertionError("concurrent timing did not return samples")
+        concurrent_samples = concurrent_timing.join_us
 
         report(
             "c8_li_only",
@@ -1292,6 +1436,12 @@ def main() -> None:
         get_label = f"{args.transport}_get_only"
         serial_label = f"c8_li_then_{args.transport}_get_serial"
         concurrent_label = f"c8_li_with_{args.transport}_get_concurrent_join"
+        concurrent_li_span_label = (
+            f"c8_li_with_{args.transport}_get_concurrent_li_span"
+        )
+        concurrent_get_span_label = (
+            f"c8_li_with_{args.transport}_get_concurrent_get_span"
+        )
         report(
             get_label,
             get_samples,
@@ -1313,19 +1463,46 @@ def main() -> None:
             active_tokens=active_tokens,
             moves_payload=True,
         )
+        report(
+            concurrent_li_span_label,
+            concurrent_timing.li_span_us,
+            warmup=args.warmup,
+            active_tokens=active_tokens,
+            moves_payload=False,
+        )
+        report(
+            concurrent_get_span_label,
+            concurrent_timing.get_span_us,
+            warmup=args.warmup,
+            active_tokens=active_tokens,
+            moves_payload=True,
+        )
         serial_p90 = percentile(serial_samples, 0.90)
         concurrent_p90 = percentile(concurrent_samples, 0.90)
-        per_stream_p90_reference = max(
-            percentile(li_samples, 0.90), percentile(get_samples, 0.90)
+        li_p90 = percentile(li_samples, 0.90)
+        get_p90 = percentile(get_samples, 0.90)
+        concurrent_li_span_p90 = percentile(concurrent_timing.li_span_us, 0.90)
+        concurrent_get_span_p90 = percentile(concurrent_timing.get_span_us, 0.90)
+        per_stream_p90_reference = max(li_p90, get_p90)
+        hide_budget_p90 = serial_p90 - per_stream_p90_reference
+        hidden_p90 = serial_p90 - concurrent_p90
+        overlap_efficiency = (
+            hidden_p90 / hide_budget_p90 if hide_budget_p90 > 0 else math.nan
         )
+        contention_penalty_p90 = concurrent_p90 - per_stream_p90_reference
         print(
             "C8_KVAF_OVERLAP_RESULT "
+            f"li_p90_us={li_p90:.3f} "
+            f"get_p90_us={get_p90:.3f} "
             f"serial_p90_us={serial_p90:.3f} "
             f"concurrent_p90_us={concurrent_p90:.3f} "
-            f"per_stream_p90_reference_us={per_stream_p90_reference:.3f} "
-            f"overlap_saved_p90_us={serial_p90 - concurrent_p90:.3f} "
-            "concurrent_over_per_stream_reference_p90_us="
-            f"{concurrent_p90 - per_stream_p90_reference:.3f}",
+            f"ideal_lower_bound_p90_us={per_stream_p90_reference:.3f} "
+            f"hide_budget_p90_us={hide_budget_p90:.3f} "
+            f"hidden_p90_us={hidden_p90:.3f} "
+            f"overlap_efficiency={overlap_efficiency:.3f} "
+            f"contention_penalty_p90_us={contention_penalty_p90:.3f} "
+            f"concurrent_li_span_p90_us={concurrent_li_span_p90:.3f} "
+            f"concurrent_get_span_p90_us={concurrent_get_span_p90:.3f}",
             flush=True,
         )
         if args.enable_stream_resource_quota:
