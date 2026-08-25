@@ -103,6 +103,19 @@ if [[ -n "${NANOVLLM_A5_OPS_ONLY:-}" ]]; then
 fi
 echo "[nanovllm_a5_ops] selected operators: ${OP_NAMES[*]}"
 
+# A single ExactScanSpeculativeGet build is a self-contained P1 component:
+# staging the complete repository here would make msopgen package (and often
+# compile) unrelated SFA/LI implementations.  Besides wasting minutes, that
+# turns an unrelated legacy compile failure into a false P1 blocker.  Keep
+# its generated project strictly to this operator plus the KVAF device helper
+# injected below.  Multi-op/normal builds retain the repository-wide staging
+# behavior because those existing operators have cross-directory headers.
+STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=0
+if [[ "${#OP_NAMES[@]}" == "1" && \
+      "${OP_NAMES[0]}" == "A5ExactScanSpeculativeGet" ]]; then
+    STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=1
+fi
+
 # The repository stores each operator in its own directory. Build a temporary
 # flat *operator collection* for msopgen, but preserve the relative directory
 # structure below every op_host/op_kernel directory.  In particular, do not
@@ -111,33 +124,43 @@ echo "[nanovllm_a5_ops] selected operators: ${OP_NAMES[*]}"
 # add_op_to_compiled_list().
 rm -rf "${GENERATED}" "${OP_DEV}"
 mkdir -p "${BUILD_ROOT}" "${OP_DEV}/op_host" "${OP_DEV}/op_kernel"
-cp "${ROOT}/ops.json" "${OP_DEV}/ops.json"
+if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
+    cp "${ROOT}/a5_exact_scan_speculative_get/ops.json" \
+        "${OP_DEV}/ops.json"
+    cp -a "${ROOT}/a5_exact_scan_speculative_get/op_host/." \
+        "${OP_DEV}/op_host/"
+    cp -a "${ROOT}/a5_exact_scan_speculative_get/op_kernel/." \
+        "${OP_DEV}/op_kernel/"
+    echo "[nanovllm_a5_ops] strict P1 staging: A5ExactScanSpeculativeGet only"
+else
+    cp "${ROOT}/ops.json" "${OP_DEV}/ops.json"
 
-while IFS= read -r -d '' file; do
-    rel="${file#*/op_host/}"
-    if [[ "${rel}" == "CMakeLists.txt" || "${rel}" == */CMakeLists.txt ]]; then
-        continue
-    fi
-    dst="${OP_DEV}/op_host/${rel}"
-    mkdir -p "$(dirname "${dst}")"
-    cp -f "${file}" "${dst}"
-done < <(
-    find "${ROOT}" -type f -path '*/op_host/*' \
-        ! -path "${BUILD_ROOT}/*" -print0
-)
+    while IFS= read -r -d '' file; do
+        rel="${file#*/op_host/}"
+        if [[ "${rel}" == "CMakeLists.txt" || "${rel}" == */CMakeLists.txt ]]; then
+            continue
+        fi
+        dst="${OP_DEV}/op_host/${rel}"
+        mkdir -p "$(dirname "${dst}")"
+        cp -f "${file}" "${dst}"
+    done < <(
+        find "${ROOT}" -type f -path '*/op_host/*' \
+            ! -path "${BUILD_ROOT}/*" -print0
+    )
 
-while IFS= read -r -d '' file; do
-    rel="${file#*/op_kernel/}"
-    if [[ "${rel}" == "CMakeLists.txt" || "${rel}" == */CMakeLists.txt ]]; then
-        continue
-    fi
-    dst="${OP_DEV}/op_kernel/${rel}"
-    mkdir -p "$(dirname "${dst}")"
-    cp -f "${file}" "${dst}"
-done < <(
-    find "${ROOT}" -type f -path '*/op_kernel/*' \
-        ! -path "${BUILD_ROOT}/*" -print0
-)
+    while IFS= read -r -d '' file; do
+        rel="${file#*/op_kernel/}"
+        if [[ "${rel}" == "CMakeLists.txt" || "${rel}" == */CMakeLists.txt ]]; then
+            continue
+        fi
+        dst="${OP_DEV}/op_kernel/${rel}"
+        mkdir -p "$(dirname "${dst}")"
+        cp -f "${file}" "${dst}"
+    done < <(
+        find "${ROOT}" -type f -path '*/op_kernel/*' \
+            ! -path "${BUILD_ROOT}/*" -print0
+    )
+fi
 
 # ExactScanSpeculativeGet compiles the current KVAF device-side full Get
 # protocol into its two dedicated AIV lanes.  Keep KVAF as the source of
