@@ -24,8 +24,15 @@ geometry that is safe with the current official C8 LI tiler: LI gets
 legacy path each quota is bound only for its own host-side submission. In the
 native-worker path, the worker binds the already-configured Get stream once
 and verifies that its own thread sees the requested two-Vector-core limit.
-The probe does not claim fixed physical core IDs; that requires a later
-device-side core-ID diagnostic.
+
+This is deliberately named a *best-effort count quota*, not a physical AIV
+partition.  CANN 9.1's public 950DT ACL interface has no verified API for
+binding an operator or stream to an explicit physical-AIV ID set.  The
+``--require-physical-aiv-partition`` contract therefore fails before device
+work begins instead of silently running this quota experiment and calling it
+hard isolation.  A true Stage-5 hard-partition path needs either a supported
+vendor affinity capability or a custom unified ExactScan+SpeculativePost
+operator with fixed in-invocation roles.
 
 The selected KVAF data plane is explicit. ``--transport local`` uses A5 HBM
 and the same A5 host DDR through the dsa-direct-get Direct-HCCP backend;
@@ -115,6 +122,58 @@ class StreamResourceState:
     stream_handle: int
     cube_cores: int
     vector_cores: int
+
+
+@dataclass(frozen=True)
+class PhysicalAivPartitionCapability:
+    """Whether this process can enforce a physical AIV-ID partition.
+
+    The current benchmark intentionally models the public CANN 9.1 / 950DT
+    surface only.  ``aclrtSetStreamResLimit`` accepts Cube/Vector *counts*;
+    it does not accept an AIV-ID mask, range, or affinity group.  Keeping that
+    distinction as data rather than a comment prevents a future graph chooser
+    from silently treating a successful count-quota probe as hard isolation.
+    """
+
+    supported: bool
+    enforcement: str
+    reason: str
+
+
+def physical_aiv_partition_capability() -> PhysicalAivPartitionCapability:
+    """Return the verified physical-AIV capability of the public 950DT ABI."""
+
+    return PhysicalAivPartitionCapability(
+        supported=False,
+        enforcement="none",
+        reason="no_public_cann_9_1_950dt_aiv_id_mask_or_affinity_api",
+    )
+
+
+def emit_physical_aiv_partition_contract(
+    capability: PhysicalAivPartitionCapability,
+    *,
+    requested: bool,
+    args: argparse.Namespace,
+) -> None:
+    """Print one machine-readable contract before any device-side work."""
+
+    print(
+        "C8_KVAF_PHYSICAL_AIV_PARTITION "
+        f"requested={int(requested)} "
+        f"supported={int(capability.supported)} "
+        f"enforcement={capability.enforcement} "
+        "li_physical_aiv_ids=unavailable "
+        "get_physical_aiv_ids=unavailable "
+        "disjoint_verified=0 "
+        f"li_cube_requested={args.li_cube_cores} "
+        f"li_vector_requested={args.li_vector_cores} "
+        f"get_vector_requested={args.get_vector_cores} "
+        f"get_logical_launch_blocks={args.npu_cores} "
+        f"reason={capability.reason} "
+        "next_path=custom_unified_operator_or_vendor_affinity",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -423,9 +482,19 @@ def parse_args() -> argparse.Namespace:
         dest="enable_stream_resource_quota",
         action="store_true",
         help=(
-            "Enable the eager CANN per-stream resource-quota probe. "
-            "This is not physical core-ID pinning; the old --enable-stream-"
-            "resource-slice spelling remains an alias."
+            "Enable the eager CANN best-effort per-stream Cube/Vector-count "
+            "quota probe. This is not physical AIV-ID pinning; the old "
+            "--enable-stream-resource-slice spelling remains an alias."
+        ),
+    )
+    parser.add_argument(
+        "--require-physical-aiv-partition",
+        action="store_true",
+        help=(
+            "Require a verified LI/Get physical-AIV-ID partition. CANN 9.1 "
+            "on Ascend 950DT has no public affinity/mask ABI for this, so "
+            "the benchmark emits an explicit unavailable result before any "
+            "NPU or KVAF work rather than silently falling back to quota."
         ),
     )
     parser.add_argument(
@@ -1764,9 +1833,24 @@ def capture_concurrent_get_aiv_profile(
     return capture_get_aiv_profile(runtime, launch_pair)
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     validate_args(args)
+    physical_partition = physical_aiv_partition_capability()
+    emit_physical_aiv_partition_contract(
+        physical_partition,
+        requested=args.require_physical_aiv_partition,
+        args=args,
+    )
+    if args.require_physical_aiv_partition and not physical_partition.supported:
+        print(
+            "C8_KVAF_PHYSICAL_AIV_PARTITION_UNAVAILABLE "
+            "action=aborted_before_device_work "
+            "fallback=not_selected "
+            f"reason={physical_partition.reason}",
+            flush=True,
+        )
+        return 2
     device = torch.device(args.device)
     if device.type != "npu":
         raise ValueError("--device must select an NPU, for example npu:0")
@@ -1920,7 +2004,7 @@ def main() -> None:
             f"get_submit_mode={args.get_submit_mode} "
             "eager_concurrent_host_submit_order=get_first "
             "execution_mode="
-            f"{'stream_resource_quota' if args.enable_stream_resource_quota else 'baseline'} "
+            f"{'best_effort_stream_resource_quota' if args.enable_stream_resource_quota else 'baseline'} "
             f"dsa_registration_backend={dsa_registration_backend}",
             flush=True,
         )
@@ -2503,9 +2587,10 @@ def main() -> None:
             )
             print(
                 "C8_KVAF_RESOURCE_QUOTA_CAPABILITY_PASS "
-                "scope=stream_limit_and_submit_tls "
+                "scope=best_effort_stream_limit_and_submit_tls "
                 "physical_core_id_proof=0 "
-                "li_tiler_callback_thread_proof=0",
+                "li_tiler_callback_thread_proof=0 "
+                "physical_partition_satisfied=0",
                 flush=True,
             )
         if native_lane_created:
@@ -2624,7 +2709,8 @@ def main() -> None:
                 print(
                     f"C8_KVAF_OVERLAP_CLEANUP shutdown_error={error}", flush=True
                 )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
