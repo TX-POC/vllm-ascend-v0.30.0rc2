@@ -19,7 +19,7 @@ import nanovllm_exact_scan_probe  # noqa: F401
 
 LI_AIV_COUNT = 62
 POST_AIV_COUNT = 2
-ROLE_TRACE_COUNT = 96
+ROLE_TRACE_COUNT = LI_AIV_COUNT + POST_AIV_COUNT
 POST_MARKER_XOR = 0x5A5A5A5A
 
 
@@ -60,10 +60,10 @@ def check_result(
     torch.testing.assert_close(
         post_markers.cpu(), post_seed ^ POST_MARKER_XOR
     )
-    # Only AIV directly writes this trace. The fixed 1C2V tiling establishes
-    # 31 LI groups plus one Post group; direct scalar AIC-to-GM stores are not
-    # used as an execution proof because they are not a stable trace path.
-    expected_trace = torch.zeros(ROLE_TRACE_COUNT, dtype=torch.int32)
+    # Every item of this output is written by one AIV lane. The fixed 1C2V
+    # tiling establishes 31 LI groups plus one Post group; AIC has no scalar
+    # GM trace because that is not a stable execution-observation path.
+    expected_trace = torch.empty(ROLE_TRACE_COUNT, dtype=torch.int32)
     expected_trace[:LI_AIV_COUNT] = torch.arange(
         1000, 1000 + LI_AIV_COUNT, dtype=torch.int32
     )

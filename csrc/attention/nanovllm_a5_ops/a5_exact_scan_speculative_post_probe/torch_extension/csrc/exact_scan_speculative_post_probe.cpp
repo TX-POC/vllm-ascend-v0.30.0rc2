@@ -12,7 +12,7 @@
 namespace {
 constexpr int64_t kLiAivCount = 62;
 constexpr int64_t kPostAivCount = 2;
-constexpr int64_t kRoleTraceCount = 96;
+constexpr int64_t kRoleTraceCount = kLiAivCount + kPostAivCount;
 
 void CheckInputs(
     const at::Tensor& scanValues,
@@ -46,11 +46,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> ProbeNpu(
     const auto int64Options = scanValues.options().dtype(at::kLong);
     auto liChecksums = at::empty({kLiAivCount}, int64Options);
     auto postMarkers = at::empty({kPostAivCount}, int32Options);
-    // The AIV half of this output is written by the kernel.  The AIC half is
-    // deliberately kept zero: scalar AIC-to-GM stores are not a reliable
-    // trace primitive, and P0's role proof is the fixed 1C2V tiling plus the
-    // exact AIV lane results.
-    auto roleTrace = at::zeros({kRoleTraceCount}, int32Options);
+    // Every element is written by one AIV lane. Do not use at::zeros here:
+    // its fill is not ordered with this low-level ACLNN launch as required by
+    // the probe, and can overwrite a completed role trace.
+    auto roleTrace = at::empty({kRoleTraceCount}, int32Options);
     auto keepalive = std::make_tuple(
         scanValues, postSeed, liChecksums, postMarkers, roleTrace);
     EXEC_NPU_CMD_ORDERED(

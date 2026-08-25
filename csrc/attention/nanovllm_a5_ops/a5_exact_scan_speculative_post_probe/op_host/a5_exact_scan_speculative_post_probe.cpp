@@ -33,7 +33,10 @@ constexpr uint32_t kLiGroupCount = kAicCount - 1;
 constexpr uint32_t kLiAivCount = kLiGroupCount * kAivPerMixedGroup;
 constexpr uint32_t kPostAivCount = kAivPerMixedGroup;
 constexpr int64_t kPostSeedCount = kPostAivCount;
-constexpr int64_t kRoleTraceCount = kAicCount + kAivCount;
+// P0 exposes only the lanes that write a deterministic trace. The cube-side
+// role is fixed by the 1C2V task layout, but it is not represented by a
+// scalar AIC-to-GM trace output.
+constexpr int64_t kRoleTraceCount = kAivCount;
 
 bool IsPositiveVector(const gert::Shape& shape)
 {
