@@ -69,6 +69,7 @@ def _make_adapter(
     )
     monkeypatch.setenv("VLLM_ASCEND_KVAF_NPU_CORE_COUNT", "1")
     monkeypatch.setenv("VLLM_ASCEND_KVAF_JETTYS_PER_CORE", "2")
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_TRANSPORT", "remote")
     monkeypatch.setenv(
         "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
         "192.0.2.1:28999",

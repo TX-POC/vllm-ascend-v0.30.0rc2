@@ -121,8 +121,17 @@ env_variables: dict[str, Callable[[], Any]] = {
         "VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL",
         os.getenv("KVAF_BATCH_PUT_KERNEL", ""),
     ),
+    # KVAF has two intentionally incompatible NPU Runtime ABIs. "remote"
+    # keeps the existing A5<->K5 CPU-service path; "local" selects the
+    # dsa-direct-get A5 host-DDR Direct-HCCP path. This is a selection, never
+    # an automatic fallback after a remote link failure.
+    "VLLM_ASCEND_KVAF_TRANSPORT": lambda: os.getenv(
+        "VLLM_ASCEND_KVAF_TRANSPORT",
+        os.getenv("KVAF_TRANSPORT", "remote"),
+    ).strip().lower(),
     # Remote KVAF CPU Runtime endpoint. KVAF 6abe must connect to this
-    # service before the NPU Runtime can initialize its remote DDR region.
+    # service before the remote NPU Runtime can initialize its DDR region.
+    # It is not consumed when VLLM_ASCEND_KVAF_TRANSPORT=local.
     "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR": lambda: os.getenv(
         "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
         os.getenv("KVAF_CPU_SERVICE_ADDR", ""),

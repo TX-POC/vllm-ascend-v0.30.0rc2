@@ -99,12 +99,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npu-cores", type=int, default=32)
     parser.add_argument("--jettys-per-core", type=int, default=2)
     parser.add_argument(
+        "--transport",
+        choices=("local", "remote"),
+        default=os.getenv(
+            "VLLM_ASCEND_KVAF_TRANSPORT",
+            os.getenv("KVAF_TRANSPORT", "remote"),
+        ).strip().lower(),
+        help=(
+            "KVAF data plane: local=A5 HBM<->A5 CPU DDR Direct-HCCP; "
+            "remote=A5<->K5 CPU-service. No automatic fallback occurs."
+        ),
+    )
+    parser.add_argument(
         "--cpu-service-addr",
         default=os.getenv(
             "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
             os.getenv("KVAF_CPU_SERVICE_ADDR", ""),
         ),
-        help="KVAF CPU service endpoint, for example 141.61.92.77:28999",
+        help="Required only by --transport remote, for example 141.61.92.77:28999",
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -117,7 +129,7 @@ def parse_args() -> argparse.Namespace:
         "--batch-put-kernel",
         type=Path,
         required=True,
-        help="Built kvaf_execute_batch_put_kernels.o for real remote DDR population",
+        help="Built kvaf_execute_batch_put_kernels.o for real KVAF DDR population",
     )
     parser.add_argument(
         "--max-ddr-gib",
@@ -148,10 +160,10 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.max_ddr_gib <= 0:
         raise ValueError("max-ddr-gib must be positive")
-    if not args.cpu_service_addr:
+    if args.transport == "remote" and not args.cpu_service_addr:
         raise ValueError(
             "--cpu-service-addr or KVAF_CPU_SERVICE_ADDR must name the "
-            "remote KVAF CPU service"
+            "remote KVAF CPU service when --transport remote"
         )
     if not args.batch_get_kernel.is_file():
         raise FileNotFoundError(args.batch_get_kernel)
@@ -445,6 +457,57 @@ def validate_batch_get(
         raise AssertionError("BatchGet output payload does not match BatchPut data")
 
 
+def create_kvaf_runtime(args: argparse.Namespace, device_id: int) -> object:
+    """Construct the one explicitly selected KVAF ABI; never retry another."""
+
+    if args.transport == "local":
+        try:
+            runtime = kvaf.NpuRuntime(
+                str(args.batch_get_kernel),
+                device_id,
+                args.npu_cores,
+                str(args.batch_put_kernel),
+                args.jettys_per_core,
+            )
+        except TypeError as error:
+            raise RuntimeError(
+                "KVAF transport=local ABI mismatch: this benchmark requires "
+                "the dsa-direct-get NpuRuntime "
+                "(get_kernel, device_id, npu_cores, put_kernel, jettys)"
+            ) from error
+        if callable(getattr(runtime, "link_to", None)):
+            raise RuntimeError(
+                "KVAF transport=local ABI mismatch: the selected binding "
+                "exposes remote link_to(); select the dsa-direct-get build"
+            )
+        return runtime
+
+    try:
+        runtime = kvaf.NpuRuntime(
+            str(args.batch_get_kernel),
+            PACKED_TOKEN_BYTES,
+            BLOCK_SIZE,
+            device_id,
+            args.npu_cores,
+            str(args.batch_put_kernel),
+            args.jettys_per_core,
+        )
+    except TypeError as error:
+        raise RuntimeError(
+            "KVAF transport=remote ABI mismatch: this benchmark requires "
+            "the CPU-service NpuRuntime "
+            "(get_kernel, 656, 128, device_id, npu_cores, put_kernel, jettys)"
+        ) from error
+    link_to = getattr(runtime, "link_to", None)
+    if not callable(link_to):
+        raise RuntimeError(
+            "KVAF transport=remote ABI mismatch: the selected binding does "
+            "not provide link_to(); select the CPU-service build"
+        )
+    link_to(str(args.cpu_service_addr))
+    return runtime
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -464,23 +527,7 @@ def main() -> None:
         )
 
     device_id = 0 if device.index is None else int(device.index)
-    batch_put_kernel = str(args.batch_put_kernel)
-    runtime = kvaf.NpuRuntime(
-        str(args.batch_get_kernel),
-        PACKED_TOKEN_BYTES,
-        BLOCK_SIZE,
-        device_id,
-        args.npu_cores,
-        batch_put_kernel,
-        args.jettys_per_core,
-    )
-    link_to = getattr(runtime, "link_to", None)
-    if not callable(link_to):
-        raise RuntimeError(
-            "KVAF NpuRuntime must provide link_to(); use KVAF 6abe076 or "
-            "a compatible CPU-service runtime"
-        )
-    link_to(str(args.cpu_service_addr))
+    runtime = create_kvaf_runtime(args, device_id)
     inputs, outputs, packed_output = make_prepare_case(args, device)
     handle = None
     device_table = None
@@ -489,13 +536,24 @@ def main() -> None:
     active_tokens = args.batch_size * args.miss_count
     try:
         print(
+            "KVAF_TRANSPORT "
+            f"mode={args.transport} "
+            "backend="
+            f"{'aclrtMallocHost_direct_hccp' if args.transport == 'local' else 'peer_cpu_service'} "
+            "cpu_service_addr="
+            f"{args.cpu_service_addr if args.transport == 'remote' else 'not_used'}",
+            flush=True,
+        )
+        print(
             "KVAF_SUBGRAPH_C_BENCHMARK_CONFIG "
             f"device={device} batch={args.batch_size} "
             f"num_layers={args.num_layers} layer_id={args.layer_id} "
             f"qcap={args.qcap} table_capacity={table_capacity} "
             f"ddr_gib={ddr_gib:.3f} miss_count={args.miss_count} "
             f"source_layout={args.source_layout} "
-            f"cpu_service_addr={args.cpu_service_addr} "
+            f"transport={args.transport} "
+            "cpu_service_addr="
+            f"{args.cpu_service_addr if args.transport == 'remote' else 'not_used'} "
             f"active_tokens={active_tokens} warmup={args.warmup} "
             f"iters={args.iters} npu_cores={args.npu_cores} "
             f"jettys_per_core={args.jettys_per_core} "

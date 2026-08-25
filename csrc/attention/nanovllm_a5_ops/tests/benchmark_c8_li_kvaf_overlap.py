@@ -25,6 +25,11 @@ two-AIV-block launch.  This avoids putting resource-TLS driver work in each
 timed submit path.  It
 does not claim fixed physical core IDs; that requires a later device-side
 core-ID diagnostic.
+
+The selected KVAF data plane is explicit. ``--transport local`` uses A5 HBM
+and the same A5 host DDR through the dsa-direct-get Direct-HCCP backend;
+``--transport remote`` uses the existing A5<->K5 CPU-service backend.  The
+benchmark never retries the other backend after a failure.
 """
 
 from __future__ import annotations
@@ -324,6 +329,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npu-cores", type=int, default=32)
     parser.add_argument("--jettys-per-core", type=int, default=1)
     parser.add_argument(
+        "--transport",
+        choices=("local", "remote"),
+        default=os.getenv(
+            "VLLM_ASCEND_KVAF_TRANSPORT",
+            os.getenv("KVAF_TRANSPORT", "remote"),
+        ).strip().lower(),
+        help=(
+            "KVAF data plane: local=A5 HBM<->A5 CPU DDR Direct-HCCP; "
+            "remote=A5<->K5 CPU-service. No automatic fallback occurs."
+        ),
+    )
+    parser.add_argument(
         "--enable-stream-resource-quota",
         "--enable-stream-resource-slice",
         dest="enable_stream_resource_quota",
@@ -360,13 +377,13 @@ def parse_args() -> argparse.Namespace:
         "--batch-get-kernel",
         type=Path,
         required=True,
-        help="Built kvaf_execute_batch_get_kernels.o from KVAF 6abe076.",
+        help="Built kvaf_execute_batch_get_kernels.o for the selected KVAF build.",
     )
     parser.add_argument(
         "--batch-put-kernel",
         type=Path,
         required=True,
-        help="Built kvaf_execute_batch_put_kernels.o from KVAF 6abe076.",
+        help="Built kvaf_execute_batch_put_kernels.o for the selected KVAF build.",
     )
     parser.add_argument(
         "--cpu-service-addr",
@@ -374,13 +391,13 @@ def parse_args() -> argparse.Namespace:
             "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
             os.getenv("KVAF_CPU_SERVICE_ADDR", ""),
         ),
-        help="K5 KVAF CPU service, for example 141.61.92.77:28999.",
+        help="Required only by --transport remote, for example 141.61.92.77:28999.",
     )
     parser.add_argument(
         "--max-ddr-gib",
         type=float,
         default=4.0,
-        help="Safety limit for the one-time remote DDR allocation.",
+        help="Safety limit for the selected KVAF DDR allocation.",
     )
     return parser.parse_args()
 
@@ -416,8 +433,10 @@ def validate_args(args: argparse.Namespace) -> None:
             )
     if args.max_ddr_gib <= 0:
         raise ValueError("--max-ddr-gib must be positive")
-    if not args.cpu_service_addr:
-        raise ValueError("--cpu-service-addr is required for the remote K5 data plane")
+    if args.transport == "remote" and not args.cpu_service_addr:
+        raise ValueError(
+            "--cpu-service-addr is required when --transport remote"
+        )
     if not args.batch_get_kernel.is_file():
         raise FileNotFoundError(args.batch_get_kernel)
     if not args.batch_put_kernel.is_file():
@@ -739,11 +758,33 @@ def validate_prepare(
         )
 
 
-def create_remote_runtime(
+def create_kvaf_runtime(
     args: argparse.Namespace,
     device_id: int,
 ) -> object:
-    """Construct only the KVAF 6abe remote-runtime ABI; do not fall back."""
+    """Construct the one explicitly selected KVAF ABI; do not fall back."""
+
+    if args.transport == "local":
+        try:
+            runtime = kvaf.NpuRuntime(
+                str(args.batch_get_kernel),
+                device_id,
+                args.npu_cores,
+                str(args.batch_put_kernel),
+                args.jettys_per_core,
+            )
+        except TypeError as error:
+            raise RuntimeError(
+                "KVAF transport=local ABI mismatch: this benchmark requires "
+                "the dsa-direct-get NpuRuntime "
+                "(get_kernel, device_id, npu_cores, put_kernel, jettys)"
+            ) from error
+        if callable(getattr(runtime, "link_to", None)):
+            raise RuntimeError(
+                "KVAF transport=local ABI mismatch: the selected binding "
+                "exposes remote link_to(); select the dsa-direct-get build"
+            )
+        return runtime
 
     try:
         runtime = kvaf.NpuRuntime(
@@ -757,14 +798,15 @@ def create_remote_runtime(
         )
     except TypeError as error:
         raise RuntimeError(
-            "This benchmark requires KVAF 6abe076 remote NpuRuntime: "
-            "NpuRuntime(get_kernel, 656, 128, ..., put_kernel, ...)"
+            "KVAF transport=remote ABI mismatch: this benchmark requires "
+            "the CPU-service NpuRuntime "
+            "(get_kernel, 656, 128, device_id, npu_cores, put_kernel, jettys)"
         ) from error
     link_to = getattr(runtime, "link_to", None)
     if not callable(link_to):
         raise RuntimeError(
-            "This benchmark requires KVAF 6abe076 NpuRuntime.link_to(); "
-            "do not run it against the older local/mock Runtime."
+            "KVAF transport=remote ABI mismatch: the selected binding does "
+            "not provide link_to(); select the CPU-service build"
         )
     link_to(args.cpu_service_addr)
     return runtime
@@ -776,7 +818,7 @@ def populate_kvaf(
     device: torch.device,
     table_capacity: int,
 ) -> tuple[object, torch.Tensor, torch.Tensor, list[int]]:
-    """Fill all source blocks over the real K5 link, then materialize its table."""
+    """Fill selected DDR, then materialize the stable NPU address table."""
 
     keys = list(range(1, table_capacity + 1))
     packed_input = torch.full(
@@ -1045,7 +1087,7 @@ def main() -> None:
     device_id = 0 if device.index is None else int(device.index)
     active_tokens = args.batch_size * args.miss_count
     c8_inputs = make_disjoint_c8_inputs(args, device)
-    runtime = create_remote_runtime(args, device_id)
+    runtime = create_kvaf_runtime(args, device_id)
     control_stream = torch.npu.current_stream()
     # Do not reuse the default/control stream for LI.  Its earlier input
     # construction is intentionally not subject to the experimental quota.
@@ -1129,6 +1171,15 @@ def main() -> None:
                 return official_c8_lightning_indexer(c8_inputs)
 
         print(
+            "KVAF_TRANSPORT "
+            f"mode={args.transport} "
+            "backend="
+            f"{'aclrtMallocHost_direct_hccp' if args.transport == 'local' else 'peer_cpu_service'} "
+            "cpu_service_addr="
+            f"{args.cpu_service_addr if args.transport == 'remote' else 'not_used'}",
+            flush=True,
+        )
+        print(
             "C8_KVAF_OVERLAP_CONFIG "
             f"device={device} device_name={device_name!r} "
             f"batch={args.batch_size} source_len={args.source_len} "
@@ -1136,7 +1187,9 @@ def main() -> None:
             "key_layout=disjoint_physical_blocks_per_row_shuffled "
             f"miss_count={args.miss_count} active_tokens={active_tokens} "
             "descriptor_source=official_c8_topk_known_miss_prefix "
-            f"cpu_service_addr={args.cpu_service_addr} "
+            f"transport={args.transport} "
+            "cpu_service_addr="
+            f"{args.cpu_service_addr if args.transport == 'remote' else 'not_used'} "
             f"ddr_gib={ddr_gib:.3f} warmup={args.warmup} iters={args.iters} "
             f"npu_cores={args.npu_cores} jettys_per_core={args.jettys_per_core} "
             "execution_mode="
@@ -1183,7 +1236,7 @@ def main() -> None:
         validate_batch_get(outputs, packed_output)
         print(
             "C8_KVAF_OVERLAP_CORRECTNESS "
-            "official_c8_topk=1 prepare=1 remote_payload=1",
+            "official_c8_topk=1 prepare=1 kvaf_payload=1",
             flush=True,
         )
 
@@ -1236,22 +1289,25 @@ def main() -> None:
             active_tokens=active_tokens,
             moves_payload=False,
         )
+        get_label = f"{args.transport}_get_only"
+        serial_label = f"c8_li_then_{args.transport}_get_serial"
+        concurrent_label = f"c8_li_with_{args.transport}_get_concurrent_join"
         report(
-            "remote_get_only",
+            get_label,
             get_samples,
             warmup=args.warmup,
             active_tokens=active_tokens,
             moves_payload=True,
         )
         report(
-            "c8_li_then_get_serial",
+            serial_label,
             serial_samples,
             warmup=args.warmup,
             active_tokens=active_tokens,
             moves_payload=True,
         )
         report(
-            "c8_li_with_remote_get_concurrent_join",
+            concurrent_label,
             concurrent_samples,
             warmup=args.warmup,
             active_tokens=active_tokens,

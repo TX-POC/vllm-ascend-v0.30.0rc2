@@ -29,11 +29,6 @@ class _FakeKvafRuntime:
         self.released_handles: list[tuple[int, ...]] = []
         self.committed: dict[int, tuple[int, int]] = {}
 
-    def link_to(self, address: str) -> None:
-        if self.initialized:
-            raise RuntimeError("link_to must precede initialize")
-        self.linked_to.append(address)
-
     def initialize(self, ddr_bytes: int, slot_size: int) -> None:
         self.initialized = True
         self.remote_region = {
@@ -117,6 +112,7 @@ def _make_adapter(
     monkeypatch: pytest.MonkeyPatch,
     *,
     fail_batch_put_call: int | None = None,
+    transport: str = "remote",
 ) -> tuple[
     KvafAdapter,
     _FakeKvafRuntime,
@@ -131,6 +127,14 @@ def _make_adapter(
     def npu_runtime(*args):
         constructor_args.append(args)
         return runtime
+
+    if transport == "remote":
+        def link_to(address: str) -> None:
+            if runtime.initialized:
+                raise RuntimeError("link_to must precede initialize")
+            runtime.linked_to.append(address)
+
+        runtime.link_to = link_to  # type: ignore[attr-defined]
 
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -147,24 +151,37 @@ def _make_adapter(
     )
     monkeypatch.setenv("VLLM_ASCEND_KVAF_NPU_CORE_COUNT", "1")
     monkeypatch.setenv("VLLM_ASCEND_KVAF_JETTYS_PER_CORE", "2")
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_TRANSPORT", transport)
     monkeypatch.setenv(
         "VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR",
         "192.0.2.1:28999",
     )
     monkeypatch.setattr(torch.npu, "set_device", lambda _device_id: None)
     adapter = KvafAdapter(device_id=3)
-    assert constructor_args == [
-        (
-            "/tmp/kvaf_batch_get.o",
-            656,
-            128,
-            3,
-            1,
-            "/tmp/kvaf_batch_put.o",
-            2,
-        )
-    ]
-    assert runtime.linked_to == ["192.0.2.1:28999"]
+    if transport == "remote":
+        assert constructor_args == [
+            (
+                "/tmp/kvaf_batch_get.o",
+                656,
+                128,
+                3,
+                1,
+                "/tmp/kvaf_batch_put.o",
+                2,
+            )
+        ]
+        assert runtime.linked_to == ["192.0.2.1:28999"]
+    else:
+        assert constructor_args == [
+            (
+                "/tmp/kvaf_batch_get.o",
+                3,
+                1,
+                "/tmp/kvaf_batch_put.o",
+                2,
+            )
+        ]
+        assert runtime.linked_to == []
     layout = PackedKvLayout(
         layout_id="test",
         tokens_per_logical_block=2,
@@ -193,6 +210,56 @@ def _make_adapter(
         block_table,
         geometry,
     )
+
+
+def test_local_transport_uses_direct_get_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, runtime, _, _ = _make_adapter(monkeypatch, transport="local")
+
+    assert adapter.transport == "local"
+    assert not hasattr(runtime, "link_to")
+    assert runtime.linked_to == []
+
+
+def test_remote_transport_requires_cpu_service_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _FakeKvafRuntime()
+    runtime.link_to = lambda _address: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "kvaf",
+        SimpleNamespace(NpuRuntime=lambda *_args: runtime),
+    )
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_TRANSPORT", "remote")
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_BATCH_GET_KERNEL", "/tmp/get.o")
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL", "/tmp/put.o")
+    monkeypatch.delenv("VLLM_ASCEND_KVAF_CPU_SERVICE_ADDR", raising=False)
+    monkeypatch.delenv("KVAF_CPU_SERVICE_ADDR", raising=False)
+
+    with pytest.raises(RuntimeError, match="CPU_SERVICE_ADDR"):
+        KvafAdapter(device_id=0)
+
+
+def test_local_transport_rejects_remote_runtime_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def remote_constructor(*_args: object) -> object:
+        raise TypeError("expected seven remote arguments")
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "kvaf",
+        SimpleNamespace(NpuRuntime=remote_constructor),
+    )
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_TRANSPORT", "local")
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_BATCH_GET_KERNEL", "/tmp/get.o")
+    monkeypatch.setenv("VLLM_ASCEND_KVAF_BATCH_PUT_KERNEL", "/tmp/put.o")
+    monkeypatch.setattr(torch.npu, "set_device", lambda _device_id: None)
+
+    with pytest.raises(RuntimeError, match="transport=local ABI mismatch"):
+        KvafAdapter(device_id=0)
 
 
 def _jobs() -> dict[str, np.ndarray]:
