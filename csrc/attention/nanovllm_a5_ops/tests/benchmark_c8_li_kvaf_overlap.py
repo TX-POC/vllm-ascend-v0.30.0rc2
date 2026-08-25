@@ -46,6 +46,7 @@ import importlib
 import math
 import os
 import statistics
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -120,14 +121,21 @@ class StreamResourceState:
 class ConcurrentTimingSamples:
     """Per-stream spans and their joint completion for one overlap run.
 
-    The spans make the source of a bad join observable: LI may slow down,
-    Get may slow down, or both can contend for shared resources.  All values
-    are NPU-event durations in microseconds.
+    The device spans make the source of a bad join observable: LI may slow
+    down, Get may slow down, or both can contend for shared resources.  The
+    host samples separately record the current eager launcher order: Get is
+    submitted on the Python thread before LI is submitted.  This matters
+    because a common device gate cannot make LI begin before that Get submit
+    returns to Python.
     """
 
     join_us: list[float]
     li_span_us: list[float]
     get_span_us: list[float]
+    get_host_submit_us: list[float]
+    li_host_submit_us: list[float]
+    get_return_to_li_enter_us: list[float]
+    pair_host_submit_us: list[float]
 
 
 @dataclass(frozen=True)
@@ -994,6 +1002,26 @@ def report(
     )
 
 
+def report_host_submit(
+    signal: str,
+    samples_us: list[float],
+    *,
+    warmup: int,
+) -> None:
+    """Report eager host-submit timing separately from NPU event timing."""
+
+    print(
+        "C8_KVAF_HOST_SUBMIT "
+        f"signal={signal} clock=perf_counter_ns "
+        f"samples={len(samples_us)} warmup_excluded={warmup} "
+        f"mean_us={statistics.mean(samples_us):.3f} "
+        f"p50_us={percentile(samples_us, 0.50):.3f} "
+        f"p90_us={percentile(samples_us, 0.90):.3f} "
+        f"p99_us={percentile(samples_us, 0.99):.3f}",
+        flush=True,
+    )
+
+
 def require_matching_sample_count(
     label: str,
     *sample_sets: list[float],
@@ -1027,7 +1055,14 @@ def serial_join_minus_sum(samples: SerialTimingSamples) -> list[float]:
 def concurrent_join_minus_max_span(
     samples: ConcurrentTimingSamples,
 ) -> list[float]:
-    """Return a same-iteration join diagnostic for the two-stream launch."""
+    """Return a same-iteration residual, not a pure hardware-contention cost.
+
+    In the current eager path, it includes device-side event/join work and
+    any offset created because the single Python host thread submits Get
+    before it submits LI.  The separately reported host-submit samples make
+    that potential offset observable instead of mislabeling it as AIV or
+    HBM contention.
+    """
 
     require_matching_sample_count(
         "concurrent timing",
@@ -1313,6 +1348,15 @@ def time_concurrent_join(
     warmup_count: int,
     iters: int,
 ) -> ConcurrentTimingSamples:
+    """Time host-ordered Get-first submission to two device streams.
+
+    This intentionally preserves the existing eager executor order.  It is
+    not a simultaneous host-submit implementation: ``runtime.batch_get``
+    returns to this Python thread before the official LI call is entered.
+    Record that host window explicitly so the device join residual is not
+    treated as a core-contention measurement by itself.
+    """
+
     def launch_warmup() -> tuple[torch.Tensor, object, object]:
         gate = torch.npu.Event()
         get_done = torch.npu.Event()
@@ -1337,6 +1381,10 @@ def time_concurrent_join(
     gates = [torch.npu.Event() for _ in range(iters)]
     get_dones = [torch.npu.Event() for _ in range(iters)]
     retained: list[torch.Tensor] = []
+    get_host_submit_us: list[float] = []
+    li_host_submit_us: list[float] = []
+    get_return_to_li_enter_us: list[float] = []
+    pair_host_submit_us: list[float] = []
     for (
         join_start,
         join_end,
@@ -1356,23 +1404,40 @@ def time_concurrent_join(
         gates,
         get_dones,
     ):
-        # The common gate makes both streams start after the same LI-stream
-        # marker. LI and Get have no dependency on each other here.
+        # The common gate makes both streams eligible after the same LI-stream
+        # marker.  Host submission remains intentionally Get-first below, so
+        # the two device workloads are not assumed to begin at the same time.
         join_start.record(li_stream)
         gate.record(li_stream)
         with torch.npu.stream(copy_stream):
             copy_stream.wait_event(gate)
             get_start.record(copy_stream)
+            get_submit_enter_ns = time.perf_counter_ns()
             launch_get(copy_stream)
+            get_submit_return_ns = time.perf_counter_ns()
             get_end.record(copy_stream)
             get_done.record(copy_stream)
         li_start.record(li_stream)
+        li_submit_enter_ns = time.perf_counter_ns()
         retained.append(launch_li())
+        li_submit_return_ns = time.perf_counter_ns()
         li_end.record(li_stream)
         # join_end is recorded on the LI stream after LI's in-stream work and
         # after the Get completion dependency, so it is a true two-stream join.
         li_stream.wait_event(get_done)
         join_end.record(li_stream)
+        get_host_submit_us.append(
+            (get_submit_return_ns - get_submit_enter_ns) / 1_000.0
+        )
+        li_host_submit_us.append(
+            (li_submit_return_ns - li_submit_enter_ns) / 1_000.0
+        )
+        get_return_to_li_enter_us.append(
+            (li_submit_enter_ns - get_submit_return_ns) / 1_000.0
+        )
+        pair_host_submit_us.append(
+            (li_submit_return_ns - get_submit_enter_ns) / 1_000.0
+        )
     join_ends[-1].synchronize()
     return ConcurrentTimingSamples(
         join_us=[
@@ -1387,6 +1452,10 @@ def time_concurrent_join(
             start.elapsed_time(end) * 1000.0
             for start, end in zip(get_starts, get_ends)
         ],
+        get_host_submit_us=get_host_submit_us,
+        li_host_submit_us=li_host_submit_us,
+        get_return_to_li_enter_us=get_return_to_li_enter_us,
+        pair_host_submit_us=pair_host_submit_us,
     )
 
 
@@ -1564,6 +1633,7 @@ def main() -> None:
             f"npu_cores={args.npu_cores} jettys_per_core={args.jettys_per_core} "
             "kvaf_get_kernel_profile="
             f"{int(args.enable_kvaf_get_kernel_profile)} "
+            "concurrent_host_submit_order=get_first "
             "execution_mode="
             f"{'stream_resource_quota' if args.enable_stream_resource_quota else 'baseline'} "
             f"dsa_registration_backend={dsa_registration_backend}",
@@ -1751,6 +1821,26 @@ def main() -> None:
             active_tokens=active_tokens,
             moves_payload=True,
         )
+        report_host_submit(
+            "get_call",
+            concurrent_timing.get_host_submit_us,
+            warmup=args.warmup,
+        )
+        report_host_submit(
+            "li_call",
+            concurrent_timing.li_host_submit_us,
+            warmup=args.warmup,
+        )
+        report_host_submit(
+            "get_return_to_li_enter",
+            concurrent_timing.get_return_to_li_enter_us,
+            warmup=args.warmup,
+        )
+        report_host_submit(
+            "pair_get_enter_to_li_return",
+            concurrent_timing.pair_host_submit_us,
+            warmup=args.warmup,
+        )
         serial_residuals = serial_join_minus_sum(serial_timing)
         concurrent_residuals = concurrent_join_minus_max_span(concurrent_timing)
         report(
@@ -1787,6 +1877,9 @@ def main() -> None:
             "C8_KVAF_TIMING_CONTRACT "
             "serial_dependency=li_done_then_get_done_then_join "
             "concurrent_dependency=common_gate_then_join "
+            "concurrent_host_submit_order=get_first "
+            "concurrent_join_minus_max="
+            "submit_skew_plus_event_join_plus_device_contention "
             "cross_run_p90_arithmetic=not_used",
             flush=True,
         )
