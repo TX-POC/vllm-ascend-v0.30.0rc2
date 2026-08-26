@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
+import pytest
 import torch
 
 # Pre-initialize `vllm_ascend.ops` (which fully loads `device_op` via the
@@ -52,6 +53,22 @@ def test_a5_c8_policy_keeps_kvaf_dump_owners_unpatched() -> None:
     assert DSALayerOffloadContext.dump_full_blocks.__module__ == (
         "vllm_ascend.dsa_offload.runtime"
     )
+
+
+def test_c8_streaming_prefetch_contract_is_disabled_and_fails_closed(
+    monkeypatch,
+) -> None:
+    """The experimental gate must not turn remote/local into a legacy route."""
+    import vllm_ascend.envs as envs
+
+    monkeypatch.delenv("VLLM_ASCEND_DSA_C8_STREAMING_PREFETCH", raising=False)
+    assert not envs.VLLM_ASCEND_DSA_C8_STREAMING_PREFETCH
+
+    with pytest.raises(RuntimeError, match="requires .*TRANSPORT=local"):
+        onv.require_c8_streaming_prefetch_operator(transport="remote")
+
+    with pytest.raises(RuntimeError, match="Refusing to fall back"):
+        onv.require_c8_streaming_prefetch_operator(transport="local")
 
 
 def test_lidu_weights_normalizes_fused_projection_suffix_view() -> None:

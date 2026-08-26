@@ -29,6 +29,7 @@ import torch
 from vllm.logger import logger
 from vllm.v1.utils import CpuGpuBuffer
 
+from vllm_ascend import envs
 from vllm_ascend.dsa_offload.contracts import (
     DSA_OP_BACKEND_NANOVLLM_A5,
     DSA_PACKED_KV_DIM,
@@ -587,6 +588,22 @@ def install_a5_c8_runtime_policy() -> None:
             lightning_indexer_decode_update_c8 as lidu_c8,
         )
 
+        if envs.VLLM_ASCEND_DSA_C8_STREAMING_PREFETCH:
+            # Do not run any part of the legacy route before this check.  A
+            # streaming implementation must own LI score emission, private
+            # speculative storage, exact reconciliation, and the final Get.
+            # Until that complete contract is registered, fail before either
+            # LIDU or BatchGet can mutate live C8 selection state.
+            from vllm_ascend.dsa_offload.ops_nanovllm import (
+                require_c8_streaming_prefetch_operator,
+            )
+
+            require_c8_streaming_prefetch_operator(
+                transport=envs.VLLM_ASCEND_KVAF_TRANSPORT,
+            )
+
+        # Legacy baseline: retain both ordering and arithmetic unchanged when
+        # the experimental gate is disabled.
         lidu_c8(
             query=query,
             key=self.indexer_cache,

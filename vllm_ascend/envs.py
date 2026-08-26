@@ -111,6 +111,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     "VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG": lambda: int(os.getenv("VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG", "0")),
+    # Experimental only.  When enabled, the A5 C8 policy *requests* the
+    # source-derived streaming LI + speculative-get route.  It is deliberately
+    # off by default: until every private-arena and reconciliation capability
+    # is registered, the request fails before it can mutate the resident
+    # mapping.  It never silently falls back to the legacy LI -> BatchGet path.
+    "VLLM_ASCEND_DSA_C8_STREAMING_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_C8_STREAMING_PREFETCH", "0"))
+    ),
     # Path to the external KVAF NPU BatchGet kernel object.
     "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL": lambda: os.getenv(
         "VLLM_ASCEND_KVAF_BATCH_GET_KERNEL",

@@ -74,6 +74,13 @@ ALL_OP_NAMES=(
     A5ExactScanSpeculativePostProbe
     A5ExactScanSpeculativeGet
 )
+# The source-derived streaming LI and reconcile op are deliberately not in
+# ALL_OP_NAMES: both are standalone P3 probes, never default product routes.
+SUPPORTED_OP_NAMES=(
+    "${ALL_OP_NAMES[@]}"
+    A5StreamingQuantLiGet
+    A5ExactReconcilePrivateView
+)
 
 # A prototype operator must be buildable without replacing the normal custom
 # OPP package or compiling the full vLLM-Ascend extension.  A comma-separated
@@ -84,7 +91,7 @@ if [[ -n "${NANOVLLM_A5_OPS_ONLY:-}" ]]; then
     OP_NAMES=()
     for requested_name in "${REQUESTED_OP_NAMES[@]}"; do
         found=0
-        for known_name in "${ALL_OP_NAMES[@]}"; do
+        for known_name in "${SUPPORTED_OP_NAMES[@]}"; do
             if [[ "${requested_name}" == "${known_name}" ]]; then
                 found=1
                 break
@@ -111,9 +118,31 @@ echo "[nanovllm_a5_ops] selected operators: ${OP_NAMES[*]}"
 # injected below.  Multi-op/normal builds retain the repository-wide staging
 # behavior because those existing operators have cross-directory headers.
 STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=0
+STAGE_STREAMING_QUANT_LI_GET_ONLY=0
+STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY=0
 if [[ "${#OP_NAMES[@]}" == "1" && \
       "${OP_NAMES[0]}" == "A5ExactScanSpeculativeGet" ]]; then
     STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=1
+fi
+if [[ "${#OP_NAMES[@]}" == "1" && \
+      "${OP_NAMES[0]}" == "A5StreamingQuantLiGet" ]]; then
+    STAGE_STREAMING_QUANT_LI_GET_ONLY=1
+fi
+if [[ "${#OP_NAMES[@]}" == "1" && \
+      "${OP_NAMES[0]}" == "A5ExactReconcilePrivateView" ]]; then
+    STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY=1
+fi
+if [[ " ${OP_NAMES[*]} " == *" A5StreamingQuantLiGet "* && \
+      "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" != "1" ]]; then
+    echo "[nanovllm_a5_ops] ERROR: A5StreamingQuantLiGet is intentionally buildable only as NANOVLLM_A5_OPS_ONLY=A5StreamingQuantLiGet." >&2
+    echo "[nanovllm_a5_ops] Mixing it with legacy operators would stage unrelated sources and invalidate the isolated C8 closure check." >&2
+    exit 2
+fi
+if [[ " ${OP_NAMES[*]} " == *" A5ExactReconcilePrivateView "* && \
+      "${STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY}" != "1" ]]; then
+    echo "[nanovllm_a5_ops] ERROR: A5ExactReconcilePrivateView is intentionally buildable only as NANOVLLM_A5_OPS_ONLY=A5ExactReconcilePrivateView." >&2
+    echo "[nanovllm_a5_ops] It is a transaction-local P3 probe and must not enter the normal product OPP collection." >&2
+    exit 2
 fi
 
 # The repository stores each operator in its own directory. Build a temporary
@@ -132,6 +161,38 @@ if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
     cp -a "${ROOT}/a5_exact_scan_speculative_get/op_kernel/." \
         "${OP_DEV}/op_kernel/"
     echo "[nanovllm_a5_ops] strict P1 staging: A5ExactScanSpeculativeGet only"
+elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
+    # A5StreamingQuantLiGet is a source-derived copy of the official C8 LI
+    # closure.  Keep it isolated from every legacy custom op: generated OPP
+    # code must see precisely this operator's host/kernel tree, plus the KVAF
+    # device helper staged below.  In particular, do not use the old
+    # descriptor_stage_only prototype: its ABI starts from externally supplied
+    # score tiles and cannot prove score-time prefetch.
+    STREAMING_LI_DIR="${ROOT}/a5_streaming_quant_li_get"
+    STREAMING_LI_SPEC="${STREAMING_LI_DIR}/ops.json"
+    if [[ ! -f "${STREAMING_LI_SPEC}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: A5StreamingQuantLiGet requires ${STREAMING_LI_SPEC}." >&2
+        echo "[nanovllm_a5_ops] The descriptor_stage_only/ spec is intentionally incompatible and will not be staged." >&2
+        exit 2
+    fi
+    cp "${STREAMING_LI_SPEC}" "${OP_DEV}/ops.json"
+    cp -a "${STREAMING_LI_DIR}/op_host/." "${OP_DEV}/op_host/"
+    cp -a "${STREAMING_LI_DIR}/op_kernel/." "${OP_DEV}/op_kernel/"
+    echo "[nanovllm_a5_ops] strict P3 staging: A5StreamingQuantLiGet official C8 closure only"
+    echo "[nanovllm_a5_ops] metadata companion: VllmQuantLightningIndexerMetadata must already be registered at runtime; this isolated OPP consumes its [1024] output and does not package a duplicate AICPU producer"
+    echo "[nanovllm_a5_ops] layout contract: source-derived tiling preserves official layout_query=TND and BSND behavior; production decode uses TND with layout_key=PA_BSND"
+elif [[ "${STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY}" == "1" ]]; then
+    RECONCILE_DIR="${ROOT}/a5_exact_reconcile_private_view"
+    RECONCILE_SPEC="${RECONCILE_DIR}/ops.json"
+    if [[ ! -f "${RECONCILE_SPEC}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: A5ExactReconcilePrivateView requires ${RECONCILE_SPEC}." >&2
+        exit 2
+    fi
+    cp "${RECONCILE_SPEC}" "${OP_DEV}/ops.json"
+    cp -a "${RECONCILE_DIR}/op_host/." "${OP_DEV}/op_host/"
+    cp -a "${RECONCILE_DIR}/op_kernel/." "${OP_DEV}/op_kernel/"
+    echo "[nanovllm_a5_ops] strict P3 staging: A5ExactReconcilePrivateView only"
+    echo "[nanovllm_a5_ops] transaction boundary: plan-only; no Get, QSFA, or persistent cache-slot publication"
 else
     cp "${ROOT}/ops.json" "${OP_DEV}/ops.json"
 
@@ -145,6 +206,7 @@ else
         cp -f "${file}" "${dst}"
     done < <(
         find "${ROOT}" -type f -path '*/op_host/*' \
+            ! -path "${ROOT}/a5_exact_reconcile_private_view/*" \
             ! -path "${BUILD_ROOT}/*" -print0
     )
 
@@ -158,6 +220,7 @@ else
         cp -f "${file}" "${dst}"
     done < <(
         find "${ROOT}" -type f -path '*/op_kernel/*' \
+            ! -path "${ROOT}/a5_exact_reconcile_private_view/*" \
             ! -path "${BUILD_ROOT}/*" -print0
     )
 fi
@@ -166,9 +229,17 @@ fi
 # protocol into its two dedicated AIV lanes.  Keep KVAF as the source of
 # truth: stage the helper and ABI from the exact checkout selected for this
 # build instead of maintaining a divergent WQE/CQ copy under vLLM.
-if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
+if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* || \
+      " ${OP_NAMES[*]} " == *" A5StreamingQuantLiGet "* ]]; then
+    KVAF_CONSUMER_NAMES=()
+    if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
+        KVAF_CONSUMER_NAMES+=("A5ExactScanSpeculativeGet")
+    fi
+    if [[ " ${OP_NAMES[*]} " == *" A5StreamingQuantLiGet "* ]]; then
+        KVAF_CONSUMER_NAMES+=("A5StreamingQuantLiGet")
+    fi
     if [[ -z "${KVAF_FUSED_GET_SOURCE:-}" ]]; then
-        echo "[nanovllm_a5_ops] ERROR: A5ExactScanSpeculativeGet requires KVAF_FUSED_GET_SOURCE=<exact KVAF checkout>." >&2
+        echo "[nanovllm_a5_ops] ERROR: ${KVAF_CONSUMER_NAMES[*]} requires KVAF_FUSED_GET_SOURCE=<exact KVAF checkout>." >&2
         exit 2
     fi
     KVAF_FUSED_HEADER="${KVAF_FUSED_GET_SOURCE}/access_operator/demo/aiv_batch_get/kernel/kvaf_fused_full_get_device.h"
@@ -187,7 +258,7 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
     if ! grep -q 'BeginKvafDenseBatchGetPostOnly' "${KVAF_FUSED_SOURCE}" || \
        ! grep -q 'TryRetireKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}" || \
        ! grep -q 'FinishKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}"; then
-        echo "[nanovllm_a5_ops] ERROR: A5ExactScanSpeculativeGet P2 requires KVAF split PostOnly/TryRetire/Finish helpers." >&2
+        echo "[nanovllm_a5_ops] ERROR: ${KVAF_CONSUMER_NAMES[*]} requires KVAF split PostOnly/TryRetire/Finish helpers." >&2
         echo "[nanovllm_a5_ops] source=${KVAF_FUSED_SOURCE}" >&2
         exit 2
     fi
@@ -236,8 +307,8 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
     fi
     rm -rf "${OP_DEV}/op_kernel/simt_api"
     cp -a "${KVAF_SIMT_ROOT}/simt_api" "${OP_DEV}/op_kernel/simt_api"
-    echo "[nanovllm_a5_ops] ExactScanSpeculativeGet KVAF source: ${KVAF_FUSED_GET_SOURCE}"
-    echo "[nanovllm_a5_ops] ExactScanSpeculativeGet SIMT root: ${KVAF_SIMT_ROOT}"
+    echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} KVAF source: ${KVAF_FUSED_GET_SOURCE}"
+    echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} SIMT root: ${KVAF_SIMT_ROOT}"
 fi
 
 if find "${OP_DEV}/op_host" "${OP_DEV}/op_kernel" \
@@ -257,6 +328,10 @@ for index in "${!OP_NAMES[@]}"; do
         op_spec="${ROOT}/a5_exact_scan_speculative_post_probe/ops.json"
     elif [[ "${op_name}" == "A5ExactScanSpeculativeGet" ]]; then
         op_spec="${ROOT}/a5_exact_scan_speculative_get/ops.json"
+    elif [[ "${op_name}" == "A5StreamingQuantLiGet" ]]; then
+        op_spec="${ROOT}/a5_streaming_quant_li_get/ops.json"
+    elif [[ "${op_name}" == "A5ExactReconcilePrivateView" ]]; then
+        op_spec="${ROOT}/a5_exact_reconcile_private_view/ops.json"
     fi
     echo "[nanovllm_a5_ops] generate operator: ${op_name}"
     msopgen_args=(

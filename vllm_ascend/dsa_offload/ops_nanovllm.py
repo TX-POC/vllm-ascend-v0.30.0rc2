@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import zlib
 
@@ -992,6 +993,144 @@ def lightning_indexer_decode_update_c8(
         outputs.miss_count,
     )
     torch.npu.synchronize()
+
+
+def require_c8_streaming_prefetch_operator(*, transport: str) -> None:
+    """Fail closed until the real streaming C8 LI operator is installed.
+
+    This is intentionally a *contract check*, not a compatibility shim.  The
+    real route must emit C8 scores while scanning, lease a Direct-HCCP queue,
+    place speculative payload in a private HBM arena, run the unchanged exact
+    C8 Top-K, and reconcile only its exact miss set before QSFA.  Reusing
+    ``lidu_decode_update_c8_out`` followed by ``KvafAdapter.execute_batch_get``
+    here would merely recreate the serial legacy route and could publish a
+    speculative result into the persistent resident mapping.
+
+    Only local Direct-HCCP has the queue/control ABI being developed for that
+    operation.  Remote KVAF is therefore rejected explicitly; it is never
+    treated as a fallback.  The local error is also deliberate until the
+    source-derived operator and its private-arena/reconcile ABI are registered.
+    """
+
+    if transport != "local":
+        raise RuntimeError(
+            "A5 C8 streaming prefetch requires "
+            "VLLM_ASCEND_KVAF_TRANSPORT=local; remote KVAF is not a fallback "
+            "for this experimental route"
+        )
+    raise RuntimeError(
+        "A5 C8 streaming prefetch was requested, but the required "
+        "source-derived streaming LI + private-arena reconcile operator is "
+        "not registered. Refusing to fall back to serial LIDU -> KVAF "
+        "BatchGet, because that would not provide score-time speculative Get."
+    )
+
+
+@dataclass(frozen=True)
+class C8StreamingPrefetchResources:
+    """Fixed-address buffers owned by the future streaming C8 route.
+
+    None of these aliases the persistent resident mapping or its final HBM
+    slots.  That separation is the invariant which lets score-time prefetch
+    remain speculative while preserving the legacy C8 result exactly.
+    """
+
+    # Per-row uint16 threshold estimated from the resident C8 score scan.
+    resident_threshold: torch.Tensor
+    # Private [tokens, 656] Direct-HCCP destination.  A speculative transfer
+    # may write only here, never directly to a final QSFA slot.
+    private_packed_output: torch.Tensor
+    # Temporary ``[row, LI-source-index] -> private-global-slot`` mapping.
+    # ``-1`` means no speculative copy; a non-negative value is encoded as
+    # ``queue * private_rows_per_queue + local_row``.  It is transaction-local
+    # and must never be confused with the persistent cache_slots directory.
+    private_source_to_slot: torch.Tensor
+    # ``[queue, private_rows_per_queue]`` CQ receipt table.  A later exact
+    # reconcile is allowed to consume only READY entries; PENDING/FAILED takes
+    # the guaranteed-final-Get path.
+    private_ready: torch.Tensor
+    # One monotonically increasing, graph-reset arena cursor per queue.  This
+    # replaces the old free-list placeholder: a private row is not recycled
+    # until the final QSFA reader has completed.
+    private_arena_head: torch.Tensor
+    # Host-registered Direct-HCCP control, whose ``output`` address must equal
+    # private_packed_output.  The custom LI validates that equality on device
+    # before it can ring a doorbell.
+    direct_hccp_queue_control: torch.Tensor
+    # One ownership word per Direct-HCCP queue. Any official LI AIV may lease
+    # an idle queue while it continues scanning later score tiles.
+    direct_hccp_queue_leases: torch.Tensor
+    # Exact-final planner/materializer workspace.  It must produce a
+    # QSFA-readable private physical-slot view and a placement delta, but may
+    # not publish the delta before QSFA's terminal reader.
+    reconcile_workspace: torch.Tensor
+
+
+def run_c8_streaming_prefetch(
+    *,
+    transport: str,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    query_dequant_scale: torch.Tensor,
+    key_dequant_scale: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    cache_slots: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    outputs: DSALightningIndexerOutputs,
+    resident_pool_indices: torch.Tensor,
+    resident_block_table: torch.Tensor,
+    logical_seq_lengths: torch.Tensor,
+    resident_seq_lengths: torch.Tensor,
+    address_table: torch.Tensor,
+    valid_table: torch.Tensor,
+    resident_output: torch.Tensor,
+    resources: C8StreamingPrefetchResources,
+) -> None:
+    """Integration contract for source-derived LI + speculative Direct-HCCP.
+
+    The eventual registered operator has to perform this order internally:
+
+    1. scan quantized C8 scores tile by tile and use ``resident_threshold``;
+    2. for a predicted miss, lease a queue and post to the *private* arena;
+    3. preserve the official C8 exact score/Top-K result in ``outputs``;
+    4. reconcile final misses from private-ready data or a guaranteed Get;
+    5. only then publish the normal final slots for QSFA.
+
+    This callable is deliberately not wired into the policy yet.  Keeping the
+    full boundary ABI here prevents a partial implementation from accidentally
+    replacing the mathematically equivalent legacy route.
+    """
+
+    # Keep the signature live for static callers while the CANN bridge is
+    # being staged.  The capability check always raises today, before a custom
+    # op, queue, mapping, or resident payload can be touched.
+    del (
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        actual_seq_lengths_query,
+        req_pool_entries,
+        cache_slots,
+        cache_tokens,
+        candidate_lens,
+        block_table,
+        outputs,
+        resident_pool_indices,
+        resident_block_table,
+        logical_seq_lengths,
+        resident_seq_lengths,
+        address_table,
+        valid_table,
+        resident_output,
+        resources,
+    )
+    require_c8_streaming_prefetch_operator(transport=transport)
 
 
 def packed_kvcache_scatter_copy(

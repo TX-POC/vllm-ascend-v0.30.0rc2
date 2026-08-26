@@ -1,0 +1,31 @@
+[
+    {
+        "op": "A5ExactReconcilePrivateView",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "exact_topk_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "logical_token_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "private_source_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "private_ready", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "source_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "placement_delta", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "private_view_descriptors", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "ready_private_source_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "ready_private_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "ready_private_destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "ready_private_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "fallback_logical_token_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "fallback_destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "fallback_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "attr": []
+    }
+]
