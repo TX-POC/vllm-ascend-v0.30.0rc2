@@ -232,11 +232,10 @@ private:
     __aicore__ inline void PublishRingSlot(
         const RingView& ring, uint32_t slot, uint32_t count, uint64_t epoch)
     {
-        // Release the payload before publishing its record count, then
-        // release both before publishing `state = epoch`.  `state` is the
-        // only ready flag the Get lane polls.  Without these two boundaries a
-        // different AIV can observe ready while still reading an old count.
-        DataSyncBarrier<MemDsbT::DDR>();
+        // `state` is the only ready flag the Get lane polls.  Publish count,
+        // then release both the earlier payload stores and this count before
+        // publishing `state = epoch`.  Without this boundary another AIV can
+        // observe ready while still reading an old count.
         StoreRingWord(ring.SlotCount(slot), count);
         DataSyncBarrier<MemDsbT::DDR>();
         StoreRingWord(ring.SlotState(slot), epoch);
