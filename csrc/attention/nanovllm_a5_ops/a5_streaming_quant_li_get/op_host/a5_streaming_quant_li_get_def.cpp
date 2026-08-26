@@ -84,7 +84,9 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("cache_slots_snapshot")
+        // Object-directory snapshot.  Its index domain is declared by the
+        // required graph-static kv_object_domain attribute below.
+        this->Input("kv_object_slots_snapshot")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
@@ -94,7 +96,8 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("logical_token_map")
+        // Maps official C8 score-source S to a QSFA-addressable KV object.
+        this->Input("kv_object_map")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
@@ -132,6 +135,15 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
+        // Per C8 sparse-output row, this is the active KV-object prefix.
+        // It is distinct from output score_source_lens (the compressed C8
+        // score-source S prefix). The hook needs both before it may dereference
+        // kv_object_map or kv_object_slots_snapshot.
+        this->Input("kv_object_lens")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         this->Output("sparse_values").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
         // These two outputs are transaction receipts, aliasing the caller's
@@ -143,6 +155,10 @@ public:
         this->Output("private_packed_output_out").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
         this->Output("queue_leases_out").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         this->Output("telemetry").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
+        // The exact C8 ProcessTopK path is the authoritative producer of
+        // this per-output-row score-source length.  Reconcile must consume
+        // it rather than infer compressed-S2 lengths on the host.
+        this->Output("score_source_lens").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         this->Attr("query_quant_mode").AttrType(REQUIRED).Int(0);  // 0: 默认值，per-token-head
         this->Attr("key_quant_mode").AttrType(REQUIRED).Int(0);    // 0: 默认值，per-token-head
         // Product decode calls C8 with TND query plus paged PA_BSND key.
@@ -163,6 +179,12 @@ public:
         // property, not a LI score/topk parameter; it is kept explicit so
         // the derived op never silently assumes 128-token pages.
         this->Attr("kvaf_rows_per_entry").AttrType(OPTIONAL).Int(128);
+        // 0 = RAW_TOKEN: valid only when cmp_ratio == 1.
+        // 1 = C8_COMPRESSED_OBJECT: values name the exact cmp_kv objects
+        // consumed by the final QSFA path; cmp_ratio may be 1, 4, or 128.
+        // Required intentionally: omitting this semantic choice must fail
+        // graph construction rather than silently assume raw-token mapping.
+        this->Attr("kv_object_domain").AttrType(REQUIRED).Int();
         // This derivative embeds the A5 C310 score tile and its Direct-HCCP
         // device helper.  Do not advertise a 910B/910_93 configuration: the
         // kernel intentionally has no compatible implementation for them.
@@ -222,7 +244,7 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
-        aicore_config_950.Input("cache_slots_snapshot")
+        aicore_config_950.Input("kv_object_slots_snapshot")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
@@ -232,7 +254,7 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
-        aicore_config_950.Input("logical_token_map")
+        aicore_config_950.Input("kv_object_map")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
@@ -267,6 +289,11 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
+        aicore_config_950.Input("kv_object_lens")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
         aicore_config_950.Output("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("sparse_values").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("private_source_to_slot_out").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
@@ -275,6 +302,7 @@ public:
         aicore_config_950.Output("private_packed_output_out").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("queue_leases_out").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("telemetry").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
+        aicore_config_950.Output("score_source_lens").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         aicore_config_950.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)
             .DynamicRankSupportFlag(true)

@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Target-only adapter for the A5StreamingQuantLiGet equivalence harness.
+
+This module deliberately does not register, monkey-patch, or select any
+vLLM product route.  It performs one controlled target-NPU comparison:
+
+1. run the real A5 ``VllmQuantLightningIndexerMetadata`` companion and the
+   real A5 ``VllmQuantLightningIndexer`` reference;
+2. switch the *isolated bridge resolver only* to the separately built
+   ``A5StreamingQuantLiGet`` OPP;
+3. run the derived 21-input / 9-output operator with the very same nine C8
+   input allocations; and
+4. return the strict dictionary consumed by
+   ``test_streaming_quant_li_get_target_equivalence.py``.
+
+The transaction control deliberately marks its one queue busy.  That gives
+the device hook a structurally valid, graph-shaped transaction ABI while
+preventing it from dereferencing an invented KVAF transport descriptor or
+posting a fabricated H2D request.  Therefore this adapter proves target C8
+score/Top-K equivalence, output-alias wiring, and exact score-source lengths;
+it does *not* claim Direct-HCCP correctness or H2D performance.
+
+Before importing this module, build/install the isolated bridge and set
+``NANOVLLM_A5_STREAMING_LI_OPP`` to either the matching OPP output root or
+its printed ``vendors/customize`` directory.  The normal A5 registration is
+loaded first so the reference ACLNN symbols are resolved from its normal
+packaged OPP before this module selects the isolated target OPP for the new
+bridge.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch_npu  # noqa: F401  # Registers the NPU backend and FP8 quantizer.
+
+
+BLOCK_SIZE = 128
+HEAD_DIM = 128
+INDEX_HEADS = 32
+SPARSE_COUNT = 2048
+BATCH_SIZE = 2
+SOURCE_TOKENS = 4096
+METADATA_WORDS = 1024
+PACKED_KV_ROW_BYTES = 656
+QUEUE_COUNT = 1
+PRIVATE_ARENA_CAPACITY = 1
+STREAMING_CONTROL_WORDS = 16
+STREAMING_CONTROL_MAGIC = 0x4B5641465354524D  # "KVAFSTRM"
+STREAMING_CONTROL_VERSION = 1
+INT64_MAX = (1 << 63) - 1
+
+
+def _require_a5_npu() -> torch.device:
+    device = torch.device("npu:0")
+    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
+    name = str(getter(0))
+    if "950" not in name.lower():
+        raise RuntimeError(
+            "target equivalence requires an Ascend 950 NPU, "
+            f"got {name!r}"
+        )
+    return device
+
+
+def _quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the C8 FP8 tensor and the FP32 per-token/head scale view."""
+    quantized, scale = torch_npu.npu_dynamic_quant(
+        tensor, dst_type=torch.float8_e4m3fn
+    )
+    return (
+        quantized.contiguous(),
+        scale.view(tensor.shape[:-1]).to(torch.float32).contiguous(),
+    )
+
+
+def _require_official_c8_ops() -> tuple[Any, Any]:
+    """Load only the normal A5 operator registrar, not DSA runtime policy."""
+    # This module intentionally imports the narrow registrar described by its
+    # own docstring.  It loads vllm_ascend_C and normal A5 OPP paths, but does
+    # not import dsa_offload.ops_nanovllm or select a product execution path.
+    import vllm_ascend.a5_dsa_registration  # noqa: F401
+
+    namespace = getattr(torch.ops, "_C_ascend", None)
+    reference = (
+        getattr(namespace, "npu_vllm_quant_lightning_indexer", None)
+        if namespace is not None
+        else None
+    )
+    metadata = (
+        getattr(namespace, "npu_vllm_quant_lightning_indexer_metadata", None)
+        if namespace is not None
+        else None
+    )
+    if reference is None or metadata is None:
+        raise RuntimeError(
+            "the installed vllm_ascend_C does not expose the required official "
+            "A5 VllmQuantLightningIndexer and metadata companion"
+        )
+    return reference, metadata
+
+
+def _build_official_inputs(device: torch.device) -> dict[str, torch.Tensor]:
+    """Create one real TND/PA_BSND C8 case shared byte-for-byte by both ops."""
+    if SOURCE_TOKENS % BLOCK_SIZE:
+        raise AssertionError("SOURCE_TOKENS must be page aligned")
+    blocks = SOURCE_TOKENS // BLOCK_SIZE
+    torch.manual_seed(20260826)
+    torch.npu.manual_seed_all(20260826)
+
+    query_fp = torch.empty(
+        (BATCH_SIZE, INDEX_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
+    ).uniform_(-1.0, 1.0)
+    key_fp = torch.empty(
+        (blocks, BLOCK_SIZE, 1, HEAD_DIM), dtype=torch.bfloat16, device=device
+    ).uniform_(-1.0, 1.0)
+    query, query_scale = _quantize_fp8(query_fp)
+    key, key_scale = _quantize_fp8(key_fp)
+    weights = torch.empty(
+        (BATCH_SIZE, INDEX_HEADS), dtype=torch.float32, device=device
+    ).uniform_(0.01, 1.0).contiguous()
+
+    # TND decode has one query row per request.  The final row has a shorter
+    # logical/source prefix, exercising that score_source_lens is per row.
+    candidate_lengths = (SOURCE_TOKENS, SOURCE_TOKENS - BLOCK_SIZE)
+    actual_q = torch.arange(1, BATCH_SIZE + 1, dtype=torch.int32, device=device)
+    actual_k = torch.tensor(candidate_lengths, dtype=torch.int32, device=device)
+    block_table = torch.stack(
+        [torch.randperm(blocks, dtype=torch.int64).to(torch.int32)
+         for _ in range(BATCH_SIZE)]
+    ).to(device)
+    return {
+        "query": query,
+        "key": key,
+        "weights": weights,
+        "query_dequant_scale": query_scale,
+        "key_dequant_scale": key_scale,
+        "actual_seq_lengths_query": actual_q,
+        "actual_seq_lengths_key": actual_k,
+        "block_table": block_table,
+    }
+
+
+def _official_metadata(metadata_op: Any, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Use the registered official metadata companion, never a host stand-in."""
+    metadata = metadata_op(
+        num_heads_q=INDEX_HEADS,
+        num_heads_k=1,
+        head_dim=HEAD_DIM,
+        query_quant_mode=0,
+        key_quant_mode=0,
+        actual_seq_lengths_query=inputs["actual_seq_lengths_query"],
+        actual_seq_lengths_key=inputs["actual_seq_lengths_key"],
+        batch_size=BATCH_SIZE,
+        max_seqlen_q=1,
+        max_seqlen_k=SOURCE_TOKENS,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=SPARSE_COUNT,
+        sparse_mode=3,
+        pre_tokens=INT64_MAX,
+        next_tokens=INT64_MAX,
+        cmp_ratio=1,
+        device=str(inputs["query"].device),
+    )
+    if (
+        not isinstance(metadata, torch.Tensor)
+        or metadata.dtype != torch.int32
+        or metadata.numel() != METADATA_WORDS
+        or metadata.device != inputs["query"].device
+    ):
+        raise RuntimeError(
+            "official C8 metadata companion returned an unexpected tensor: "
+            f"type={type(metadata).__name__} "
+            f"shape={getattr(metadata, 'shape', None)} "
+            f"dtype={getattr(metadata, 'dtype', None)}"
+        )
+    return metadata.contiguous()
+
+
+def _call_official(reference_op: Any, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    result = reference_op(
+        query=inputs["query"],
+        key=inputs["key"],
+        weights=inputs["weights"],
+        query_dequant_scale=inputs["query_dequant_scale"],
+        key_dequant_scale=inputs["key_dequant_scale"],
+        actual_seq_lengths_query=inputs["actual_seq_lengths_query"],
+        actual_seq_lengths_key=inputs["actual_seq_lengths_key"],
+        block_table=inputs["block_table"],
+        metadata=inputs["metadata"],
+        query_quant_mode=0,
+        key_quant_mode=0,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=SPARSE_COUNT,
+        sparse_mode=3,
+        pre_tokens=INT64_MAX,
+        next_tokens=INT64_MAX,
+        cmp_ratio=1,
+        return_value=False,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(
+            "official A5 C8 LI did not return its registered two-output ABI"
+        )
+    indices = result[0]
+    if not isinstance(indices, torch.Tensor) or indices.dtype != torch.int32:
+        raise RuntimeError("official A5 C8 LI returned no int32 sparse_indices")
+    expected_shape = (BATCH_SIZE, 1, SPARSE_COUNT)
+    if tuple(indices.shape) != expected_shape:
+        raise RuntimeError(
+            "official A5 C8 LI sparse_indices shape mismatch: "
+            f"got={tuple(indices.shape)} expected={expected_shape}"
+        )
+    return indices
+
+
+def _bind_isolated_target_opp() -> Path:
+    """Select exactly one separately built target OPP after the reference ran."""
+    root_value = os.getenv("NANOVLLM_A5_STREAMING_LI_OPP")
+    if not root_value:
+        raise RuntimeError(
+            "set NANOVLLM_A5_STREAMING_LI_OPP to the built "
+            "A5StreamingQuantLiGet OPP root or vendor directory before "
+            "running this adapter"
+        )
+    root = Path(root_value).expanduser().resolve()
+    # The standalone build log prints the vendor directory, while callers
+    # often retain the enclosing OPP root.  Both identify the same artifact;
+    # accept either spelling but fail if it is ambiguous.
+    candidates = [root / "op_api" / "lib" / "libcust_opapi.so"]
+    candidates.extend(root.glob("vendors/*/op_api/lib/libcust_opapi.so"))
+    opapis = tuple(
+        sorted({candidate.resolve() for candidate in candidates if candidate.is_file()})
+    )
+    if len(opapis) != 1:
+        raise RuntimeError(
+            "expected exactly one target libcust_opapi.so below or at "
+            f"{root}, found={len(opapis)}"
+        )
+    opapi = opapis[0].resolve()
+    vendor = opapi.parents[2]
+    if not vendor.is_dir():
+        raise RuntimeError(f"target OPP vendor path is invalid: {vendor}")
+    # The target bridge uses a process-local static resolver on its first
+    # launch.  The official C8 call above has already resolved its own normal
+    # APIs, so this switch cannot redirect that reference call.
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(vendor)
+    os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(opapi)
+    return opapi
+
+
+def _make_no_post_transaction(
+    device: torch.device,
+    row_count: int,
+) -> dict[str, torch.Tensor]:
+    """Build a valid-shape transaction whose queue cannot be leased.
+
+    A full Direct-HCCP control must be cold-bound by KVAF; this isolated math
+    comparator intentionally does not claim to reproduce that lifecycle.  A
+    busy lease table makes ``TryAcquire...`` fail before any descriptor pointer
+    is dereferenced, while every shape and mandatory control invariant seen by
+    the A5 hook remains explicit and testable.
+    """
+    pool_rows = BATCH_SIZE
+    kv_object_map = torch.arange(
+        SOURCE_TOKENS, dtype=torch.int32, device=device
+    ).repeat(pool_rows, 1).contiguous()
+    private_packed_output = torch.empty(
+        (QUEUE_COUNT * PRIVATE_ARENA_CAPACITY, PACKED_KV_ROW_BYTES),
+        dtype=torch.uint8,
+        device=device,
+    )
+    queue_leases = torch.ones(QUEUE_COUNT, dtype=torch.int32, device=device)
+    safe_nonzero_pointer = int(private_packed_output.data_ptr())
+    control_words = [
+        STREAMING_CONTROL_MAGIC,
+        STREAMING_CONTROL_VERSION,
+        safe_nonzero_pointer,  # channel_entity, never dereferenced: queue busy
+        safe_nonzero_pointer,  # queue_state, never dereferenced: queue busy
+        safe_nonzero_pointer,  # core_status, never dereferenced: queue busy
+        safe_nonzero_pointer,  # output: must exactly match packed output
+        int(queue_leases.data_ptr()),
+        safe_nonzero_pointer,  # descriptor_scratch, never dereferenced
+        QUEUE_COUNT,
+        QUEUE_COUNT * PRIVATE_ARENA_CAPACITY,
+        PRIVATE_ARENA_CAPACITY * PACKED_KV_ROW_BYTES,
+        0,
+        1,
+        PACKED_KV_ROW_BYTES,
+        safe_nonzero_pointer,  # descriptor_templates, never dereferenced
+        QUEUE_COUNT,
+    ]
+    return {
+        "resident_threshold": torch.zeros(
+            row_count, dtype=torch.int32, device=device
+        ),
+        # A valid resident tau makes this a stronger no-post guard: the queue
+        # saturation, rather than an invalid tau sentinel, prevents H2D.
+        "resident_threshold_valid": torch.ones(
+            row_count, dtype=torch.int32, device=device
+        ),
+        "kv_object_slots_snapshot": torch.full(
+            (pool_rows, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
+        ),
+        "req_pool_entries": torch.arange(
+            row_count, dtype=torch.int32, device=device
+        ),
+        "kv_object_map": kv_object_map,
+        "private_source_to_slot": torch.full(
+            (row_count, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
+        ),
+        "private_ready_table": torch.zeros(
+            (QUEUE_COUNT, PRIVATE_ARENA_CAPACITY), dtype=torch.int32, device=device
+        ),
+        "private_arena_head": torch.zeros(
+            QUEUE_COUNT, dtype=torch.int32, device=device
+        ),
+        "private_packed_output": private_packed_output,
+        "queue_control": torch.tensor(
+            control_words, dtype=torch.int64, device=device
+        ),
+        "queue_leases": queue_leases,
+        "kv_object_lens": torch.tensor(
+            (SOURCE_TOKENS, SOURCE_TOKENS - BLOCK_SIZE),
+            dtype=torch.int32,
+            device=device,
+        ),
+    }
+
+
+def _expected_score_source_lens(device: torch.device) -> torch.Tensor:
+    """Independent decode-TND reconstruction of official C8's valid S bound.
+
+    Each request has exactly one query token and this adapter fixes
+    ``cmp_ratio=1``.  The unmodified official causal formula is therefore
+    ``(L - 1 + 0 + 1) / 1 == L`` per output row.  Constructing a fresh tensor
+    from host scalars—not copying the target output—keeps the harness's
+    score-source check independent.
+    """
+    return torch.tensor(
+        [(SOURCE_TOKENS - 1 + 0 + 1) // 1,
+         (SOURCE_TOKENS - BLOCK_SIZE - 1 + 0 + 1) // 1],
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def run_target_equivalence() -> dict[str, Any]:
+    """Run one real official/derived C8 comparison for the harness."""
+    device = _require_a5_npu()
+    official_op, metadata_op = _require_official_c8_ops()
+    inputs = _build_official_inputs(device)
+    inputs["metadata"] = _official_metadata(metadata_op, inputs)
+    official_indices = _call_official(official_op, inputs)
+    # Fix the normal reference result before the isolated bridge chooses its
+    # own libcust_opapi DSO.  This is validation-only synchronization, not a
+    # product execution dependency.
+    torch.npu.synchronize()
+
+    if "nanovllm_streaming_quant_li_get" in sys.modules:
+        raise RuntimeError(
+            "run target equivalence in a fresh Python process: the isolated "
+            "bridge resolver was already initialized"
+        )
+    target_opapi = _bind_isolated_target_opp()
+    importlib.import_module("nanovllm_streaming_quant_li_get")
+    namespace = getattr(torch.ops, "a5_streaming_quant_li_get", None)
+    derived_op = (
+        getattr(namespace, "streaming_quant_li_get", None)
+        if namespace is not None
+        else None
+    )
+    if derived_op is None:
+        raise RuntimeError(
+            "isolated StreamingQuantLiGet bridge did not register "
+            "torch.ops.a5_streaming_quant_li_get.streaming_quant_li_get"
+        )
+
+    row_count = BATCH_SIZE
+    transaction = _make_no_post_transaction(device, row_count)
+    print(
+        "P3_STREAMING_LI_GET_TARGET_ADAPTER "
+        f"device={device} batch={BATCH_SIZE} source_tokens={SOURCE_TOKENS} "
+        f"heads={INDEX_HEADS} metadata_words={inputs['metadata'].numel()} "
+        f"target_opapi={target_opapi} queue_mode=all_busy_no_post "
+        "product_route=disabled h2d_result=not_exercised",
+        flush=True,
+    )
+    outputs = derived_op(
+        inputs["query"],
+        inputs["key"],
+        inputs["weights"],
+        inputs["query_dequant_scale"],
+        inputs["key_dequant_scale"],
+        inputs["actual_seq_lengths_query"],
+        inputs["actual_seq_lengths_key"],
+        inputs["block_table"],
+        inputs["metadata"],
+        transaction["resident_threshold"],
+        transaction["resident_threshold_valid"],
+        transaction["kv_object_slots_snapshot"],
+        transaction["req_pool_entries"],
+        transaction["kv_object_map"],
+        transaction["private_source_to_slot"],
+        transaction["private_ready_table"],
+        transaction["private_arena_head"],
+        transaction["private_packed_output"],
+        transaction["queue_control"],
+        transaction["queue_leases"],
+        transaction["kv_object_lens"],
+        kv_object_domain=0,
+        query_quant_mode=0,
+        key_quant_mode=0,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=SPARSE_COUNT,
+        sparse_mode=3,
+        pre_tokens=INT64_MAX,
+        next_tokens=INT64_MAX,
+        cmp_ratio=1,
+        return_values=False,
+        stride=int(inputs["key"].stride(0)),
+        scale_stride=int(inputs["key_dequant_scale"].stride(0)),
+        kvaf_rows_per_entry=BLOCK_SIZE,
+    )
+    if not isinstance(outputs, tuple) or len(outputs) != 9:
+        raise RuntimeError(
+            "derived A5StreamingQuantLiGet did not return its 9-output ABI"
+        )
+    torch.npu.synchronize()
+
+    return {
+        "official_indices": official_indices,
+        "derived_indices": outputs[0],
+        "input_aliases": {
+            name: (inputs[name], inputs[name])
+            for name in (
+                "query",
+                "key",
+                "weights",
+                "query_dequant_scale",
+                "key_dequant_scale",
+                "actual_seq_lengths_query",
+                "actual_seq_lengths_key",
+                "block_table",
+                "metadata",
+            )
+        },
+        "transaction_aliases": {
+            "private_source_to_slot": (
+                transaction["private_source_to_slot"], outputs[2]
+            ),
+            "private_ready_table": (
+                transaction["private_ready_table"], outputs[3]
+            ),
+            "private_arena_head": (
+                transaction["private_arena_head"], outputs[4]
+            ),
+            "private_packed_output": (
+                transaction["private_packed_output"], outputs[5]
+            ),
+            "queue_leases": (transaction["queue_leases"], outputs[6]),
+        },
+        # A5 C8 rejects return_value=True in the reference tiling, so this
+        # first real target proof deliberately compares only sparse indices.
+        "official_values": None,
+        "derived_values": None,
+        "expected_score_source_lens": _expected_score_source_lens(device),
+        "derived_score_source_lens": outputs[8],
+    }
+
+
+__all__ = ["run_target_equivalence"]

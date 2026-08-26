@@ -14,15 +14,16 @@
       {"name": "metadata", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
       {"name": "resident_threshold", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "resident_threshold_valid", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "cache_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "logical_token_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "private_source_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "private_ready_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "private_arena_head", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "private_packed_output", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
       {"name": "queue_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
-      {"name": "queue_leases", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+      {"name": "queue_leases", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
     ],
     "output_desc": [
       {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
@@ -32,7 +33,8 @@
       {"name": "private_arena_head_out", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "private_packed_output_out", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
       {"name": "queue_leases_out", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "telemetry", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+      {"name": "telemetry", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "score_source_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
     ],
     "attr": [
       {"name": "query_quant_mode", "type": "int", "default_value": "0"},
@@ -47,7 +49,8 @@
       {"name": "return_values", "type": "bool", "default_value": "false"},
       {"name": "stride", "type": "int", "default_value": "1"},
       {"name": "scale_stride", "type": "int", "default_value": "1"},
-      {"name": "kvaf_rows_per_entry", "type": "int", "default_value": "128"}
+      {"name": "kvaf_rows_per_entry", "type": "int", "default_value": "128"},
+      {"name": "kv_object_domain", "param_type": "required", "type": "int"}
     ]
   }
 ]

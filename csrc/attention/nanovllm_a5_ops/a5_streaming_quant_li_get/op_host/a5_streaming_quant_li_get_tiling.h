@@ -58,9 +58,9 @@ constexpr uint32_t METADATA_INDEX = 8;
 // source-derived A5 implementation can be staged without touching it.
 constexpr uint32_t RESIDENT_THRESHOLD_INDEX = 9;
 constexpr uint32_t RESIDENT_THRESHOLD_VALID_INDEX = 10;
-constexpr uint32_t CACHE_SLOTS_SNAPSHOT_INDEX = 11;
+constexpr uint32_t KV_OBJECT_SLOTS_SNAPSHOT_INDEX = 11;
 constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 12;
-constexpr uint32_t LOGICAL_TOKEN_MAP_INDEX = 13;
+constexpr uint32_t KV_OBJECT_MAP_INDEX = 13;
 constexpr uint32_t PRIVATE_SOURCE_TO_SLOT_INDEX = 14;
 constexpr uint32_t PRIVATE_READY_TABLE_INDEX = 15;
 // A transaction-local, per-queue monotonic allocator. The values start at
@@ -77,6 +77,9 @@ constexpr uint32_t QUEUE_CONTROL_INDEX = 18;
 // One int32 owner word per Direct-HCCP queue. 0 = free; a positive owner tag
 // is acquired/released by the vendored KVAF SIMT helper.
 constexpr uint32_t QUEUE_LEASES_INDEX = 19;
+// Per sparse-output row active KV-object prefix.  This is appended rather
+// than inserted so old inputs 0..19 retain their ABI indices.
+constexpr uint32_t KV_OBJECT_LENS_INDEX = 20;
 
 constexpr uint32_t SPARSE_INDICES_OUTPUT_INDEX = 0;
 constexpr uint32_t SPARSE_VALUES_OUTPUT_INDEX = 1;
@@ -86,6 +89,9 @@ constexpr uint32_t PRIVATE_ARENA_HEAD_OUTPUT_INDEX = 4;
 constexpr uint32_t PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX = 5;
 constexpr uint32_t QUEUE_LEASES_OUTPUT_INDEX = 6;
 constexpr uint32_t TELEMETRY_OUTPUT_INDEX = 7;
+// Per output row, emitted by the same official C8 ProcessTopK logic that
+// consumes scoreGm.  Its unit is score-source S, not logical KV L.
+constexpr uint32_t SCORE_SOURCE_LENS_OUTPUT_INDEX = 8;
 // Attributes Index
 constexpr uint32_t ATTR_QUERY_QUANT_MODE_INDEX = 0;
 constexpr uint32_t ATTR_KEY_QUANT_MODE_INDEX = 1;
@@ -100,6 +106,15 @@ constexpr uint32_t ATTR_RETURN_VALUES_INDEX = 9;
 constexpr uint32_t ATTR_STRIDE_INDEX = 10;
 constexpr uint32_t ATTR_SCALE_STRIDE_INDEX = 11;
 constexpr uint32_t ATTR_KVAF_ROWS_PER_ENTRY_INDEX = 12;
+constexpr uint32_t ATTR_KV_OBJECT_DOMAIN_INDEX = 13;
+
+// The values of kv_object_map, kv_object_lens, and kv_object_slots_snapshot
+// are not implicit token IDs.  The required graph-static attribute selects
+// their one common address domain.
+enum class KvObjectDomain : int64_t {
+    RAW_TOKEN = 0,
+    C8_COMPRESSED_OBJECT = 1,
+};
 // Dim Index
 constexpr uint32_t DIM_IDX_ZERO = 0;
 constexpr uint32_t DIM_IDX_ONE = 1;
@@ -143,7 +158,7 @@ TILING_DATA_FIELD_DEF(int64_t, scaleStride)
 TILING_DATA_FIELD_DEF(uint32_t, streamingRowCount)
 TILING_DATA_FIELD_DEF(uint32_t, streamingSourceCapacity)
 TILING_DATA_FIELD_DEF(uint32_t, streamingPoolSize)
-TILING_DATA_FIELD_DEF(uint32_t, streamingCacheTokenCapacity)
+TILING_DATA_FIELD_DEF(uint32_t, streamingKvObjectCapacity)
 TILING_DATA_FIELD_DEF(uint32_t, streamingPrivatePackedRows)
 TILING_DATA_FIELD_DEF(uint32_t, streamingPrivateArenaCapacity)
 TILING_DATA_FIELD_DEF(uint32_t, streamingQueueCount)
@@ -182,6 +197,7 @@ struct QLIParaInfo {
     const bool *returnValues = nullptr;
     const int64_t *stride = nullptr;
     const int64_t *scaleStride = nullptr;
+    const int64_t *kvObjectDomain = nullptr;
 };
 
 // -----------算子Tiling入参信息类---------------
@@ -303,7 +319,7 @@ public:
         uint32_t rowCount = 0;
         uint32_t sourceCapacity = 0;
         uint32_t poolSize = 0;
-        uint32_t cacheTokenCapacity = 0;
+        uint32_t kvObjectCapacity = 0;
         uint32_t privatePackedRows = 0;
         uint32_t privateArenaCapacity = 0;
         uint32_t queueCount = 0;

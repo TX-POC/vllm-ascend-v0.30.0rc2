@@ -20,21 +20,24 @@ constexpr uint32_t QUERY_INDEX = 0;
 constexpr uint32_t KEY_INDEX = 1;
 constexpr uint32_t RESIDENT_THRESHOLD_INDEX = 9;
 constexpr uint32_t RESIDENT_THRESHOLD_VALID_INDEX = 10;
-constexpr uint32_t CACHE_SLOTS_SNAPSHOT_INDEX = 11;
+constexpr uint32_t KV_OBJECT_SLOTS_SNAPSHOT_INDEX = 11;
 constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 12;
-constexpr uint32_t LOGICAL_TOKEN_MAP_INDEX = 13;
+constexpr uint32_t KV_OBJECT_MAP_INDEX = 13;
 constexpr uint32_t PRIVATE_SOURCE_TO_SLOT_INDEX = 14;
 constexpr uint32_t PRIVATE_READY_TABLE_INDEX = 15;
 constexpr uint32_t PRIVATE_ARENA_HEAD_INDEX = 16;
 constexpr uint32_t PRIVATE_PACKED_OUTPUT_INDEX = 17;
 constexpr uint32_t QUEUE_CONTROL_INDEX = 18;
 constexpr uint32_t QUEUE_LEASES_INDEX = 19;
+constexpr uint32_t KV_OBJECT_LENS_INDEX = 20;
 
 constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 2;
 constexpr uint32_t ATTR_KV_LAYOUT_INDEX = 3;
 constexpr uint32_t ATTR_SPARSE_COUNT_INDEX = 4;
 constexpr uint32_t ATTR_RETURN_VALUE_INDEX = 9;
 constexpr uint32_t ATTR_KVAF_ROWS_PER_ENTRY_INDEX = 12;
+constexpr uint32_t ATTR_CMP_RATIO_INDEX = 8;
+constexpr uint32_t ATTR_KV_OBJECT_DOMAIN_INDEX = 13;
 constexpr uint32_t SPARSE_INDICES_OUTPUT_INDEX = 0;
 constexpr uint32_t SPARSE_VALUES_OUTPUT_INDEX = 1;
 constexpr uint32_t PRIVATE_SOURCE_TO_SLOT_OUTPUT_INDEX = 2;
@@ -43,6 +46,7 @@ constexpr uint32_t PRIVATE_ARENA_HEAD_OUTPUT_INDEX = 4;
 constexpr uint32_t PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX = 5;
 constexpr uint32_t QUEUE_LEASES_OUTPUT_INDEX = 6;
 constexpr uint32_t TELEMETRY_OUTPUT_INDEX = 7;
+constexpr uint32_t SCORE_SOURCE_LENS_OUTPUT_INDEX = 8;
 constexpr uint32_t STREAMING_TELEMETRY_COLUMNS = 13;
 constexpr uint32_t STREAMING_KVAF_CONTROL_WORDS = 16;
 constexpr uint32_t STREAMING_PACKED_KV_ROW_BYTES = 656;
@@ -74,28 +78,30 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     const gert::Shape *key = context->GetInputShape(KEY_INDEX);
     const gert::Shape *resident = context->GetInputShape(RESIDENT_THRESHOLD_INDEX);
     const gert::Shape *residentValid = context->GetInputShape(RESIDENT_THRESHOLD_VALID_INDEX);
-    const gert::Shape *cacheSlots = context->GetInputShape(CACHE_SLOTS_SNAPSHOT_INDEX);
+    const gert::Shape *kvObjectSlots = context->GetInputShape(KV_OBJECT_SLOTS_SNAPSHOT_INDEX);
     const gert::Shape *poolEntries = context->GetInputShape(REQ_POOL_ENTRIES_INDEX);
-    const gert::Shape *logicalMap = context->GetInputShape(LOGICAL_TOKEN_MAP_INDEX);
+    const gert::Shape *kvObjectMap = context->GetInputShape(KV_OBJECT_MAP_INDEX);
     const gert::Shape *sourceToSlot = context->GetInputShape(PRIVATE_SOURCE_TO_SLOT_INDEX);
     const gert::Shape *ready = context->GetInputShape(PRIVATE_READY_TABLE_INDEX);
     const gert::Shape *arenaHead = context->GetInputShape(PRIVATE_ARENA_HEAD_INDEX);
     const gert::Shape *privatePackedOutput = context->GetInputShape(PRIVATE_PACKED_OUTPUT_INDEX);
     const gert::Shape *control = context->GetInputShape(QUEUE_CONTROL_INDEX);
     const gert::Shape *leases = context->GetInputShape(QUEUE_LEASES_INDEX);
+    const gert::Shape *kvObjectLens = context->GetInputShape(KV_OBJECT_LENS_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, query);
     OP_CHECK_NULL_WITH_CONTEXT(context, key);
     OP_CHECK_NULL_WITH_CONTEXT(context, resident);
     OP_CHECK_NULL_WITH_CONTEXT(context, residentValid);
-    OP_CHECK_NULL_WITH_CONTEXT(context, cacheSlots);
+    OP_CHECK_NULL_WITH_CONTEXT(context, kvObjectSlots);
     OP_CHECK_NULL_WITH_CONTEXT(context, poolEntries);
-    OP_CHECK_NULL_WITH_CONTEXT(context, logicalMap);
+    OP_CHECK_NULL_WITH_CONTEXT(context, kvObjectMap);
     OP_CHECK_NULL_WITH_CONTEXT(context, sourceToSlot);
     OP_CHECK_NULL_WITH_CONTEXT(context, ready);
     OP_CHECK_NULL_WITH_CONTEXT(context, arenaHead);
     OP_CHECK_NULL_WITH_CONTEXT(context, privatePackedOutput);
     OP_CHECK_NULL_WITH_CONTEXT(context, control);
     OP_CHECK_NULL_WITH_CONTEXT(context, leases);
+    OP_CHECK_NULL_WITH_CONTEXT(context, kvObjectLens);
 
     gert::Shape *sparseIndices = context->GetOutputShape(SPARSE_INDICES_OUTPUT_INDEX);
     gert::Shape *sparseValues = context->GetOutputShape(SPARSE_VALUES_OUTPUT_INDEX);
@@ -105,6 +111,7 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     gert::Shape *privatePackedOutputOut = context->GetOutputShape(PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX);
     gert::Shape *leasesOut = context->GetOutputShape(QUEUE_LEASES_OUTPUT_INDEX);
     gert::Shape *telemetry = context->GetOutputShape(TELEMETRY_OUTPUT_INDEX);
+    gert::Shape *scoreSourceLens = context->GetOutputShape(SCORE_SOURCE_LENS_OUTPUT_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, sparseIndices);
     OP_CHECK_NULL_WITH_CONTEXT(context, sparseValues);
     OP_CHECK_NULL_WITH_CONTEXT(context, sourceToSlotOut);
@@ -113,6 +120,7 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     OP_CHECK_NULL_WITH_CONTEXT(context, privatePackedOutputOut);
     OP_CHECK_NULL_WITH_CONTEXT(context, leasesOut);
     OP_CHECK_NULL_WITH_CONTEXT(context, telemetry);
+    OP_CHECK_NULL_WITH_CONTEXT(context, scoreSourceLens);
 
     auto attrs = context->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
@@ -120,16 +128,26 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     const char *keyLayoutAttr = attrs->GetAttrPointer<char>(ATTR_KV_LAYOUT_INDEX);
     const int64_t *sparseCount = attrs->GetInt(ATTR_SPARSE_COUNT_INDEX);
     const int64_t *rowsPerEntry = attrs->GetAttrPointer<int64_t>(ATTR_KVAF_ROWS_PER_ENTRY_INDEX);
+    const int64_t *cmpRatio = attrs->GetAttrPointer<int64_t>(ATTR_CMP_RATIO_INDEX);
+    const int64_t *kvObjectDomain = attrs->GetAttrPointer<int64_t>(ATTR_KV_OBJECT_DOMAIN_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, queryLayoutAttr);
     OP_CHECK_NULL_WITH_CONTEXT(context, keyLayoutAttr);
     OP_CHECK_NULL_WITH_CONTEXT(context, sparseCount);
     OP_CHECK_NULL_WITH_CONTEXT(context, rowsPerEntry);
+    OP_CHECK_NULL_WITH_CONTEXT(context, cmpRatio);
+    OP_CHECK_NULL_WITH_CONTEXT(context, kvObjectDomain);
 
     const std::string queryLayout(queryLayoutAttr);
     const std::string keyLayout(keyLayoutAttr);
     if ((queryLayout != "TND" && queryLayout != "BSND") || *sparseCount <= 0 ||
-        *rowsPerEntry <= 0) {
-        OP_LOGE(context, "layout_query must be TND or BSND; sparse_count and kvaf_rows_per_entry must be positive.");
+        *rowsPerEntry <= 0 ||
+        (*cmpRatio != 1 && *cmpRatio != 4 && *cmpRatio != 128) ||
+        (*kvObjectDomain != 0 && *kvObjectDomain != 1) ||
+        (*kvObjectDomain == 0 && *cmpRatio != 1)) {
+        OP_LOGE(context,
+                "invalid KV-object contract: cmp_ratio must be 1, 4, or 128; "
+                "RAW_TOKEN requires cmp_ratio=1; "
+                "C8_COMPRESSED_OBJECT is kv_object_domain=1.");
         return ge::GRAPH_FAILED;
     }
     const int64_t keyHeads = (keyLayout == "TND") ? key->GetDim(1) : key->GetDim(2);
@@ -160,7 +178,7 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     }
 
     const int64_t rowCount = ProductExceptLast(*sparseIndices);
-    const int64_t sourceCapacity = (logicalMap->GetDimNum() == 2) ? logicalMap->GetDim(1) : -1;
+    const int64_t sourceCapacity = (kvObjectMap->GetDimNum() == 2) ? kvObjectMap->GetDim(1) : -1;
     const int64_t queueCount = (leases->GetDimNum() == 1) ? leases->GetDim(0) : -1;
     const int64_t privateCapacity = (ready->GetDimNum() == 2) ? ready->GetDim(1) : -1;
     const bool validTransactionInterface =
@@ -168,11 +186,12 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
         resident->GetDimNum() == 1 && resident->GetDim(0) == rowCount &&
         residentValid->GetDimNum() == 1 && residentValid->GetDim(0) == rowCount &&
         poolEntries->GetDimNum() == 1 && poolEntries->GetDim(0) == rowCount &&
-        logicalMap->GetDimNum() == 2 && logicalMap->GetDim(0) > 0 &&
+        kvObjectLens->GetDimNum() == 1 && kvObjectLens->GetDim(0) == rowCount &&
+        kvObjectMap->GetDimNum() == 2 && kvObjectMap->GetDim(0) > 0 &&
         sourceToSlot->GetDimNum() == 2 && sourceToSlot->GetDim(0) == rowCount &&
         sourceToSlot->GetDim(1) == sourceCapacity &&
-        cacheSlots->GetDimNum() == 2 && cacheSlots->GetDim(0) == logicalMap->GetDim(0) &&
-        cacheSlots->GetDim(1) > 0 &&
+        kvObjectSlots->GetDimNum() == 2 && kvObjectSlots->GetDim(0) == kvObjectMap->GetDim(0) &&
+        kvObjectSlots->GetDim(1) > 0 &&
         ready->GetDimNum() == 2 && ready->GetDim(0) == queueCount &&
         arenaHead->GetDimNum() == 1 && arenaHead->GetDim(0) == queueCount &&
         privatePackedOutput->GetDimNum() == 2 && privatePackedOutput->GetDim(0) > 0 &&
@@ -192,6 +211,11 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     telemetry->SetDimNum(2);
     telemetry->SetDim(0, queueCount);
     telemetry->SetDim(1, STREAMING_TELEMETRY_COLUMNS);
+    // This output is filled by the exact ProcessTopK valid-length formula on
+    // device.  It is deliberately row-count shaped, matching sparse output
+    // rows rather than cache-pool or KV-object capacity.
+    scoreSourceLens->SetDimNum(1);
+    scoreSourceLens->SetDim(0, rowCount);
     OP_LOGD(context->GetNodeName(), "A5StreamingQuantLiGet InferShape end.");
     return ge::GRAPH_SUCCESS;
 }
@@ -211,6 +235,7 @@ static ge::graphStatus InferDataTypeA5StreamingQuantLiGet(
     context->SetOutputDataType(PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX, ge::DT_UINT8);
     context->SetOutputDataType(QUEUE_LEASES_OUTPUT_INDEX, ge::DT_INT32);
     context->SetOutputDataType(TELEMETRY_OUTPUT_INDEX, ge::DT_INT64);
+    context->SetOutputDataType(SCORE_SOURCE_LENS_OUTPUT_INDEX, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
 

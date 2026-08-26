@@ -34,17 +34,36 @@ def test_reconcile_schema_and_kernel_are_plan_only() -> None:
         ROOT / "csrc" / "attention" / "nanovllm_a5_ops" / "build_nanovllm_ops.sh"
     ).read_text()
 
-    assert schema.count('"name":') == 20  # 8 inputs + 12 outputs
+    assert schema.count('"name":') == 23  # 9 inputs + 12 outputs + 2 attrs
     for name in (
-        "ready_private_source_ids",
+        "kv_object_slots_snapshot",
+        "kv_object_lens",
+        "kv_object_map",
+        "kv_object_ids",
+        "ready_private_kv_object_ids",
         "ready_private_slots",
         "ready_private_destination_slots",
-        "fallback_logical_token_ids",
+        "fallback_kv_object_ids",
         "fallback_destination_slots",
         "placement_delta",
+        "score_source_lens",
     ):
         assert f'"name": "{name}"' in schema
-    assert "cacheSlotsSnapshotGm_.SetValue" not in kernel
+    assert "kvObjectSlotsSnapshotGm_.SetValue" not in kernel
+    assert "scoreSourceLensGm_" in kernel
+    assert "scoreSourceCapacity" in kernel
+    assert "kvObjectCapacity" in kernel
+    assert '"kv_object_domain"' in schema
+    assert '"cmp_ratio"' in schema
+    assert "kv_object_domain=RAW_TOKEN requires cmp_ratio=1" in bridge
+    host = (OP_ROOT / "op_host" / "a5_exact_reconcile_private_view.cpp").read_text()
+    assert "kC8CompressedObjectDomain" in host
+    assert "cmpRatio == 1 || cmpRatio == 4 || cmpRatio == 128" in host
+    assert "IsValidKvObjectDomain" in host
+    assert "tiling_->rowCount" in kernel
+    assert "GetExactTopkRowCount" in (OP_ROOT / "op_host" / "a5_exact_reconcile_private_view.cpp").read_text()
+    assert "ExactTopkRowCount" in bridge
+    assert "ProductExceptLast(exact_topk_indices)" in bridge
     assert "aclnnA5ExactReconcilePrivateView" in bridge
     assert "exact_reconcile_private_view" not in policy
     assert "A5SparseAndTailAttention" not in kernel

@@ -27,11 +27,17 @@ OP_DEF = ROOT / "op_host/a5_streaming_quant_li_get_def.cpp"
 INFER = ROOT / "op_host/a5_streaming_quant_li_get_infershape.cpp"
 TILING = ROOT / "op_host/a5_streaming_quant_li_get_tiling.cpp"
 TILING_HEADER = ROOT / "op_host/a5_streaming_quant_li_get_tiling.h"
+BRIDGE = ROOT / "torch_extension/csrc/streaming_quant_li_get.cpp"
 OPS = ROOT / "ops.json"
 ROOT_CMAKE = ROOT / "CMakeLists.txt"
 METADATA_COMPANION = ROOT / "metadata_companion.md"
 
-INPUT_NAMES = [
+# These are the public CANN-generated operator parameter names.  The isolated
+# Torch bridge is deliberately required to use the same names and positional
+# order: a 21-input ACLNN function is invoked through a dynamically typed
+# function pointer, so a friendly alias or an order-only drift cannot be made
+# safe by the C++ compiler.
+CANN_INPUT_NAMES = [
     "query",
     "key",
     "weights",
@@ -43,16 +49,90 @@ INPUT_NAMES = [
     "metadata",
     "resident_threshold",
     "resident_threshold_valid",
-    "cache_slots_snapshot",
+    "kv_object_slots_snapshot",
     "req_pool_entries",
-    "logical_token_map",
+    "kv_object_map",
     "private_source_to_slot",
     "private_ready_table",
     "private_arena_head",
     "private_packed_output",
     "queue_control",
     "queue_leases",
+    "kv_object_lens",
 ]
+
+# `kv_object_domain` is a required public Torch semantic choice, not an
+# optional tuning knob.  Torch must therefore take it before its optional
+# defaults.  CANN's generated ACLNN ABI intentionally retains its existing
+# declaration order, where the same value is last.  The bridge is the sole,
+# explicit reorder boundary between the two.
+CANN_ATTR_NAMES = [
+    "query_quant_mode",
+    "key_quant_mode",
+    "layout_query",
+    "layout_key",
+    "sparse_count",
+    "sparse_mode",
+    "pre_tokens",
+    "next_tokens",
+    "cmp_ratio",
+    "return_values",
+    "stride",
+    "scale_stride",
+    "kvaf_rows_per_entry",
+    "kv_object_domain",
+]
+TORCH_SCHEMA_ATTR_TOKENS = [
+    "int kv_object_domain",
+    "int query_quant_mode",
+    "int key_quant_mode",
+    "str layout_query",
+    "str layout_key",
+    "int sparse_count",
+    "int sparse_mode",
+    "int pre_tokens",
+    "int next_tokens",
+    "int cmp_ratio",
+    "bool return_values",
+    "int stride",
+    "int scale_stride",
+    "int kvaf_rows_per_entry",
+]
+ACLNN_ATTR_ARGUMENTS = [
+    "queryQuantMode",
+    "keyQuantMode",
+    "layoutQueryPtr",
+    "layoutKeyPtr",
+    "sparseCount",
+    "sparseMode",
+    "preTokens",
+    "nextTokens",
+    "cmpRatio",
+    "returnValues",
+    "stride",
+    "scaleStride",
+    "kvafRowsPerEntry",
+    "kvObjectDomain",
+]
+ALLOCATE_ATTR_ARGUMENTS = [
+    "queryQuantMode",
+    "keyQuantMode",
+    "layoutQuery",
+    "layoutKey",
+    "sparseCount",
+    "sparseMode",
+    "preTokens",
+    "nextTokens",
+    "cmpRatio",
+    "returnValues",
+    "stride",
+    "scaleStride",
+    "kvafRowsPerEntry",
+    "kvObjectDomain",
+]
+BRIDGE_ATTR_REORDER_COMMENT = (
+    "ACLNN ABI keeps kvObjectDomain after kvafRowsPerEntry."
+)
 OUTPUT_NAMES = [
     "sparse_indices",
     "sparse_values",
@@ -62,6 +142,7 @@ OUTPUT_NAMES = [
     "private_packed_output_out",
     "queue_leases_out",
     "telemetry",
+    "score_source_lens",
 ]
 KERNEL_ARGUMENT_NAMES = [
     "query",
@@ -75,15 +156,16 @@ KERNEL_ARGUMENT_NAMES = [
     "metadata",
     "residentThreshold",
     "residentThresholdValid",
-    "cacheSlotsSnapshot",
+    "kvObjectSlotsSnapshot",
     "reqPoolEntries",
-    "logicalTokenMap",
+    "kvObjectMap",
     "privateSourceToSlot",
     "privateReadyTable",
     "privateArenaHead",
     "privatePackedOutput",
     "queueControl",
     "queueLeases",
+    "kvObjectLens",
     "sparseIndices",
     "sparseValues",
     "privateSourceToSlotOut",
@@ -92,6 +174,7 @@ KERNEL_ARGUMENT_NAMES = [
     "privatePackedOutputOut",
     "queueLeasesOut",
     "telemetry",
+    "scoreSourceLens",
 ]
 
 
@@ -100,6 +183,15 @@ def topk(scores: list[int], k: int) -> list[int]:
     # deterministic index tie-break makes the source-level non-mutation model
     # unambiguous. This is not a target-runtime bitwise equivalence result.
     return [index for index, _ in sorted(enumerate(scores), key=lambda x: (-x[1], x[0]))[:k]]
+
+
+def assert_order(label: str, actual: list[str], expected: list[str]) -> None:
+    """Fail with the complete ABI order instead of a vague target error."""
+    assert actual == expected, (
+        f"{label} order mismatch\n"
+        f"expected: {' -> '.join(expected)}\n"
+        f"actual:   {' -> '.join(actual)}"
+    )
 
 
 def require_source_contract() -> None:
@@ -111,14 +203,22 @@ def require_source_contract() -> None:
     infer = INFER.read_text()
     tiling = TILING.read_text()
     tiling_header = TILING_HEADER.read_text()
+    bridge = BRIDGE.read_text()
     ops = json.loads(OPS.read_text())
     assert len(ops) == 1 and ops[0]["op"] == "A5StreamingQuantLiGet"
-    assert len(ops[0]["input_desc"]) == 20
-    assert len(ops[0]["output_desc"]) == 8
+    assert len(ops[0]["input_desc"]) == 21
+    assert len(ops[0]["output_desc"]) == 9
     inputs = ops[0]["input_desc"]
     outputs = ops[0]["output_desc"]
-    assert [item["name"] for item in inputs] == INPUT_NAMES
-    assert [item["name"] for item in outputs] == OUTPUT_NAMES
+    assert_order("ops.json input ABI", [item["name"] for item in inputs], CANN_INPUT_NAMES)
+    assert_order("ops.json output ABI", [item["name"] for item in outputs], OUTPUT_NAMES)
+    attrs = ops[0]["attr"]
+    assert_order("ops.json attr ABI", [item["name"] for item in attrs], CANN_ATTR_NAMES)
+    assert attrs[-1] == {
+        "name": "kv_object_domain",
+        "param_type": "required",
+        "type": "int",
+    }
     assert inputs[9]["name"] == "resident_threshold"
     # ResidentSeed exports int32 (low 16 bits are the exact C8 sortable kth
     # score), so this must stay int32 to preserve the direct graph edge.
@@ -129,6 +229,8 @@ def require_source_contract() -> None:
         "format": ["ND"],
         "type": ["int32"],
     }
+    assert inputs[11]["name"] == "kv_object_slots_snapshot"
+    assert inputs[13]["name"] == "kv_object_map"
     assert inputs[17] == {
         "name": "private_packed_output",
         "param_type": "required",
@@ -139,6 +241,18 @@ def require_source_contract() -> None:
     assert inputs[18]["type"] == ["int64"]
     assert inputs[19]["name"] == "queue_leases"
     assert inputs[19]["type"] == ["int32"]
+    assert inputs[20] == {
+        "name": "kv_object_lens",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"],
+    }
+    assert outputs[8] == {
+        "name": "score_source_lens",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"],
+    }
     assert ROOT_CMAKE.is_file()
     assert "descriptor_stage_only" not in OPS.read_text()
     assert "descriptor_stage_only" not in ROOT_CMAKE.read_text()
@@ -146,6 +260,8 @@ def require_source_contract() -> None:
     assert "BatchMulWeightAndReduceSum" in vector
     assert "streamingKvafHook_.Emit" in vector
     assert "streamingKvafHook_.Finish" in vector
+    assert "scoreSourceLensGm.SetValue(" in vector
+    assert "outputRow, validS2Len > 0 ? validS2Len : 0" in vector
     assert "ProcessTopK" in vector
     assert vector.index("BatchMulWeightAndReduceSum") < vector.index("streamingKvafHook_.Emit")
     assert vector.index("streamingKvafHook_.Emit") < vector.index("DataCopyPad(scoreGm")
@@ -158,6 +274,19 @@ def require_source_contract() -> None:
     assert topk_body.rindex("DataCopyPad(indiceOutGm") < topk_body.rindex(
         "streamingKvafHook_.Finish()"
     )
+    # score_source_lens must use the same per-row value before either the
+    # short-row / invalid output path or normal official TopK branch. It is a
+    # source-score S bound, not a host approximation of logical KV L.
+    valid_formula = topk_body.index("validS2Len = ((int32_t)i + cuRealAcSeq)")
+    source_len_store = topk_body.index("scoreSourceLensGm.SetValue(")
+    invalid_branch = topk_body.index("if (validS2Len <= 0)")
+    assert valid_formula < source_len_store < invalid_branch
+    clean_body = vector[vector.index(
+        "__aicore__ inline void QLIVector<QLIT>::CleanInvalidOutput"
+    ):vector.index(
+        "__aicore__ inline void QLIVector<QLIT>::GetKeyScale"
+    )]
+    assert "scoreSourceLensGm.SetValue" in clean_body
     for symbol in (
         "TryAcquireKvafStreamingBatchGetQueueFromAicore",
         "PublishKvafStreamingBatchGetDescriptorScratch",
@@ -167,8 +296,8 @@ def require_source_contract() -> None:
         "GetKvafStreamingBatchGetReady",
         "ReleaseKvafStreamingBatchGetQueueFromAicore",
         "LoadKvafStreamingBatchGetQueueTemplate",
-        "logicalTokenMap_.GetValue",
-        "cacheSlots_.GetValue",
+        "kvObjectMap_.GetValue",
+        "kvObjectSlots_.GetValue",
         "ClaimStreamingPrivateArenaSimt",
         "residentThresholdValid_.GetValue(row) != 1",
         "& 0xffffU",
@@ -186,7 +315,7 @@ def require_source_contract() -> None:
     # CANN build on a non-A5 host.
     public_def = op_def.split("OpAICoreConfig", 1)[0]
     previous = -1
-    for name in INPUT_NAMES:
+    for name in CANN_INPUT_NAMES:
         position = public_def.index(f'this->Input("{name}")')
         assert position > previous, name
         previous = position
@@ -195,7 +324,107 @@ def require_source_contract() -> None:
         position = public_def.index(f'this->Output("{name}")')
         assert position > previous, name
         previous = position
+    # The public Torch schema keeps the required domain before its optional
+    # defaults, while generated ACLNN follows the immutable CANN declaration
+    # order. EXEC_NPU_CMD_ORDERED creates a function pointer from its argument
+    # tuple, so the bridge must prove this one deliberate reorder explicitly.
+    assert BRIDGE.is_file()
+    assert BRIDGE_ATTR_REORDER_COMMENT in bridge, (
+        "bridge must document the intentional public-Torch to generated-ACLNN "
+        "attribute reorder"
+    )
+    bridge_def = bridge[bridge.index("TORCH_LIBRARY("):bridge.index("TORCH_LIBRARY_IMPL")]
+    previous = -1
+    for name in CANN_INPUT_NAMES:
+        position = bridge_def.index(f"Tensor {name}")
+        assert position > previous, name
+        previous = position
+    previous = -1
+    for token in TORCH_SCHEMA_ATTR_TOKENS:
+        position = bridge_def.index(token)
+        assert position > previous, token
+        previous = position
+
+    public_def_attr_order = []
+    for name in CANN_ATTR_NAMES:
+        position = public_def.index(f'this->Attr("{name}")')
+        public_def_attr_order.append((position, name))
+    assert_order(
+        "OpDef attr ABI",
+        [name for _, name in sorted(public_def_attr_order)],
+        CANN_ATTR_NAMES,
+    )
+
+    allocate_start = bridge.index("Result AllocateAndLaunch(")
+    allocate_signature = bridge[
+        allocate_start:bridge.index("\n{", allocate_start)
+    ]
+    previous = -1
     for token in (
+        "int64_t queryQuantMode",
+        "int64_t keyQuantMode",
+        "const std::string& layoutQuery",
+        "const std::string& layoutKey",
+        "int64_t sparseCount",
+        "int64_t sparseMode",
+        "int64_t preTokens",
+        "int64_t nextTokens",
+        "int64_t cmpRatio",
+        "bool returnValues",
+        "int64_t stride",
+        "int64_t scaleStride",
+        "int64_t kvafRowsPerEntry",
+        "int64_t kvObjectDomain",
+    ):
+        position = allocate_signature.index(token)
+        assert position > previous, token
+        previous = position
+
+    npu_to_launch = bridge[
+        bridge.index("Result StreamingQuantLiGetNpu("):bridge.index("Result StreamingQuantLiGetMeta(")
+    ]
+    npu_launch_call = npu_to_launch[npu_to_launch.index("return AllocateAndLaunch("):]
+    previous = -1
+    for token in ALLOCATE_ATTR_ARGUMENTS:
+        position = npu_launch_call.index(token)
+        assert position > previous, token
+        previous = position
+
+    aclnn_call = bridge[bridge.index("EXEC_NPU_CMD_ORDERED("):bridge.index("return std::make_tuple(")]
+    previous = -1
+    for name in (
+        "query", "keyArg", "weights", "queryScale", "keyScale",
+        "actualSeqLengthsQ", "actualSeqLengthsK", "blockTable", "metadata",
+        "residentThreshold", "residentThresholdValid", "kvObjectSlotsSnapshot",
+        "reqPoolEntries", "kvObjectMap", "privateSourceToSlot",
+        "privateReadyTable", "privateArenaHead", "privatePackedOutput",
+        "queueControl", "queueLeases", "kvObjectLens",
+        *ACLNN_ATTR_ARGUMENTS,
+        "sparseIndices", "sparseValues", "privateSourceToSlotOut",
+        "privateReadyTableOut", "privateArenaHeadOut", "privatePackedOutputOut",
+        "queueLeasesOut", "telemetry", "scoreSourceLens",
+    ):
+        position = aclnn_call.index(name)
+        assert position > previous, name
+        previous = position
+    for token in (
+        "KV_OBJECT_SLOTS_SNAPSHOT_INDEX = 11",
+        "KV_OBJECT_MAP_INDEX = 13",
+        "KV_OBJECT_LENS_INDEX = 20",
+        "ATTR_QUERY_QUANT_MODE_INDEX = 0",
+        "ATTR_KEY_QUANT_MODE_INDEX = 1",
+        "ATTR_QUERY_LAYOUT_INDEX = 2",
+        "ATTR_KEY_LAYOUT_INDEX = 3",
+        "ATTR_SPARSE_COUNT_INDEX = 4",
+        "ATTR_SPARSE_MODE_INDEX = 5",
+        "ATTR_PRE_TOKENS_INDEX = 6",
+        "ATTR_NEXT_TOKENS_INDEX = 7",
+        "ATTR_CMP_RATIO_INDEX = 8",
+        "ATTR_RETURN_VALUES_INDEX = 9",
+        "ATTR_STRIDE_INDEX = 10",
+        "ATTR_SCALE_STRIDE_INDEX = 11",
+        "ATTR_KVAF_ROWS_PER_ENTRY_INDEX = 12",
+        "ATTR_KV_OBJECT_DOMAIN_INDEX = 13",
         "RESIDENT_THRESHOLD_VALID_INDEX = 10",
         "PRIVATE_PACKED_OUTPUT_INDEX = 17",
         "QUEUE_CONTROL_INDEX = 18",
@@ -203,27 +432,39 @@ def require_source_contract() -> None:
         "PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX = 5",
         "QUEUE_LEASES_OUTPUT_INDEX = 6",
         "TELEMETRY_OUTPUT_INDEX = 7",
+        "SCORE_SOURCE_LENS_OUTPUT_INDEX = 8",
         "streamingPrivatePackedRows",
     ):
         assert token in tiling_header, token
     for token in (
+        "KV_OBJECT_SLOTS_SNAPSHOT_INDEX = 11",
+        "KV_OBJECT_MAP_INDEX = 13",
+        "KV_OBJECT_LENS_INDEX = 20",
+        "ATTR_KV_OBJECT_DOMAIN_INDEX = 13",
         "RESIDENT_THRESHOLD_VALID_INDEX = 10",
         "PRIVATE_PACKED_OUTPUT_INDEX = 17",
         "QUEUE_CONTROL_INDEX = 18",
         "QUEUE_LEASES_INDEX = 19",
+        "KV_OBJECT_LENS_INDEX = 20",
         "PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX = 5",
         "QUEUE_LEASES_OUTPUT_INDEX = 6",
         "TELEMETRY_OUTPUT_INDEX = 7",
+        "SCORE_SOURCE_LENS_OUTPUT_INDEX = 8",
         "privatePackedOutputOut",
+        "scoreSourceLens->SetDim(0, rowCount)",
     ):
         assert token in infer, token
     for token in (
+        "KV_OBJECT_LENS_INDEX",
+        "ATTR_KV_OBJECT_DOMAIN_INDEX",
         "privatePackedOutput.GetDim(1) != 656",
         "privatePackedOutput.GetDim(0) / queueCount != privateCapacity",
         "privatePackedOutputOut",
         "streamingInfo->privatePackedRows",
         "QUEUE_CONTROL_INDEX",
         "QUEUE_LEASES_INDEX",
+        "SCORE_SOURCE_LENS_OUTPUT_INDEX",
+        "!ShapeEquals(scoreSourceLens, {rowCount})",
     ):
         assert token in tiling, token
     signature = kernel[kernel.index("void a5_streaming_quant_li_get("):kernel.index("__gm__ uint8_t *workspace")]
@@ -239,21 +480,46 @@ def require_source_contract() -> None:
     for name in (
         "query", "key", "weights", "queryScale", "keyScale",
         "actualSeqLengthsQ", "actualSeqLengthsK", "blocktable", "metadata",
-        "residentThreshold", "residentThresholdValid", "cacheSlotsSnapshot",
+        "residentThreshold", "residentThresholdValid", "kvObjectSlotsSnapshot",
         "reqPoolEntries",
-        "logicalTokenMap", "privateSourceToSlot", "privateReadyTable",
+        "kvObjectMap", "privateSourceToSlot", "privateReadyTable",
         "privateArenaHead", "privatePackedOutput", "queueControl",
-        "queueLeases", "sparseIndices", "sparseValues",
+        "queueLeases", "kvObjectLens", "sparseIndices", "sparseValues",
         "privateSourceToSlotOut", "privateReadyTableOut", "privateArenaHeadOut",
         "privatePackedOutputOut", "queueLeasesOut", "telemetry",
+        "scoreSourceLens",
     ):
         position = init_call.index(name)
         assert position > previous, name
         previous = position
     assert "privatePackedOutput, queueControl, queueLeases" in preload
+    assert "kvObjectSlotsSnapshot" in preload
+    assert "kvObjectMap" in preload
+    assert "kvObjectLens" in preload
     assert "residentThresholdValid" in preload
     assert "privatePackedOutputOut" in preload
     assert "queueLeasesOut" in preload
+    assert "InitScoreSourceLensOutput" in preload
+    # Object L is distinct from LI's score-source S. It must bound the
+    # logical map before the resident directory is consulted, so static tails
+    # cannot create a speculative H2D request on graph replay.
+    candidate_bound = hook.index("kvObjectLens_.GetValue(row)")
+    cache_lookup = hook.index("kvObjectSlots_.GetValue")
+    assert candidate_bound < cache_lookup
+    assert "kvObjectLen <= 0" in hook
+    assert "kvObjectLen) > kvObjectCapacity_" in hook
+    # ProcessInvalid is the no-ProcessTopK graph-replay path. It must clear
+    # output #8, otherwise stale S_active from the prior forward can pass
+    # Reconcile's source bound alongside freshly invalid sparse indices.
+    assert "ClearScoreSourceLensForInvalidForward" in preload
+    assert "InitGlobalMemory(output, end - begin, 0)" in vector
+    # Actual A5 C8 is N2==1 with G==64.  The frequently discussed C=4 is an
+    # *internal S1 score tile* (M_BASE_SIZE=256 / G=64), not a second sparse
+    # output dimension and not an independent cache-directory namespace.
+    assert "n2Size_ != 1" in tiling
+    assert "gSize_ != G_SIZE_LIMIT" in tiling
+    assert "M_BASE_SIZE" in preload
+    assert "constInfo.s1BaseSize = (constInfo.mBaseSize + constInfo.gSize - 1) / constInfo.gSize" in preload
 
 
 def probe_math_and_lifecycle() -> None:
@@ -265,6 +531,45 @@ def probe_math_and_lifecycle() -> None:
     original = tile0 + tile1
     observed = list(original)  # TileReady reads; it never writes score data.
     assert topk(original, 4) == topk(observed, 4)
+
+    # The production output carries the exact `validS2Len` used by C8
+    # ProcessTopK.  In causal compressed-S2 mode this is not the logical-KV
+    # length, so an arbitrary logical cache capacity must never be substituted
+    # for it by the host-side Reconcile bridge.
+    def official_score_source_len(
+        act_s2: int, act_s2_orig: int, act_s1: int, s1_index: int,
+        cmp_ratio: int, causal: bool,
+    ) -> int:
+        if not causal:
+            return act_s2
+        return max(0, (act_s2_orig - act_s1 + s1_index + 1) // cmp_ratio)
+
+    compressed_lengths = [
+        official_score_source_len(4096, 16384, 4, row, 4, True)
+        for row in range(4)
+    ]
+    assert compressed_lengths == [4095, 4095, 4095, 4096]
+    logical_capacity = 16384
+    assert all(0 <= value < logical_capacity for value in compressed_lengths)
+    assert compressed_lengths[-1] != logical_capacity
+
+    # The four C8 rows in one score tile are ordinary flattened output rows.
+    # Each paired AIV processes two of them; neither AIV invents an N2=2
+    # output axis.  The mapping must agree with ProcessTopK's
+    # `indiceOutOffset / K + s1_index` calculation.
+    m_base, group_size, n2 = 256, 64, 1
+    c_rows = (m_base + group_size - 1) // group_size
+    assert (n2, c_rows) == (1, 4)
+    aiv0_rows, aiv1_rows = [0, 1], [2, 3]
+    assert sorted(aiv0_rows + aiv1_rows) == list(range(c_rows))
+    sparse_k = 2048
+    # TND: the current product path has T rows and N2=1.
+    tnd_offset = 7 * sparse_k
+    assert [tnd_offset // sparse_k + row for row in aiv0_rows + aiv1_rows] == [7, 8, 9, 10]
+    # BSND: B=2, S1=6, N2=1.  A C=4 tile starting at S1=0 likewise emits
+    # the four consecutive flattened output rows for that batch.
+    bsnd_offset = (1 * 6 * n2) * sparse_k
+    assert [bsnd_offset // sparse_k + row for row in aiv0_rows + aiv1_rows] == [6, 7, 8, 9]
 
     timeline: list[str] = []
     timeline.append("scan_tile_0")
@@ -282,6 +587,7 @@ def probe_math_and_lifecycle() -> None:
         "P3_STREAMING_LI_GET_CONTRACT_PASS "
         f"source_score_nonmutation_guard=1 doorbell_before_scan_done=1 "
         f"final_get_overlaps_exact_topk=1 cq_before_release=1 "
+        "exact_score_source_lens=1 c8_n2_one=1 c8_internal_s1_tile_rows=4 "
         f"model_topk={topk(original, 4)} "
         "runtime_bitwise_equivalence=required payload_bandwidth=not_reported"
     )

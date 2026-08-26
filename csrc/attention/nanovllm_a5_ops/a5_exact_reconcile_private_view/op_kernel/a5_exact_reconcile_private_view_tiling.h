@@ -4,14 +4,20 @@
 #include <cstdint>
 
 // All fields describe graph-stable tensor dimensions.  In particular, this
-// operator never receives a writable persistent cache_slots tensor: the
+// operator never receives a writable persistent KV-object directory: the
 // snapshot is an input-only directory and placement_delta is the only output
 // that can later request a persistent publication.
 struct A5ExactReconcilePrivateViewTilingData {
     uint32_t usedCoreNum;
-    uint32_t batchSize;
+    // Number of exact C8 vectors: ProductExceptLast(exact_topk_indices).
+    // It is not necessarily the request-batch B (TND/MTP can have N2 > 1).
+    uint32_t rowCount;
     uint32_t poolSize;
-    uint32_t sourceCapacity;
+    // C8 emits indices in the score-source domain.  kv_object_map resolves
+    // those to the declared QSFA-addressable object domain.  These two
+    // capacities are deliberately separate when cmp_ratio > 1.
+    uint32_t scoreSourceCapacity;
+    uint32_t kvObjectCapacity;
     uint32_t privateQueueCount;
     uint32_t privateRowsPerQueue;
 };

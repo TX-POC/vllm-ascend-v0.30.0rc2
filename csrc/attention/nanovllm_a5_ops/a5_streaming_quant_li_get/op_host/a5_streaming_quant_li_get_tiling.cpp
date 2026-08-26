@@ -72,6 +72,9 @@ ge::graphStatus QLIInfoParser::CheckRequiredAttrExistence() const
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.keyQuantMode == nullptr, OP_LOGE(opName_, "key_quant_mode is nullptr"),
                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(opParamInfo_.kvObjectDomain == nullptr,
+               OP_LOGE(opName_, "required attr kv_object_domain is nullptr"),
+               return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -178,6 +181,8 @@ ge::graphStatus QLIInfoParser::GetAttrParaInfo()
     opParamInfo_.returnValues = attrs->GetAttrPointer<bool>(ATTR_RETURN_VALUES_INDEX);
     opParamInfo_.stride = attrs->GetAttrPointer<int64_t>(ATTR_STRIDE_INDEX);
     opParamInfo_.scaleStride = attrs->GetAttrPointer<int64_t>(ATTR_SCALE_STRIDE_INDEX);
+    opParamInfo_.kvObjectDomain =
+        attrs->GetAttrPointer<int64_t>(ATTR_KV_OBJECT_DOMAIN_INDEX);
 
     if (opParamInfo_.layOutQuery != nullptr) {
         OP_LOGI(context_->GetNodeName(), "layout_query is:%s", opParamInfo_.layOutQuery);
@@ -208,6 +213,10 @@ ge::graphStatus QLIInfoParser::GetAttrParaInfo()
     }
     if (opParamInfo_.keyQuantMode != nullptr) {
         OP_LOGI(context_->GetNodeName(), "key_quant_mode mode is:%d", *opParamInfo_.keyQuantMode);
+    }
+    if (opParamInfo_.kvObjectDomain != nullptr) {
+        OP_LOGI(context_->GetNodeName(), "kv_object_domain is:%d",
+                *opParamInfo_.kvObjectDomain);
     }
     OP_LOGI(context_->GetNodeName(), "GetAttrParaInfo end");
 
@@ -267,6 +276,17 @@ ge::graphStatus QLIInfoParser::CheckAttrParaInfo()
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(*opParamInfo_.returnValues, OP_LOGE(opName_, "input attr returnValues only supported False."),
                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(*opParamInfo_.kvObjectDomain !=
+                        static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
+                    *opParamInfo_.kvObjectDomain !=
+                        static_cast<int64_t>(KvObjectDomain::C8_COMPRESSED_OBJECT),
+                OP_LOGE(opName_, "kv_object_domain must be 0 (RAW_TOKEN) or 1 (C8_COMPRESSED_OBJECT)."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(*opParamInfo_.kvObjectDomain ==
+                        static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
+                    *opParamInfo_.cmpRatio != 1,
+                OP_LOGE(opName_, "kv_object_domain=RAW_TOKEN requires cmp_ratio=1."),
+                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -917,7 +937,7 @@ ge::graphStatus A5StreamingQuantLiGetTiling::DoTiling(
     tilingData_.set_streamingRowCount(streamingInfo.rowCount);
     tilingData_.set_streamingSourceCapacity(streamingInfo.sourceCapacity);
     tilingData_.set_streamingPoolSize(streamingInfo.poolSize);
-    tilingData_.set_streamingCacheTokenCapacity(streamingInfo.cacheTokenCapacity);
+    tilingData_.set_streamingKvObjectCapacity(streamingInfo.kvObjectCapacity);
     tilingData_.set_streamingPrivatePackedRows(streamingInfo.privatePackedRows);
     tilingData_.set_streamingPrivateArenaCapacity(
         streamingInfo.privateArenaCapacity);
@@ -971,14 +991,14 @@ static ge::graphStatus ParseStreamingInterface(
         return ge::GRAPH_FAILED;
     }
     for (uint32_t input = RESIDENT_THRESHOLD_INDEX;
-         input <= QUEUE_LEASES_INDEX; ++input) {
+         input <= KV_OBJECT_LENS_INDEX; ++input) {
         if (context->GetInputShape(input) == nullptr ||
             context->GetInputDesc(input) == nullptr) {
             return ge::GRAPH_FAILED;
         }
     }
     for (uint32_t output = PRIVATE_SOURCE_TO_SLOT_OUTPUT_INDEX;
-         output <= TELEMETRY_OUTPUT_INDEX; ++output) {
+         output <= SCORE_SOURCE_LENS_OUTPUT_INDEX; ++output) {
         if (context->GetOutputShape(output) == nullptr ||
             context->GetOutputDesc(output) == nullptr) {
             return ge::GRAPH_FAILED;
@@ -989,12 +1009,12 @@ static ge::graphStatus ParseStreamingInterface(
         context->GetInputShape(RESIDENT_THRESHOLD_INDEX)->GetStorageShape();
     const auto residentValid =
         context->GetInputShape(RESIDENT_THRESHOLD_VALID_INDEX)->GetStorageShape();
-    const auto cacheSlots = context->GetInputShape(
-        CACHE_SLOTS_SNAPSHOT_INDEX)->GetStorageShape();
+    const auto kvObjectSlots = context->GetInputShape(
+        KV_OBJECT_SLOTS_SNAPSHOT_INDEX)->GetStorageShape();
     const auto poolEntries = context->GetInputShape(
         REQ_POOL_ENTRIES_INDEX)->GetStorageShape();
-    const auto logicalMap = context->GetInputShape(
-        LOGICAL_TOKEN_MAP_INDEX)->GetStorageShape();
+    const auto kvObjectMap = context->GetInputShape(
+        KV_OBJECT_MAP_INDEX)->GetStorageShape();
     const auto sourceToSlot = context->GetInputShape(
         PRIVATE_SOURCE_TO_SLOT_INDEX)->GetStorageShape();
     const auto readyTable = context->GetInputShape(
@@ -1007,6 +1027,8 @@ static ge::graphStatus ParseStreamingInterface(
         QUEUE_CONTROL_INDEX)->GetStorageShape();
     const auto queueLeases = context->GetInputShape(
         QUEUE_LEASES_INDEX)->GetStorageShape();
+    const auto kvObjectLens = context->GetInputShape(
+        KV_OBJECT_LENS_INDEX)->GetStorageShape();
     const auto sourceToSlotOut = context->GetOutputShape(
         PRIVATE_SOURCE_TO_SLOT_OUTPUT_INDEX)->GetStorageShape();
     const auto readyTableOut = context->GetOutputShape(
@@ -1019,6 +1041,8 @@ static ge::graphStatus ParseStreamingInterface(
         QUEUE_LEASES_OUTPUT_INDEX)->GetStorageShape();
     const auto telemetry = context->GetOutputShape(
         TELEMETRY_OUTPUT_INDEX)->GetStorageShape();
+    const auto scoreSourceLens = context->GetOutputShape(
+        SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetStorageShape();
     const auto sparseIndices = context->GetOutputShape(
         SPARSE_INDICES_OUTPUT_INDEX)->GetStorageShape();
     auto attrs = context->GetAttrs();
@@ -1027,6 +1051,8 @@ static ge::graphStatus ParseStreamingInterface(
     }
     const int64_t *rowsPerEntry = attrs->GetAttrPointer<int64_t>(
         ATTR_KVAF_ROWS_PER_ENTRY_INDEX);
+    const int64_t *kvObjectDomain = attrs->GetAttrPointer<int64_t>(
+        ATTR_KV_OBJECT_DOMAIN_INDEX);
 
     const int64_t source = liInfo.s2Size;
     int64_t rowCount = 1;
@@ -1040,10 +1066,15 @@ static ge::graphStatus ParseStreamingInterface(
         }
         rowCount *= value;
     }
-    const int64_t poolSize = cacheSlots.GetDimNum() == 2 ? cacheSlots.GetDim(0) : -1;
+    const int64_t poolSize = kvObjectSlots.GetDimNum() == 2 ? kvObjectSlots.GetDim(0) : -1;
     const int64_t queueCount = queueLeases.GetDimNum() == 1 ? queueLeases.GetDim(0) : -1;
     const int64_t privateCapacity = readyTable.GetDimNum() == 2 ? readyTable.GetDim(1) : -1;
-    if (rowsPerEntry == nullptr || *rowsPerEntry <= 0 ||
+    if (rowsPerEntry == nullptr || kvObjectDomain == nullptr ||
+        (*kvObjectDomain != static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
+         *kvObjectDomain != static_cast<int64_t>(KvObjectDomain::C8_COMPRESSED_OBJECT)) ||
+        (*kvObjectDomain == static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
+         liInfo.cmpRatio != 1U) ||
+        *rowsPerEntry <= 0 ||
         *rowsPerEntry > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         rowCount <= 0 || source <= 0 || poolSize <= 0 || queueCount <= 0 ||
         privateCapacity <= 0 ||
@@ -1052,11 +1083,11 @@ static ge::graphStatus ParseStreamingInterface(
             ge::DT_INT32 ||
         context->GetInputDesc(RESIDENT_THRESHOLD_VALID_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
-        context->GetInputDesc(CACHE_SLOTS_SNAPSHOT_INDEX)->GetDataType() !=
+        context->GetInputDesc(KV_OBJECT_SLOTS_SNAPSHOT_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
         context->GetInputDesc(REQ_POOL_ENTRIES_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
-        context->GetInputDesc(LOGICAL_TOKEN_MAP_INDEX)->GetDataType() !=
+        context->GetInputDesc(KV_OBJECT_MAP_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
         context->GetInputDesc(PRIVATE_SOURCE_TO_SLOT_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
@@ -1070,13 +1101,17 @@ static ge::graphStatus ParseStreamingInterface(
             ge::DT_INT64 ||
         context->GetInputDesc(QUEUE_LEASES_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
+        context->GetInputDesc(KV_OBJECT_LENS_INDEX)->GetDataType() !=
+            ge::DT_INT32 ||
+        context->GetOutputDesc(SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetDataType() !=
+            ge::DT_INT32 ||
         !ShapeEquals(resident, {rowCount}) ||
         !ShapeEquals(residentValid, {rowCount}) ||
         !ShapeEquals(poolEntries, {rowCount}) ||
-        cacheSlots.GetDimNum() != 2 || cacheSlots.GetDim(1) <= 0 ||
-        cacheSlots.GetDim(1) >
+        kvObjectSlots.GetDimNum() != 2 || kvObjectSlots.GetDim(1) <= 0 ||
+        kvObjectSlots.GetDim(1) >
             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-        !ShapeEquals(logicalMap, {poolSize, source}) ||
+        !ShapeEquals(kvObjectMap, {poolSize, source}) ||
         !ShapeEquals(sourceToSlot, {rowCount, source}) ||
         !ShapeEquals(readyTable, {queueCount, privateCapacity}) ||
         !ShapeEquals(arenaHead, {queueCount}) ||
@@ -1089,6 +1124,7 @@ static ge::graphStatus ParseStreamingInterface(
         privatePackedOutput.GetDim(0) / queueCount != privateCapacity ||
         !ShapeEquals(queueControl, {STREAMING_KVAF_CONTROL_WORDS}) ||
         !ShapeEquals(queueLeases, {queueCount}) ||
+        !ShapeEquals(kvObjectLens, {rowCount}) ||
         !ShapeEquals(sourceToSlotOut, {rowCount, source}) ||
         !ShapeEquals(readyTableOut, {queueCount, privateCapacity}) ||
         !ShapeEquals(arenaHeadOut, {queueCount}) ||
@@ -1096,6 +1132,7 @@ static ge::graphStatus ParseStreamingInterface(
                      {privatePackedOutput.GetDim(0), 656}) ||
         !ShapeEquals(queueLeasesOut, {queueCount}) ||
         !ShapeEquals(telemetry, {queueCount, STREAMING_TELEMETRY_COLUMNS}) ||
+        !ShapeEquals(scoreSourceLens, {rowCount}) ||
         poolSize >
             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         queueCount >
@@ -1108,7 +1145,7 @@ static ge::graphStatus ParseStreamingInterface(
     streamingInfo->rowCount = static_cast<uint32_t>(rowCount);
     streamingInfo->sourceCapacity = static_cast<uint32_t>(source);
     streamingInfo->poolSize = static_cast<uint32_t>(poolSize);
-    streamingInfo->cacheTokenCapacity = static_cast<uint32_t>(cacheSlots.GetDim(1));
+    streamingInfo->kvObjectCapacity = static_cast<uint32_t>(kvObjectSlots.GetDim(1));
     streamingInfo->privatePackedRows = static_cast<uint32_t>(privatePackedOutput.GetDim(0));
     streamingInfo->privateArenaCapacity = static_cast<uint32_t>(privateCapacity);
     streamingInfo->queueCount = static_cast<uint32_t>(queueCount);

@@ -1,89 +1,106 @@
-# A5ExactReconcilePrivateView (isolated prototype)
+# A5ExactReconcilePrivateView — exact object-domain planner
 
-This operator is the **post-Top-K transaction planner** for the streaming C8
-experiment.  It deliberately begins only after the source-derived Lightning
-Indexer has emitted its unchanged exact Top-2048 indices.
+This isolated operator runs after the streaming C8 Lightning Indexer has
+finished its unchanged exact Top-K. Its job is deliberately narrow: it turns
+the selected C8 score sources into a transaction-private plan that tells the
+next stage which KV objects are already resident, which speculative H2D rows
+are ready, and which objects still need a guaranteed Get.
 
-It has one narrow job: reproduce the selection order and victim-slot choice of
-`A5LiduCacheUpdate` against a read-only `cache_slots_snapshot`, then classify
-each exact miss as either already present in the transaction's private HBM
-arena or requiring a guaranteed final Get.
+It does not copy payload, start a Get, call QSFA, publish a persistent
+mapping, mutate the resident directory, or release a private slot. Keeping
+those actions outside the planner is what lets the transaction protect the
+current QSFA read set until its terminal reader finishes.
 
-It does **not** issue a Get, copy a private packed-KV row into the resident
-cache, call QSFA, mutate `cache_slots`, publish a mapping, or recycle a private
-slot.  Those steps require a terminal-CQ / QSFA-reader lifetime contract and
-are intentionally outside this component.
+## Why the ABI says “KV object”, not “token”
 
-## Input contract
+Official C8 Top-K indices live in score-source domain `S`. When C8 is
+compressed, an `S` index is not automatically a raw token address. The
+planner therefore resolves each selected source through an explicit map to a
+KV object `O`, the address unit understood by the resident directory, H2D
+descriptors, private view, and final QSFA.
 
-All tensors are contiguous NPU tensors.
+`kv_object_domain` is required for every graph:
+
+| Value | Name | Valid `cmp_ratio` | Object `O` means |
+| ---: | --- | --- | --- |
+| `0` | `RAW_TOKEN` | `1` only | A legacy raw token ID. |
+| `1` | `C8_COMPRESSED_OBJECT` | `1`, `4`, `128` | The exact compressed KV object that final QSFA consumes. |
+
+The bridge and host tiling reject every other combination. In particular,
+the planner never derives an object ID from `S * cmp_ratio`. That inference
+is not valid for a paged or causal C8 score stream.
+
+## Inputs
+
+All nine inputs are contiguous `int32` NPU tensors. Let
+`R = ProductExceptLast(exact_topk_indices)`; one independent plan is produced
+for every flattened exact C8 Top-K row.
 
 | Input | Shape | Meaning |
 | --- | --- | --- |
-| `exact_topk_indices` | `[B, 1, 2048]` int32 | Exact official LI candidates.  These are the same source indices consumed by legacy LIDU. |
-| `req_pool_entries` | `[B]` int32 | Pool row for each request. |
-| `cache_slots_snapshot` | `[P, S]` int32 | Frozen logical-source to resident-slot directory.  It is never written. |
-| `cache_tokens`, `candidate_lens` | `[B]` int32 | Same budget and candidate-length inputs used by legacy LIDU. |
-| `logical_token_map` | `[P, S]` int32 | Maps a LI source index to the logical KV token required by Direct-HCCP Get. |
-| `private_source_to_slot` | `[B, S]` int32 | `-1` for no speculative copy; otherwise global private slot `queue * private_rows_per_queue + row`. |
-| `private_ready` | `[Q, R]` int32 | Shared streaming state: `0=free`, `1=pending`, `2=ready after terminal CQ`, `3=failed`. Only `2` may enter the private view; every other value becomes a guaranteed fallback Get. |
+| `exact_topk_indices` | `[...,2048]` | Unchanged official C8 score-source indices `S`. |
+| `req_pool_entries` | `[R]` | Pool row for each C8 output row. |
+| `kv_object_slots_snapshot` | `[P,O_capacity]` | Frozen resident object-to-slot directory. It is read only. |
+| `cache_tokens` | `[R]` | Resident-slot budget used by the reference placement algorithm. |
+| `kv_object_lens` | `[R]` | Active `O` prefix for each row. |
+| `score_source_lens` | `[R]` | Exact active `S` prefix emitted by C8; it is not inferred from `O`. |
+| `kv_object_map` | `[P,S_capacity]` | Explicit `S -> O` map. |
+| `private_source_to_slot` | `[R,S_capacity]` | Speculative private row per C8 source, or `-1`. |
+| `private_ready` | `[Q,private_rows]` | `0=free`, `1=pending`, `2=terminal-CQ ready`, `3=failed`. |
 
-`logical_token_map` does not change legacy source ordering.  `source_ids` use
-the original LI source indices so they can be checked mechanically against
-legacy LIDU; only the Get request list is translated to logical token IDs.
+For every exact index, the planner performs this order of checks:
+
+```text
+S is inside score_source_lens[row]
+    -> O = kv_object_map[pool, S]
+    -> O is inside kv_object_lens[row]
+    -> inspect kv_object_slots_snapshot[pool, O]
+```
+
+Only then may it classify the object as a resident hit, a ready private row,
+or a guaranteed fallback. A padded C8 source, invalid map entry, invalid
+private row, or duplicate selected object fails closed; it is not repaired by
+guessing a raw token number.
 
 ## Outputs
 
-`source_ids`, `destination_slots`, and `miss_counts` exactly mirror legacy
-`A5LiduCacheUpdate` for the same snapshot.  The miss prefix and hit suffix are
-preserved.
+All fields named `*_kv_object_ids` contain `O` values. They contain raw token
+IDs only when `kv_object_domain=RAW_TOKEN` (which is already limited to
+`cmp_ratio=1`).
 
-`placement_delta` has shape `[B, 3, 2048]`.  Each miss-prefix column contains
-`[victim_source, incoming_source, destination_slot]`; all other entries are
-`-1`.  A later transaction terminal may apply this delta **after** QSFA's last
-reader.  This operator never applies it.
+| Output | Meaning |
+| --- | --- |
+| `kv_object_ids`, `destination_slots`, `miss_counts` | Exact LIDU-style miss-prefix/hit-suffix plan in object domain `O`. |
+| `placement_delta[R,3,2048]` | `[victim_O, incoming_O, destination_slot]` for miss-prefix positions. It is a proposal, not a mutation. |
+| `private_view_descriptors[R,4,2048]` | `[O, destination_slot, disposition, private_global_slot]`; disposition is resident hit, ready private, fallback, or invalid. |
+| `ready_private_kv_object_ids`, `ready_private_slots`, `ready_private_destination_slots`, `ready_private_counts` | Compact ready-private subset in original miss order. |
+| `fallback_kv_object_ids`, `fallback_destination_slots`, `fallback_counts` | Compact exact unresolved subset that must be fetched before QSFA. |
 
-`private_view_descriptors` has shape `[B, 4, 2048]`, with planes
-`[logical_token, destination_slot, disposition, private_global_slot]`.
-Disposition is `0 = resident hit`, `1 = private CQ-ready`, `2 = guaranteed
-fallback Get required`, or `3 = invalid transaction descriptor`.
+The selected `S -> O` map must be injective. Official C8 normally makes valid
+selected `S` values unique, but a user map can still cause two selected
+sources to name the same object. Allowing that would make a placement delta
+ambiguous, so the kernel rejects it.
 
-The explicit plan split makes the next two device stages unambiguous:
+## Equivalence boundary
 
-- `ready_private_source_ids`, `ready_private_slots`,
-  `ready_private_destination_slots`, and `ready_private_counts` compact the
-  disposition-1 exact misses in original miss-prefix order.  Source IDs remain
-  the exact LI source IDs; the materializer reads the already-ready private
-  row at `ready_private_slots` and writes it to the given final destination.
-- `fallback_logical_token_ids`, `fallback_destination_slots`, and
-  `fallback_counts` compact only disposition-2 exact misses in the same order.
-  These source IDs are **logical token IDs**, because Direct-HCCP Get indexes
-  the layer directory by logical token rather than LI's possibly compressed
-  score index.
+The planner preserves the serial selection/placement order only in the
+address domain declared by `kv_object_domain`:
 
-Either plan count being `-1` means a malformed logical mapping or private-slot
-reference; the caller must fail closed rather than let QSFA read an incomplete
-view.
+- For `RAW_TOKEN`, this is the legacy LIDU contract and is valid only when
+  `cmp_ratio=1`.
+- For `C8_COMPRESSED_OBJECT`, the comparison baseline must also operate on
+  those exact compressed objects. The DDR/HBM source, private payload,
+  object directory, and QSFA view must all describe the same representation.
 
-## Correct future composition
+After this plan, a materializer combines resident hits, terminal-CQ-ready
+private rows, and the small exact fallback Get set into the private QSFA
+view. QSFA is the final reader. Only after it finishes may a later stage apply
+`placement_delta`, publish persistent mapping, and recycle private resources.
 
-```text
-unchanged exact LI Top-K
-          |
-          v
-A5ExactReconcilePrivateView
-  |                 |
-  | private-ready   +--> guaranteed final Get (only exact unresolved misses)
-  v
-materialize both paths into a QSFA-readable temporary physical-slot view
-          |
-          v
-QSFA terminal reader
-          |
-          v
-apply placement_delta / release private arena
+The operator is built only through
+`NANOVLLM_A5_OPS_ONLY=A5ExactReconcilePrivateView`; it is not part of the
+normal product policy path. The static contract test is:
+
+```bash
+python3 -m pytest tests/ut/dsa_offload/test_exact_reconcile_private_view_contract.py
 ```
-
-The operator is buildable only through
-`NANOVLLM_A5_OPS_ONLY=A5ExactReconcilePrivateView`; it is not added to the
-normal product package or policy route.

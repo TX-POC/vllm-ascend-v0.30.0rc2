@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Fail-closed target-runtime equivalence harness for A5StreamingQuantLiGet.
 
-This file intentionally contains no invented ACLNN/PyTorch binding.  The
-isolated OPP has no generated launch bridge yet, and a host-side score model is
-not evidence that the A5 C8 implementation is equivalent.  Once the bridge is
-generated, pass an adapter in ``module:function`` form.  The adapter must run
+This file intentionally contains no invented target adapter.  The isolated
+OPP bridge is only a launch path; a host-side score model is not evidence that
+the A5 C8 implementation is equivalent.  Pass an adapter in
+``module:function`` form.  The adapter must run
 one *identical* target-NPU case through both the official C8 op and the derived
 op and return the two output tensors.
 
@@ -39,6 +39,10 @@ Required adapter result:
       # Optional only when the actual official configuration exposes values:
       "official_values": tensor_or_array_or_none,
       "derived_values": tensor_or_array_or_none,
+      # Required: an independent host reconstruction using the same official
+      # C8 actual-sequence/metadata rules, not a copy of the derived output.
+      "expected_score_source_lens": tensor_or_array,
+      "derived_score_source_lens": tensor_or_array,
     }
 
 The harness compares shape, dtype, and raw contiguous bytes.  Any mismatch is
@@ -161,6 +165,88 @@ def _assert_official_input_aliases(result: dict[str, Any]) -> None:
         )
 
 
+def _assert_source_index_domain(result: dict[str, Any]) -> None:
+    """Require the derived S-domain bound and reject out-of-domain TopK ids.
+
+    C8 sparse indices are score-source indices S.  The later Reconcile maps
+    S to logical KV L, so treating a cache-slot capacity or logical sequence
+    length as this bound would be a mathematical bug when cmp_ratio > 1.
+    """
+    _assert_bitwise_equal(
+        result.get("expected_score_source_lens"),
+        result.get("derived_score_source_lens"),
+        "score_source_lens",
+    )
+
+    indices = result.get("derived_indices")
+    lengths = result.get("derived_score_source_lens")
+    if hasattr(indices, "detach"):
+        indices = indices.detach()
+    if hasattr(lengths, "detach"):
+        lengths = lengths.detach()
+    if hasattr(indices, "cpu"):
+        indices = indices.cpu()
+    if hasattr(lengths, "cpu"):
+        lengths = lengths.cpu()
+    if hasattr(indices, "tolist"):
+        indices = indices.tolist()
+    if hasattr(lengths, "tolist"):
+        lengths = lengths.tolist()
+
+    def flatten_rows(value: Any) -> list[list[int]]:
+        if not isinstance(value, list):
+            raise TypeError("derived_indices must be list-convertible")
+        if value and isinstance(value[0], int):
+            return [value]
+        rows: list[list[int]] = []
+        for child in value:
+            rows.extend(flatten_rows(child))
+        return rows
+
+    rows = flatten_rows(indices)
+    if not isinstance(lengths, list):
+        raise TypeError("derived_score_source_lens must be list-convertible")
+    flat_lengths: list[int] = []
+    pending = list(lengths)
+    while pending:
+        item = pending.pop(0)
+        if isinstance(item, list):
+            pending[:0] = item
+        else:
+            flat_lengths.append(int(item))
+    if len(rows) != len(flat_lengths):
+        raise AssertionError(
+            "score_source_lens row count mismatches sparse_indices: "
+            f"rows={len(rows)} lengths={len(flat_lengths)}"
+        )
+    for row, source_len in zip(rows, flat_lengths, strict=True):
+        if source_len < 0:
+            raise AssertionError(f"negative score-source length {source_len}")
+        for source_index in row:
+            if source_index != -1 and not 0 <= int(source_index) < source_len:
+                raise AssertionError(
+                    "derived sparse index exceeds its exact score-source "
+                    f"length: index={source_index} length={source_len}"
+                )
+
+
+def _assert_actual_c8_output_domain(result: dict[str, Any]) -> None:
+    """Reject a fictitious N2/C output axis before calling it C8 equivalent.
+
+    A5 C8 accepts N2 == 1.  C=4 is its internal S1 score tile, so target
+    output must be either TND [T, 1, 2048] or BSND [B, S1, 1, 2048].  This is
+    deliberately checked on both official and derived output, not inferred
+    from a test adapter's description.
+    """
+    for side in ("official_indices", "derived_indices"):
+        shape, _, _ = _canonical(result.get(side), side)
+        if len(shape) not in (3, 4) or shape[-2:] != (1, 2048):
+            raise AssertionError(
+                f"{side} is not an actual A5 C8 output shape: {shape}; "
+                "expected [T,1,2048] or [B,S1,1,2048]"
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -178,6 +264,8 @@ def main() -> int:
     _assert_bitwise_equal(
         result.get("official_indices"), result.get("derived_indices"), "indices"
     )
+    _assert_actual_c8_output_domain(result)
+    _assert_source_index_domain(result)
 
     official_values = result.get("official_values")
     derived_values = result.get("derived_values")
@@ -189,7 +277,7 @@ def main() -> int:
     print(
         "P3_STREAMING_LI_GET_TARGET_EQ_PASS "
         f"values_compared={int(official_values is not None)} "
-        "math_gate=bitwise_official_c8 input_aliases=verified "
+        "math_gate=bitwise_official_c8 source_domain=verified c8_n2_one=verified input_aliases=verified "
         "graph_aliases=verified"
     )
     return 0

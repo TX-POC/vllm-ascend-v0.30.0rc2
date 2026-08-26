@@ -29,12 +29,13 @@ using namespace optiling::detail;
         GET_TILING_DATA_WITH_STRUCT(QLITilingData, tiling_data_in, tiling);                                  \
         const QLITilingData *__restrict tiling_data = &tiling_data_in;                                       \
         op.Init(query, key, weights, queryScale, keyScale, actualSeqLengthsQ, actualSeqLengthsK, blocktable, \
-                metadata, residentThreshold, residentThresholdValid, cacheSlotsSnapshot,                     \
-                reqPoolEntries, logicalTokenMap,                                                              \
+                metadata, residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,                  \
+                reqPoolEntries, kvObjectMap,                                                                   \
                 privateSourceToSlot, privateReadyTable, privateArenaHead, privatePackedOutput,                \
-                queueControl, queueLeases,                                                                     \
+                queueControl, queueLeases, kvObjectLens,                                                      \
                 sparseIndices, sparseValues, privateSourceToSlotOut, privateReadyTableOut,                    \
                 privateArenaHeadOut, privatePackedOutputOut, queueLeasesOut, telemetry,                       \
+                scoreSourceLens,                                                                               \
                 user, tiling_data, &tPipe);                                                                    \
         op.Process();                                                                                        \
     } while (0)
@@ -46,15 +47,16 @@ __global__ __aicore__ void a5_streaming_quant_li_get(__gm__ uint8_t *query, __gm
                                                    __gm__ uint8_t *blocktable, __gm__ uint8_t *metadata,
                                                    __gm__ uint8_t *residentThreshold,
                                                    __gm__ uint8_t *residentThresholdValid,
-                                                   __gm__ uint8_t *cacheSlotsSnapshot,
+                                                   __gm__ uint8_t *kvObjectSlotsSnapshot,
                                                    __gm__ uint8_t *reqPoolEntries,
-                                                   __gm__ uint8_t *logicalTokenMap,
+                                                   __gm__ uint8_t *kvObjectMap,
                                                    __gm__ uint8_t *privateSourceToSlot,
                                                    __gm__ uint8_t *privateReadyTable,
                                                    __gm__ uint8_t *privateArenaHead,
                                                    __gm__ uint8_t *privatePackedOutput,
                                                    __gm__ uint8_t *queueControl,
                                                    __gm__ uint8_t *queueLeases,
+                                                   __gm__ uint8_t *kvObjectLens,
                                                    __gm__ uint8_t *sparseIndices,
                                                    __gm__ uint8_t *sparseValues,
                                                    __gm__ uint8_t *privateSourceToSlotOut,
@@ -63,6 +65,7 @@ __global__ __aicore__ void a5_streaming_quant_li_get(__gm__ uint8_t *query, __gm
                                                    __gm__ uint8_t *privatePackedOutputOut,
                                                    __gm__ uint8_t *queueLeasesOut,
                                                    __gm__ uint8_t *telemetry,
+                                                   __gm__ uint8_t *scoreSourceLens,
                                                    __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
     TPipe tPipe;

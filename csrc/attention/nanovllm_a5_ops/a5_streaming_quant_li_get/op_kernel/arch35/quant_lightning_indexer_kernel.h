@@ -63,15 +63,16 @@ public:
                                 __gm__ uint8_t *metadata,
                                 __gm__ uint8_t *residentThreshold,
                                 __gm__ uint8_t *residentThresholdValid,
-                                __gm__ uint8_t *cacheSlotsSnapshot,
+                                __gm__ uint8_t *kvObjectSlotsSnapshot,
                                 __gm__ uint8_t *reqPoolEntries,
-                                __gm__ uint8_t *logicalTokenMap,
+                                __gm__ uint8_t *kvObjectMap,
                                 __gm__ uint8_t *privateSourceToSlot,
                                 __gm__ uint8_t *privateReadyTable,
                                 __gm__ uint8_t *privateArenaHead,
                                 __gm__ uint8_t *privatePackedOutput,
                                 __gm__ uint8_t *queueControl,
                                 __gm__ uint8_t *queueLeases,
+                                __gm__ uint8_t *kvObjectLens,
                                 __gm__ uint8_t *sparseIndices,
                                 __gm__ uint8_t *sparseValues,
                                 __gm__ uint8_t *privateSourceToSlotOut,
@@ -80,6 +81,7 @@ public:
                                 __gm__ uint8_t *privatePackedOutputOut,
                                 __gm__ uint8_t *queueLeasesOut,
                                 __gm__ uint8_t *telemetry,
+                                __gm__ uint8_t *scoreSourceLens,
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
 
@@ -396,15 +398,16 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
                                               __gm__ uint8_t *blockTable, __gm__ uint8_t *metadata,
                                               __gm__ uint8_t *residentThreshold,
                                               __gm__ uint8_t *residentThresholdValid,
-                                              __gm__ uint8_t *cacheSlotsSnapshot,
+                                              __gm__ uint8_t *kvObjectSlotsSnapshot,
                                               __gm__ uint8_t *reqPoolEntries,
-                                              __gm__ uint8_t *logicalTokenMap,
+                                              __gm__ uint8_t *kvObjectMap,
                                               __gm__ uint8_t *privateSourceToSlot,
                                               __gm__ uint8_t *privateReadyTable,
                                               __gm__ uint8_t *privateArenaHead,
                                               __gm__ uint8_t *privatePackedOutput,
                                               __gm__ uint8_t *queueControl,
                                               __gm__ uint8_t *queueLeases,
+                                              __gm__ uint8_t *kvObjectLens,
                                               __gm__ uint8_t *sparseIndices,
                                               __gm__ uint8_t *sparseValues,
                                               __gm__ uint8_t *privateSourceToSlotOut,
@@ -413,6 +416,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
                                               __gm__ uint8_t *privatePackedOutputOut,
                                               __gm__ uint8_t *queueLeasesOut,
                                               __gm__ uint8_t *telemetry,
+                                              __gm__ uint8_t *scoreSourceLens,
                                               __gm__ uint8_t *workspace,
                                               const QLITilingData *__restrict tiling, TPipe *tPipe)
 {
@@ -449,8 +453,11 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         qScaleGm.SetGlobalBuffer((__gm__ float *)queryScale);
         kScaleGm.SetGlobalBuffer((__gm__ float *)keyScale);
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
+        GlobalTensor<int32_t> scoreSourceLensGm;
+        scoreSourceLensGm.SetGlobalBuffer((__gm__ int32_t *)scoreSourceLens);
         vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, blockTableGm);
         vectorService.InitVecWorkspaceTensor(scoreGm);
+        vectorService.InitScoreSourceLensOutput(scoreSourceLensGm);
     } else {
         matmulService.InitParams(constInfo);
         queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
@@ -472,11 +479,11 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         (void)privatePackedOutputOut;
         (void)queueLeasesOut;
         vectorService.InitStreamingKvafHook(
-            residentThreshold, residentThresholdValid, cacheSlotsSnapshot,
+            residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
             reqPoolEntries,
-            logicalTokenMap, privateSourceToSlot, privateReadyTable,
+            kvObjectMap, privateSourceToSlot, privateReadyTable,
             privateArenaHead, privatePackedOutput, queueControl, queueLeases,
-            telemetry, tiling);
+            kvObjectLens, telemetry, tiling);
     }
 }
 
@@ -617,6 +624,14 @@ __aicore__ inline void QLIPreload<QLIT>::ProcessInvalid()
 {
     if ASCEND_IS_AIV {
         uint32_t aivCoreNum = GetBlockNum() * 2;  // 2 means c:v = 1:2
+        // In an all-invalid graph replay there is no ProcessTopK or
+        // CleanInvalidOutput call to overwrite output #8. Clear it in the
+        // same no-work branch, using a disjoint AIV partition of the exact
+        // row_count supplied by the streaming ABI. This prevents a previous
+        // forward's nonzero score-source lengths from being consumed by
+        // Reconcile alongside freshly invalid (-1) sparse indices.
+        vectorService.ClearScoreSourceLensForInvalidForward(
+            tmpBlockIdx, aivCoreNum);
         uint64_t totalOutputSize =
             constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount;
         uint64_t singleCoreSize =

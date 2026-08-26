@@ -46,18 +46,28 @@ public:
     __aicore__ inline void InitParams(const struct QLICommon::ConstInfo &constInfo,
                                       const QLITilingData *__restrict tilingData);
     __aicore__ inline void InitVecWorkspaceTensor(GlobalTensor<SCORE_T> scoreGm);
+    // Produced by this operator, not inferred by its host bridge.  Each
+    // element is the exact score-source S length used by ProcessTopK for the
+    // corresponding sparse-index output row.
+    __aicore__ inline void InitScoreSourceLensOutput(
+        GlobalTensor<int32_t> scoreSourceLensGm);
     __aicore__ inline void InitVecInputTensor(GlobalTensor<float> weightsGm, GlobalTensor<float> qScaleGm,
                                               GlobalTensor<float> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
     __aicore__ inline void InitStreamingKvafHook(
         __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
-        __gm__ uint8_t *cacheSlotsSnapshot,
-        __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *logicalTokenMap,
+        __gm__ uint8_t *kvObjectSlotsSnapshot,
+        __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *kvObjectMap,
         __gm__ uint8_t *privateSourceToSlot, __gm__ uint8_t *privateReadyTable,
         __gm__ uint8_t *privateArenaHead, __gm__ uint8_t *privatePackedOutput,
         __gm__ uint8_t *queueControl,
-        __gm__ uint8_t *queueLeases, __gm__ uint8_t *telemetry,
+        __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
+        __gm__ uint8_t *telemetry,
         const QLITilingData *__restrict tilingData);
+    // Used only by the all-invalid forward path. It clears non-alias output
+    // #8 in disjoint AIV shards so graph replay cannot expose an old S length.
+    __aicore__ inline void ClearScoreSourceLensForInvalidForward(
+        uint32_t producerIndex, uint32_t producerCount);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -69,6 +79,7 @@ protected:
     GlobalTensor<float> kScaleGm;
     GlobalTensor<int32_t> indiceOutGm;
     GlobalTensor<int32_t> blockTableGm;
+    GlobalTensor<int32_t> scoreSourceLensGm;
     // =================================常量区=================================
     static constexpr uint32_t VEC1_V_MTE2_EVENT = EVENT_ID0;
     static constexpr uint32_t VEC1_MTE2_V_EVENT = EVENT_ID1;
@@ -151,6 +162,7 @@ private:
     uint32_t topkCount_ = 0;
     uint32_t topkCountAlign256_ = 0; // topkCount对齐到256(直方图需要)，支持topk泛化
     uint32_t trunkLen_ = 0;
+    uint32_t streamingRowCount_ = 0;
 
     struct QLICommon::ConstInfo constInfo_;
     topk::LITopk<SCORE_T> topkOp_;
@@ -219,6 +231,7 @@ __aicore__ inline void QLIVector<QLIT>::InitParams(const struct QLICommon::Const
     trunkLen_ = TRUNK_LEN_16K;
     topkCount_ = constInfo.sparseCount;
     topkCountAlign256_ = QLICommon::Align(constInfo.sparseCount, (uint64_t)256); // topkCount对齐到256
+    streamingRowCount_ = tilingData->streamingRowCount;
     topkOp_.Init(topkCount_, trunkLen_);
 }
 
@@ -242,24 +255,32 @@ __aicore__ inline void QLIVector<QLIT>::InitVecWorkspaceTensor(GlobalTensor<SCOR
 }
 
 template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::InitScoreSourceLensOutput(
+    GlobalTensor<int32_t> scoreSourceLensGm)
+{
+    this->scoreSourceLensGm = scoreSourceLensGm;
+}
+
+template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
     __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
-    __gm__ uint8_t *cacheSlotsSnapshot,
-    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *logicalTokenMap,
+    __gm__ uint8_t *kvObjectSlotsSnapshot,
+    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *kvObjectMap,
     __gm__ uint8_t *privateSourceToSlot, __gm__ uint8_t *privateReadyTable,
     __gm__ uint8_t *privateArenaHead, __gm__ uint8_t *privatePackedOutput,
     __gm__ uint8_t *queueControl,
-    __gm__ uint8_t *queueLeases, __gm__ uint8_t *telemetry,
+    __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
+    __gm__ uint8_t *telemetry,
     const QLITilingData *__restrict tilingData)
 {
     streamingKvafHook_.Init(
-        residentThreshold, residentThresholdValid, cacheSlotsSnapshot,
-        reqPoolEntries, logicalTokenMap,
+        residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
+        reqPoolEntries, kvObjectLens, kvObjectMap,
         privateSourceToSlot, privateReadyTable, privateArenaHead,
         privatePackedOutput, queueControl,
         queueLeases, telemetry, constInfo_, tilingData->streamingRowCount,
         tilingData->streamingSourceCapacity, tilingData->streamingPoolSize,
-        tilingData->streamingCacheTokenCapacity,
+        tilingData->streamingKvObjectCapacity,
         tilingData->streamingPrivatePackedRows,
         tilingData->streamingPrivateArenaCapacity,
         tilingData->streamingQueueCount,
@@ -270,6 +291,25 @@ __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
             streamingClaimUb_.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint64_t *>(streamingSourceOffsetsUb_.GetPhyAddr()),
         static_cast<uint32_t>(blockId_));
+}
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::ClearScoreSourceLensForInvalidForward(
+    uint32_t producerIndex, uint32_t producerCount)
+{
+    if (producerCount == 0U || producerIndex >= producerCount ||
+        streamingRowCount_ == 0U) {
+        return;
+    }
+    const uint64_t begin =
+        static_cast<uint64_t>(streamingRowCount_) * producerIndex / producerCount;
+    const uint64_t end =
+        static_cast<uint64_t>(streamingRowCount_) * (producerIndex + 1U) /
+        producerCount;
+    if (end > begin) {
+        GlobalTensor<int32_t> output = scoreSourceLensGm[begin];
+        AscendC::InitGlobalMemory(output, end - begin, 0);
+    }
 }
 
 template <typename QLIT>
@@ -301,6 +341,13 @@ __aicore__ inline void QLIVector<QLIT>::FreeEventID()
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::CleanInvalidOutput(int64_t invalidS1Offset)
 {
+    // Keep the side output in exact lockstep with official invalid-index
+    // cleanup.  `invalidS1Offset` is the flattened sparse-index offset, so
+    // division by sparseCount yields exactly the graph-visible output row.
+    // A downstream reconcile must treat zero as "no valid score source",
+    // never as a host-inferred sequence length.
+    scoreSourceLensGm.SetValue(
+        static_cast<uint64_t>(invalidS1Offset) / constInfo_.sparseCount, 0);
     // init -1 and copy to output
     Duplicate(outInvalidLocal_, constInfo_.INVALID_IDX, constInfo_.sparseCount);
 
@@ -491,6 +538,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         if (constInfo_.attenMaskFlag) {
             validS2Len = ((int32_t)i + cuRealAcSeq) / static_cast<int32_t>(constInfo_.cmpRatio);
         }
+        // This is intentionally emitted from the unmodified official C8
+        // valid-length calculation, before either the short-row or 16K
+        // TopK branch.  `sparse_indices` live in score-source domain S; the
+        // later exact-reconcile stage must use this S limit before mapping
+        // any selected index to logical KV domain L.
+        const uint64_t outputRow =
+            static_cast<uint64_t>(info.indiceOutOffset) / topkCount_ +
+            static_cast<uint64_t>(curS1Idx + rowIdx);
+        scoreSourceLensGm.SetValue(
+            outputRow, validS2Len > 0 ? validS2Len : 0);
         if (validS2Len <= 0) {
             WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);

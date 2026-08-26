@@ -30,6 +30,18 @@
 typedef struct aclOpExecutor aclOpExecutor;
 typedef struct aclTensor aclTensor;
 
+// Older CANN headers expose the FP8 enum through the C API spelling while
+// newer headers publish ACL_FLOAT8_E4M3FN directly.  The source-derived C8
+// LI bridge needs the real FP8 type; silently downgrading it to byte/int8
+// would break the official score arithmetic rather than merely slow it down.
+#ifndef ACL_FLOAT8_E4M3FN
+#ifdef C_DT_FLOAT8_E4M3FN
+#define ACL_FLOAT8_E4M3FN C_DT_FLOAT8_E4M3FN
+#else
+#define ACL_FLOAT8_E4M3FN ACL_DT_UNDEFINED
+#endif
+#endif
+
 namespace nanovllm_a5_opapi {
 
 using AclCreateTensorFn = aclTensor *(*)(
@@ -119,6 +131,8 @@ inline aclDataType ToAclDataType(at::ScalarType dtype) {
       return ACL_BOOL;
     case at::kBFloat16:
       return ACL_BF16;
+    case at::kFloat8_e4m3fn:
+      return ACL_FLOAT8_E4M3FN;
     default:
       TORCH_CHECK(
           false,
@@ -127,13 +141,25 @@ inline aclDataType ToAclDataType(at::ScalarType dtype) {
   }
 }
 
-inline aclTensor *ConvertType(const at::Tensor &tensor) {
+struct AclTensorArgument {
+  const at::Tensor &tensor;
+  bool require_contiguous;
+};
+
+inline AclTensorArgument AllowStridedAclTensor(const at::Tensor &tensor) {
+  return {tensor, false};
+}
+
+inline aclTensor *ConvertTensor(
+    const at::Tensor &tensor, bool require_contiguous) {
   if (!tensor.defined()) {
     return nullptr;
   }
-  TORCH_CHECK(
-      tensor.is_contiguous(),
-      "nanovllm A5 ACLNN launcher requires contiguous tensors");
+  if (require_contiguous) {
+    TORCH_CHECK(
+        tensor.is_contiguous(),
+        "nanovllm A5 ACLNN launcher requires contiguous tensors");
+  }
   auto create_tensor =
       reinterpret_cast<AclCreateTensorFn>(ResolveSymbol("aclCreateTensor"));
   TORCH_CHECK(create_tensor != nullptr, "aclCreateTensor is unavailable");
@@ -154,6 +180,14 @@ inline aclTensor *ConvertType(const at::Tensor &tensor) {
       storage_dims.data(),
       static_cast<uint64_t>(storage_dims.size()),
       tensor.data_ptr());
+}
+
+inline aclTensor *ConvertType(const at::Tensor &tensor) {
+  return ConvertTensor(tensor, true);
+}
+
+inline aclTensor *ConvertType(const AclTensorArgument &argument) {
+  return ConvertTensor(argument.tensor, argument.require_contiguous);
 }
 
 template <typename T>

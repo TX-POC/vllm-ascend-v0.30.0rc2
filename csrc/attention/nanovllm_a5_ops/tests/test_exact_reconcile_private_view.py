@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""NPU validation for transaction-local exact Top-K reconciliation.
+"""NPU validation for transaction-local exact C8 Top-K reconciliation.
 
-The reference below is deliberately a direct translation of the ordering and
-victim-selection portion of ``a5_lidu_cache_update.cpp``.  It verifies the
-new boundary separately from QSFA: the operator is allowed to plan a ready
-private materialization and a guaranteed-recall fallback, but it must never
-change the persistent ``cache_slots_snapshot`` input.
+This target probe deliberately sets ``cmp_ratio=1`` and
+``kv_object_domain=RAW_TOKEN``. It therefore tests the legacy raw-token
+equivalence case with a non-identity score-source ``S -> O`` map, where the
+active C8 score domain S (4096) differs from the raw-token object directory O
+(8192). The CPU reference mirrors the device op and compares all twelve
+outputs; no persistent cache directory is allowed to change. A compressed
+object domain needs an end-to-end QSFA representation proof, not a guessed
+token conversion in this test.
 """
 
 from __future__ import annotations
@@ -41,58 +44,94 @@ class Expected(NamedTuple):
     fallback_counts: torch.Tensor
 
 
+def _mapped_logical(pool: int, source: int, logical_capacity: int) -> int:
+    # 3 is coprime to 8192, so the active prefix maps injectively. The map is
+    # intentionally non-identity and pool-specific while still remaining in L.
+    return (source * 3 + 17 + pool * 97) % logical_capacity
+
+
+def _install_row(
+    snapshot: torch.Tensor, logical_map: torch.Tensor, pool: int,
+    hit_count: int, cache_tokens: int,
+) -> None:
+    topk_logicals = [int(logical_map[pool, source]) for source in range(TOPK)]
+    snapshot[pool, topk_logicals[:hit_count]] = torch.arange(
+        hit_count, dtype=torch.int32
+    )
+    selected = set(topk_logicals)
+    victims = [
+        logical for logical in range(snapshot.size(1)) if logical not in selected
+    ][: TOPK - hit_count]
+    snapshot[pool, victims] = torch.arange(
+        hit_count, TOPK, dtype=torch.int32
+    )
+    if cache_tokens < TOPK:
+        raise AssertionError("test assumes LIDU cache budget >= TOPK")
+
+
 def build_case() -> tuple[torch.Tensor, ...]:
-    """Build unordered request-pool rows with both ready and fallback misses."""
+    """Build twelve actual-C8-shaped rows plus intentional no-cache rows.
 
-    batch, pool_size, source_capacity = 3, 5, 4096
-    queues, rows_per_queue = 2, 2048
-    topk = torch.empty((batch, 1, TOPK), dtype=torch.int32)
-    topk[0, 0] = torch.arange(TOPK, dtype=torch.int32)
-    topk[1, 0] = torch.arange(TOPK, dtype=torch.int32)
-    topk[2, 0] = torch.arange(TOPK, dtype=torch.int32)
-    req_pool_entries = torch.tensor([3, 1, 4], dtype=torch.int32)
-    cache_tokens = torch.tensor([3072, 4096, 0], dtype=torch.int32)
-    candidate_lens = torch.full((batch,), source_capacity, dtype=torch.int32)
+    A5 C8 requires N2 == 1.  Its often cited C=4 is an internal S1 score tile,
+    so the compatible BSND sparse output is [B, S1, 1, K], not [B, 2, K].
+    This test gives each flattened row a distinct pool entry.  That is a
+    transaction-isolated planner test: two C=4 rows belonging to the same
+    request/pool need an explicit deterministic merge before any placement
+    delta is published, and are deliberately not claimed equivalent here.
+    """
+
+    batch, s1, n2 = 3, 4, 1
+    row_count = batch * s1 * n2
+    pool_size = row_count
+    logical_capacity, source_capacity = 8192, 4096
+    queues, rows_per_queue = 3, 8192
+    topk = torch.arange(TOPK, dtype=torch.int32).repeat(row_count).view(
+        batch, s1, n2, TOPK
+    )
+    req_pool_entries = torch.arange(row_count, dtype=torch.int32)
+    cache_tokens = torch.tensor(
+        [3072, 4096, 0, 3072] * batch, dtype=torch.int32
+    )
+    candidate_lens = torch.tensor(
+        [logical_capacity] * row_count, dtype=torch.int32
+    )
+    score_source_lens = torch.tensor(
+        [source_capacity, source_capacity, 0, source_capacity] * batch,
+        dtype=torch.int32,
+    )
     cache_slots_snapshot = torch.full(
-        (pool_size, source_capacity), -1, dtype=torch.int32
+        (pool_size, logical_capacity), -1, dtype=torch.int32
     )
-
-    # Row 0: top-k has 1536 hits followed by 512 misses.  The first allowed
-    # victims are sources 2048..2559, so first-unprotected-victim selection is
-    # unambiguous and exercises the legacy scan order.
-    row0, hit0 = int(req_pool_entries[0]), 1536
-    cache_slots_snapshot[row0, :hit0] = torch.arange(hit0, dtype=torch.int32)
-    cache_slots_snapshot[row0, TOPK : TOPK + (TOPK - hit0)] = torch.arange(
-        hit0, TOPK, dtype=torch.int32
+    logical_token_map = torch.empty(
+        (pool_size, source_capacity), dtype=torch.int32
     )
+    for pool in range(pool_size):
+        logical_token_map[pool] = torch.tensor(
+            [_mapped_logical(pool, source, logical_capacity)
+             for source in range(source_capacity)],
+            dtype=torch.int32,
+        )
 
-    # Row 1 has a different hit/miss split and a different pool row, proving
-    # the cache snapshot lookup uses req_pool_entries rather than B identity.
-    row1, hit1 = int(req_pool_entries[1]), 1200
-    cache_slots_snapshot[row1, :hit1] = torch.arange(hit1, dtype=torch.int32)
-    cache_slots_snapshot[row1, TOPK : TOPK + (TOPK - hit1)] = torch.arange(
-        hit1, TOPK, dtype=torch.int32
-    )
-
-    logical_token_map = torch.arange(
-        pool_size * source_capacity, dtype=torch.int32
-    ).reshape(pool_size, source_capacity)
-    # Make logical tokens explicitly pool-row scoped so a wrong map base is
-    # caught by the fallback plan assertion.
-    logical_token_map.mul_(7).add_(13)
+    hit0, hit1 = 1536, 1200
+    hit_counts = [hit0, hit1, 0, hit0] * batch
+    for row_index, (pool, budget, hit_count) in enumerate(
+        zip(req_pool_entries.tolist(), cache_tokens.tolist(), hit_counts, strict=True)
+    ):
+        if budget != 0:
+            _install_row(cache_slots_snapshot, logical_token_map, pool, hit_count, budget)
 
     private_source_to_slot = torch.full(
-        (batch, source_capacity), -1, dtype=torch.int32
+        (row_count, source_capacity), -1, dtype=torch.int32
     )
     private_ready = torch.zeros((queues, rows_per_queue), dtype=torch.int32)
-    # Every third miss has a speculative destination.  Even sources become
-    # terminal-ready; odd ones deliberately force guaranteed recall.
-    for batch_index, hit_count in enumerate((hit0, hit1)):
+    for row_index, hit_count in enumerate(hit_counts):
+        if cache_tokens[row_index].item() == 0:
+            continue
         for source in range(hit_count, TOPK):
             if source % 3 == 0:
-                private_source_to_slot[batch_index, source] = source
+                private_source_to_slot[row_index, source] = row_index * TOPK + source
                 if source % 2 == 0:
-                    private_ready.reshape(-1)[source] = PRIVATE_READY_AFTER_CQ
+                    private_ready.reshape(-1)[row_index * TOPK + source] = PRIVATE_READY_AFTER_CQ
 
     return (
         topk,
@@ -100,6 +139,7 @@ def build_case() -> tuple[torch.Tensor, ...]:
         cache_slots_snapshot,
         cache_tokens,
         candidate_lens,
+        score_source_lens,
         logical_token_map,
         private_source_to_slot,
         private_ready,
@@ -112,110 +152,129 @@ def reference(
     cache_slots_snapshot: torch.Tensor,
     cache_tokens: torch.Tensor,
     candidate_lens: torch.Tensor,
+    score_source_lens: torch.Tensor,
     logical_token_map: torch.Tensor,
     private_source_to_slot: torch.Tensor,
     private_ready: torch.Tensor,
 ) -> Expected:
-    """CPU mirror of LIDU ordering plus transaction-local plan splitting."""
+    """CPU mirror of source-S -> logical-L reconcile and private split."""
 
-    batch = exact_topk_indices.size(0)
-    source_ids = torch.full_like(exact_topk_indices, -1)
-    destination_slots = torch.full_like(exact_topk_indices, -1)
-    miss_counts = torch.zeros((batch,), dtype=torch.int32)
-    placement_delta = torch.full((batch, 3, TOPK), -1, dtype=torch.int32)
-    view = torch.full((batch, 4, TOPK), -1, dtype=torch.int32)
-    ready_source = torch.full_like(exact_topk_indices, -1)
-    ready_slot = torch.full_like(exact_topk_indices, -1)
-    ready_destination = torch.full_like(exact_topk_indices, -1)
-    ready_counts = torch.zeros((batch,), dtype=torch.int32)
-    fallback_logical = torch.full_like(exact_topk_indices, -1)
-    fallback_destination = torch.full_like(exact_topk_indices, -1)
-    fallback_counts = torch.zeros((batch,), dtype=torch.int32)
+    row_count = exact_topk_indices.numel() // TOPK
+    raw_rows = exact_topk_indices.reshape(row_count, TOPK)
+    source_rows = source_ids = torch.full_like(exact_topk_indices, -1).reshape(
+        row_count, TOPK
+    )
+    destination_rows = destination_slots = torch.full_like(
+        exact_topk_indices, -1
+    ).reshape(row_count, TOPK)
+    miss_counts = torch.zeros((row_count,), dtype=torch.int32)
+    placement_delta = torch.full((row_count, 3, TOPK), -1, dtype=torch.int32)
+    view = torch.full((row_count, 4, TOPK), -1, dtype=torch.int32)
+    ready_source = torch.full_like(exact_topk_indices, -1).reshape(row_count, TOPK)
+    ready_slot = torch.full_like(exact_topk_indices, -1).reshape(row_count, TOPK)
+    ready_destination = torch.full_like(exact_topk_indices, -1).reshape(row_count, TOPK)
+    ready_counts = torch.zeros((row_count,), dtype=torch.int32)
+    fallback_logical = torch.full_like(exact_topk_indices, -1).reshape(row_count, TOPK)
+    fallback_destination = torch.full_like(exact_topk_indices, -1).reshape(row_count, TOPK)
+    fallback_counts = torch.zeros((row_count,), dtype=torch.int32)
     private_capacity = private_ready.numel()
 
-    for b in range(batch):
+    for b in range(row_count):
         budget = int(cache_tokens[b])
         if budget == 0:
             continue
-        candidate_len = int(candidate_lens[b])
+        logical_len = int(candidate_lens[b])
+        source_len = int(score_source_lens[b])
         pool = int(req_pool_entries[b])
-        topk = [int(value) for value in exact_topk_indices[b, 0]]
+        raw_sources = [int(value) for value in raw_rows[b]]
+        logicals = [int(logical_token_map[pool, source]) for source in raw_sources]
+        if not all(0 <= source < source_len for source in raw_sources):
+            raise AssertionError("fixture contains an inactive score source")
+        if not all(0 <= logical < logical_len for logical in logicals):
+            raise AssertionError("fixture contains an invalid logical map")
+        if len(set(logicals)) != TOPK:
+            raise AssertionError("fixture has duplicate selected logical tokens")
         snapshot = cache_slots_snapshot[pool]
 
-        misses: list[int] = []
+        misses: list[tuple[int, int]] = []
         hits: list[tuple[int, int]] = []
         protected: set[int] = set()
-        for source in topk:
-            slot = int(snapshot[source]) if 0 <= source < candidate_len else -1
+        for raw_source, logical in zip(raw_sources, logicals):
+            slot = int(snapshot[logical])
             if 0 <= slot < budget:
-                hits.append((source, slot))
+                hits.append((logical, slot))
                 protected.add(slot)
             else:
-                misses.append(source)
+                misses.append((raw_source, logical))
 
         victims: list[tuple[int, int]] = []
-        for victim_source in range(candidate_len):
+        for victim_logical in range(logical_len):
             if len(victims) == len(misses):
                 break
-            slot = int(snapshot[victim_source])
+            slot = int(snapshot[victim_logical])
             if slot < 0 or slot >= budget or slot in protected:
                 continue
             protected.add(slot)
-            victims.append((victim_source, slot))
+            victims.append((victim_logical, slot))
         if len(victims) != len(misses):
             raise AssertionError("fixture has insufficient LIDU victims")
 
-        ordered_sources = misses + [source for source, _ in hits]
-        ordered_slots = [slot for _, slot in victims] + [slot for _, slot in hits]
-        source_ids[b, 0] = torch.tensor(ordered_sources, dtype=torch.int32)
-        destination_slots[b, 0] = torch.tensor(ordered_slots, dtype=torch.int32)
+        ordered_logicals = [logical for _, logical in misses] + [
+            logical for logical, _ in hits
+        ]
+        ordered_slots = [slot for _, slot in victims] + [
+            slot for _, slot in hits
+        ]
+        source_rows[b] = torch.tensor(ordered_logicals, dtype=torch.int32)
+        destination_rows[b] = torch.tensor(ordered_slots, dtype=torch.int32)
         miss_counts[b] = len(misses)
-        for index, ((victim, slot), incoming) in enumerate(zip(victims, misses)):
+        for index, ((victim, slot), (_, incoming)) in enumerate(
+            zip(victims, misses)
+        ):
             placement_delta[b, 0, index] = victim
             placement_delta[b, 1, index] = incoming
             placement_delta[b, 2, index] = slot
 
         ready_count = 0
         fallback_count = 0
-        for index, (source, destination) in enumerate(
-            zip(ordered_sources, ordered_slots)
-        ):
-            logical = int(logical_token_map[pool, source])
+        for index, logical in enumerate(ordered_logicals):
+            destination = ordered_slots[index]
             view[b, 0, index] = logical
             view[b, 1, index] = destination
             if index >= len(misses):
                 view[b, 2, index] = VIEW_RESIDENT_HIT
                 continue
-            private_slot = int(private_source_to_slot[b, source])
+            raw_source = misses[index][0]
+            private_slot = int(private_source_to_slot[b, raw_source])
             if 0 <= private_slot < private_capacity and int(
                 private_ready.reshape(-1)[private_slot]
             ) == PRIVATE_READY_AFTER_CQ:
                 view[b, 2, index] = VIEW_PRIVATE_READY
                 view[b, 3, index] = private_slot
-                ready_source[b, 0, ready_count] = source
-                ready_slot[b, 0, ready_count] = private_slot
-                ready_destination[b, 0, ready_count] = destination
+                ready_source[b, ready_count] = logical
+                ready_slot[b, ready_count] = private_slot
+                ready_destination[b, ready_count] = destination
                 ready_count += 1
             else:
                 view[b, 2, index] = VIEW_FALLBACK_REQUIRED
-                fallback_logical[b, 0, fallback_count] = logical
-                fallback_destination[b, 0, fallback_count] = destination
+                fallback_logical[b, fallback_count] = logical
+                fallback_destination[b, fallback_count] = destination
                 fallback_count += 1
         ready_counts[b] = ready_count
         fallback_counts[b] = fallback_count
 
     return Expected(
-        source_ids,
-        destination_slots,
+        source_ids.reshape_as(exact_topk_indices),
+        destination_slots.reshape_as(exact_topk_indices),
         miss_counts,
         placement_delta,
         view,
-        ready_source,
-        ready_slot,
-        ready_destination,
+        ready_source.reshape_as(exact_topk_indices),
+        ready_slot.reshape_as(exact_topk_indices),
+        ready_destination.reshape_as(exact_topk_indices),
         ready_counts,
-        fallback_logical,
-        fallback_destination,
+        fallback_logical.reshape_as(exact_topk_indices),
+        fallback_destination.reshape_as(exact_topk_indices),
         fallback_counts,
     )
 
@@ -238,7 +297,7 @@ def main() -> None:
     snapshot_before = inputs_cpu[2].clone()
     inputs_npu = tuple(tensor.to(device).contiguous() for tensor in inputs_cpu)
     outputs = torch.ops.a5_exact_reconcile_private_view.exact_reconcile_private_view(
-        *inputs_npu
+        *inputs_npu, 1, 0
     )
     torch.npu.synchronize()
     if len(outputs) != len(expected):
@@ -246,16 +305,13 @@ def main() -> None:
     for index, (actual, wanted) in enumerate(zip(outputs, expected)):
         if not torch.equal(actual.cpu(), wanted):
             raise AssertionError(
-                f"output {index} differs from the LIDU-equivalent reference"
+                f"output {index} differs from the logical-domain LIDU reference"
             )
     if not torch.equal(inputs_npu[2].cpu(), snapshot_before):
         raise AssertionError("cache_slots_snapshot changed; reconcile crossed transaction boundary")
 
-    # It must be repeatable against the same immutable snapshot.  In contrast,
-    # legacy LIDU's second call sees its published mapping and becomes a
-    # different (usually zero-miss) operation.
     replay = torch.ops.a5_exact_reconcile_private_view.exact_reconcile_private_view(
-        *inputs_npu
+        *inputs_npu, 1, 0
     )
     torch.npu.synchronize()
     if not all(torch.equal(left.cpu(), right.cpu()) for left, right in zip(outputs, replay)):
@@ -265,11 +321,15 @@ def main() -> None:
     ready = expected.ready_private_counts.tolist()
     fallback = expected.fallback_counts.tolist()
     if any(r + f != m for m, r, f in zip(miss, ready, fallback)):
-        raise AssertionError("ready/fallback split does not cover the exact miss prefix")
+        raise AssertionError("ready/fallback split does not cover exact miss prefix")
     print(
         "A5_EXACT_RECONCILE_PRIVATE_VIEW_PASS "
-        f"batch={len(miss)} misses={miss} ready={ready} fallback={fallback} "
-        "lidu_order=miss_prefix_hit_suffix snapshot_unchanged=1 "
+        "logical_capacity=8192 score_source_capacity=4096 "
+        f"rows={len(miss)} topk_shape={tuple(expected.source_ids.shape)} "
+        f"misses={miss} ready={ready} fallback={fallback} "
+        "logical_map_nonidentity=1 snapshot_unchanged=1 "
+        "kv_object_domain=RAW_TOKEN cmp_ratio=1 "
+        "c8_shape=BSND_Bx4x1x2048 distinct_pool_rows=1 "
         "placement_delta_plan_only=1 qsfa_called=0 guaranteed_get_called=0",
         flush=True,
     )

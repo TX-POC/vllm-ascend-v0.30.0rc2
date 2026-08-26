@@ -134,9 +134,10 @@ public:
     __aicore__ inline void Init(
         __gm__ uint8_t *resident_threshold,
         __gm__ uint8_t *resident_threshold_valid,
-        __gm__ uint8_t *cache_slots_snapshot,
+        __gm__ uint8_t *kv_object_slots_snapshot,
         __gm__ uint8_t *req_pool_entries,
-        __gm__ uint8_t *logical_token_map,
+        __gm__ uint8_t *kv_object_lens,
+        __gm__ uint8_t *kv_object_map,
         __gm__ uint8_t *private_source_to_slot,
         __gm__ uint8_t *private_ready_table,
         __gm__ uint8_t *private_arena_head,
@@ -148,7 +149,7 @@ public:
         uint32_t row_count,
         uint32_t source_capacity,
         uint32_t pool_size,
-        uint32_t cache_token_capacity,
+        uint32_t kv_object_capacity,
         uint32_t private_packed_rows,
         uint32_t private_arena_capacity,
         uint32_t queue_count,
@@ -160,9 +161,10 @@ public:
     {
         residentThreshold_.SetGlobalBuffer((__gm__ int32_t *)resident_threshold);
         residentThresholdValid_.SetGlobalBuffer((__gm__ int32_t *)resident_threshold_valid);
-        cacheSlots_.SetGlobalBuffer((__gm__ int32_t *)cache_slots_snapshot);
+        kvObjectSlots_.SetGlobalBuffer((__gm__ int32_t *)kv_object_slots_snapshot);
         reqPoolEntries_.SetGlobalBuffer((__gm__ int32_t *)req_pool_entries);
-        logicalTokenMap_.SetGlobalBuffer((__gm__ int32_t *)logical_token_map);
+        kvObjectLens_.SetGlobalBuffer((__gm__ int32_t *)kv_object_lens);
+        kvObjectMap_.SetGlobalBuffer((__gm__ int32_t *)kv_object_map);
         sourceToSlot_.SetGlobalBuffer((__gm__ int32_t *)private_source_to_slot);
         privateReady_.SetGlobalBuffer((__gm__ int32_t *)private_ready_table);
         privateArenaHead_.SetGlobalBuffer((__gm__ int32_t *)private_arena_head);
@@ -181,7 +183,7 @@ public:
         rowCount_ = row_count;
         sourceCapacity_ = source_capacity;
         poolSize_ = pool_size;
-        cacheTokenCapacity_ = cache_token_capacity;
+        kvObjectCapacity_ = kv_object_capacity;
         privatePackedRows_ = private_packed_rows;
         privateArenaCapacity_ = private_arena_capacity;
         queueCount_ = queue_count;
@@ -191,9 +193,10 @@ public:
         hasWave_ = false;
         stagedCount_ = 0U;
         if (resident_threshold == nullptr || resident_threshold_valid == nullptr ||
+            kv_object_lens == nullptr ||
             controlGm_ == nullptr || leaseResult_ == nullptr || claimResult_ == nullptr ||
             sourceOffsets_ == nullptr || rowCount_ == 0U || sourceCapacity_ == 0U ||
-            poolSize_ == 0U || cacheTokenCapacity_ == 0U || privateArenaCapacity_ == 0U ||
+            poolSize_ == 0U || kvObjectCapacity_ == 0U || privateArenaCapacity_ == 0U ||
             privatePackedOutputRaw_ == nullptr || privatePackedRows_ == 0U ||
             queueCount_ == 0U || rowsPerEntry_ == 0U) {
             return;
@@ -390,15 +393,25 @@ private:
             AddTelemetry(queue_id, kInvalidLogicalToken, 1);
             return;
         }
-        const int32_t logicalToken = logicalTokenMap_.GetValue(
+        const int32_t kvObject = kvObjectMap_.GetValue(
             static_cast<uint64_t>(poolRow) * sourceCapacity_ + source_index);
-        if (logicalToken < 0 || static_cast<uint32_t>(logicalToken) >= cacheTokenCapacity_) {
+        const int32_t kvObjectLen = kvObjectLens_.GetValue(row);
+        // `kv_object_map` is a static [pool,S_capacity] table, while a
+        // forward's active QSFA-object prefix can be shorter.  Without this
+        // check a graph replay could prefetch stale tail entries that are
+        // outside the current request even though they fit static HBM shape.
+        if (kvObjectLen <= 0 ||
+            static_cast<uint32_t>(kvObjectLen) > kvObjectCapacity_ ||
+            kvObject < 0 ||
+            static_cast<uint32_t>(kvObject) >=
+                static_cast<uint32_t>(kvObjectLen)) {
             AddTelemetry(queue_id, kInvalidLogicalToken, 1);
             return;
         }
-        // Resident view is indexed by real logical token, not compressed S2.
-        if (cacheSlots_.GetValue(static_cast<uint64_t>(poolRow) * cacheTokenCapacity_ +
-                                 static_cast<uint32_t>(logicalToken)) >= 0) {
+        // The snapshot is indexed by the declared KV-object domain, never by
+        // a guessed `source_index * cmp_ratio` raw-token conversion.
+        if (kvObjectSlots_.GetValue(static_cast<uint64_t>(poolRow) * kvObjectCapacity_ +
+                                    static_cast<uint32_t>(kvObject)) >= 0) {
             AddTelemetry(queue_id, kResidentHits, 1);
             return;
         }
@@ -415,8 +428,8 @@ private:
             return;
         }
         const uint32_t request = stagedCount_;
-        const uint32_t logical = static_cast<uint32_t>(logicalToken);
-        const uint32_t tableIndex = logical / rowsPerEntry_;
+        const uint32_t object = static_cast<uint32_t>(kvObject);
+        const uint32_t tableIndex = object / rowsPerEntry_;
         if (tableIndex >= descriptor.table_capacity) {
             sourceToSlot_.SetValue(sourceOffset, kSourceUnmapped);
             privateReady_.SetValue(static_cast<uint64_t>(queue_id) * privateArenaCapacity_ +
@@ -429,7 +442,7 @@ private:
         __gm__ int32_t *outputIndices = reinterpret_cast<__gm__ int32_t *>(descriptor.output_indices);
         __gm__ uint8_t *mask = reinterpret_cast<__gm__ uint8_t *>(descriptor.mask);
         indices[request] = static_cast<int32_t>(tableIndex);
-        offsets[request] = static_cast<int32_t>((logical % rowsPerEntry_) * kPackedKvRowBytes);
+        offsets[request] = static_cast<int32_t>((object % rowsPerEntry_) * kPackedKvRowBytes);
         outputIndices[request] = static_cast<int32_t>(PrivateOutputRowBase(queue_id) +
                                                        claimResult_->local_slot);
         if (mask != nullptr) {
@@ -539,9 +552,10 @@ private:
 
     GlobalTensor<int32_t> residentThreshold_;
     GlobalTensor<int32_t> residentThresholdValid_;
-    GlobalTensor<int32_t> cacheSlots_;
+    GlobalTensor<int32_t> kvObjectSlots_;
     GlobalTensor<int32_t> reqPoolEntries_;
-    GlobalTensor<int32_t> logicalTokenMap_;
+    GlobalTensor<int32_t> kvObjectLens_;
+    GlobalTensor<int32_t> kvObjectMap_;
     GlobalTensor<int32_t> sourceToSlot_;
     GlobalTensor<int32_t> privateReady_;
     GlobalTensor<int32_t> privateArenaHead_;
@@ -562,7 +576,7 @@ private:
     uint32_t rowCount_ = 0U;
     uint32_t sourceCapacity_ = 0U;
     uint32_t poolSize_ = 0U;
-    uint32_t cacheTokenCapacity_ = 0U;
+    uint32_t kvObjectCapacity_ = 0U;
     uint32_t privatePackedRows_ = 0U;
     uint32_t privateArenaCapacity_ = 0U;
     uint32_t queueCount_ = 0U;
