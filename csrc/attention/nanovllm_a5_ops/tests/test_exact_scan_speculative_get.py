@@ -251,12 +251,20 @@ def validate_result(
         stats[:, 0] != expected_selected, as_tuple=False
     ).flatten()
     if selected_bad.numel() != 0:
+        producer_rows = stats.index_select(0, selected_bad).tolist()
+        get_errors = [int(value) for value in get[:, 2].tolist()]
+        get_control_masks = [
+            (value >> 16) if (value & 0xFFFF) == 0x1001 else 0
+            for value in get_errors
+        ]
         print(
             "A5_EXACT_SCAN_SPECULATIVE_GET_DIAGNOSTIC "
             f"producer_selected_bad_count={selected_bad.numel()} "
             f"producer_ids={selected_bad.tolist()} "
             f"selected_values={stats[selected_bad, 0].tolist()} "
-            f"get_errors={get[:, 2].tolist()} "
+            f"producer_rows={producer_rows} "
+            f"get_errors={get_errors} "
+            f"get_control_masks={get_control_masks} "
             f"role_trace={trace.tolist()}"
         )
     torch.testing.assert_close(
@@ -380,10 +388,18 @@ def main() -> None:
         )
         runtime.bind_fused_batch_get_control(packed_output, fused_get_control)
         control_bound = True
+        torch.npu.synchronize()
+        control_snapshot = [int(value) for value in fused_get_control.cpu().tolist()]
         print(
             "A5_EXACT_SCAN_SPECULATIVE_GET_CONTROL_BOUND "
             "runtime_get_workers=2 fixed_output=1 control_words=16 "
             "ordinary_get_put_free_blocked=1"
+        )
+        print(
+            "A5_EXACT_SCAN_SPECULATIVE_GET_CONTROL_SNAPSHOT "
+            f"words0_9={control_snapshot[:10]} "
+            f"output_data_ptr={packed_output.data_ptr()} "
+            f"output_rows={packed_output.shape[0]}"
         )
 
         outputs = torch.ops.a5_exact_scan_get.exact_scan_speculative_get(

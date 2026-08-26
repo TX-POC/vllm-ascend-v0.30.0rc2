@@ -63,6 +63,37 @@ constexpr uint64_t kGetResultProtocolError = 0x1001U;
 constexpr uint64_t kGetResultConsumerTimeout = 0x1002U;
 constexpr uint64_t kGetResultRingRecordError = 0x1003U;
 
+struct FusedGetControlSnapshot {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t channelEntity;
+    uint64_t queueState;
+    uint64_t coreStatus;
+    uint64_t output;
+    uint64_t outputRows;
+    uint64_t blockCount;
+    uint64_t jettysPerCore;
+    uint64_t blockBytes;
+};
+
+// `frameEpoch` and `fusedGetControl` are cold values written through the ACL
+// runtime before this graph launch.  Do not use the normal scalar GM path for
+// them: a DCCI clean of an AIV's old DCache line can write the allocation's
+// earlier zero-fill back to HBM just before the read.  `ld_dev` (exposed by
+// ReadGmByPassDCache) avoids that DCache ownership entirely.
+__aicore__ inline uint64_t LoadColdU64(__gm__ uint64_t* word)
+{
+    return ReadGmByPassDCache<uint64_t>(word);
+}
+
+__aicore__ inline uint64_t LoadColdEpoch(__gm__ int64_t* word)
+{
+    const uint64_t value = static_cast<uint64_t>(
+        ReadGmByPassDCache<int64_t>(word));
+    DataSyncBarrier<MemDsbT::DDR>();
+    return value;
+}
+
 // The compact candidate stream is consumed later by ExactTopK/Reconcile.
 // A deferred miss is still part of that stream, but is deliberately not
 // considered materialized by this speculative prefetch pass.  The later
@@ -247,8 +278,9 @@ private:
             if (LoadEpochWord(ring.SlotState(writeSlot)) == epoch) {
                 *overflow = 1U;
                 for (uint32_t record = 0U; record < writeCount; ++record) {
-                    candidateKind_[pendingCandidateSlots[record]] =
-                        kCandidateDdrDeferred;
+                    WriteGmByPassDCache<uint8_t>(
+                        candidateKind_ + pendingCandidateSlots[record],
+                        kCandidateDdrDeferred);
                 }
                 *deferred += writeCount;
             } else {
@@ -263,12 +295,12 @@ private:
 
     __aicore__ inline void ProcessExactScanProducer(uint32_t producer)
     {
-        const uint64_t epoch = static_cast<uint64_t>(frameEpoch_[0]);
+        const uint64_t epoch = LoadColdEpoch(frameEpoch_);
         // Keep roleTrace in task-lane order so the P1 test can prove the two
         // Direct-HCCP workers occupy task lanes 0/1 rather than merely prove
         // that two workers existed somewhere in the launch.
-        roleTrace_[kProducerAivBegin + producer] =
-            kRoleTraceExactScanBase + static_cast<int32_t>(producer);
+        WriteRoleTrace(kProducerAivBegin + producer,
+                       kRoleTraceExactScanBase + static_cast<int32_t>(producer));
         if (epoch == 0U) {
             WriteProducerStats(producer, 0U, 0U, 0U, 0U,
                                static_cast<uint64_t>(-1), 0U,
@@ -295,11 +327,13 @@ private:
             }
             const uint64_t candidateSlot = selected * tiling_->producerCount +
                                            producer;
-            candidateIndices_[candidateSlot] = static_cast<int32_t>(source);
+            WriteGmByPassDCache<int32_t>(
+                candidateIndices_ + candidateSlot, static_cast<int32_t>(source));
             const bool isResident = resident_[source] != 0U;
             ++selected;
             if (isResident) {
-                candidateKind_[candidateSlot] = kCandidateHbmHit;
+                WriteGmByPassDCache<uint8_t>(candidateKind_ + candidateSlot,
+                                              kCandidateHbmHit);
                 ++hit;
                 continue;
             }
@@ -309,7 +343,8 @@ private:
             const int32_t offset = offsets_[source];
             const int32_t outputIndex = outputIndices_[source];
             if (!IsValidDirectGetDescriptor(tableIndex, offset, outputIndex)) {
-                candidateKind_[candidateSlot] = kCandidateDdrDeferred;
+                WriteGmByPassDCache<uint8_t>(candidateKind_ + candidateSlot,
+                                              kCandidateDdrDeferred);
                 ++deferred;
                 continue;
             }
@@ -317,7 +352,8 @@ private:
             // production C8 integration replaces source>>7 by row^block.
             const uint32_t lane = static_cast<uint32_t>((source >> 7U) & 1U);
             if (laneOverflow[lane] != 0U) {
-                candidateKind_[candidateSlot] = kCandidateDdrDeferred;
+                WriteGmByPassDCache<uint8_t>(candidateKind_ + candidateSlot,
+                                              kCandidateDdrDeferred);
                 ++deferred;
                 continue;
             }
@@ -327,10 +363,12 @@ private:
                                candidateSlot, pendingCandidateSlots[lane],
                                &firstPublishCycle[lane])) {
                 laneOverflow[lane] = 1U;
-                candidateKind_[candidateSlot] = kCandidateDdrDeferred;
+                WriteGmByPassDCache<uint8_t>(candidateKind_ + candidateSlot,
+                                              kCandidateDdrDeferred);
                 ++deferred;
             } else {
-                candidateKind_[candidateSlot] = kCandidateDdrEnqueued;
+                WriteGmByPassDCache<uint8_t>(candidateKind_ + candidateSlot,
+                                              kCandidateDdrEnqueued);
                 ++enqueued;
             }
         }
@@ -375,17 +413,35 @@ private:
         __gm__ int64_t* stats = producerStats_ +
                                 static_cast<uint64_t>(producer) *
                                     kProducerStatColumns;
-        stats[0] = static_cast<int64_t>(selected);
-        stats[1] = static_cast<int64_t>(hit);
-        stats[2] = static_cast<int64_t>(miss);
-        stats[3] = static_cast<int64_t>(enqueued);
-        stats[4] = static_cast<int64_t>(deferred);
-        stats[5] = static_cast<int64_t>(firstPublish);
-        stats[6] = static_cast<int64_t>(scanDone);
-        // This is terminal output, not a producer/consumer handoff.  A row
-        // contains seven int64 values (56 B), so a DCCI here would touch a
-        // neighboring producer row and can overwrite that producer's store.
-        // Stream completion provides output visibility to the host.
+        // Adjacent 7-word rows share 64-B lines.  Bypassing DCache makes each
+        // scalar store independent, so a terminal write from one producer
+        // cannot evict or overwrite a neighbouring producer's result.
+        WriteGmByPassDCache<int64_t>(stats + 0U,
+                                     static_cast<int64_t>(selected));
+        WriteGmByPassDCache<int64_t>(stats + 1U,
+                                     static_cast<int64_t>(hit));
+        WriteGmByPassDCache<int64_t>(stats + 2U,
+                                     static_cast<int64_t>(miss));
+        WriteGmByPassDCache<int64_t>(stats + 3U,
+                                     static_cast<int64_t>(enqueued));
+        WriteGmByPassDCache<int64_t>(stats + 4U,
+                                     static_cast<int64_t>(deferred));
+        WriteGmByPassDCache<int64_t>(stats + 5U,
+                                     static_cast<int64_t>(firstPublish));
+        WriteGmByPassDCache<int64_t>(stats + 6U,
+                                     static_cast<int64_t>(scanDone));
+        // This is the terminal publish for this producer.  The barrier waits
+        // for its preceding bypass stores (including candidate output) before
+        // the task reports completion to the stream/host.
+        DataSyncBarrier<MemDsbT::DDR>();
+    }
+
+    __aicore__ inline void WriteRoleTrace(uint32_t taskLane, int32_t value)
+    {
+        // 16 int32 trace entries occupy one cache line.  This is terminal
+        // telemetry, not a handoff, so direct scalar stores are sufficient
+        // and avoid cross-AIV cache-line ownership entirely.
+        WriteGmByPassDCache<int32_t>(roleTrace_ + taskLane, value);
     }
 
     __aicore__ inline bool AllRingsClosed(uint32_t lane, uint64_t epoch) const
@@ -463,26 +519,52 @@ private:
         return queued;
     }
 
-    __aicore__ inline uint64_t ValidateControl(uint32_t lane) const
+    __aicore__ inline FusedGetControlSnapshot LoadFusedGetControl() const
     {
-        // fusedGetControl_ is an HBM (__gm__) object.  AscendC must load its
-        // scalar fields through the GM pointer; binding it to an ordinary C++
-        // reference would discard the address-space qualifier at compilation.
-        if (fusedGetControl_->magic != KVAF_FUSED_BATCH_GET_CONTROL_MAGIC ||
-            fusedGetControl_->version != KVAF_FUSED_BATCH_GET_CONTROL_VERSION ||
-            fusedGetControl_->channel_entity == 0U ||
-            fusedGetControl_->queue_state == 0U ||
-            fusedGetControl_->core_status == 0U ||
-            fusedGetControl_->output == 0U ||
-            fusedGetControl_->output != reinterpret_cast<uint64_t>(packedOutput_) ||
-            fusedGetControl_->output_rows != tiling_->outputRows ||
-            fusedGetControl_->block_count != kGetLaneCount ||
-            fusedGetControl_->jettys_per_core != 1U ||
-            fusedGetControl_->block_bytes != kPackedEntryBytes ||
-            lane >= kGetLaneCount) {
-            return kGetResultProtocolError;
-        }
-        return 0U;
+        // This 16-word ABI is populated by the cold KVAF bind.  Snapshot the
+        // ten fields used by the device path through bypass loads once, then
+        // use only registers for validation and WQE construction.
+        __gm__ uint64_t* const words =
+            reinterpret_cast<__gm__ uint64_t*>(fusedGetControl_);
+        const FusedGetControlSnapshot control{
+            LoadColdU64(words + 0U), LoadColdU64(words + 1U),
+            LoadColdU64(words + 2U), LoadColdU64(words + 3U),
+            LoadColdU64(words + 4U), LoadColdU64(words + 5U),
+            LoadColdU64(words + 6U), LoadColdU64(words + 7U),
+            LoadColdU64(words + 8U), LoadColdU64(words + 9U)};
+        DataSyncBarrier<MemDsbT::DDR>();
+        return control;
+    }
+
+    __aicore__ inline uint64_t ValidateControl(
+        const FusedGetControlSnapshot& control, uint32_t lane) const
+    {
+        // Keep the low 16 bits compatible with the existing protocol error.
+        // The upper bits make a remaining cold-bind mismatch diagnosable
+        // without expanding any output tensor or KVAF ABI.
+        uint64_t mismatch = 0U;
+        mismatch |= control.magic != KVAF_FUSED_BATCH_GET_CONTROL_MAGIC
+                        ? (1U << 0U)
+                        : 0U;
+        mismatch |= control.version != KVAF_FUSED_BATCH_GET_CONTROL_VERSION
+                        ? (1U << 1U)
+                        : 0U;
+        mismatch |= control.channelEntity == 0U ? (1U << 2U) : 0U;
+        mismatch |= control.queueState == 0U ? (1U << 3U) : 0U;
+        mismatch |= control.coreStatus == 0U ? (1U << 4U) : 0U;
+        mismatch |= control.output == 0U ? (1U << 5U) : 0U;
+        mismatch |= control.output != reinterpret_cast<uint64_t>(packedOutput_)
+                        ? (1U << 6U)
+                        : 0U;
+        mismatch |= control.outputRows != tiling_->outputRows ? (1U << 7U)
+                                                               : 0U;
+        mismatch |= control.blockCount != kGetLaneCount ? (1U << 8U) : 0U;
+        mismatch |= control.jettysPerCore != 1U ? (1U << 9U) : 0U;
+        mismatch |= control.blockBytes != kPackedEntryBytes ? (1U << 10U)
+                                                              : 0U;
+        mismatch |= lane >= kGetLaneCount ? (1U << 11U) : 0U;
+        return mismatch == 0U ? 0U
+                              : kGetResultProtocolError | (mismatch << 16U);
     }
 
     __aicore__ inline uint64_t IssueFullGet(
@@ -492,7 +574,8 @@ private:
         if (requestCount == 0U) {
             return 0U;
         }
-        const uint64_t controlError = ValidateControl(lane);
+        const FusedGetControlSnapshot control = LoadFusedGetControl();
+        const uint64_t controlError = ValidateControl(control, lane);
         if (controlError != 0U) {
             return controlError;
         }
@@ -500,10 +583,10 @@ private:
         // graph replay.  Materialize only the scalar addresses needed below
         // from GM into AIV-local registers; do not form a non-GM struct
         // reference to HBM memory.
-        const uint64_t outputAddress = fusedGetControl_->output;
-        const uint64_t coreStatusAddress = fusedGetControl_->core_status;
-        const uint64_t channelEntityAddress = fusedGetControl_->channel_entity;
-        const uint64_t queueStateAddress = fusedGetControl_->queue_state;
+        const uint64_t outputAddress = control.output;
+        const uint64_t coreStatusAddress = control.coreStatus;
+        const uint64_t channelEntityAddress = control.channelEntity;
+        const uint64_t queueStateAddress = control.queueState;
         __gm__ int32_t* laneIndices =
             getIndices_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
         __gm__ int32_t* laneOffsets =
@@ -558,8 +641,8 @@ private:
 
     __aicore__ inline void ProcessFullGetLane(uint32_t lane)
     {
-        const uint64_t epoch = static_cast<uint64_t>(frameEpoch_[0]);
-        roleTrace_[lane] = kRoleTraceGetBase + static_cast<int32_t>(lane);
+        const uint64_t epoch = LoadColdEpoch(frameEpoch_);
+        WriteRoleTrace(lane, kRoleTraceGetBase + static_cast<int32_t>(lane));
         __gm__ int64_t* stats = getStats_ +
                                 static_cast<uint64_t>(lane) * kGetStatColumns;
         uint64_t requested = 0U;
@@ -609,16 +692,24 @@ private:
             }
         }
 
-        stats[0] = static_cast<int64_t>(requested);
-        stats[1] = static_cast<int64_t>(batches);
-        stats[2] = static_cast<int64_t>(error);
-        stats[3] = static_cast<int64_t>(firstDoorbell);
-        stats[4] = static_cast<int64_t>(completionCycle);
-        stats[5] = static_cast<int64_t>(idlePolls);
-        stats[6] = static_cast<int64_t>(consumedChunks);
-        stats[7] = static_cast<int64_t>(GetSystemCycle());
-        // As with producerStats, this is terminal output.  It has no
-        // cross-AIV reader and must not participate in the DCCI handoff path.
+        WriteGmByPassDCache<int64_t>(stats + 0U,
+                                     static_cast<int64_t>(requested));
+        WriteGmByPassDCache<int64_t>(stats + 1U,
+                                     static_cast<int64_t>(batches));
+        WriteGmByPassDCache<int64_t>(stats + 2U,
+                                     static_cast<int64_t>(error));
+        WriteGmByPassDCache<int64_t>(stats + 3U,
+                                     static_cast<int64_t>(firstDoorbell));
+        WriteGmByPassDCache<int64_t>(stats + 4U,
+                                     static_cast<int64_t>(completionCycle));
+        WriteGmByPassDCache<int64_t>(stats + 5U,
+                                     static_cast<int64_t>(idlePolls));
+        WriteGmByPassDCache<int64_t>(stats + 6U,
+                                     static_cast<int64_t>(consumedChunks));
+        WriteGmByPassDCache<int64_t>(stats + 7U,
+                                     static_cast<int64_t>(GetSystemCycle()));
+        // Same terminal-publish boundary for the Get lane's telemetry.
+        DataSyncBarrier<MemDsbT::DDR>();
     }
 
 private:
