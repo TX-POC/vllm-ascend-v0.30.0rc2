@@ -31,21 +31,20 @@ if len(_OPAPI_LIBS) != 1:
 
 _OPAPI = _OPAPI_LIBS[0].resolve()
 _VENDOR = _OPAPI.parents[2]
-_existing = [
-    value for value in os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(":")
-    if value
-]
-if str(_VENDOR) not in _existing:
-    os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join(
-        [str(_VENDOR), *_existing]
-    )
+# P1 is a standalone prototype and its bridge has one custom-OPAPI resolver.
+# Do not append historical vendor roots here: CANN could load this build's
+# generated API DSO while selecting metadata or a binary from an older P1
+# package with the same operator name.  A mixed-custom-OPP process needs a
+# proper multi-library resolver and is deliberately outside this probe.
+os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(_VENDOR)
 os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(_OPAPI)
 
 if os.getenv("NANOVLLM_A5_OPAPI_DEBUG") not in (None, "", "0"):
     print(
         "P1_OPAPI_BIND "
         f"opp_root={_LOCAL_OPP} vendor={_VENDOR} opapi={_OPAPI} "
-        f"ascend_custom_opp_path={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}",
+        f"ascend_custom_opp_path={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')} "
+        "isolated=1",
         flush=True,
     )
 
