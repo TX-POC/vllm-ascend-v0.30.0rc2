@@ -26,7 +26,7 @@ All tensors are contiguous NPU tensors.
 | `cache_tokens`, `candidate_lens` | `[B]` int32 | Same budget and candidate-length inputs used by legacy LIDU. |
 | `logical_token_map` | `[P, S]` int32 | Maps a LI source index to the logical KV token required by Direct-HCCP Get. |
 | `private_source_to_slot` | `[B, S]` int32 | `-1` for no speculative copy; otherwise global private slot `queue * private_rows_per_queue + row`. |
-| `private_ready` | `[Q, R]` int32 | Must be `1` only after the corresponding speculative Get's terminal CQ succeeds. |
+| `private_ready` | `[Q, R]` int32 | Shared streaming state: `0=free`, `1=pending`, `2=ready after terminal CQ`, `3=failed`. Only `2` may enter the private view; every other value becomes a guaranteed fallback Get. |
 
 `logical_token_map` does not change legacy source ordering.  `source_ids` use
 the original LI source indices so they can be checked mechanically against

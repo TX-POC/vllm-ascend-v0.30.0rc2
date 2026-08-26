@@ -62,6 +62,7 @@ public:
                                 __gm__ uint8_t *actualSeqLengthsK, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *metadata,
                                 __gm__ uint8_t *residentThreshold,
+                                __gm__ uint8_t *residentThresholdValid,
                                 __gm__ uint8_t *cacheSlotsSnapshot,
                                 __gm__ uint8_t *reqPoolEntries,
                                 __gm__ uint8_t *logicalTokenMap,
@@ -394,6 +395,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
                                               __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsK,
                                               __gm__ uint8_t *blockTable, __gm__ uint8_t *metadata,
                                               __gm__ uint8_t *residentThreshold,
+                                              __gm__ uint8_t *residentThresholdValid,
                                               __gm__ uint8_t *cacheSlotsSnapshot,
                                               __gm__ uint8_t *reqPoolEntries,
                                               __gm__ uint8_t *logicalTokenMap,
@@ -470,7 +472,8 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         (void)privatePackedOutputOut;
         (void)queueLeasesOut;
         vectorService.InitStreamingKvafHook(
-            residentThreshold, cacheSlotsSnapshot, reqPoolEntries,
+            residentThreshold, residentThresholdValid, cacheSlotsSnapshot,
+            reqPoolEntries,
             logicalTokenMap, privateSourceToSlot, privateReadyTable,
             privateArenaHead, privatePackedOutput, queueControl, queueLeases,
             telemetry, tiling);

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 TOPK = 2048
 MAX_CACHE_TOKENS = 16256
+PRIVATE_READY_AFTER_CQ = 2
 
 
 @dataclass(frozen=True)
@@ -174,7 +175,8 @@ def reconcile_private_plan(
         source = source_ids[index]
         destination = destination_slots[index]
         private_slot = private_source_to_slot[source]
-        if 0 <= private_slot < len(private_ready) and private_ready[private_slot] == 1:
+        if (0 <= private_slot < len(private_ready) and
+                private_ready[private_slot] == PRIVATE_READY_AFTER_CQ):
             ready_plan.append((source, private_slot, destination))
         else:
             fallback_plan.append((logical_token_map[source], destination))
@@ -222,11 +224,11 @@ class ExactReconcilePrivateViewMathTest(unittest.TestCase):
                 if rng.randrange(4) == 0:
                     slot = rng.randrange(len(private_ready_a))
                     private_source_to_slot_a[source] = slot
-                    private_ready_a[slot] = rng.randrange(2)
+                    private_ready_a[slot] = rng.randrange(4)
                 if rng.randrange(3) == 0:
                     slot = rng.randrange(len(private_ready_b))
                     private_source_to_slot_b[source] = slot
-                    private_ready_b[slot] = rng.randrange(2)
+                    private_ready_b[slot] = rng.randrange(4)
 
             legacy_mapping = copy.deepcopy(snapshot)
             legacy = legacy_lidu_update(

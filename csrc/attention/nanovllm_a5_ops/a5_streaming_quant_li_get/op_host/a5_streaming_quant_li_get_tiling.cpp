@@ -987,6 +987,8 @@ static ge::graphStatus ParseStreamingInterface(
 
     const auto resident =
         context->GetInputShape(RESIDENT_THRESHOLD_INDEX)->GetStorageShape();
+    const auto residentValid =
+        context->GetInputShape(RESIDENT_THRESHOLD_VALID_INDEX)->GetStorageShape();
     const auto cacheSlots = context->GetInputShape(
         CACHE_SLOTS_SNAPSHOT_INDEX)->GetStorageShape();
     const auto poolEntries = context->GetInputShape(
@@ -1047,7 +1049,9 @@ static ge::graphStatus ParseStreamingInterface(
         privateCapacity <= 0 ||
         source > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         context->GetInputDesc(RESIDENT_THRESHOLD_INDEX)->GetDataType() !=
-            ge::DT_UINT16 ||
+            ge::DT_INT32 ||
+        context->GetInputDesc(RESIDENT_THRESHOLD_VALID_INDEX)->GetDataType() !=
+            ge::DT_INT32 ||
         context->GetInputDesc(CACHE_SLOTS_SNAPSHOT_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
         context->GetInputDesc(REQ_POOL_ENTRIES_INDEX)->GetDataType() !=
@@ -1067,6 +1071,7 @@ static ge::graphStatus ParseStreamingInterface(
         context->GetInputDesc(QUEUE_LEASES_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
         !ShapeEquals(resident, {rowCount}) ||
+        !ShapeEquals(residentValid, {rowCount}) ||
         !ShapeEquals(poolEntries, {rowCount}) ||
         cacheSlots.GetDimNum() != 2 || cacheSlots.GetDim(1) <= 0 ||
         cacheSlots.GetDim(1) >
@@ -1080,6 +1085,8 @@ static ge::graphStatus ParseStreamingInterface(
         privatePackedOutput.GetDim(0) >
             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         privatePackedOutput.GetDim(1) != 656 ||
+        privatePackedOutput.GetDim(0) % queueCount != 0 ||
+        privatePackedOutput.GetDim(0) / queueCount != privateCapacity ||
         !ShapeEquals(queueControl, {STREAMING_KVAF_CONTROL_WORDS}) ||
         !ShapeEquals(queueLeases, {queueCount}) ||
         !ShapeEquals(sourceToSlotOut, {rowCount, source}) ||

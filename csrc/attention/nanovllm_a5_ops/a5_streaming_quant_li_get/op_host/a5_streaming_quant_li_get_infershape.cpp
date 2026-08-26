@@ -19,15 +19,16 @@ namespace ops {
 constexpr uint32_t QUERY_INDEX = 0;
 constexpr uint32_t KEY_INDEX = 1;
 constexpr uint32_t RESIDENT_THRESHOLD_INDEX = 9;
-constexpr uint32_t CACHE_SLOTS_SNAPSHOT_INDEX = 10;
-constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 11;
-constexpr uint32_t LOGICAL_TOKEN_MAP_INDEX = 12;
-constexpr uint32_t PRIVATE_SOURCE_TO_SLOT_INDEX = 13;
-constexpr uint32_t PRIVATE_READY_TABLE_INDEX = 14;
-constexpr uint32_t PRIVATE_ARENA_HEAD_INDEX = 15;
-constexpr uint32_t PRIVATE_PACKED_OUTPUT_INDEX = 16;
-constexpr uint32_t QUEUE_CONTROL_INDEX = 17;
-constexpr uint32_t QUEUE_LEASES_INDEX = 18;
+constexpr uint32_t RESIDENT_THRESHOLD_VALID_INDEX = 10;
+constexpr uint32_t CACHE_SLOTS_SNAPSHOT_INDEX = 11;
+constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 12;
+constexpr uint32_t LOGICAL_TOKEN_MAP_INDEX = 13;
+constexpr uint32_t PRIVATE_SOURCE_TO_SLOT_INDEX = 14;
+constexpr uint32_t PRIVATE_READY_TABLE_INDEX = 15;
+constexpr uint32_t PRIVATE_ARENA_HEAD_INDEX = 16;
+constexpr uint32_t PRIVATE_PACKED_OUTPUT_INDEX = 17;
+constexpr uint32_t QUEUE_CONTROL_INDEX = 18;
+constexpr uint32_t QUEUE_LEASES_INDEX = 19;
 
 constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 2;
 constexpr uint32_t ATTR_KV_LAYOUT_INDEX = 3;
@@ -72,6 +73,7 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     const gert::Shape *query = context->GetInputShape(QUERY_INDEX);
     const gert::Shape *key = context->GetInputShape(KEY_INDEX);
     const gert::Shape *resident = context->GetInputShape(RESIDENT_THRESHOLD_INDEX);
+    const gert::Shape *residentValid = context->GetInputShape(RESIDENT_THRESHOLD_VALID_INDEX);
     const gert::Shape *cacheSlots = context->GetInputShape(CACHE_SLOTS_SNAPSHOT_INDEX);
     const gert::Shape *poolEntries = context->GetInputShape(REQ_POOL_ENTRIES_INDEX);
     const gert::Shape *logicalMap = context->GetInputShape(LOGICAL_TOKEN_MAP_INDEX);
@@ -84,6 +86,7 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     OP_CHECK_NULL_WITH_CONTEXT(context, query);
     OP_CHECK_NULL_WITH_CONTEXT(context, key);
     OP_CHECK_NULL_WITH_CONTEXT(context, resident);
+    OP_CHECK_NULL_WITH_CONTEXT(context, residentValid);
     OP_CHECK_NULL_WITH_CONTEXT(context, cacheSlots);
     OP_CHECK_NULL_WITH_CONTEXT(context, poolEntries);
     OP_CHECK_NULL_WITH_CONTEXT(context, logicalMap);
@@ -163,6 +166,7 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     const bool validTransactionInterface =
         rowCount > 0 && sourceCapacity > 0 && queueCount > 0 && privateCapacity > 0 &&
         resident->GetDimNum() == 1 && resident->GetDim(0) == rowCount &&
+        residentValid->GetDimNum() == 1 && residentValid->GetDim(0) == rowCount &&
         poolEntries->GetDimNum() == 1 && poolEntries->GetDim(0) == rowCount &&
         logicalMap->GetDimNum() == 2 && logicalMap->GetDim(0) > 0 &&
         sourceToSlot->GetDimNum() == 2 && sourceToSlot->GetDim(0) == rowCount &&

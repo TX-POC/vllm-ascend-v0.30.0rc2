@@ -50,7 +50,8 @@ public:
                                               GlobalTensor<float> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
     __aicore__ inline void InitStreamingKvafHook(
-        __gm__ uint8_t *residentThreshold, __gm__ uint8_t *cacheSlotsSnapshot,
+        __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
+        __gm__ uint8_t *cacheSlotsSnapshot,
         __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *logicalTokenMap,
         __gm__ uint8_t *privateSourceToSlot, __gm__ uint8_t *privateReadyTable,
         __gm__ uint8_t *privateArenaHead, __gm__ uint8_t *privatePackedOutput,
@@ -242,7 +243,8 @@ __aicore__ inline void QLIVector<QLIT>::InitVecWorkspaceTensor(GlobalTensor<SCOR
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
-    __gm__ uint8_t *residentThreshold, __gm__ uint8_t *cacheSlotsSnapshot,
+    __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
+    __gm__ uint8_t *cacheSlotsSnapshot,
     __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *logicalTokenMap,
     __gm__ uint8_t *privateSourceToSlot, __gm__ uint8_t *privateReadyTable,
     __gm__ uint8_t *privateArenaHead, __gm__ uint8_t *privatePackedOutput,
@@ -251,7 +253,8 @@ __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
     const QLITilingData *__restrict tilingData)
 {
     streamingKvafHook_.Init(
-        residentThreshold, cacheSlotsSnapshot, reqPoolEntries, logicalTokenMap,
+        residentThreshold, residentThresholdValid, cacheSlotsSnapshot,
+        reqPoolEntries, logicalTokenMap,
         privateSourceToSlot, privateReadyTable, privateArenaHead,
         privatePackedOutput, queueControl,
         queueLeases, telemetry, constInfo_, tilingData->streamingRowCount,

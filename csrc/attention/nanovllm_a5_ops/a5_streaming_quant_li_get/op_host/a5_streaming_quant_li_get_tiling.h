@@ -57,25 +57,26 @@ constexpr uint32_t METADATA_INDEX = 8;
 // output retain the official C8 ABI exactly; these are appended so the
 // source-derived A5 implementation can be staged without touching it.
 constexpr uint32_t RESIDENT_THRESHOLD_INDEX = 9;
-constexpr uint32_t CACHE_SLOTS_SNAPSHOT_INDEX = 10;
-constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 11;
-constexpr uint32_t LOGICAL_TOKEN_MAP_INDEX = 12;
-constexpr uint32_t PRIVATE_SOURCE_TO_SLOT_INDEX = 13;
-constexpr uint32_t PRIVATE_READY_TABLE_INDEX = 14;
+constexpr uint32_t RESIDENT_THRESHOLD_VALID_INDEX = 10;
+constexpr uint32_t CACHE_SLOTS_SNAPSHOT_INDEX = 11;
+constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 12;
+constexpr uint32_t LOGICAL_TOKEN_MAP_INDEX = 13;
+constexpr uint32_t PRIVATE_SOURCE_TO_SLOT_INDEX = 14;
+constexpr uint32_t PRIVATE_READY_TABLE_INDEX = 15;
 // A transaction-local, per-queue monotonic allocator. The values start at
 // zero for each forward; a bounded successful claim gets one private output
 // row in the acquired queue's arena.
-constexpr uint32_t PRIVATE_ARENA_HEAD_INDEX = 15;
+constexpr uint32_t PRIVATE_ARENA_HEAD_INDEX = 16;
 // Explicit graph-visible private HBM output. Its address must match
 // KvafStreamingBatchGetControl::output; the AIV hook rejects otherwise.
-constexpr uint32_t PRIVATE_PACKED_OUTPUT_INDEX = 16;
+constexpr uint32_t PRIVATE_PACKED_OUTPUT_INDEX = 17;
 // The verified KVAF streaming control is exactly uint64[16]. It contains the
 // registered HBM output, per-queue descriptor scratch, SQ/CQ state and the
 // authoritative pointer to queue_leases.
-constexpr uint32_t QUEUE_CONTROL_INDEX = 17;
+constexpr uint32_t QUEUE_CONTROL_INDEX = 18;
 // One int32 owner word per Direct-HCCP queue. 0 = free; a positive owner tag
 // is acquired/released by the vendored KVAF SIMT helper.
-constexpr uint32_t QUEUE_LEASES_INDEX = 18;
+constexpr uint32_t QUEUE_LEASES_INDEX = 19;
 
 constexpr uint32_t SPARSE_INDICES_OUTPUT_INDEX = 0;
 constexpr uint32_t SPARSE_VALUES_OUTPUT_INDEX = 1;

@@ -29,7 +29,8 @@ using namespace optiling::detail;
         GET_TILING_DATA_WITH_STRUCT(QLITilingData, tiling_data_in, tiling);                                  \
         const QLITilingData *__restrict tiling_data = &tiling_data_in;                                       \
         op.Init(query, key, weights, queryScale, keyScale, actualSeqLengthsQ, actualSeqLengthsK, blocktable, \
-                metadata, residentThreshold, cacheSlotsSnapshot, reqPoolEntries, logicalTokenMap,             \
+                metadata, residentThreshold, residentThresholdValid, cacheSlotsSnapshot,                     \
+                reqPoolEntries, logicalTokenMap,                                                              \
                 privateSourceToSlot, privateReadyTable, privateArenaHead, privatePackedOutput,                \
                 queueControl, queueLeases,                                                                     \
                 sparseIndices, sparseValues, privateSourceToSlotOut, privateReadyTableOut,                    \
@@ -44,6 +45,7 @@ __global__ __aicore__ void a5_streaming_quant_li_get(__gm__ uint8_t *query, __gm
                                                    __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsK,
                                                    __gm__ uint8_t *blocktable, __gm__ uint8_t *metadata,
                                                    __gm__ uint8_t *residentThreshold,
+                                                   __gm__ uint8_t *residentThresholdValid,
                                                    __gm__ uint8_t *cacheSlotsSnapshot,
                                                    __gm__ uint8_t *reqPoolEntries,
                                                    __gm__ uint8_t *logicalTokenMap,

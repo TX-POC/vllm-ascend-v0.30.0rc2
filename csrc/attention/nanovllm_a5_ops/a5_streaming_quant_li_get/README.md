@@ -76,13 +76,17 @@ hardware.
 
 ## Resident-threshold prerequisite
 
-`resident_threshold:uint16[row_count]` is intentionally an input, not a value
+`resident_threshold:int32[row_count]` is intentionally an input, not a value
 derived from the final full-sequence Top-K.  Its producer must be a separate,
 graph-stable `A5ResidentC8Threshold`/ResidentSeed node that runs the same C8
 score representation and Top-K selection on the **resident-only LI index
-view**, then emits the per-row 2048th sortable `uint16` score.  It must also
-produce the resident source-to-logical-token relation used to construct this
-op's `logical_token_map`.
+view**, then emits the per-row 2048th sortable `uint16` score in the low
+16 bits of an `int32` tensor, plus `resident_threshold_valid:int32[row_count]`.
+This preserves a direct graph edge from Seed to streaming LI: no dtype cast or
+copy allocation is allowed in between. A zero valid bit disables speculative
+Get for that row; it is never interpreted as a zero score threshold. The seed
+must also produce the resident source-to-logical-token relation used to
+construct this op's `logical_token_map`.
 
 The existing packed 656-byte QSFA KV payload is not a Lightning-Indexer key
 view, and `cache_slots_snapshot` merely tells this op whether a logical token
@@ -97,30 +101,31 @@ threshold.
 
 ## Exact transaction ABI
 
-The root `ops.json` and host definition use exactly 19 inputs and 8 outputs:
+The root `ops.json` and host definition use exactly 20 inputs and 8 outputs:
 
 | Inputs 0–8 | Unchanged official C8 LI tensors, including mandatory metadata |
 | --- | --- |
-| 9 | `resident_threshold:uint16[row_count]` |
-| 10 | `cache_slots_snapshot:int32[pool_rows,max_logical_tokens]` |
-| 11 | `req_pool_entries:int32[row_count]` |
-| 12 | `logical_token_map:int32[pool_rows,source_score_count]` |
-| 13 | `private_source_to_slot:int32[row_count,source_score_count]`, initially `-1` |
-| 14 | `private_ready_table:int32[queue_count,private_arena_capacity]` |
-| 15 | `private_arena_head:int32[queue_count]`, zeroed per forward |
-| 16 | `private_packed_output:uint8[total_private_rows,656]`, the explicit graph-visible owner of the registered KVAF output |
-| 17 | `queue_control:int64[16]` (`KvafStreamingBatchGetControl`) |
-| 18 | `queue_leases:int32[queue_count]`, zero means free |
+| 9 | `resident_threshold:int32[row_count]`; low 16 bits are the C8 sortable score |
+| 10 | `resident_threshold_valid:int32[row_count]`; `0` suppresses speculation |
+| 11 | `cache_slots_snapshot:int32[pool_rows,max_logical_tokens]` |
+| 12 | `req_pool_entries:int32[row_count]` |
+| 13 | `logical_token_map:int32[pool_rows,source_score_count]` |
+| 14 | `private_source_to_slot:int32[row_count,source_score_count]`, initially `-1` |
+| 15 | `private_ready_table:int32[queue_count,private_arena_capacity]` (`0=free,1=pending,2=ready,3=failed`) |
+| 16 | `private_arena_head:int32[queue_count]`, zeroed per forward |
+| 17 | `private_packed_output:uint8[queue_count * private_arena_capacity,656]`, the explicit graph-visible owner of the registered KVAF output; its per-queue physical stride must equal `private_arena_capacity` exactly |
+| 18 | `queue_control:int64[16]` (`KvafStreamingBatchGetControl`) |
+| 19 | `queue_leases:int32[queue_count]`, zero means free |
 
 Outputs are exact official `sparse_indices`, official `sparse_values`, and
 formal alias receipts for every mutable transaction resource:
 
 ```text
-private_source_to_slot_out  -> input 13
-private_ready_table_out     -> input 14
-private_arena_head_out      -> input 15
-private_packed_output_out   -> input 16
-queue_leases_out            -> input 18
+private_source_to_slot_out  -> input 14
+private_ready_table_out     -> input 15
+private_arena_head_out      -> input 16
+private_packed_output_out   -> input 17
+queue_leases_out            -> input 19
 telemetry                   -> int64[queue_count,13]
 ```
 
@@ -128,7 +133,7 @@ The alias outputs must bind to the same transaction allocations as their
 inputs; the LI kernel deliberately does not copy a 128K source map or a
 private HBM payload.  `StreamingKvafTileReadyHook::Init` additionally rejects
 the graph if `queue_control.output` is not exactly the address of explicit
-input 16, or if `queue_control.output_rows` differs from its row count.
+input 17, or if `queue_control.output_rows` differs from its row count.
 
 ### Graph physical-buffer rule (fail closed)
 
@@ -138,17 +143,17 @@ receipt output to the same allocation as its mutable input and verify the
 device addresses before graph capture:
 
 ```text
-13 -> private_source_to_slot_out
-14 -> private_ready_table_out
-15 -> private_arena_head_out
-16 -> private_packed_output_out
-18 -> queue_leases_out
+14 -> private_source_to_slot_out
+15 -> private_ready_table_out
+16 -> private_arena_head_out
+17 -> private_packed_output_out
+19 -> queue_leases_out
 ```
 
 The later reconcile/QSFA stage reads the *same physical buffer supplied as
-input 16*, using `private_source_to_slot_out` and `private_ready_table_out` as
+input 17*, using `private_source_to_slot_out` and `private_ready_table_out` as
 the ordering/visibility receipts. It must either consume the verified alias
-output 5 as that buffer or consume input 16 plus a receipt output that creates
+output 5 as that buffer or consume input 17 plus a receipt output that creates
 the graph dependency. If any input/output address pair differs, or the bridge
 cannot express that dependency, the streaming route is disabled; it may not
 silently read a separately allocated `private_packed_output_out`.
@@ -156,7 +161,7 @@ silently read a separately allocated `private_packed_output_out`.
 The cold KVAF binder owns graph-static per-queue request templates
 (`address_table`, `valid_table`, `indices`, `offsets`, `mask`,
 `output_indices`). Each queue gets non-overlapping candidate-array slices and
-an absolute private row range inside input 16. The device hook loads that
+an absolute private row range inside input 17. The device hook loads that
 template only after acquiring the lease, fills only candidate arrays plus
 `active_request_count`, then publishes into the active shared scratch. The
 control itself represents one registered layer output whose rows divide evenly

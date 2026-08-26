@@ -26,6 +26,9 @@ constexpr int32_t kViewResidentHit = 0;
 constexpr int32_t kViewPrivateReady = 1;
 constexpr int32_t kViewFallbackRequired = 2;
 constexpr int32_t kViewInvalid = 3;
+// Shared transaction ABI with A5StreamingQuantLiGet: only terminal-CQ
+// READY=2 may use a private payload. PENDING/FAILED stay on fallback.
+constexpr int32_t kPrivateReadyReady = 2;
 
 class A5ExactReconcilePrivateViewKernel {
 public:
@@ -446,7 +449,7 @@ private:
                 continue;
             }
             if (privateReadyGm_.GetValue(
-                    static_cast<uint64_t>(privateSlot)) == 1) {
+                    static_cast<uint64_t>(privateSlot)) == kPrivateReadyReady) {
                 viewKind.SetValue(index, kViewPrivateReady);
                 viewPrivateSlot.SetValue(index, privateSlot);
                 readySource.SetValue(readyCount, source);

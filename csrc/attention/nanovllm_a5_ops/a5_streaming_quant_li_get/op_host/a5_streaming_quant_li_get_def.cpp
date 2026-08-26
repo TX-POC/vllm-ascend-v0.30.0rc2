@@ -69,7 +69,19 @@ public:
         // the runtime transaction; none replaces an official LI input.
         this->Input("resident_threshold")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_UINT16})
+            // Preserve the resident seed's int32 ABI.  Its low 16 bits are
+            // the official C8 sortable score, so graph capture can wire the
+            // seed output here without a cast/copy allocation.
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
+        // A zero means the resident-only C8 seed has fewer than sparse_count
+        // valid candidates.  In that case this operator must not reinterpret
+        // the seed's zero tau as a real score threshold and flood the private
+        // Get arena; it simply disables speculation for that row.
+        this->Input("resident_threshold_valid")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
         this->Input("cache_slots_snapshot")
@@ -202,7 +214,12 @@ public:
             .AutoContiguous();
         aicore_config_950.Input("resident_threshold")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_UINT16})
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
+        aicore_config_950.Input("resident_threshold_valid")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
         aicore_config_950.Input("cache_slots_snapshot")

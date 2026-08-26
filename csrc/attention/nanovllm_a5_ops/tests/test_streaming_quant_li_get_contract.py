@@ -42,6 +42,7 @@ INPUT_NAMES = [
     "block_table",
     "metadata",
     "resident_threshold",
+    "resident_threshold_valid",
     "cache_slots_snapshot",
     "req_pool_entries",
     "logical_token_map",
@@ -73,6 +74,7 @@ KERNEL_ARGUMENT_NAMES = [
     "blocktable",
     "metadata",
     "residentThreshold",
+    "residentThresholdValid",
     "cacheSlotsSnapshot",
     "reqPoolEntries",
     "logicalTokenMap",
@@ -111,22 +113,32 @@ def require_source_contract() -> None:
     tiling_header = TILING_HEADER.read_text()
     ops = json.loads(OPS.read_text())
     assert len(ops) == 1 and ops[0]["op"] == "A5StreamingQuantLiGet"
-    assert len(ops[0]["input_desc"]) == 19
+    assert len(ops[0]["input_desc"]) == 20
     assert len(ops[0]["output_desc"]) == 8
     inputs = ops[0]["input_desc"]
     outputs = ops[0]["output_desc"]
     assert [item["name"] for item in inputs] == INPUT_NAMES
     assert [item["name"] for item in outputs] == OUTPUT_NAMES
-    assert inputs[16] == {
+    assert inputs[9]["name"] == "resident_threshold"
+    # ResidentSeed exports int32 (low 16 bits are the exact C8 sortable kth
+    # score), so this must stay int32 to preserve the direct graph edge.
+    assert inputs[9]["type"] == ["int32"]
+    assert inputs[10] == {
+        "name": "resident_threshold_valid",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"],
+    }
+    assert inputs[17] == {
         "name": "private_packed_output",
         "param_type": "required",
         "format": ["ND"],
         "type": ["uint8"],
     }
-    assert inputs[17]["name"] == "queue_control"
-    assert inputs[17]["type"] == ["int64"]
-    assert inputs[18]["name"] == "queue_leases"
-    assert inputs[18]["type"] == ["int32"]
+    assert inputs[18]["name"] == "queue_control"
+    assert inputs[18]["type"] == ["int64"]
+    assert inputs[19]["name"] == "queue_leases"
+    assert inputs[19]["type"] == ["int32"]
     assert ROOT_CMAKE.is_file()
     assert "descriptor_stage_only" not in OPS.read_text()
     assert "descriptor_stage_only" not in ROOT_CMAKE.read_text()
@@ -158,6 +170,9 @@ def require_source_contract() -> None:
         "logicalTokenMap_.GetValue",
         "cacheSlots_.GetValue",
         "ClaimStreamingPrivateArenaSimt",
+        "residentThresholdValid_.GetValue(row) != 1",
+        "& 0xffffU",
+        "privateArenaCapacity_ != privateRows",
         "control_.output != reinterpret_cast<uint64_t>(privatePackedOutputRaw_)",
         "control_.output_rows != privatePackedRows_",
     ):
@@ -181,9 +196,10 @@ def require_source_contract() -> None:
         assert position > previous, name
         previous = position
     for token in (
-        "PRIVATE_PACKED_OUTPUT_INDEX = 16",
-        "QUEUE_CONTROL_INDEX = 17",
-        "QUEUE_LEASES_INDEX = 18",
+        "RESIDENT_THRESHOLD_VALID_INDEX = 10",
+        "PRIVATE_PACKED_OUTPUT_INDEX = 17",
+        "QUEUE_CONTROL_INDEX = 18",
+        "QUEUE_LEASES_INDEX = 19",
         "PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX = 5",
         "QUEUE_LEASES_OUTPUT_INDEX = 6",
         "TELEMETRY_OUTPUT_INDEX = 7",
@@ -191,9 +207,10 @@ def require_source_contract() -> None:
     ):
         assert token in tiling_header, token
     for token in (
-        "PRIVATE_PACKED_OUTPUT_INDEX = 16",
-        "QUEUE_CONTROL_INDEX = 17",
-        "QUEUE_LEASES_INDEX = 18",
+        "RESIDENT_THRESHOLD_VALID_INDEX = 10",
+        "PRIVATE_PACKED_OUTPUT_INDEX = 17",
+        "QUEUE_CONTROL_INDEX = 18",
+        "QUEUE_LEASES_INDEX = 19",
         "PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX = 5",
         "QUEUE_LEASES_OUTPUT_INDEX = 6",
         "TELEMETRY_OUTPUT_INDEX = 7",
@@ -202,6 +219,7 @@ def require_source_contract() -> None:
         assert token in infer, token
     for token in (
         "privatePackedOutput.GetDim(1) != 656",
+        "privatePackedOutput.GetDim(0) / queueCount != privateCapacity",
         "privatePackedOutputOut",
         "streamingInfo->privatePackedRows",
         "QUEUE_CONTROL_INDEX",
@@ -221,7 +239,8 @@ def require_source_contract() -> None:
     for name in (
         "query", "key", "weights", "queryScale", "keyScale",
         "actualSeqLengthsQ", "actualSeqLengthsK", "blocktable", "metadata",
-        "residentThreshold", "cacheSlotsSnapshot", "reqPoolEntries",
+        "residentThreshold", "residentThresholdValid", "cacheSlotsSnapshot",
+        "reqPoolEntries",
         "logicalTokenMap", "privateSourceToSlot", "privateReadyTable",
         "privateArenaHead", "privatePackedOutput", "queueControl",
         "queueLeases", "sparseIndices", "sparseValues",
@@ -232,6 +251,7 @@ def require_source_contract() -> None:
         assert position > previous, name
         previous = position
     assert "privatePackedOutput, queueControl, queueLeases" in preload
+    assert "residentThresholdValid" in preload
     assert "privatePackedOutputOut" in preload
     assert "queueLeasesOut" in preload
 

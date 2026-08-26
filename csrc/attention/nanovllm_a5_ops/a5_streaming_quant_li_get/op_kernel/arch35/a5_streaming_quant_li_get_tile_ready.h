@@ -133,6 +133,7 @@ class StreamingKvafTileReadyHook {
 public:
     __aicore__ inline void Init(
         __gm__ uint8_t *resident_threshold,
+        __gm__ uint8_t *resident_threshold_valid,
         __gm__ uint8_t *cache_slots_snapshot,
         __gm__ uint8_t *req_pool_entries,
         __gm__ uint8_t *logical_token_map,
@@ -157,7 +158,8 @@ public:
         __ubuf__ uint64_t *source_offsets,
         uint32_t producer_id)
     {
-        residentThreshold_.SetGlobalBuffer((__gm__ uint16_t *)resident_threshold);
+        residentThreshold_.SetGlobalBuffer((__gm__ int32_t *)resident_threshold);
+        residentThresholdValid_.SetGlobalBuffer((__gm__ int32_t *)resident_threshold_valid);
         cacheSlots_.SetGlobalBuffer((__gm__ int32_t *)cache_slots_snapshot);
         reqPoolEntries_.SetGlobalBuffer((__gm__ int32_t *)req_pool_entries);
         logicalTokenMap_.SetGlobalBuffer((__gm__ int32_t *)logical_token_map);
@@ -188,7 +190,8 @@ public:
         enabled_ = false;
         hasWave_ = false;
         stagedCount_ = 0U;
-        if (controlGm_ == nullptr || leaseResult_ == nullptr || claimResult_ == nullptr ||
+        if (resident_threshold == nullptr || resident_threshold_valid == nullptr ||
+            controlGm_ == nullptr || leaseResult_ == nullptr || claimResult_ == nullptr ||
             sourceOffsets_ == nullptr || rowCount_ == 0U || sourceCapacity_ == 0U ||
             poolSize_ == 0U || cacheTokenCapacity_ == 0U || privateArenaCapacity_ == 0U ||
             privatePackedOutputRaw_ == nullptr || privatePackedRows_ == 0U ||
@@ -205,7 +208,13 @@ public:
             return;
         }
         const uint64_t privateRows = control_.private_output_stride_bytes / kPackedKvRowBytes;
-        if (privateRows == 0U || privateArenaCapacity_ > privateRows) {
+        // `private_source_to_slot` encodes queue * privateArenaCapacity +
+        // local_slot, and reconcile later consumes that value as the physical
+        // row in private_packed_output.  Therefore the queue stride in the
+        // registered output must be *exactly* privateArenaCapacity, not just
+        // large enough to contain it. Otherwise queue>0 would point at a
+        // different physical row than the payload written by Direct-HCCP.
+        if (privateRows == 0U || privateArenaCapacity_ != privateRows) {
             AddTelemetry(0U, kControlRejected, 1);
             return;
         }
@@ -361,7 +370,18 @@ private:
         const kvaf_fused_get::KvafStreamingBatchGetDescriptorScratch &descriptor)
     {
         AddTelemetry(queue_id, kScoresScanned, 1);
-        if (score < residentThreshold_.GetValue(row)) {
+        // A zero validity bit is a sentinel from the resident-only C8 seed,
+        // not a score threshold.  Suppressing speculation here preserves the
+        // final exact path while avoiding an accidental all-score prefetch.
+        if (residentThresholdValid_.GetValue(row) != 1) {
+            return;
+        }
+        // ResidentSeed writes the official sortable uint16 C8 kth score into
+        // the low 16 bits of an int32 output.  Keeping that storage type here
+        // permits a direct graph edge from ResidentSeed with no cast/copy.
+        const uint16_t threshold = static_cast<uint16_t>(
+            static_cast<uint32_t>(residentThreshold_.GetValue(row)) & 0xffffU);
+        if (score < threshold) {
             return;
         }
         AddTelemetry(queue_id, kThresholdPassed, 1);
@@ -517,7 +537,8 @@ private:
         telemetry_.SetValue(offset, telemetry_.GetValue(offset) + value);
     }
 
-    GlobalTensor<uint16_t> residentThreshold_;
+    GlobalTensor<int32_t> residentThreshold_;
+    GlobalTensor<int32_t> residentThresholdValid_;
     GlobalTensor<int32_t> cacheSlots_;
     GlobalTensor<int32_t> reqPoolEntries_;
     GlobalTensor<int32_t> logicalTokenMap_;

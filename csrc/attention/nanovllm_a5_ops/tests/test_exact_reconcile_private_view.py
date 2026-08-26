@@ -23,6 +23,7 @@ TOPK = 2048
 VIEW_RESIDENT_HIT = 0
 VIEW_PRIVATE_READY = 1
 VIEW_FALLBACK_REQUIRED = 2
+PRIVATE_READY_AFTER_CQ = 2
 
 
 class Expected(NamedTuple):
@@ -91,7 +92,7 @@ def build_case() -> tuple[torch.Tensor, ...]:
             if source % 3 == 0:
                 private_source_to_slot[batch_index, source] = source
                 if source % 2 == 0:
-                    private_ready.reshape(-1)[source] = 1
+                    private_ready.reshape(-1)[source] = PRIVATE_READY_AFTER_CQ
 
     return (
         topk,
@@ -188,7 +189,7 @@ def reference(
             private_slot = int(private_source_to_slot[b, source])
             if 0 <= private_slot < private_capacity and int(
                 private_ready.reshape(-1)[private_slot]
-            ) == 1:
+            ) == PRIVATE_READY_AFTER_CQ:
                 view[b, 2, index] = VIEW_PRIVATE_READY
                 view[b, 3, index] = private_slot
                 ready_source[b, 0, ready_count] = source
