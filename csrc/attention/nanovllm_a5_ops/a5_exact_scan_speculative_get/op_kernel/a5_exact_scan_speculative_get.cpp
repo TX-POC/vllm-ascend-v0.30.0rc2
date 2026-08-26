@@ -232,10 +232,13 @@ private:
     __aicore__ inline void PublishRingSlot(
         const RingView& ring, uint32_t slot, uint32_t count, uint64_t epoch)
     {
-        // `state` is the only ready flag the Get lane polls.  Publish count,
-        // then release both the earlier payload stores and this count before
-        // publishing `state = epoch`.  Without this boundary another AIV can
-        // observe ready while still reading an old count.
+        // The three record words are bypass-GM stores.  On the A5 path their
+        // completion must be released *before* the count is published, then
+        // the count must be released before `state = epoch` becomes visible.
+        // `state` is the sole ready flag polled by the Get lane; collapsing
+        // the two boundaries can therefore produce a successful Direct-HCCP
+        // CQ for an old-but-valid descriptor triple.
+        DataSyncBarrier<MemDsbT::DDR>();
         StoreRingWord(ring.SlotCount(slot), count);
         DataSyncBarrier<MemDsbT::DDR>();
         StoreRingWord(ring.SlotState(slot), epoch);
