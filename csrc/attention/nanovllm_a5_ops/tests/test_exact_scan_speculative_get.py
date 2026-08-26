@@ -244,6 +244,16 @@ def validate_result(
     get = get_stats.cpu()
     trace = role_trace.cpu()
 
+    # Keep the first device-side Get error visible in the concise test log.
+    # This runs only on failure, so it does not add a normal-path host copy.
+    if not bool(torch.all(get[:, 2] == 0)):
+        pipeline_words = int(torch.count_nonzero(pipeline_state_out.cpu()))
+        print(
+            "A5_EXACT_SCAN_SPECULATIVE_GET_DIAGNOSTIC "
+            f"get_stats={get.tolist()} "
+            f"pipeline_nonzero_words={pipeline_words}"
+        )
+
     expected_selected = len(expected[0])
     expected_hits = sum(item.kind == CANDIDATE_HBM_HIT for item in expected[0])
     expected_miss_per_producer = expected_selected - expected_hits

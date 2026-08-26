@@ -36,10 +36,11 @@ constexpr uint32_t kCacheLineWords = kCacheLineBytes / sizeof(int64_t);
 constexpr uint32_t kRingSlots = 2;
 constexpr uint32_t kRecordsPerRingSlot = 32;
 constexpr uint32_t kRecordWords = 3;
-// A producer and its Get lane exchange these words through DCCI.  Give the
-// ready state, record count, payload, and close epoch separate cache lines.
-// In particular, do not let a DCCI of one producer's partial line clean or
-// invalidate a neighbor producer's state.
+// A producer and its Get lane exchange these words through a tiny SPSC ring.
+// These are cross-AIV handoff words, so they deliberately bypass DCache: a
+// DCCI on one AIV must never publish an old cache line over another AIV's
+// record/count/state update.  The fields still occupy separate cache lines so
+// the compact layout remains safe if surrounding code later needs DCCI.
 constexpr uint32_t kRingSlotStateWord = 0U;
 constexpr uint32_t kRingSlotCountWord = kCacheLineWords;
 constexpr uint32_t kRingSlotRecordWord = 2U * kCacheLineWords;
@@ -121,18 +122,19 @@ __aicore__ inline void FlushGmRange(__gm__ uint8_t* address, uint64_t bytes)
     }
 }
 
-__aicore__ inline uint64_t LoadEpochWord(__gm__ int64_t* word)
+// Ring records are hot producer-to-consumer traffic, unlike the cold values
+// above.  Each SPSC ring has one writer and one reader, but they run on
+// different AIV task lanes.  Bypass loads/stores remove DCache ownership from
+// that exchange; the explicit DataSyncBarrier calls at publish/acquire points
+// establish the ordering contract.
+__aicore__ inline uint64_t LoadRingWord(__gm__ int64_t* word)
 {
-    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(word), sizeof(int64_t));
-    __asm__ __volatile__("" ::: "memory");
-    return static_cast<uint64_t>(*word);
+    return static_cast<uint64_t>(ReadGmByPassDCache<int64_t>(word));
 }
 
-__aicore__ inline void StoreEpochWord(__gm__ int64_t* word, uint64_t value)
+__aicore__ inline void StoreRingWord(__gm__ int64_t* word, uint64_t value)
 {
-    __asm__ __volatile__("" ::: "memory");
-    *word = static_cast<int64_t>(value);
-    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(word), sizeof(int64_t));
+    WriteGmByPassDCache<int64_t>(word, static_cast<int64_t>(value));
 }
 
 struct RingView {
@@ -230,15 +232,14 @@ private:
     __aicore__ inline void PublishRingSlot(
         const RingView& ring, uint32_t slot, uint32_t count, uint64_t epoch)
     {
-        // Payload and count reach GM before the ready epoch.  The consumer
-        // invalidates the ready line before dereferencing the payload.
-        FlushGmRange(
-            reinterpret_cast<__gm__ uint8_t*>(ring.RecordWord(slot, 0, 0)),
-            static_cast<uint64_t>(count) * kRecordWords * sizeof(int64_t));
-        *ring.SlotCount(slot) = static_cast<int64_t>(count);
-        FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(ring.SlotCount(slot)),
-                     sizeof(int64_t));
-        StoreEpochWord(ring.SlotState(slot), epoch);
+        // Release the payload before publishing its record count, then
+        // release both before publishing `state = epoch`.  `state` is the
+        // only ready flag the Get lane polls.  Without these two boundaries a
+        // different AIV can observe ready while still reading an old count.
+        DataSyncBarrier<MemDsbT::DDR>();
+        StoreRingWord(ring.SlotCount(slot), count);
+        DataSyncBarrier<MemDsbT::DDR>();
+        StoreRingWord(ring.SlotState(slot), epoch);
     }
 
     __aicore__ inline bool TryAppendMiss(
@@ -247,14 +248,18 @@ private:
         int32_t outputIndex, uint64_t candidateSlot,
         uint64_t* pendingCandidateSlots, uint64_t* firstPublishCycle)
     {
-        if (*writeCount == 0U && LoadEpochWord(ring.SlotState(*writeSlot)) == epoch) {
+        if (*writeCount == 0U &&
+            LoadRingWord(ring.SlotState(*writeSlot)) == epoch) {
             return false;
         }
         __gm__ int64_t* const tableWord =
             ring.RecordWord(*writeSlot, *writeCount, 0);
-        *tableWord = static_cast<int64_t>(tableIndex);
-        *(tableWord + 1) = static_cast<int64_t>(offset);
-        *(tableWord + 2) = static_cast<int64_t>(outputIndex);
+        WriteGmByPassDCache<int64_t>(tableWord,
+                                     static_cast<int64_t>(tableIndex));
+        WriteGmByPassDCache<int64_t>(tableWord + 1,
+                                     static_cast<int64_t>(offset));
+        WriteGmByPassDCache<int64_t>(tableWord + 2,
+                                     static_cast<int64_t>(outputIndex));
         pendingCandidateSlots[*writeCount] = candidateSlot;
         ++(*writeCount);
         if (*writeCount == kRecordsPerRingSlot) {
@@ -275,7 +280,7 @@ private:
         uint64_t* deferred)
     {
         if (writeCount != 0U) {
-            if (LoadEpochWord(ring.SlotState(writeSlot)) == epoch) {
+            if (LoadRingWord(ring.SlotState(writeSlot)) == epoch) {
                 *overflow = 1U;
                 for (uint32_t record = 0U; record < writeCount; ++record) {
                     WriteGmByPassDCache<uint8_t>(
@@ -290,7 +295,10 @@ private:
                 }
             }
         }
-        StoreEpochWord(ring.ClosedEpoch(), epoch);
+        // `closed` is also a release flag: do not let a Get lane conclude the
+        // scan before every preceding ready-slot publication is visible.
+        DataSyncBarrier<MemDsbT::DDR>();
+        StoreRingWord(ring.ClosedEpoch(), epoch);
     }
 
     __aicore__ inline void ProcessExactScanProducer(uint32_t producer)
@@ -447,7 +455,7 @@ private:
     __aicore__ inline bool AllRingsClosed(uint32_t lane, uint64_t epoch) const
     {
         for (uint32_t producer = 0U; producer < kProducerCount; ++producer) {
-            if (LoadEpochWord(Ring(producer, lane).ClosedEpoch()) != epoch) {
+            if (LoadRingWord(Ring(producer, lane).ClosedEpoch()) != epoch) {
                 return false;
             }
         }
@@ -474,10 +482,15 @@ private:
             const RingView ring = Ring(producer, lane);
             for (uint32_t slot = 0U;
                  slot < kRingSlots && queued < kGetWaveRecords; ++slot) {
-                if (LoadEpochWord(ring.SlotState(slot)) != epoch) {
+                if (LoadRingWord(ring.SlotState(slot)) != epoch) {
                     continue;
                 }
-                const uint64_t count64 = LoadEpochWord(ring.SlotCount(slot));
+                // Acquire after observing ready.  The producer's release
+                // barrier makes the payload and count visible before this
+                // point; this barrier prevents following reads from moving
+                // ahead of the ready observation.
+                DataSyncBarrier<MemDsbT::DDR>();
+                const uint64_t count64 = LoadRingWord(ring.SlotCount(slot));
                 if (count64 == 0U || count64 > kRecordsPerRingSlot ||
                     queued + count64 > kGetWaveRecords) {
                     if (queued + count64 > kGetWaveRecords) {
@@ -485,19 +498,18 @@ private:
                         return queued;  // issue current wave before consuming it
                     }
                     *protocolError = kGetResultRingRecordError;
-                    StoreEpochWord(ring.SlotState(slot), 0U);
+                    StoreRingWord(ring.SlotState(slot), 0U);
                     continue;
                 }
                 const uint32_t count = static_cast<uint32_t>(count64);
-                FlushGmRange(
-                    reinterpret_cast<__gm__ uint8_t*>(ring.RecordWord(slot, 0, 0)),
-                    static_cast<uint64_t>(count) * kRecordWords * sizeof(int64_t));
                 for (uint32_t record = 0U; record < count; ++record) {
                     __gm__ int64_t* const words = ring.RecordWord(slot, record, 0);
-                    laneIndices[queued + record] = static_cast<int32_t>(words[0]);
-                    laneOffsets[queued + record] = static_cast<int32_t>(words[1]);
+                    laneIndices[queued + record] = static_cast<int32_t>(
+                        LoadRingWord(words));
+                    laneOffsets[queued + record] = static_cast<int32_t>(
+                        LoadRingWord(words + 1));
                     laneOutputIndices[queued + record] =
-                        static_cast<int32_t>(words[2]);
+                        static_cast<int32_t>(LoadRingWord(words + 2));
                     laneMask[queued + record] = 1U;
                 }
                 // The descriptor copy is complete.  Only now can this SPSC
@@ -511,7 +523,11 @@ private:
                     count * sizeof(int32_t));
                 FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(laneMask + queued),
                              count * sizeof(uint8_t));
-                StoreEpochWord(ring.SlotState(slot), 0U);
+                // The consumer must finish its descriptor stores before it
+                // returns this slot to the producer.  The same barrier also
+                // completes the bypass record reads for this chunk.
+                DataSyncBarrier<MemDsbT::DDR>();
+                StoreRingWord(ring.SlotState(slot), 0U);
                 queued += count;
                 ++(*consumedChunks);
             }
