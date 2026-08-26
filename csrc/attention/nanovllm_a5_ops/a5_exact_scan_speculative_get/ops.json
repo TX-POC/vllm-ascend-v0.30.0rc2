@@ -14,7 +14,8 @@
             {"name": "packed_output", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
             {"name": "fused_get_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
             {"name": "frame_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
-            {"name": "pipeline_state", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+            {"name": "pipeline_state", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+            {"name": "execution_mode", "param_type": "required", "format": ["ND"], "type": ["int64"]}
         ],
         "output_desc": [
             {"name": "packed_output_out", "param_type": "required", "format": ["ND"], "type": ["uint8"]},

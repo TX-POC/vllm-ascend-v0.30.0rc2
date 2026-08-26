@@ -22,8 +22,8 @@ constexpr int64_t kPipelineWordsPerRing =
     kRingSlots * kRingWordsPerSlot + kCacheLineWords;
 constexpr int64_t kPipelineRingCount = kProducerCount * kGetLaneCount;
 constexpr int64_t kGetWaveRecords = 256;
-constexpr int64_t kProducerStatColumns = 7;
-constexpr int64_t kGetStatColumns = 8;
+constexpr int64_t kProducerStatColumns = 8;
+constexpr int64_t kGetStatColumns = 16;
 constexpr int64_t kControlWords = 16;
 constexpr int64_t kPackedEntryBytes = 656;
 
@@ -39,7 +39,8 @@ void CheckInputs(
     const at::Tensor& offsets, const at::Tensor& outputIndices,
     const at::Tensor& addressTable, const at::Tensor& validTable,
     const at::Tensor& packedOutput, const at::Tensor& fusedGetControl,
-    const at::Tensor& frameEpoch, const at::Tensor& pipelineState)
+    const at::Tensor& frameEpoch, const at::Tensor& pipelineState,
+    const at::Tensor& executionMode)
 {
     TORCH_CHECK(liScores.device().is_privateuseone(),
                 "exact_scan_speculative_get requires NPU inputs.");
@@ -47,7 +48,7 @@ void CheckInputs(
     for (const auto& tensor : {threshold, resident, tableIndices, offsets,
                                outputIndices, addressTable, validTable,
                                packedOutput, fusedGetControl, frameEpoch,
-                               pipelineState}) {
+                               pipelineState, executionMode}) {
         TORCH_CHECK(tensor.device() == device,
                     "exact_scan_speculative_get inputs must use one NPU.");
         TORCH_CHECK(tensor.is_contiguous(),
@@ -66,7 +67,8 @@ void CheckInputs(
                     packedOutput.scalar_type() == at::kByte &&
                     fusedGetControl.scalar_type() == at::kLong &&
                     frameEpoch.scalar_type() == at::kLong &&
-                    pipelineState.scalar_type() == at::kLong,
+                    pipelineState.scalar_type() == at::kLong &&
+                    executionMode.scalar_type() == at::kLong,
                 "exact_scan_speculative_get input dtypes do not match its ABI.");
     TORCH_CHECK(liScores.dim() == 1 && liScores.numel() >= kProducerCount,
                 "li_scores must be float32[N], N >= 62.");
@@ -83,6 +85,7 @@ void CheckInputs(
                 "packed_output must be uint8[output_rows, 656].");
     CheckVector(fusedGetControl, kControlWords, "fused_get_control");
     CheckVector(frameEpoch, 1, "frame_epoch");
+    CheckVector(executionMode, 1, "execution_mode");
     TORCH_CHECK(pipelineState.dim() == 2 &&
                     pipelineState.size(0) == kPipelineRingCount &&
                     pipelineState.size(1) == kPipelineWordsPerRing,
@@ -102,11 +105,12 @@ Result ExactScanSpeculativeGetNpu(
     const at::Tensor& offsets, const at::Tensor& outputIndices,
     const at::Tensor& addressTable, const at::Tensor& validTable,
     at::Tensor packedOutput, const at::Tensor& fusedGetControl,
-    const at::Tensor& frameEpoch, at::Tensor pipelineState)
+    const at::Tensor& frameEpoch, at::Tensor pipelineState,
+    const at::Tensor& executionMode)
 {
     CheckInputs(liScores, threshold, resident, tableIndices, offsets,
                 outputIndices, addressTable, validTable, packedOutput,
-                fusedGetControl, frameEpoch, pipelineState);
+                fusedGetControl, frameEpoch, pipelineState, executionMode);
     const auto int32Options = liScores.options().dtype(at::kInt);
     const auto int64Options = liScores.options().dtype(at::kLong);
     const auto uint8Options = liScores.options().dtype(at::kByte);
@@ -126,7 +130,7 @@ Result ExactScanSpeculativeGetNpu(
     auto keepalive = std::make_tuple(
         liScores, threshold, resident, tableIndices, offsets, outputIndices,
         addressTable, validTable, packedOutput, fusedGetControl, frameEpoch,
-        pipelineState, candidateIndices, candidateKind, producerStats, getStats,
+        pipelineState, executionMode, candidateIndices, candidateKind, producerStats, getStats,
         roleTrace, getIndices, getOffsets, getOutputIndices, getMask);
     // CANN sees both mutable buffers as genuine outputs.  This is important:
     // the graph dataflow now contains the H2D-written packed KV and the
@@ -135,7 +139,7 @@ Result ExactScanSpeculativeGetNpu(
         aclnnA5ExactScanSpeculativeGet, keepalive,
         liScores, threshold, resident, tableIndices, offsets, outputIndices,
         addressTable, validTable, packedOutput, fusedGetControl, frameEpoch,
-        pipelineState, packedOutput, candidateIndices, candidateKind,
+        pipelineState, executionMode, packedOutput, candidateIndices, candidateKind,
         producerStats, getStats, roleTrace, getIndices, getOffsets,
         getOutputIndices, getMask, pipelineState);
     return std::make_tuple(
@@ -150,7 +154,8 @@ Result ExactScanSpeculativeGetMeta(
     const at::Tensor& offsets, const at::Tensor& outputIndices,
     const at::Tensor& addressTable, const at::Tensor& validTable,
     at::Tensor packedOutput, const at::Tensor& fusedGetControl,
-    const at::Tensor& frameEpoch, at::Tensor pipelineState)
+    const at::Tensor& frameEpoch, at::Tensor pipelineState,
+    const at::Tensor& executionMode)
 {
     TORCH_CHECK(liScores.dim() == 1 && liScores.numel() >= kProducerCount &&
                     threshold.dim() == 1 && threshold.numel() == 1 &&
@@ -168,6 +173,7 @@ Result ExactScanSpeculativeGetMeta(
                     fusedGetControl.dim() == 1 &&
                     fusedGetControl.numel() == kControlWords &&
                     frameEpoch.dim() == 1 && frameEpoch.numel() == 1 &&
+                    executionMode.dim() == 1 && executionMode.numel() == 1 &&
                     pipelineState.dim() == 2 &&
                     pipelineState.size(0) == kPipelineRingCount &&
                     pipelineState.size(1) == kPipelineWordsPerRing,
@@ -196,7 +202,7 @@ TORCH_LIBRARY(a5_exact_scan_get, m)
         "Tensor resident, Tensor table_indices, Tensor offsets, "
         "Tensor output_indices, Tensor address_table, Tensor valid_table, "
         "Tensor(a!) packed_output, Tensor fused_get_control, Tensor frame_epoch, "
-        "Tensor(b!) pipeline_state) "
+        "Tensor(b!) pipeline_state, Tensor execution_mode) "
         "-> (Tensor(a!) packed_output, Tensor candidate_indices, "
         "Tensor candidate_kind, Tensor producer_stats, Tensor get_stats, "
         "Tensor role_trace, Tensor get_indices, Tensor get_offsets, "

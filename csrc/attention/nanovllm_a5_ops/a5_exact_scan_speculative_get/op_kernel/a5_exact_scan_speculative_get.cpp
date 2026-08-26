@@ -9,8 +9,12 @@
  *   compacted miss descriptors -> WQE/SQ -> doorbell -> CQ terminal wait.
  *
  * Therefore a Get AIV stays occupied while its H2D DMA is in flight.  The LI
- * producers do not wait for it: a full ring marks overflow and leaves final
- * correctness to later Guaranteed Recall rather than deadlocking the scan.
+ * producers do not wait for it in streaming mode: a full ring marks overflow
+ * and leaves final correctness to later Guaranteed Recall rather than
+ * deadlocking the scan.  A strict serial mode uses the same launch, inputs,
+ * queues, and WQE segmentation, but makes both Get lanes wait until every
+ * producer has closed both rings before their first consume/doorbell.  That
+ * is the fair reference for measuring chunk-pipeline overlap.
  */
 
 #include "kernel_operator.h"
@@ -50,10 +54,14 @@ constexpr uint32_t kRingClosedWord = kRingSlots * kRingWordsPerSlot;
 constexpr uint32_t kRingWords = kRingClosedWord + kCacheLineWords;
 constexpr uint32_t kGetBootstrapRecords = 64;
 constexpr uint32_t kGetWaveRecords = 256;
-constexpr uint32_t kProducerStatColumns = 7;
-constexpr uint32_t kGetStatColumns = 8;
+constexpr uint32_t kProducerStatColumns = 8;
+constexpr uint32_t kGetStatColumns = 16;
 constexpr uint32_t kPackedEntryBytes = 656;
 constexpr uint32_t kConsumerIdlePollLimit = 16U * 1024U * 1024U;
+constexpr uint32_t kSerialGatePollLimit = 16U * 1024U * 1024U;
+
+constexpr uint64_t kPipelineModeParallel = 0U;
+constexpr uint64_t kPipelineModeSerialWaitAllClosed = 1U;
 
 static_assert(kRingWords % kCacheLineWords == 0U,
               "each SPSC ring must start on a cache-line boundary");
@@ -63,6 +71,8 @@ constexpr int32_t kRoleTraceGetBase = 2000;
 constexpr uint64_t kGetResultProtocolError = 0x1001U;
 constexpr uint64_t kGetResultConsumerTimeout = 0x1002U;
 constexpr uint64_t kGetResultRingRecordError = 0x1003U;
+constexpr uint64_t kGetResultInvalidPipelineMode = 0x1004U;
+constexpr uint64_t kGetResultSerialGateTimeout = 0x1005U;
 
 struct FusedGetControlSnapshot {
     uint64_t magic;
@@ -175,7 +185,7 @@ public:
         GM_ADDR tableIndices, GM_ADDR offsets, GM_ADDR outputIndices,
         GM_ADDR addressTable, GM_ADDR validTable, GM_ADDR packedOutput,
         GM_ADDR fusedGetControl, GM_ADDR frameEpoch,
-        GM_ADDR pipelineState,
+        GM_ADDR pipelineState, GM_ADDR executionMode,
         GM_ADDR candidateIndices, GM_ADDR candidateKind,
         GM_ADDR producerStats, GM_ADDR getStats, GM_ADDR roleTrace,
         GM_ADDR getIndices, GM_ADDR getOffsets, GM_ADDR getOutputIndices,
@@ -194,6 +204,7 @@ public:
             reinterpret_cast<__gm__ KvafFusedBatchGetControl*>(fusedGetControl);
         frameEpoch_ = reinterpret_cast<__gm__ int64_t*>(frameEpoch);
         pipelineState_ = reinterpret_cast<__gm__ int64_t*>(pipelineState);
+        executionMode_ = reinterpret_cast<__gm__ int64_t*>(executionMode);
         candidateIndices_ = reinterpret_cast<__gm__ int32_t*>(candidateIndices);
         candidateKind_ = reinterpret_cast<__gm__ uint8_t*>(candidateKind);
         producerStats_ = reinterpret_cast<__gm__ int64_t*>(producerStats);
@@ -314,7 +325,7 @@ private:
         if (epoch == 0U) {
             WriteProducerStats(producer, 0U, 0U, 0U, 0U,
                                static_cast<uint64_t>(-1), 0U,
-                               static_cast<uint64_t>(GetSystemCycle()));
+                               static_cast<uint64_t>(GetSystemCycle()), 0U);
             return;
         }
 
@@ -383,6 +394,10 @@ private:
             }
         }
 
+        // The scalar score/resident walk itself is complete here.  Keep this
+        // distinct from `closedPublish`: strict serial is allowed to begin
+        // only after the two tail flushes have made every ring terminal.
+        const uint64_t scanDone = static_cast<uint64_t>(GetSystemCycle());
         for (uint32_t lane = 0U; lane < kGetLaneCount; ++lane) {
             FlushProducerTail(Ring(producer, lane), writeSlot[lane],
                               writeCount[lane], epoch,
@@ -393,9 +408,9 @@ private:
         const uint64_t firstPublish = firstPublishCycle[0] != 0U
                                           ? firstPublishCycle[0]
                                           : firstPublishCycle[1];
+        const uint64_t closedPublish = static_cast<uint64_t>(GetSystemCycle());
         WriteProducerStats(producer, selected, hit, miss, enqueued, deferred,
-                           firstPublish,
-                           static_cast<uint64_t>(GetSystemCycle()));
+                           firstPublish, scanDone, closedPublish);
     }
 
     __aicore__ inline bool IsValidDirectGetDescriptor(
@@ -418,14 +433,14 @@ private:
     __aicore__ inline void WriteProducerStats(
         uint32_t producer, uint64_t selected, uint64_t hit, uint64_t miss,
         uint64_t enqueued, uint64_t deferred, uint64_t firstPublish,
-        uint64_t scanDone)
+        uint64_t scanDone, uint64_t closedPublish)
     {
         __gm__ int64_t* stats = producerStats_ +
                                 static_cast<uint64_t>(producer) *
                                     kProducerStatColumns;
-        // Adjacent 7-word rows share 64-B lines.  Bypassing DCache makes each
-        // scalar store independent, so a terminal write from one producer
-        // cannot evict or overwrite a neighbouring producer's result.
+        // Eight int64 words make each producer row exactly one cache line.
+        // Bypassing DCache keeps this terminal telemetry independent of the
+        // hot SPSC-ring ownership protocol.
         WriteGmByPassDCache<int64_t>(stats + 0U,
                                      static_cast<int64_t>(selected));
         WriteGmByPassDCache<int64_t>(stats + 1U,
@@ -440,6 +455,8 @@ private:
                                      static_cast<int64_t>(firstPublish));
         WriteGmByPassDCache<int64_t>(stats + 6U,
                                      static_cast<int64_t>(scanDone));
+        WriteGmByPassDCache<int64_t>(stats + 7U,
+                                     static_cast<int64_t>(closedPublish));
         // This is the terminal publish for this producer.  The barrier waits
         // for its preceding bypass stores (including candidate output) before
         // the task reports completion to the stream/host.
@@ -464,9 +481,29 @@ private:
         return true;
     }
 
+    // The strict serial reference is intentionally stronger than the normal
+    // per-Get-lane completion condition: every producer must have published
+    // the tail/closed word for *both* HCCP queues before either Get lane may
+    // copy a descriptor or ring a doorbell.  Checking only `lane` would allow
+    // lane 0 to start while a producer still has lane 1 open.
+    __aicore__ inline bool AllProducerRingsClosed(uint64_t epoch) const
+    {
+        for (uint32_t producer = 0U; producer < kProducerCount; ++producer) {
+            for (uint32_t lane = 0U; lane < kGetLaneCount; ++lane) {
+                if (LoadRingWord(Ring(producer, lane).ClosedEpoch()) != epoch) {
+                    return false;
+                }
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        return true;
+    }
+
     __aicore__ inline uint32_t ConsumeReadyRings(
         uint32_t lane, uint64_t epoch, uint32_t queued,
-        uint64_t* consumedChunks, uint64_t* protocolError,
+        uint32_t consumeLimit, uint64_t* consumedChunks,
+        uint64_t* firstConsumedChunkCycle, uint64_t* descriptorHashSum,
+        uint64_t* descriptorHashXor, uint64_t* protocolError,
         bool* deferredReady)
     {
         __gm__ int32_t* laneIndices =
@@ -479,11 +516,11 @@ private:
             getMask_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
 
         for (uint32_t producer = 0U;
-             producer < kProducerCount && queued < kGetWaveRecords;
+             producer < kProducerCount && queued < consumeLimit;
              ++producer) {
             const RingView ring = Ring(producer, lane);
             for (uint32_t slot = 0U;
-                 slot < kRingSlots && queued < kGetWaveRecords; ++slot) {
+                 slot < kRingSlots && queued < consumeLimit; ++slot) {
                 if (LoadRingWord(ring.SlotState(slot)) != epoch) {
                     continue;
                 }
@@ -494,10 +531,10 @@ private:
                 DataSyncBarrier<MemDsbT::DDR>();
                 const uint64_t count64 = LoadRingWord(ring.SlotCount(slot));
                 if (count64 == 0U || count64 > kRecordsPerRingSlot ||
-                    queued + count64 > kGetWaveRecords) {
-                    if (queued + count64 > kGetWaveRecords) {
+                    queued + count64 > consumeLimit) {
+                    if (queued + count64 > consumeLimit) {
                         *deferredReady = true;
-                        return queued;  // issue current wave before consuming it
+                        return queued;  // issue the fixed-size wave first
                     }
                     *protocolError = kGetResultRingRecordError;
                     StoreRingWord(ring.SlotState(slot), 0U);
@@ -506,13 +543,30 @@ private:
                 const uint32_t count = static_cast<uint32_t>(count64);
                 for (uint32_t record = 0U; record < count; ++record) {
                     __gm__ int64_t* const words = ring.RecordWord(slot, record, 0);
-                    laneIndices[queued + record] = static_cast<int32_t>(
+                    const int32_t tableIndex = static_cast<int32_t>(
                         LoadRingWord(words));
-                    laneOffsets[queued + record] = static_cast<int32_t>(
+                    const int32_t offset = static_cast<int32_t>(
                         LoadRingWord(words + 1));
-                    laneOutputIndices[queued + record] =
-                        static_cast<int32_t>(LoadRingWord(words + 2));
+                    const int32_t outputIndex = static_cast<int32_t>(
+                        LoadRingWord(words + 2));
+                    laneIndices[queued + record] = tableIndex;
+                    laneOffsets[queued + record] = offset;
+                    laneOutputIndices[queued + record] = outputIndex;
                     laneMask[queued + record] = 1U;
+                    // The benchmark does not copy the known-bad payload, so
+                    // retain a small device-side fingerprint of every
+                    // descriptor consumed by this lane.  Sum+xor is
+                    // commutative: streaming may see ready producers in a
+                    // different order than strict serial without weakening
+                    // the same-work assertion.
+                    const uint64_t fingerprint =
+                        (static_cast<uint64_t>(static_cast<uint32_t>(tableIndex))
+                         << 32U) ^
+                        (static_cast<uint64_t>(static_cast<uint32_t>(offset))
+                         << 1U) ^
+                        static_cast<uint64_t>(static_cast<uint32_t>(outputIndex));
+                    *descriptorHashSum += fingerprint;
+                    *descriptorHashXor ^= fingerprint;
                 }
                 // The descriptor copy is complete.  Only now can this SPSC
                 // slot be reused by its producer.
@@ -532,6 +586,10 @@ private:
                 StoreRingWord(ring.SlotState(slot), 0U);
                 queued += count;
                 ++(*consumedChunks);
+                if (*firstConsumedChunkCycle == 0U) {
+                    *firstConsumedChunkCycle =
+                        static_cast<uint64_t>(GetSystemCycle());
+                }
             }
         }
         return queued;
@@ -660,25 +718,60 @@ private:
     __aicore__ inline void ProcessFullGetLane(uint32_t lane)
     {
         const uint64_t epoch = LoadColdEpoch(frameEpoch_);
+        const uint64_t pipelineMode = LoadColdEpoch(executionMode_);
         WriteRoleTrace(lane, kRoleTraceGetBase + static_cast<int32_t>(lane));
         __gm__ int64_t* stats = getStats_ +
                                 static_cast<uint64_t>(lane) * kGetStatColumns;
         uint64_t requested = 0U;
         uint64_t batches = 0U;
         uint64_t error = epoch == 0U ? kGetResultProtocolError : 0U;
+        if (pipelineMode != kPipelineModeParallel &&
+            pipelineMode != kPipelineModeSerialWaitAllClosed) {
+            error = kGetResultInvalidPipelineMode;
+        }
         uint64_t firstDoorbell = 0U;
         uint64_t completionCycle = 0U;
         uint64_t idlePolls = 0U;
         uint64_t consumedChunks = 0U;
+        uint64_t serialGateOpenCycle = 0U;
+        uint64_t firstConsumedChunkCycle = 0U;
+        uint64_t serialGatePolls = 0U;
+        uint64_t descriptorHashSum = 0U;
+        uint64_t descriptorHashXor = 0U;
         uint32_t queued = 0U;
 
+        // `serial_wait_all_closed` is the strict reference, not a delayed
+        // input fixture.  It shares the identical 64-AIV launch, score and
+        // resident tensors, two Direct-HCCP queues, ring layout, and Get
+        // segmentation with streaming.  The only changed causal edge is that
+        // no Get descriptor can be consumed before all 124 producer rings
+        // have been terminally closed for this epoch.
+        if (error == 0U && pipelineMode == kPipelineModeSerialWaitAllClosed) {
+            while (!AllProducerRingsClosed(epoch)) {
+                ++serialGatePolls;
+                if (serialGatePolls >= kSerialGatePollLimit) {
+                    error = kGetResultSerialGateTimeout;
+                    break;
+                }
+            }
+            if (error == 0U) {
+                serialGateOpenCycle = static_cast<uint64_t>(GetSystemCycle());
+            }
+        }
+
         while (error == 0U) {
-            const uint32_t before = queued;
-            bool deferredReady = false;
-            queued = ConsumeReadyRings(lane, epoch, queued, &consumedChunks,
-                                       &error, &deferredReady);
+            // This limit is intentionally selected before consuming.  It
+            // fixes every replay to [64, 256, ..., tail] per Get lane, so the
+            // serial reference cannot accidentally fuse a different WQE
+            // shape merely because all rings are already ready.
             const uint32_t target = batches == 0U ? kGetBootstrapRecords
                                                    : kGetWaveRecords;
+            const uint32_t before = queued;
+            bool deferredReady = false;
+            queued = ConsumeReadyRings(
+                lane, epoch, queued, target, &consumedChunks,
+                &firstConsumedChunkCycle, &descriptorHashSum,
+                &descriptorHashXor, &error, &deferredReady);
             const bool allClosed = AllRingsClosed(lane, epoch);
             if (queued >= target ||
                 (allClosed && queued != 0U) ||
@@ -726,6 +819,20 @@ private:
                                      static_cast<int64_t>(consumedChunks));
         WriteGmByPassDCache<int64_t>(stats + 7U,
                                      static_cast<int64_t>(GetSystemCycle()));
+        WriteGmByPassDCache<int64_t>(stats + 8U,
+                                     static_cast<int64_t>(pipelineMode));
+        WriteGmByPassDCache<int64_t>(stats + 9U,
+                                     static_cast<int64_t>(serialGateOpenCycle));
+        WriteGmByPassDCache<int64_t>(stats + 10U,
+                                     static_cast<int64_t>(firstConsumedChunkCycle));
+        WriteGmByPassDCache<int64_t>(stats + 11U,
+                                     static_cast<int64_t>(serialGatePolls));
+        WriteGmByPassDCache<int64_t>(stats + 12U,
+                                     static_cast<int64_t>(descriptorHashSum));
+        WriteGmByPassDCache<int64_t>(stats + 13U,
+                                     static_cast<int64_t>(descriptorHashXor));
+        WriteGmByPassDCache<int64_t>(stats + 14U, 0);
+        WriteGmByPassDCache<int64_t>(stats + 15U, 0);
         // Same terminal-publish boundary for the Get lane's telemetry.
         DataSyncBarrier<MemDsbT::DDR>();
     }
@@ -753,6 +860,7 @@ private:
     __gm__ int32_t* getOutputIndices_{nullptr};
     __gm__ uint8_t* getMask_{nullptr};
     __gm__ int64_t* pipelineState_{nullptr};
+    __gm__ int64_t* executionMode_{nullptr};
 };
 }  // namespace
 
@@ -761,7 +869,7 @@ extern "C" __global__ __aicore__ void a5_exact_scan_speculative_get(
     GM_ADDR tableIndices, GM_ADDR offsets, GM_ADDR outputIndices,
     GM_ADDR addressTable, GM_ADDR validTable, GM_ADDR packedOutput,
     GM_ADDR fusedGetControl, GM_ADDR frameEpoch,
-    GM_ADDR pipelineState,
+    GM_ADDR pipelineState, GM_ADDR executionMode,
     GM_ADDR packedOutputOut, GM_ADDR candidateIndices, GM_ADDR candidateKind,
     GM_ADDR producerStats,
     GM_ADDR getStats, GM_ADDR roleTrace, GM_ADDR getIndices, GM_ADDR getOffsets,
@@ -782,7 +890,7 @@ extern "C" __global__ __aicore__ void a5_exact_scan_speculative_get(
     A5ExactScanSpeculativeGetKernel op(&tilingData);
     op.Init(liScores, threshold, resident, tableIndices, offsets, outputIndices,
             addressTable, validTable, packedOutput, fusedGetControl, frameEpoch,
-            pipelineState,
+            pipelineState, executionMode,
             candidateIndices, candidateKind, producerStats, getStats, roleTrace,
             getIndices, getOffsets, getOutputIndices, getMask);
     op.Process();

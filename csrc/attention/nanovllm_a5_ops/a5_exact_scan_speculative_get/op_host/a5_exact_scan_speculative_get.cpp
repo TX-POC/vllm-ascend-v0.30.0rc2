@@ -35,6 +35,7 @@ constexpr size_t kPackedOutput = 8;
 constexpr size_t kFusedGetControl = 9;
 constexpr size_t kFrameEpoch = 10;
 constexpr size_t kPipelineState = 11;
+constexpr size_t kExecutionMode = 12;
 
 constexpr size_t kPackedOutputOut = 0;
 constexpr size_t kCandidateIndices = 1;
@@ -64,8 +65,16 @@ constexpr uint32_t kGetBootstrapRecords = 64;
 constexpr uint32_t kGetWaveRecords = 256;
 constexpr uint32_t kFusedGetControlWords = 16;
 constexpr uint32_t kPackedEntryBytes = 656;
-constexpr uint32_t kProducerStatColumns = 7;
-constexpr uint32_t kGetStatColumns = 8;
+// ExactScan emits its normal five counters plus first-chunk, scan-done and
+// both-rings-closed timestamps.  The final timestamp is what lets the strict
+// serial reference prove that it waited for the terminal producer boundary.
+constexpr uint32_t kProducerStatColumns = 8;
+// Get telemetry has the original eight lifecycle fields plus the strict
+// serial-gate timestamp, the mode observed by the device, and a commutative
+// descriptor fingerprint.  The latter lets the benchmark prove that the
+// serial and streaming modes issued the same descriptor multiset even though
+// their arrival order may differ.
+constexpr uint32_t kGetStatColumns = 16;
 
 bool IsVectorWithPositiveLength(const gert::Shape& shape)
 {
@@ -85,7 +94,7 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     if (context == nullptr || context->GetPlatformInfo() == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    for (size_t input = 0; input <= kPipelineState; ++input) {
+    for (size_t input = 0; input <= kExecutionMode; ++input) {
         if (context->GetInputShape(input) == nullptr ||
             context->GetInputDesc(input) == nullptr) {
             return ge::GRAPH_FAILED;
@@ -116,6 +125,8 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
         context->GetInputShape(kFrameEpoch)->GetStorageShape();
     const gert::Shape pipelineState =
         context->GetInputShape(kPipelineState)->GetStorageShape();
+    const gert::Shape executionMode =
+        context->GetInputShape(kExecutionMode)->GetStorageShape();
 
     if (context->GetInputDesc(kLiScores)->GetDataType() != ge::DT_FLOAT ||
         context->GetInputDesc(kThreshold)->GetDataType() != ge::DT_FLOAT ||
@@ -128,7 +139,8 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
         context->GetInputDesc(kPackedOutput)->GetDataType() != ge::DT_UINT8 ||
         context->GetInputDesc(kFusedGetControl)->GetDataType() != ge::DT_INT64 ||
         context->GetInputDesc(kFrameEpoch)->GetDataType() != ge::DT_INT64 ||
-        context->GetInputDesc(kPipelineState)->GetDataType() != ge::DT_INT64) {
+        context->GetInputDesc(kPipelineState)->GetDataType() != ge::DT_INT64 ||
+        context->GetInputDesc(kExecutionMode)->GetDataType() != ge::DT_INT64) {
         return ge::GRAPH_FAILED;
     }
 
@@ -145,6 +157,7 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
         packedOutput.GetDim(1) != static_cast<int64_t>(kPackedEntryBytes) ||
         !IsVectorOfLength(control, kFusedGetControlWords) ||
         !IsVectorOfLength(epoch, 1) ||
+        !IsVectorOfLength(executionMode, 1) ||
         pipelineState.GetDimNum() != 2 ||
         pipelineState.GetDim(0) !=
             static_cast<int64_t>(kProducerCount * kGetLaneCount) ||
@@ -170,10 +183,14 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     if (aivOnlyBlockDim != kAivCount) {
         return ge::GRAPH_FAILED;
     }
-    // Task lanes 0/1 are persistent Get consumers while lanes 2..63 publish
-    // their SPSC rings.  Batch mode is the launch contract that starts the
-    // whole cooperative AIV set together; default wave scheduling can run the
-    // consumers first and starve producers they are waiting for.
+    // This is a single 64-AIV cooperative launch: task lanes 0/1 own the two
+    // Direct-HCCP queues and task lanes 2..63 own ExactScan.  Consequently a
+    // physical AIV executing one task in this invocation cannot execute the
+    // other role concurrently.  This is *execution-scoped* spatial
+    // isolation, not a claim that public CANN exposes a persistent physical
+    // AIV-ID mask.  Batch mode is required for this cross-AIV protocol;
+    // ordinary wave scheduling could run the waiting consumers before their
+    // producers and deadlock the rings.
     if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
@@ -208,7 +225,8 @@ static ge::graphStatus InferA5ExactScanSpeculativeGetShape(
 {
     if (context == nullptr || context->GetInputShape(kLiScores) == nullptr ||
         context->GetInputShape(kPackedOutput) == nullptr ||
-        context->GetInputShape(kPipelineState) == nullptr) {
+        context->GetInputShape(kPipelineState) == nullptr ||
+        context->GetInputShape(kExecutionMode) == nullptr) {
         return ge::GRAPH_FAILED;
     }
     for (size_t output = 0; output <= kPipelineStateOut; ++output) {
@@ -290,6 +308,7 @@ public:
         this->Input("fused_get_control").ParamType(REQUIRED).DataType(int64Types).Format(formats);
         this->Input("frame_epoch").ParamType(REQUIRED).DataType(int64Types).Format(formats);
         this->Input("pipeline_state").ParamType(REQUIRED).DataType(int64Types).Format(formats);
+        this->Input("execution_mode").ParamType(REQUIRED).DataType(int64Types).Format(formats);
         this->Output("packed_output_out").ParamType(REQUIRED).DataType(uint8Types).Format(formats);
         this->Output("candidate_indices").ParamType(REQUIRED).DataType(int32Types).Format(formats);
         this->Output("candidate_kind").ParamType(REQUIRED).DataType(uint8Types).Format(formats);

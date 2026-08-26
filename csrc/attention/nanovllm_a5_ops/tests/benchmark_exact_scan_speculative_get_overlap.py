@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""Measure P1 task-lane overlap without treating a bad payload as success.
+"""Strict same-input P1 comparison: serial Get versus chunk-pipelined Get.
 
-This benchmark runs the same 64-AIV P1 custom op in two input placements:
+The P1 operator is one AIV-only, 64-block batch-mode launch.  Logical task
+lanes 0/1 run the two blocking Direct-HCCP full-Get workers, while task lanes
+2..63 run ExactScan.  This script uses one immutable score/resident/descriptor
+fixture for both modes and changes only two graph-stable control scalars:
 
-* ``early`` publishes each producer/lane's 32-miss ring chunk near the start
-  of its ExactScan work, so the two Get task lanes can issue Direct-HCCP while
-  the remaining 62 ExactScan task lanes are still scanning.
-* ``late`` moves exactly the same hits, misses, descriptor triples, and output
-  rows to the end of each producer scan.  Get task lanes still exist from the
-  beginning, but the required chunks become available only near scan finish.
+* ``frame_epoch``: monotonically advances the reusable SPSC-ring epoch;
+* ``execution_mode``: ``0`` is streaming, ``1`` delays every Get consumer
+  until all 124 producer rings have terminally closed.
 
-It is deliberately a scheduling/CQ-path benchmark.  The current dense Get
-prototype has a known payload-integrity failure (mostly zero returned rows),
-so this script verifies only the control plane and never reports payload
-bandwidth or a real H2D end-to-end claim.
+It therefore measures the causal effect of allowing the existing blocking Get
+to consume ready chunks while ExactScan is still running.  The prototype's
+payload is a known all-zero failure, so the script validates control/CQ work
+only and intentionally makes no H2D-bandwidth or end-to-end claim.
 """
 
 from __future__ import annotations
 
 import argparse
 import statistics
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -34,12 +35,41 @@ from test_exact_scan_speculative_get import (
     PACKED_ENTRY_BYTES,
     PIPELINE_RING_COUNT,
     PIPELINE_WORDS_PER_RING,
+    PIPELINE_MODE_PARALLEL,
+    PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED,
     PRODUCER_COUNT,
+    RECORDS_PER_RING_SLOT,
+    RING_SLOTS,
     build_ddr_payload,
     build_exact_scan_inputs,
     check_args,
     create_runtime,
 )
+
+
+GET_STAT_REQUESTED = 0
+GET_STAT_BATCHES = 1
+GET_STAT_ERROR = 2
+GET_STAT_FIRST_DOORBELL = 3
+GET_STAT_COMPLETION = 4
+GET_STAT_IDLE_POLLS = 5
+GET_STAT_CONSUMED_CHUNKS = 6
+GET_STAT_FINISH = 7
+GET_STAT_MODE = 8
+GET_STAT_SERIAL_GATE_OPEN = 9
+GET_STAT_FIRST_CONSUMED_CHUNK = 10
+GET_STAT_SERIAL_GATE_POLLS = 11
+GET_STAT_DESCRIPTOR_SUM = 12
+GET_STAT_DESCRIPTOR_XOR = 13
+
+PRODUCER_STAT_SELECTED = 0
+PRODUCER_STAT_HIT = 1
+PRODUCER_STAT_MISS = 2
+PRODUCER_STAT_ENQUEUED = 3
+PRODUCER_STAT_DEFERRED = 4
+PRODUCER_STAT_FIRST_CHUNK = 5
+PRODUCER_STAT_SCAN_DONE = 6
+PRODUCER_STAT_CLOSED = 7
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,8 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-get-kernel", required=True)
     parser.add_argument("--batch-put-kernel", required=True)
     parser.add_argument("--table-capacity", type=int, default=32)
-    # 62 * 67,650 is within 4 tokens of B=32 x 128K.  This is still the P1
-    # scalar threshold-scan prototype, not the official C8 Lightning Indexer.
+    # 62 * 67,650 is within four tokens of B=32 x 128K.  This remains the
+    # scalar threshold/resident P1 seam, not an implementation of C8 LI.
     parser.add_argument("--scan-per-producer", type=int, default=67_650)
     parser.add_argument("--misses-per-lane", type=int, default=32)
     parser.add_argument("--hits-per-lane", type=int, default=2)
@@ -89,7 +119,6 @@ def validate_control(
     expected_output_rows: int,
 ) -> None:
     words = [int(value) for value in fused_get_control.cpu().tolist()]
-    mismatches: list[str] = []
     expected = (
         (0, FUSED_CONTROL_MAGIC),
         (1, FUSED_CONTROL_VERSION),
@@ -99,19 +128,71 @@ def validate_control(
         (8, 1),
         (9, PACKED_ENTRY_BYTES),
     )
-    for index, value in expected:
-        if words[index] != value:
-            mismatches.append(f"word{index}")
+    mismatches = [f"word{index}" for index, value in expected if words[index] != value]
     for index, name in ((2, "channel_entity"), (3, "queue_state"), (4, "core_status")):
         if words[index] == 0:
             mismatches.append(name)
     if mismatches:
-        raise RuntimeError(
-            "P1 fused control ABI is invalid: " + ",".join(mismatches)
-        )
+        raise RuntimeError("P1 fused control ABI is invalid: " + ",".join(mismatches))
 
 
-def validate_control_plane(
+def expected_batch_count(per_lane_requested: int) -> int:
+    if per_lane_requested <= 0:
+        return 0
+    if per_lane_requested <= 64:
+        return 1
+    remaining = per_lane_requested - 64
+    return 1 + (remaining + 255) // 256
+
+
+def candidate_signature(
+    label: str,
+    candidate_indices: torch.Tensor,
+    candidate_kind: torch.Tensor,
+    expected: list[list[Any]],
+) -> tuple[int, int]:
+    """Verify exactly the selected candidate entries and return a signature."""
+
+    indices = candidate_indices.cpu()
+    kinds = candidate_kind.cpu()
+    signature_sum = 0
+    signature_xor = 0
+    for producer, entries in enumerate(expected):
+        for rank, item in enumerate(entries):
+            slot = rank * PRODUCER_COUNT + producer
+            actual_source = int(indices[slot])
+            actual_kind = int(kinds[slot])
+            if actual_source != item.source or actual_kind != item.kind:
+                raise AssertionError(
+                    f"{label}: candidate mismatch producer={producer} rank={rank} "
+                    f"actual=({actual_source},{actual_kind}) "
+                    f"expected=({item.source},{item.kind})"
+                )
+            fingerprint = ((actual_source & 0xFFFFFFFF) << 8) ^ actual_kind
+            signature_sum += fingerprint
+            signature_xor ^= fingerprint
+    return signature_sum, signature_xor
+
+
+@dataclass(frozen=True)
+class Telemetry:
+    mode: int
+    requested: int
+    batches: int
+    consumed_chunks: int
+    errors: tuple[int, int]
+    first_doorbell: int
+    completion: int
+    first_consumed_chunk: int
+    serial_gate_open: int
+    serial_gate_polls: int
+    producer_scan_done: int
+    producer_closed: int
+    descriptor_sum: int
+    descriptor_xor: int
+
+
+def validate_sample(
     label: str,
     outputs: tuple[torch.Tensor, ...],
     packed_output: torch.Tensor,
@@ -119,7 +200,8 @@ def validate_control_plane(
     expected: list[list[Any]],
     expected_misses: int,
     lane_output_rows: int,
-) -> dict[str, Any]:
+    mode: int,
+) -> Telemetry:
     (
         packed_output_out,
         candidate_indices,
@@ -134,120 +216,103 @@ def validate_control_plane(
         pipeline_state_out,
     ) = outputs
     if packed_output_out.data_ptr() != packed_output.data_ptr():
-        raise AssertionError(f"{label}: packed output lost its bound address")
+        raise AssertionError(f"{label}: packed output lost its cold-bound address")
     if pipeline_state_out.data_ptr() != pipeline_state.data_ptr():
         raise AssertionError(f"{label}: pipeline state lost its stable address")
 
     producer = producer_stats.cpu()
     get = get_stats.cpu()
     trace = role_trace.cpu()
-    candidate_indices_cpu = candidate_indices.cpu()
-    candidate_kind_cpu = candidate_kind.cpu()
     expected_selected = len(expected[0])
     expected_hits = sum(item.kind == CANDIDATE_HBM_HIT for item in expected[0])
-    expected_miss = expected_selected - expected_hits
+    expected_miss_per_producer = expected_selected - expected_hits
     expected_trace = torch.cat(
         (
             torch.arange(2000, 2000 + GET_LANE_COUNT, dtype=torch.int32),
             torch.arange(1000, 1000 + PRODUCER_COUNT, dtype=torch.int32),
         )
     )
-
+    expected_batches = expected_batch_count(lane_output_rows)
     checks = (
-        bool(torch.all(producer[:, 0] == expected_selected)),
-        bool(torch.all(producer[:, 1] == expected_hits)),
-        bool(torch.all(producer[:, 2] == expected_miss)),
-        bool(torch.all(producer[:, 3] == expected_miss)),
-        bool(torch.all(producer[:, 4] == 0)),
-        bool(torch.all(producer[:, 5] > 0)),
-        bool(torch.all(producer[:, 6] > 0)),
-        bool(torch.all(get[:, 0] == lane_output_rows)),
-        int(get[:, 0].sum()) == expected_misses,
-        bool(torch.all(get[:, 1] > 0)),
-        bool(torch.all(get[:, 2] == 0)),
-        bool(torch.all(get[:, 3] > 0)),
-        bool(torch.all(get[:, 4] > 0)),
-        bool(torch.all(get[:, 6] == PRODUCER_COUNT)),
+        bool(torch.all(producer[:, PRODUCER_STAT_SELECTED] == expected_selected)),
+        bool(torch.all(producer[:, PRODUCER_STAT_HIT] == expected_hits)),
+        bool(torch.all(producer[:, PRODUCER_STAT_MISS] == expected_miss_per_producer)),
+        bool(torch.all(producer[:, PRODUCER_STAT_ENQUEUED] == expected_miss_per_producer)),
+        bool(torch.all(producer[:, PRODUCER_STAT_DEFERRED] == 0)),
+        bool(torch.all(producer[:, PRODUCER_STAT_FIRST_CHUNK] > 0)),
+        bool(torch.all(producer[:, PRODUCER_STAT_SCAN_DONE] > 0)),
+        bool(torch.all(producer[:, PRODUCER_STAT_CLOSED] > 0)),
+        bool(torch.all(get[:, GET_STAT_REQUESTED] == lane_output_rows)),
+        int(get[:, GET_STAT_REQUESTED].sum()) == expected_misses,
+        bool(torch.all(get[:, GET_STAT_BATCHES] == expected_batches)),
+        bool(torch.all(get[:, GET_STAT_ERROR] == 0)),
+        bool(torch.all(get[:, GET_STAT_FIRST_DOORBELL] > 0)),
+        bool(torch.all(get[:, GET_STAT_COMPLETION] > 0)),
+        bool(torch.all(get[:, GET_STAT_CONSUMED_CHUNKS] == PRODUCER_COUNT)),
+        bool(torch.all(get[:, GET_STAT_MODE] == mode)),
         bool(torch.equal(trace, expected_trace)),
     )
     if not all(checks):
         raise AssertionError(
-            f"{label}: control-plane validation failed "
-            f"producer={producer.tolist()} get={get.tolist()} trace={trace.tolist()}"
+            f"{label}: control/CQ validation failed producer={producer.tolist()} "
+            f"get={get.tolist()} trace={trace.tolist()}"
         )
 
-    # Payload bytes are intentionally not copied: their known failure is the
-    # reason this is only a scheduling/CQ-path experiment.  The compact
-    # candidate/control plane is still checked exactly, so a broken scan or
-    # a malformed ring cannot silently look like a useful overlap result.
-    for producer_id, entries in enumerate(expected):
-        for rank, item in enumerate(entries):
-            slot = rank * PRODUCER_COUNT + producer_id
-            if int(candidate_indices_cpu[slot]) != item.source:
-                raise AssertionError(
-                    f"{label}: candidate source mismatch "
-                    f"producer={producer_id} rank={rank}"
-                )
-            if int(candidate_kind_cpu[slot]) != item.kind:
-                raise AssertionError(
-                    f"{label}: candidate kind mismatch "
-                    f"producer={producer_id} rank={rank}"
-                )
+    if mode == PIPELINE_MODE_PARALLEL:
+        if not bool(torch.all(get[:, GET_STAT_SERIAL_GATE_OPEN] == 0)):
+            raise AssertionError(f"{label}: parallel mode unexpectedly opened serial gate")
+    else:
+        if not bool(torch.all(get[:, GET_STAT_SERIAL_GATE_OPEN] > 0)):
+            raise AssertionError(f"{label}: serial mode did not open both gates")
+        if not bool(torch.all(get[:, GET_STAT_FIRST_DOORBELL] >= get[:, GET_STAT_SERIAL_GATE_OPEN])):
+            raise AssertionError(f"{label}: serial doorbell preceded all-producer gate")
+        if not bool(torch.all(get[:, GET_STAT_FIRST_CONSUMED_CHUNK] >= get[:, GET_STAT_SERIAL_GATE_OPEN])):
+            raise AssertionError(f"{label}: serial consumption preceded all-producer gate")
 
-    first_doorbell = int(get[:, 3].min())
-    completion_done = int(get[:, 4].max())
-    scan_done = int(producer[:, 6].max())
-    return {
-        "first_doorbell_cycle": first_doorbell,
-        "completion_done_cycle": completion_done,
-        "scan_done_cycle": scan_done,
-        "tail_after_doorbell_cycles": max(0, scan_done - first_doorbell),
-        "doorbell_before_scan_done": int(first_doorbell < scan_done),
-        "requested": int(get[:, 0].sum()),
-        "batches": int(get[:, 1].sum()),
-        "per_lane_requested": [int(value) for value in get[:, 0].tolist()],
-        "per_lane_batches": [int(value) for value in get[:, 1].tolist()],
-    }
-
-
-def validate_all_sample_telemetry(
-    label: str,
-    samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    expected: list[list[Any]],
-    lane_output_rows: int,
-) -> None:
-    """Reject an intermittent CQ/control failure without timing host copies."""
-    expected_selected = len(expected[0])
-    expected_hits = sum(item.kind == CANDIDATE_HBM_HIT for item in expected[0])
-    expected_miss = expected_selected - expected_hits
-    expected_trace = torch.cat(
-        (
-            torch.arange(2000, 2000 + GET_LANE_COUNT, dtype=torch.int32),
-            torch.arange(1000, 1000 + PRODUCER_COUNT, dtype=torch.int32),
-        )
+    return Telemetry(
+        mode=mode,
+        requested=int(get[:, GET_STAT_REQUESTED].sum()),
+        batches=int(get[:, GET_STAT_BATCHES].sum()),
+        consumed_chunks=int(get[:, GET_STAT_CONSUMED_CHUNKS].sum()),
+        errors=tuple(int(value) for value in get[:, GET_STAT_ERROR].tolist()),
+        first_doorbell=int(get[:, GET_STAT_FIRST_DOORBELL].min()),
+        completion=int(get[:, GET_STAT_COMPLETION].max()),
+        first_consumed_chunk=int(get[:, GET_STAT_FIRST_CONSUMED_CHUNK].min()),
+        serial_gate_open=int(get[:, GET_STAT_SERIAL_GATE_OPEN].min()),
+        serial_gate_polls=int(get[:, GET_STAT_SERIAL_GATE_POLLS].sum()),
+        producer_scan_done=int(producer[:, PRODUCER_STAT_SCAN_DONE].max()),
+        producer_closed=int(producer[:, PRODUCER_STAT_CLOSED].max()),
+        descriptor_sum=int(get[:, GET_STAT_DESCRIPTOR_SUM].sum()),
+        descriptor_xor=int(get[0, GET_STAT_DESCRIPTOR_XOR]) ^ int(get[1, GET_STAT_DESCRIPTOR_XOR]),
     )
-    for sample_index, (producer_stats, get_stats, role_trace) in enumerate(samples):
-        producer = producer_stats.cpu()
-        get = get_stats.cpu()
-        trace = role_trace.cpu()
-        valid = (
-            bool(torch.all(producer[:, 0] == expected_selected))
-            and bool(torch.all(producer[:, 1] == expected_hits))
-            and bool(torch.all(producer[:, 2] == expected_miss))
-            and bool(torch.all(producer[:, 3] == expected_miss))
-            and bool(torch.all(producer[:, 4] == 0))
-            and bool(torch.all(get[:, 0] == lane_output_rows))
-            and bool(torch.all(get[:, 1] > 0))
-            and bool(torch.all(get[:, 2] == 0))
-            and bool(torch.all(get[:, 6] == PRODUCER_COUNT))
-            and bool(torch.equal(trace, expected_trace))
-        )
-        if not valid:
-            raise AssertionError(
-                f"{label}: telemetry failed at replay={sample_index} "
-                f"producer={producer.tolist()} get={get.tolist()} "
-                f"trace={trace.tolist()}"
-            )
+
+
+def validate_cross_mode(
+    parallel: list[Telemetry], serial: list[Telemetry]
+) -> tuple[Telemetry, Telemetry]:
+    if not parallel or not serial:
+        raise AssertionError("no timed P1 samples were collected")
+    parallel_reference = parallel[-1]
+    serial_reference = serial[-1]
+    for label, values, expected_mode in (
+        ("parallel", parallel, PIPELINE_MODE_PARALLEL),
+        ("serial", serial, PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED),
+    ):
+        for sample_index, value in enumerate(values):
+            if value.mode != expected_mode or any(value.errors):
+                raise AssertionError(f"{label}: invalid mode/error at sample={sample_index}")
+            if value.requested != parallel_reference.requested:
+                raise AssertionError(f"{label}: requested work drifted at sample={sample_index}")
+            if value.batches != parallel_reference.batches:
+                raise AssertionError(f"{label}: WQE segmentation drifted at sample={sample_index}")
+            if value.consumed_chunks != parallel_reference.consumed_chunks:
+                raise AssertionError(f"{label}: ring-consumption work drifted at sample={sample_index}")
+            if (value.descriptor_sum, value.descriptor_xor) != (
+                parallel_reference.descriptor_sum,
+                parallel_reference.descriptor_xor,
+            ):
+                raise AssertionError(f"{label}: descriptor multiset drifted at sample={sample_index}")
+    return parallel_reference, serial_reference
 
 
 def main() -> None:
@@ -257,102 +322,82 @@ def main() -> None:
         raise ValueError("--warmup must be non-negative")
     if args.iters <= 0:
         raise ValueError("--iters must be positive")
+    # The serial comparator intentionally leaves producer rings untouched
+    # until every scan has closed.  It is fair only if one producer/lane can
+    # retain all of its selected misses in the two-slot SPSC ring; otherwise
+    # serial would defer a descriptor that streaming could have consumed.
+    per_producer_lane_ring_capacity = RING_SLOTS * RECORDS_PER_RING_SLOT
+    if args.misses_per_lane > per_producer_lane_ring_capacity:
+        raise ValueError(
+            "strict serial requires --misses-per-lane <= "
+            f"{per_producer_lane_ring_capacity}; got {args.misses_per_lane}"
+        )
 
     device = torch.device(args.device)
     torch.npu.set_device(device)
     device_id = device.index if device.index is not None else torch.npu.current_device()
-    get_device_name = getattr(
-        torch.npu, "get_device_name", torch_npu.npu.get_device_name
-    )
+    get_device_name = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
     device_name = get_device_name(device_id)
     if "950" not in device_name.lower():
         raise RuntimeError(f"expected Ascend 950, got {device_name!r}")
 
-    cases: dict[str, dict[str, Any]] = {}
-    for label in ("early", "late"):
-        (
-            scores_cpu,
-            resident_cpu,
-            table_indices_cpu,
-            offsets_cpu,
-            output_indices_cpu,
-            expected,
-            expected_misses,
-            lane_output_rows,
-        ) = build_exact_scan_inputs(args, candidate_placement=label)
-        cases[label] = {
-            "scores": scores_cpu.to(device),
-            "resident": resident_cpu.to(device),
-            "table_indices": table_indices_cpu.to(device),
-            "offsets": offsets_cpu.to(device),
-            "output_indices": output_indices_cpu.to(device),
-            "expected": expected,
-            "expected_misses": expected_misses,
-            "lane_output_rows": lane_output_rows,
-        }
-    if (
-        cases["early"]["expected_misses"] != cases["late"]["expected_misses"]
-        or cases["early"]["lane_output_rows"] != cases["late"]["lane_output_rows"]
-    ):
-        raise AssertionError("early/late fixtures do not have identical Get work")
-    early_kind_layout = [
-        [item.kind for item in entries] for entries in cases["early"]["expected"]
-    ]
-    late_kind_layout = [
-        [item.kind for item in entries] for entries in cases["late"]["expected"]
-    ]
-    if early_kind_layout != late_kind_layout:
-        raise AssertionError("early/late fixtures changed candidate-kind order")
-    torch.npu.synchronize()
-
-    expected_misses = int(cases["early"]["expected_misses"])
-    lane_output_rows = int(cases["early"]["lane_output_rows"])
-    entry_payload_cpu, _unused_expected_payload = build_ddr_payload(
-        args.table_capacity, expected_misses
-    )
-    keys = list(range(1, args.table_capacity + 1))
+    (
+        scores_cpu,
+        resident_cpu,
+        table_indices_cpu,
+        offsets_cpu,
+        output_indices_cpu,
+        expected,
+        expected_misses,
+        lane_output_rows,
+    ) = build_exact_scan_inputs(args)
+    entry_payload_cpu, _ = build_ddr_payload(args.table_capacity, expected_misses)
     runtime = create_runtime(args, device_id)
-    table = None
+    table: Any = None
     control_bound = False
     try:
         print(
-            "P1_TASK_LANE_OVERLAP_CONFIG "
-            f"device={args.device} device_name={device_name!r} "
-            f"transport={args.transport} score_count={PRODUCER_COUNT * args.scan_per_producer} "
-            f"scan_per_producer={args.scan_per_producer} "
-            f"producer_task_lanes=2..63 get_task_lanes=0,1 "
-            "physical_core_affinity_proof=0 "
+            "P1_STRICT_SAME_INPUT_CONFIG "
+            f"device={args.device} device_name={device_name!r} transport={args.transport} "
+            f"score_count={scores_cpu.numel()} scan_per_producer={args.scan_per_producer} "
             f"misses_per_producer_lane={args.misses_per_lane} "
-            f"hits_per_producer_lane={args.hits_per_lane} "
-            f"total_misses={expected_misses} warmup={args.warmup} iters={args.iters} "
-            "placement_pair=early_vs_late"
+            f"hits_per_producer_lane={args.hits_per_lane} total_misses={expected_misses} "
+            f"per_producer_lane_ring_capacity={per_producer_lane_ring_capacity} "
+            "serial_no_deferred_required=1 "
+            f"warmup={args.warmup} iters={args.iters} semantic_inputs=identical "
+            "mutable_control=frame_epoch,execution_mode "
+            "frame_epoch_scope=ring_reuse_only comparison_variable=execution_mode"
         )
         print(
-            "P1_TASK_LANE_OVERLAP_INTEGRITY "
+            "P1_EXECUTION_SCOPED_AIV_PARTITION "
+            "aiv_instances=64 block_dim=64 schedule_mode=batch "
+            "get_task_lanes=0,1 exactscan_task_lanes=2..63 "
+            "same_invocation_role_exclusive=1 "
+            "fixed_physical_aiv_id_mask=unavailable_public_cann_9_1 "
+            "fixed_physical_aiv_id_affinity_claim=0"
+        )
+        print(
+            "P1_STRICT_SAME_INPUT_INTEGRITY "
             "payload_validation=skipped payload_integrity=known_failed "
-            "known_dense_get_payload_failure=1 "
-            "data_plane_unverified=1 h2d_bandwidth_claim=0 "
-            "result_scope=task_lane_scheduling_and_cq_path_only "
-            "descriptor_history=not_exported_final_wave_only "
-            "exactscan_kind=scalar_threshold_prototype_not_official_c8_li"
+            "h2d_bandwidth_claim=0 end_to_end_claim=0 "
+            "result_scope=control_cq_path_and_execution_scoped_overlap_only "
+            "exactscan_kind=scalar_threshold_resident_seam_not_official_c8_li"
         )
 
         runtime.initialize(args.table_capacity * ENTRY_BYTES, ENTRY_BYTES)
         source = entry_payload_cpu.to(device)
         torch.npu.synchronize()
         runtime.batch_put(
-            keys,
+            list(range(1, args.table_capacity + 1)),
             source.reshape(-1),
             [entry * ENTRY_BYTES for entry in range(args.table_capacity)],
             [ENTRY_BYTES] * args.table_capacity,
         )
         torch.npu.synchronize()
-        table = runtime.prepare_access_table(keys)
+        table = runtime.prepare_access_table(list(range(1, args.table_capacity + 1)))
         device_table = runtime.access_table_view(
             table, device="npu", capacity=args.table_capacity
         )
-        address_table = device_table.addresses
-        valid_table = device_table.valid
         packed_output = torch.empty(
             (expected_misses, PACKED_ENTRY_BYTES), dtype=torch.uint8, device=device
         )
@@ -369,139 +414,188 @@ def main() -> None:
         torch.npu.synchronize()
         validate_control(fused_get_control, packed_output, expected_misses)
 
-        frame_epoch = torch.empty(1, dtype=torch.int64, device=device)
+        scores = scores_cpu.to(device)
+        resident = resident_cpu.to(device)
+        table_indices = table_indices_cpu.to(device)
+        offsets = offsets_cpu.to(device)
+        output_indices = output_indices_cpu.to(device)
         threshold = torch.tensor([0.5], dtype=torch.float32, device=device)
+        frame_epoch = torch.empty(1, dtype=torch.int64, device=device)
+        execution_mode = torch.empty(1, dtype=torch.int64, device=device)
+        torch.npu.synchronize()
         next_epoch = args.frame_epoch - 1
-        last_outputs: dict[str, tuple[torch.Tensor, ...]] = {}
-        sample_telemetry: dict[
-            str, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-        ] = {"early": [], "late": []}
+        samples: dict[int, list[Telemetry]] = {
+            PIPELINE_MODE_PARALLEL: [],
+            PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED: [],
+        }
+        last_outputs: dict[int, tuple[torch.Tensor, ...]] = {}
 
-        def run_one(label: str) -> float:
+        def run_one(mode: int, retain_telemetry: bool) -> tuple[float, Telemetry | None]:
             nonlocal next_epoch
             next_epoch += 1
+            # These two writes happen before the start event on the same NPU
+            # stream and are deliberately excluded from the measured operator
+            # interval.  Their addresses remain graph stable across replays.
             frame_epoch.fill_(next_epoch)
-            case = cases[label]
+            execution_mode.fill_(mode)
+            # Equalize the cold-bound destination state without adding this
+            # memset to either timing.  Payload content is not validated.
+            packed_output.zero_()
             start = torch.npu.Event(enable_timing=True)
             end = torch.npu.Event(enable_timing=True)
             start.record()
             outputs = torch.ops.a5_exact_scan_get.exact_scan_speculative_get(
-                case["scores"],
+                scores,
                 threshold,
-                case["resident"],
-                case["table_indices"],
-                case["offsets"],
-                case["output_indices"],
-                address_table,
-                valid_table,
+                resident,
+                table_indices,
+                offsets,
+                output_indices,
+                device_table.addresses,
+                device_table.valid,
                 packed_output,
                 fused_get_control,
                 frame_epoch,
                 pipeline_state,
+                execution_mode,
             )
             end.record()
             end.synchronize()
-            last_outputs[label] = outputs
-            # Keep only tiny telemetry from every replay.  It is copied after
-            # timing, so an intermittent failed CQ cannot be hidden by a
-            # healthy final replay and no host copy enters the NPU event.
-            sample_telemetry[label].append((outputs[3], outputs[4], outputs[5]))
-            return start.elapsed_time(end) * 1000.0
+            elapsed_us = start.elapsed_time(end) * 1000.0
+            if retain_telemetry:
+                # Retain only the final candidate arrays per mode.  Copying
+                # their ~20 MiB result after every replay would not enter an
+                # NPU event interval, but it would add needless host traffic
+                # between paired samples.  Every replay still copies and
+                # validates the small producer/Get/role telemetry below.
+                last_outputs[mode] = outputs
+                telemetry = validate_sample(
+                    "parallel" if mode == PIPELINE_MODE_PARALLEL else "serial",
+                    outputs,
+                    packed_output,
+                    pipeline_state,
+                    expected,
+                    expected_misses,
+                    lane_output_rows,
+                    mode,
+                )
+                return elapsed_us, telemetry
+            return elapsed_us, None
 
-        # Alternate the warm-up order as well: the Direct-HCCP queue state is
-        # intentionally persistent across calls and one placement must not
-        # always inherit the warm queue.
+        # Alternate mode order.  The two persistent Direct-HCCP queues cannot
+        # systematically favor the mode that always follows a warm replay.
         for iteration in range(args.warmup):
-            order = ("early", "late") if iteration % 2 == 0 else ("late", "early")
-            for label in order:
-                run_one(label)
-
-        samples_us: dict[str, list[float]] = {"early": [], "late": []}
-        paired_saved_us: list[float] = []
-        for iteration in range(args.iters):
-            order = ("early", "late") if iteration % 2 == 0 else ("late", "early")
-            pair: dict[str, float] = {}
-            for label in order:
-                elapsed_us = run_one(label)
-                samples_us[label].append(elapsed_us)
-                pair[label] = elapsed_us
-            paired_saved_us.append(pair["late"] - pair["early"])
-
-        telemetry = {
-            label: validate_control_plane(
-                label,
-                last_outputs[label],
-                packed_output,
-                pipeline_state,
-                cases[label]["expected"],
-                int(cases[label]["expected_misses"]),
-                int(cases[label]["lane_output_rows"]),
+            order = (
+                (PIPELINE_MODE_PARALLEL, PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED)
+                if iteration % 2 == 0
+                else (PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED, PIPELINE_MODE_PARALLEL)
             )
-            for label in ("early", "late")
+            for mode in order:
+                run_one(mode, retain_telemetry=False)
+
+        timings: dict[int, list[float]] = {
+            PIPELINE_MODE_PARALLEL: [],
+            PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED: [],
         }
-        for label in ("early", "late"):
-            validate_all_sample_telemetry(
-                label,
-                sample_telemetry[label],
-                cases[label]["expected"],
-                int(cases[label]["lane_output_rows"]),
+        pair_saved_us: list[float] = []
+        for iteration in range(args.iters):
+            order = (
+                (PIPELINE_MODE_PARALLEL, PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED)
+                if iteration % 2 == 0
+                else (PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED, PIPELINE_MODE_PARALLEL)
             )
-        if telemetry["early"]["doorbell_before_scan_done"] != 1:
+            pair: dict[int, float] = {}
+            for mode in order:
+                elapsed_us, telemetry = run_one(mode, retain_telemetry=True)
+                if telemetry is None:
+                    raise AssertionError("timed replay lost its telemetry")
+                timings[mode].append(elapsed_us)
+                samples[mode].append(telemetry)
+                pair[mode] = elapsed_us
+            pair_saved_us.append(
+                pair[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED]
+                - pair[PIPELINE_MODE_PARALLEL]
+            )
+
+        parallel, serial = validate_cross_mode(
+            samples[PIPELINE_MODE_PARALLEL],
+            samples[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED],
+        )
+        parallel_candidate_signature = candidate_signature(
+            "parallel-final",
+            last_outputs[PIPELINE_MODE_PARALLEL][1],
+            last_outputs[PIPELINE_MODE_PARALLEL][2],
+            expected,
+        )
+        serial_candidate_signature = candidate_signature(
+            "serial-final",
+            last_outputs[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED][1],
+            last_outputs[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED][2],
+            expected,
+        )
+        if parallel_candidate_signature != serial_candidate_signature:
             raise AssertionError(
-                "early fixture did not create a pre-scan-completion Get window"
+                "strict modes produced different selected candidate signatures"
             )
+        if parallel.first_doorbell >= parallel.producer_scan_done:
+            raise AssertionError("parallel mode did not form a pre-scan Get window")
+        if serial.first_doorbell < serial.serial_gate_open:
+            raise AssertionError("serial mode opened doorbell before strict gate")
 
-        report_perf("p1_exact_scan_speculative_get_early", samples_us["early"], args.warmup)
-        report_perf("p1_exact_scan_speculative_get_late", samples_us["late"], args.warmup)
-        for label in ("early", "late"):
-            info = telemetry[label]
+        report_perf(
+            "p1_exact_scan_speculative_get_parallel",
+            timings[PIPELINE_MODE_PARALLEL],
+            args.warmup,
+        )
+        report_perf(
+            "p1_exact_scan_speculative_get_serial_wait_all_closed",
+            timings[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED],
+            args.warmup,
+        )
+        for label, telemetry in (("parallel", parallel), ("serial", serial)):
             print(
-                "P1_TASK_LANE_OVERLAP_TELEMETRY "
-                f"placement={label} requested={info['requested']} "
-                f"batches={info['batches']} "
-                f"per_lane_requested={info['per_lane_requested']} "
-                f"per_lane_batches={info['per_lane_batches']} "
-                f"first_doorbell_cycle={info['first_doorbell_cycle']} "
-                f"scan_done_cycle={info['scan_done_cycle']} "
-                f"completion_done_cycle={info['completion_done_cycle']} "
-                f"tail_after_doorbell_cycles={info['tail_after_doorbell_cycles']} "
-                f"doorbell_before_scan_done={info['doorbell_before_scan_done']}"
+                "P1_STRICT_SAME_INPUT_TELEMETRY "
+                f"mode={label} requested={telemetry.requested} batches={telemetry.batches} "
+                f"consumed_chunks={telemetry.consumed_chunks} errors={telemetry.errors} "
+                f"first_consumed_chunk_cycle={telemetry.first_consumed_chunk} "
+                f"first_doorbell_cycle={telemetry.first_doorbell} "
+                f"producer_scan_done_cycle={telemetry.producer_scan_done} "
+                f"producer_closed_cycle={telemetry.producer_closed} "
+                f"serial_gate_open_cycle={telemetry.serial_gate_open} "
+                f"serial_gate_polls={telemetry.serial_gate_polls} "
+                f"completion_done_cycle={telemetry.completion} "
+                f"descriptor_sum={telemetry.descriptor_sum} "
+                f"descriptor_xor={telemetry.descriptor_xor}"
             )
 
-        early_mean = statistics.mean(samples_us["early"])
-        late_mean = statistics.mean(samples_us["late"])
-        paired_mean = statistics.mean(paired_saved_us)
-        paired_reduction_pct = paired_mean * 100.0 / late_mean if late_mean else 0.0
-        direction = "positive" if paired_mean > 0.0 else "non_positive"
-        baseline_qualified = int(
-            telemetry["late"]["doorbell_before_scan_done"] == 0
+        parallel_mean = statistics.mean(timings[PIPELINE_MODE_PARALLEL])
+        serial_mean = statistics.mean(timings[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED])
+        saved_mean = statistics.mean(pair_saved_us)
+        saved_pct = saved_mean * 100.0 / serial_mean if serial_mean else 0.0
+        same_work = int(
+            parallel.requested == serial.requested
+            and parallel.batches == serial.batches
+            and parallel.consumed_chunks == serial.consumed_chunks
+            and (parallel.descriptor_sum, parallel.descriptor_xor)
+            == (serial.descriptor_sum, serial.descriptor_xor)
+            and parallel_candidate_signature == serial_candidate_signature
         )
-        batch_shape_equal = int(
-            telemetry["early"]["per_lane_requested"]
-            == telemetry["late"]["per_lane_requested"]
-            and telemetry["early"]["per_lane_batches"]
-            == telemetry["late"]["per_lane_batches"]
-        )
-        pure_overlap_qualified = int(baseline_qualified and batch_shape_equal)
         print(
-            "P1_TASK_LANE_OVERLAP_RESULT "
-            f"pairs={len(paired_saved_us)} "
-            f"early_mean_us={early_mean:.3f} "
-            f"late_mean_us={late_mean:.3f} "
-            f"observed_early_vs_delayed_mean_us={paired_mean:.3f} "
-            f"observed_early_vs_delayed_p50_us={percentile(paired_saved_us, 0.50):.3f} "
-            f"observed_early_vs_delayed_p90_us={percentile(paired_saved_us, 0.90):.3f} "
-            f"observed_early_vs_delayed_mean_pct={paired_reduction_pct:.2f} "
-            f"benefit_direction={direction} "
-            f"late_baseline_qualified={baseline_qualified} "
-            f"batch_shape_equal={batch_shape_equal} "
-            f"pure_overlap_qualified={pure_overlap_qualified} "
-            "reference=late_delayed_not_strict_serial"
+            "P1_STRICT_SAME_INPUT_RESULT "
+            f"pairs={len(pair_saved_us)} parallel_mean_us={parallel_mean:.3f} "
+            f"serial_mean_us={serial_mean:.3f} "
+            f"serial_minus_parallel_mean_us={saved_mean:.3f} "
+            f"serial_minus_parallel_p50_us={percentile(pair_saved_us, 0.50):.3f} "
+            f"serial_minus_parallel_p90_us={percentile(pair_saved_us, 0.90):.3f} "
+            f"parallel_reduction_vs_serial_pct={saved_pct:.2f} "
+            f"same_descriptor_work={same_work} "
+            f"candidate_sum={parallel_candidate_signature[0]} "
+            f"candidate_xor={parallel_candidate_signature[1]} "
+            "physical_id_affinity_claim=0 "
+            "result_meaning=execution_scoped_role_partition_control_cq_path_only"
         )
-        print("P1_TASK_LANE_OVERLAP_PASS")
+        print("P1_STRICT_SAME_INPUT_PASS")
     finally:
-        # The event for every replay has already synchronized.  Keep the
-        # explicit terminal boundary before invalidating the cold control ABI.
         if control_bound:
             torch.npu.synchronize()
             runtime.release_fused_batch_get_control()

@@ -39,11 +39,13 @@ RING_SLOT_RECORD_WORD = 2 * CACHE_LINE_WORDS
 RING_WORDS_PER_SLOT = RING_SLOT_RECORD_WORD + RECORDS_PER_RING_SLOT * 3
 PIPELINE_WORDS_PER_RING = RING_SLOTS * RING_WORDS_PER_SLOT + CACHE_LINE_WORDS
 PIPELINE_RING_COUNT = PRODUCER_COUNT * GET_LANE_COUNT
-# ``source = producer + step * 62`` preserves the two-lane route when step is
-# shifted by 128: 128 * 62 is an integer multiple of the source lane's 256
-# token period.  The performance fixture uses this to move the same candidate
-# pattern late without changing its lane or candidate-kind order.
-CANDIDATE_PLACEMENT_PERIOD_STEPS = 128
+
+# The two values are device-side scalar inputs to the same P1 operator.  They
+# change only when a Get lane may start consuming SPSC rings; ExactScan never
+# branches on them.  Keeping the mode as graph-stable data avoids a separate
+# operator, stream, or host submission in the strict benchmark.
+PIPELINE_MODE_PARALLEL = 0
+PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED = 1
 
 CANDIDATE_HBM_HIT = 0
 CANDIDATE_DDR_ENQUEUED = 1
@@ -132,10 +134,7 @@ def create_runtime(args: argparse.Namespace, device_id: int) -> object:
     return runtime
 
 
-def build_exact_scan_inputs(
-    args: argparse.Namespace,
-    candidate_placement: str = "early",
-) -> tuple[
+def build_exact_scan_inputs(args: argparse.Namespace) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -145,20 +144,13 @@ def build_exact_scan_inputs(
     int,
     int,
 ]:
-    """Build one full miss chunk per producer/lane at a chosen scan position.
+    """Build one deterministic, lane-balanced P1 input fixture.
 
-    ``early`` publishes each lane's 32-miss chunk near the beginning of its
-    producer scan.  ``late`` retains the identical score count, hit/miss
-    count, descriptors, and lane-private output layout, but moves the same
-    32 misses followed by two hits to the end of each producer scan.  The
-    latter is used only by the performance benchmark as a delayed reference
-    for the same unified 2-Get/62-ExactScan launch; it is not strict serial.
+    The strict parallel-versus-serial benchmark uses this *same* set of NPU
+    tensors for both modes.  It intentionally does not move candidates late:
+    the execution-mode scalar, rather than a changed input placement, creates
+    the serial reference.
     """
-    if candidate_placement not in ("early", "late"):
-        raise ValueError(
-            "candidate_placement must be 'early' or 'late', got "
-            f"{candidate_placement!r}"
-        )
 
     score_count = PRODUCER_COUNT * args.scan_per_producer
     scores = torch.zeros(score_count, dtype=torch.float32)
@@ -200,24 +192,6 @@ def build_exact_scan_inputs(
                 "scan is too short to place the requested candidates in both "
                 f"lanes for producer={producer}: counts={lane_scan_counts}"
             )
-        if candidate_placement == "late":
-            # Preserve the exact global candidate-kind stream by shifting the
-            # early pattern by a whole source-lane period.  The remaining tail
-            # is fewer than 128 low-score steps, so Get becomes ready only at
-            # the end of the producer scan without changing candidate order.
-            max_selected_step = max(selected_by_step)
-            shift = (
-                (args.scan_per_producer - 1 - max_selected_step)
-                // CANDIDATE_PLACEMENT_PERIOD_STEPS
-            ) * CANDIDATE_PLACEMENT_PERIOD_STEPS
-            if shift == 0:
-                raise AssertionError(
-                    "scan is too short to construct a delayed candidate "
-                    f"placement for producer={producer}"
-                )
-            selected_by_step = {
-                step + shift: kind for step, kind in selected_by_step.items()
-            }
         misses = [0, 0]
         hits = [0, 0]
         for step in range(args.scan_per_producer):
@@ -388,6 +362,10 @@ def validate_result(
 
     torch.testing.assert_close(get[:, 2], torch.zeros(GET_LANE_COUNT, dtype=torch.int64))
     torch.testing.assert_close(get[:, 0].sum(), torch.tensor(expected_misses, dtype=torch.int64))
+    torch.testing.assert_close(
+        get[:, 8], torch.full((GET_LANE_COUNT,), PIPELINE_MODE_PARALLEL, dtype=torch.int64)
+    )
+    torch.testing.assert_close(get[:, 9], torch.zeros(GET_LANE_COUNT, dtype=torch.int64))
     if not bool(torch.all(get[:, 1] > 0)):
         raise AssertionError("one of the two Get lanes never issued a full Get")
     if not bool(torch.all(get[:, 3] > 0)) or not bool(torch.all(get[:, 4] > 0)):
@@ -610,6 +588,9 @@ def main() -> None:
             fused_get_control,
             torch.tensor([args.frame_epoch], dtype=torch.int64, device=device),
             pipeline_state,
+            torch.tensor(
+                [PIPELINE_MODE_PARALLEL], dtype=torch.int64, device=device
+            ),
         )
         torch.npu.synchronize()
         validate_result(
