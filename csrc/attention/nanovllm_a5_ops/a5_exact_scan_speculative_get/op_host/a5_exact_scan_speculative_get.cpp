@@ -312,14 +312,7 @@ public:
             .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
         this->AICore()
             .SetTiling(optiling::TilingA5ExactScanSpeculativeGet)
-            // `ascend950` is the shared compiler compute unit, but CANN's
-            // runtime capability check receives the concrete A5 product
-            // name.  Register both forms, as the validated LI custom op
-            // does, so a 950DT_9582 process can resolve this OPP package.
-            .AddConfig("ascend950", config)
-            .AddConfig("ascend950dt", config)
-            .AddConfig("ascend950dt_9582", config)
-            .AddConfig("ascend950pr", config);
+            .AddConfig("ascend950", config);
     }
 };
 OP_ADD(A5ExactScanSpeculativeGet);
