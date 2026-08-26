@@ -14,12 +14,18 @@ It therefore measures the causal effect of allowing the existing blocking Get
 to consume ready chunks while ExactScan is still running.  The prototype's
 payload is a known all-zero failure, so the script validates control/CQ work
 only and intentionally makes no H2D-bandwidth or end-to-end claim.
+
+The primary latency is deliberately measured from host submission through a
+device-wide terminal fence.  A raw ACLNN custom-op launch can fall outside the
+coverage of a ``torch.npu.Event`` even when the event itself synchronizes, so
+event time is printed only as a coverage diagnostic.
 """
 
 from __future__ import annotations
 
 import argparse
 import statistics
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,6 +94,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-epoch", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--event-diagnostic",
+        action="store_true",
+        help=(
+            "also emit a fenced torch.npu.Event value for diagnosis; it is "
+            "never used as a P1 performance result"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -190,6 +204,25 @@ class Telemetry:
     producer_closed: int
     descriptor_sum: int
     descriptor_xor: int
+
+
+@dataclass(frozen=True)
+class Timing:
+    """One replay measured at the host/terminal and stream-event boundaries.
+
+    ``terminal_us`` is the primary P1 comparison metric.  It starts immediately
+    before P1 is submitted and ends only after a device-wide NPU fence.  That
+    deliberately includes host submission, ACLNN launch, and all device work
+    caused by this P1 invocation.  It is the only safe metric while the bridge
+    may submit work outside the timing event's visible stream.
+
+    The remaining fields are diagnostics.  In particular, ``event_us`` must
+    never be used to claim overlap until it agrees with the terminal fence.
+    """
+
+    submit_us: float
+    terminal_us: float
+    event_us: float | None
 
 
 def validate_sample(
@@ -430,20 +463,41 @@ def main() -> None:
         }
         last_outputs: dict[int, tuple[torch.Tensor, ...]] = {}
 
-        def run_one(mode: int, retain_telemetry: bool) -> tuple[float, Telemetry | None]:
+        def run_one(
+            mode: int, retain_telemetry: bool
+        ) -> tuple[Timing, Telemetry | None]:
             nonlocal next_epoch
+            # A P1 launch may issue work through an ACLNN path whose full
+            # stream visibility is not equivalent to a Python Event.  Fence
+            # before reusing the fixed-address input/output state so one
+            # replay cannot write over an earlier replay's ring or output.
+            # This fence is intentionally outside both compared intervals.
+            torch.npu.synchronize()
             next_epoch += 1
-            # These two writes happen before the start event on the same NPU
-            # stream and are deliberately excluded from the measured operator
-            # interval.  Their addresses remain graph stable across replays.
+            # These writes establish equal cold-bound state for both modes and
+            # are deliberately excluded from the measured operator interval.
+            # Their addresses remain graph stable across replays.
             frame_epoch.fill_(next_epoch)
             execution_mode.fill_(mode)
             # Equalize the cold-bound destination state without adding this
             # memset to either timing.  Payload content is not validated.
             packed_output.zero_()
-            start = torch.npu.Event(enable_timing=True)
-            end = torch.npu.Event(enable_timing=True)
-            start.record()
+            torch.npu.synchronize()
+
+            # A terminal fence is the primary metric because it includes a
+            # potentially host-synchronous ACLNN launch and catches work the
+            # Event did not order with.  Do not insert Event tasks in a normal
+            # performance replay: this bridge deliberately bypasses torch_npu
+            # task-queue submission, so Event is opt-in diagnosis only.
+            start = (
+                torch.npu.Event(enable_timing=True) if args.event_diagnostic else None
+            )
+            end = (
+                torch.npu.Event(enable_timing=True) if args.event_diagnostic else None
+            )
+            if start is not None:
+                start.record()
+            host_start_ns = time.perf_counter_ns()
             outputs = torch.ops.a5_exact_scan_get.exact_scan_speculative_get(
                 scores,
                 threshold,
@@ -459,9 +513,22 @@ def main() -> None:
                 pipeline_state,
                 execution_mode,
             )
-            end.record()
-            end.synchronize()
-            elapsed_us = start.elapsed_time(end) * 1000.0
+            host_submit_done_ns = time.perf_counter_ns()
+            if end is not None:
+                end.record()
+            # The device-wide fence is the authoritative completion boundary.
+            # It must stay outside the optional Event diagnostic path.
+            torch.npu.synchronize()
+            host_terminal_ns = time.perf_counter_ns()
+            event_us: float | None = None
+            if start is not None and end is not None:
+                end.synchronize()
+                event_us = start.elapsed_time(end) * 1000.0
+            timing = Timing(
+                submit_us=(host_submit_done_ns - host_start_ns) / 1000.0,
+                terminal_us=(host_terminal_ns - host_start_ns) / 1000.0,
+                event_us=event_us,
+            )
             if retain_telemetry:
                 # Retain only the final candidate arrays per mode.  Copying
                 # their ~20 MiB result after every replay would not enter an
@@ -479,8 +546,8 @@ def main() -> None:
                     lane_output_rows,
                     mode,
                 )
-                return elapsed_us, telemetry
-            return elapsed_us, None
+                return timing, telemetry
+            return timing, None
 
         # Alternate mode order.  The two persistent Direct-HCCP queues cannot
         # systematically favor the mode that always follows a warm replay.
@@ -493,7 +560,7 @@ def main() -> None:
             for mode in order:
                 run_one(mode, retain_telemetry=False)
 
-        timings: dict[int, list[float]] = {
+        timings: dict[int, list[Timing]] = {
             PIPELINE_MODE_PARALLEL: [],
             PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED: [],
         }
@@ -504,17 +571,17 @@ def main() -> None:
                 if iteration % 2 == 0
                 else (PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED, PIPELINE_MODE_PARALLEL)
             )
-            pair: dict[int, float] = {}
+            pair: dict[int, Timing] = {}
             for mode in order:
-                elapsed_us, telemetry = run_one(mode, retain_telemetry=True)
+                timing, telemetry = run_one(mode, retain_telemetry=True)
                 if telemetry is None:
                     raise AssertionError("timed replay lost its telemetry")
-                timings[mode].append(elapsed_us)
+                timings[mode].append(timing)
                 samples[mode].append(telemetry)
-                pair[mode] = elapsed_us
+                pair[mode] = timing
             pair_saved_us.append(
-                pair[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED]
-                - pair[PIPELINE_MODE_PARALLEL]
+                pair[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED].terminal_us
+                - pair[PIPELINE_MODE_PARALLEL].terminal_us
             )
 
         parallel, serial = validate_cross_mode(
@@ -542,16 +609,64 @@ def main() -> None:
         if serial.first_doorbell < serial.serial_gate_open:
             raise AssertionError("serial mode opened doorbell before strict gate")
 
+        parallel_timings = timings[PIPELINE_MODE_PARALLEL]
+        serial_timings = timings[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED]
+        print(
+            "P1_TIMING_CONTRACT "
+            "primary_metric=host_monotonic_submit_to_device_idle "
+            "terminal_fence=torch.npu.synchronize "
+            f"event_diagnostic={int(args.event_diagnostic)} "
+            "event_valid_for_result=0 "
+            "pre_replay_fence=enabled cold_state_excluded=1",
+            flush=True,
+        )
         report_perf(
-            "p1_exact_scan_speculative_get_parallel",
-            timings[PIPELINE_MODE_PARALLEL],
+            "p1_exact_scan_speculative_get_parallel_terminal",
+            [sample.terminal_us for sample in parallel_timings],
             args.warmup,
         )
         report_perf(
-            "p1_exact_scan_speculative_get_serial_wait_all_closed",
-            timings[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED],
+            "p1_exact_scan_speculative_get_serial_wait_all_closed_terminal",
+            [sample.terminal_us for sample in serial_timings],
             args.warmup,
         )
+        report_perf(
+            "p1_exact_scan_speculative_get_parallel_submit",
+            [sample.submit_us for sample in parallel_timings],
+            args.warmup,
+        )
+        report_perf(
+            "p1_exact_scan_speculative_get_serial_wait_all_closed_submit",
+            [sample.submit_us for sample in serial_timings],
+            args.warmup,
+        )
+        for label, samples_for_mode in (
+            ("parallel", parallel_timings),
+            ("serial", serial_timings),
+        ):
+            event_samples = [
+                sample.event_us
+                for sample in samples_for_mode
+                if sample.event_us is not None
+            ]
+            event_fields = "event_enabled=0"
+            if event_samples:
+                event_mean = statistics.mean(event_samples)
+                terminal_mean = statistics.mean(
+                    sample.terminal_us for sample in samples_for_mode
+                )
+                event_fields = (
+                    "event_enabled=1 "
+                    f"event_mean_us={event_mean:.3f} "
+                    f"terminal_minus_event_mean_us={terminal_mean - event_mean:.3f}"
+                )
+            print(
+                "P1_TIMING_DIAGNOSTIC "
+                f"mode={label} {event_fields} "
+                f"post_submit_to_terminal_mean_us="
+                f"{statistics.mean(sample.terminal_us - sample.submit_us for sample in samples_for_mode):.3f}",
+                flush=True,
+            )
         for label, telemetry in (("parallel", parallel), ("serial", serial)):
             print(
                 "P1_STRICT_SAME_INPUT_TELEMETRY "
@@ -568,8 +683,12 @@ def main() -> None:
                 f"descriptor_xor={telemetry.descriptor_xor}"
             )
 
-        parallel_mean = statistics.mean(timings[PIPELINE_MODE_PARALLEL])
-        serial_mean = statistics.mean(timings[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED])
+        parallel_mean = statistics.mean(
+            sample.terminal_us for sample in parallel_timings
+        )
+        serial_mean = statistics.mean(
+            sample.terminal_us for sample in serial_timings
+        )
         saved_mean = statistics.mean(pair_saved_us)
         saved_pct = saved_mean * 100.0 / serial_mean if serial_mean else 0.0
         same_work = int(
@@ -582,11 +701,12 @@ def main() -> None:
         )
         print(
             "P1_STRICT_SAME_INPUT_RESULT "
-            f"pairs={len(pair_saved_us)} parallel_mean_us={parallel_mean:.3f} "
-            f"serial_mean_us={serial_mean:.3f} "
-            f"serial_minus_parallel_mean_us={saved_mean:.3f} "
-            f"serial_minus_parallel_p50_us={percentile(pair_saved_us, 0.50):.3f} "
-            f"serial_minus_parallel_p90_us={percentile(pair_saved_us, 0.90):.3f} "
+            "measurement=terminal_submit_to_device_idle "
+            f"pairs={len(pair_saved_us)} parallel_terminal_mean_us={parallel_mean:.3f} "
+            f"serial_terminal_mean_us={serial_mean:.3f} "
+            f"serial_minus_parallel_terminal_mean_us={saved_mean:.3f} "
+            f"serial_minus_parallel_terminal_p50_us={percentile(pair_saved_us, 0.50):.3f} "
+            f"serial_minus_parallel_terminal_p90_us={percentile(pair_saved_us, 0.90):.3f} "
             f"parallel_reduction_vs_serial_pct={saved_pct:.2f} "
             f"same_descriptor_work={same_work} "
             f"candidate_sum={parallel_candidate_signature[0]} "
