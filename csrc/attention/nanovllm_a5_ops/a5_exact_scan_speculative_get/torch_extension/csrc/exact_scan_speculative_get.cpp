@@ -1,6 +1,10 @@
 // Standalone P1 bridge.  It deliberately lives outside vllm_ascend_C so the
 // real device data path can be iterated without an editable vLLM rebuild.
 
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
+#include <string>
 #include <tuple>
 
 #include <torch/extension.h>
@@ -26,6 +30,88 @@ constexpr int64_t kProducerStatColumns = 8;
 constexpr int64_t kGetStatColumns = 16;
 constexpr int64_t kControlWords = 16;
 constexpr int64_t kPackedEntryBytes = 656;
+
+bool P1OpApiDebugEnabled()
+{
+    const char* value = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
+    return value != nullptr && value[0] != '\0' &&
+           !(value[0] == '0' && value[1] == '\0');
+}
+
+std::string TensorVectorString(c10::IntArrayRef values)
+{
+    std::ostringstream stream;
+    stream << '[';
+    for (int64_t index = 0; index < values.size(); ++index) {
+        if (index != 0) {
+            stream << ',';
+        }
+        stream << values[index];
+    }
+    stream << ']';
+    return stream.str();
+}
+
+void LogP1AclnnTensor(const char* role, const at::Tensor& tensor)
+{
+    if (!P1OpApiDebugEnabled()) {
+        return;
+    }
+    const std::string shape = TensorVectorString(tensor.sizes());
+    const std::string stride = TensorVectorString(tensor.strides());
+    const std::string dtype = c10::toString(tensor.scalar_type());
+    const std::string device = tensor.device().str();
+    std::fprintf(
+        stderr,
+        "P1_ACLNN_TENSOR role=%s dtype=%s device=%s shape=%s stride=%s "
+        "contiguous=%d nbytes=%zu data=%p\n",
+        role, dtype.c_str(), device.c_str(), shape.c_str(), stride.c_str(),
+        tensor.is_contiguous() ? 1 : 0, tensor.nbytes(), tensor.data_ptr());
+}
+
+void LogP1AclnnCall(
+    const at::Tensor& liScores, const at::Tensor& threshold,
+    const at::Tensor& resident, const at::Tensor& tableIndices,
+    const at::Tensor& offsets, const at::Tensor& outputIndices,
+    const at::Tensor& addressTable, const at::Tensor& validTable,
+    const at::Tensor& packedOutput, const at::Tensor& fusedGetControl,
+    const at::Tensor& frameEpoch, const at::Tensor& pipelineState,
+    const at::Tensor& executionMode, const at::Tensor& candidateIndices,
+    const at::Tensor& candidateKind, const at::Tensor& producerStats,
+    const at::Tensor& getStats, const at::Tensor& roleTrace,
+    const at::Tensor& getIndices, const at::Tensor& getOffsets,
+    const at::Tensor& getOutputIndices, const at::Tensor& getMask)
+{
+    if (!P1OpApiDebugEnabled()) {
+        return;
+    }
+    std::fprintf(stderr, "P1_ACLNN_CALL input_count=13 output_count=11\n");
+    LogP1AclnnTensor("in0.li_scores", liScores);
+    LogP1AclnnTensor("in1.threshold", threshold);
+    LogP1AclnnTensor("in2.resident", resident);
+    LogP1AclnnTensor("in3.table_indices", tableIndices);
+    LogP1AclnnTensor("in4.offsets", offsets);
+    LogP1AclnnTensor("in5.output_indices", outputIndices);
+    LogP1AclnnTensor("in6.address_table", addressTable);
+    LogP1AclnnTensor("in7.valid_table", validTable);
+    LogP1AclnnTensor("in8.packed_output", packedOutput);
+    LogP1AclnnTensor("in9.fused_get_control", fusedGetControl);
+    LogP1AclnnTensor("in10.frame_epoch", frameEpoch);
+    LogP1AclnnTensor("in11.pipeline_state", pipelineState);
+    LogP1AclnnTensor("in12.execution_mode", executionMode);
+    LogP1AclnnTensor("out0.packed_output_out", packedOutput);
+    LogP1AclnnTensor("out1.candidate_indices", candidateIndices);
+    LogP1AclnnTensor("out2.candidate_kind", candidateKind);
+    LogP1AclnnTensor("out3.producer_stats", producerStats);
+    LogP1AclnnTensor("out4.get_stats", getStats);
+    LogP1AclnnTensor("out5.role_trace", roleTrace);
+    LogP1AclnnTensor("out6.get_indices", getIndices);
+    LogP1AclnnTensor("out7.get_offsets", getOffsets);
+    LogP1AclnnTensor("out8.get_output_indices", getOutputIndices);
+    LogP1AclnnTensor("out9.get_mask", getMask);
+    LogP1AclnnTensor("out10.pipeline_state_out", pipelineState);
+    std::fflush(stderr);
+}
 
 void CheckVector(const at::Tensor& tensor, int64_t expected, const char* name)
 {
@@ -126,6 +212,17 @@ Result ExactScanSpeculativeGetNpu(
     auto getOutputIndices =
         at::empty({kGetLaneCount, kGetWaveRecords}, int32Options);
     auto getMask = at::empty({kGetLaneCount, kGetWaveRecords}, uint8Options);
+
+    // One opt-in, bounded diagnostic bundle for failures raised inside the
+    // generated GetWorkspaceSize call.  It includes all 13 inputs and 11
+    // outputs, so the remote log can be compared mechanically with ops.json
+    // and the host registration without requesting another ad-hoc print.
+    LogP1AclnnCall(
+        liScores, threshold, resident, tableIndices, offsets, outputIndices,
+        addressTable, validTable, packedOutput, fusedGetControl, frameEpoch,
+        pipelineState, executionMode, candidateIndices, candidateKind,
+        producerStats, getStats, roleTrace, getIndices, getOffsets,
+        getOutputIndices, getMask);
 
     auto keepalive = std::make_tuple(
         liScores, threshold, resident, tableIndices, offsets, outputIndices,

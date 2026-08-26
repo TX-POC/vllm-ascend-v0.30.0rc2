@@ -9,6 +9,7 @@
 // the repository-local libcust_opapi.so.
 
 #include <cstdlib>
+#include <cstdio>
 #include <dlfcn.h>
 #include <initializer_list>
 #include <string>
@@ -226,6 +227,40 @@ inline const char *RecentAclError() {
   return message == nullptr ? "<no ACL error message>" : message;
 }
 
+inline bool OpApiDebugEnabled() {
+  const char *value = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
+  return value != nullptr && value[0] != '\0' &&
+      !(value[0] == '0' && value[1] == '\0');
+}
+
+// An ACLNN custom operator may have the same exported symbol name in several
+// local OPP packages.  When that happens, a stale ABI often fails later with a
+// generic "dtype or format" message.  This one compact line identifies the
+// exact DSO chosen by dlopen/dlsym before the generated API is called.
+inline void LogResolvedOpApi(
+    const char *api, void *workspace_addr, void *launch_addr) {
+  if (!OpApiDebugEnabled()) {
+    return;
+  }
+  Dl_info workspace_info{};
+  Dl_info launch_info{};
+  const int workspace_ok = dladdr(workspace_addr, &workspace_info);
+  const int launch_ok = dladdr(launch_addr, &launch_info);
+  const char *custom = std::getenv("NANOVLLM_CUST_OPAPI_LIB");
+  std::fprintf(
+      stderr,
+      "NANOVLLM_A5_OPAPI_RESOLVE api=%s custom_env=%s workspace_dso=%s "
+      "launch_dso=%s workspace_addr=%p launch_addr=%p\n",
+      api,
+      custom == nullptr || custom[0] == '\0' ? "<unset>" : custom,
+      workspace_ok && workspace_info.dli_fname != nullptr
+          ? workspace_info.dli_fname : "<unknown>",
+      launch_ok && launch_info.dli_fname != nullptr
+          ? launch_info.dli_fname : "<unknown>",
+      workspace_addr, launch_addr);
+  std::fflush(stderr);
+}
+
 }  // namespace nanovllm_a5_opapi
 
 #define EXEC_NPU_CMD_ORDERED(aclnn_api, tensor_keepalive, ...)                \
@@ -240,6 +275,7 @@ inline const char *RecentAclError() {
         " or ",                                                               \
         #aclnn_api "GetWorkspaceSize is missing from repository-local ",      \
         "libcust_opapi.so");                                                 \
+    LogResolvedOpApi(#aclnn_api, workspace_addr_fn, launch_addr_fn);            \
                                                                                \
     auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(           \
         ResolveSymbol("InitHugeMemThreadLocal"));                             \
