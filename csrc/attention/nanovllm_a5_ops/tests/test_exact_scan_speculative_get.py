@@ -13,6 +13,7 @@ DDR path; ``remote`` is available once an A5+K5 pair has matching KVAF builds.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 
 import torch
@@ -27,6 +28,10 @@ GET_LANE_COUNT = 2
 ROWS_PER_ENTRY = 128
 PACKED_ENTRY_BYTES = 656
 ENTRY_BYTES = ROWS_PER_ENTRY * PACKED_ENTRY_BYTES
+DMA_CACHELINE_BYTES = 64
+ROWS_PER_DMA_CACHELINE = DMA_CACHELINE_BYTES // math.gcd(
+    DMA_CACHELINE_BYTES, PACKED_ENTRY_BYTES
+)
 RING_SLOTS = 2
 RECORDS_PER_RING_SLOT = 32
 CACHE_LINE_WORDS = 8
@@ -132,6 +137,7 @@ def build_exact_scan_inputs(
     torch.Tensor,
     list[list[Candidate]],
     int,
+    int,
 ]:
     """Build a sparse score stream with one full chunk per producer/lane.
 
@@ -147,7 +153,18 @@ def build_exact_scan_inputs(
     offsets = torch.zeros(score_count, dtype=torch.int32)
     output_indices = torch.zeros(score_count, dtype=torch.int32)
     expected: list[list[Candidate]] = [[] for _ in range(PRODUCER_COUNT)]
-    next_output_row = 0
+    # A 656-byte transfer advances the next row by 16 bytes within a 64-byte
+    # cache line.  Two independent Direct-HCCP queues must therefore never
+    # scatter into interleaved rows: adjacent rows from different queues would
+    # concurrently own pieces of the same cache line.  Reserve one aligned,
+    # lane-private slab for each Get AIV instead.
+    lane_output_rows = PRODUCER_COUNT * args.misses_per_lane
+    if lane_output_rows % ROWS_PER_DMA_CACHELINE != 0:
+        raise AssertionError(
+            "P1 test requires each Get lane's output slab to start on a "
+            "DMA cache-line boundary"
+        )
+    lane_output_counts = [0, 0]
 
     for producer in range(PRODUCER_COUNT):
         misses = [0, 0]
@@ -157,17 +174,18 @@ def build_exact_scan_inputs(
             lane = (source >> 7) & 1
             is_miss = False
             if misses[lane] < args.misses_per_lane:
+                output_row = lane * lane_output_rows + lane_output_counts[lane]
                 scores[source] = 1.0
                 resident[source] = 0
-                table_indices[source] = next_output_row % args.table_capacity
+                table_indices[source] = output_row % args.table_capacity
                 offsets[source] = (
-                    (next_output_row // args.table_capacity) % ROWS_PER_ENTRY
+                    (output_row // args.table_capacity) % ROWS_PER_ENTRY
                 ) * PACKED_ENTRY_BYTES
-                output_indices[source] = next_output_row
+                output_indices[source] = output_row
                 expected[producer].append(
                     Candidate(source, CANDIDATE_DDR_ENQUEUED)
                 )
-                next_output_row += 1
+                lane_output_counts[lane] += 1
                 is_miss = True
             elif hits[lane] < args.hits_per_lane:
                 scores[source] = 1.0
@@ -187,7 +205,21 @@ def build_exact_scan_inputs(
                 f"unable to construct balanced producer pattern {producer}: "
                 f"misses={misses} hits={hits}"
             )
-    return scores, resident, table_indices, offsets, output_indices, expected, next_output_row
+    if lane_output_counts != [lane_output_rows, lane_output_rows]:
+        raise AssertionError(
+            "lane-private output slabs did not receive the expected number "
+            f"of misses: counts={lane_output_counts} rows={lane_output_rows}"
+        )
+    return (
+        scores,
+        resident,
+        table_indices,
+        offsets,
+        output_indices,
+        expected,
+        sum(lane_output_counts),
+        lane_output_rows,
+    )
 
 
 def build_ddr_payload(
@@ -221,6 +253,8 @@ def validate_result(
     expected: list[list[Candidate]],
     expected_misses: int,
     expected_payload: torch.Tensor,
+    source_payload: torch.Tensor,
+    lane_output_rows: int,
 ) -> None:
     (
         packed_output_out,
@@ -229,10 +263,10 @@ def validate_result(
         producer_stats,
         get_stats,
         role_trace,
-        _get_indices,
-        _get_offsets,
-        _get_output_indices,
-        _get_mask,
+        get_indices,
+        get_offsets,
+        get_output_indices,
+        get_mask,
         pipeline_state_out,
     ) = outputs
     if packed_output_out.data_ptr() != packed_output.data_ptr():
@@ -327,6 +361,67 @@ def validate_result(
 
     payload = packed_output[:expected_misses].cpu()
     if not bool(torch.equal(payload, expected_payload)):
+        mismatch_rows = torch.nonzero(
+            torch.any(payload != expected_payload, dim=1), as_tuple=False
+        ).flatten()
+        source_rows = source_payload.reshape(-1, PACKED_ENTRY_BYTES)
+        samples = []
+        for row_tensor in mismatch_rows[:8]:
+            row = int(row_tensor)
+            actual = payload[row]
+            expected_row = expected_payload[row]
+            bad_bytes = torch.nonzero(
+                actual != expected_row, as_tuple=False
+            ).flatten()
+            # The generated row pattern is deterministic.  Matching it back
+            # to the DDR source distinguishes an incorrect descriptor/WQE
+            # route from a missing or torn HCCP destination write.
+            prefix_matches = torch.nonzero(
+                torch.all(source_rows[:, :32] == actual[:32], dim=1),
+                as_tuple=False,
+            ).flatten()
+            source_matches = [
+                int(source_row)
+                for source_row in prefix_matches[:8]
+                if bool(torch.equal(source_rows[int(source_row)], actual))
+            ]
+            samples.append(
+                {
+                    "row": row,
+                    "owner_lane": row // lane_output_rows,
+                    "row_mod_4": row % ROWS_PER_DMA_CACHELINE,
+                    "first_bad_byte": int(bad_bytes[0]),
+                    "last_bad_byte": int(bad_bytes[-1]),
+                    "actual_first16": actual[:16].tolist(),
+                    "expected_first16": expected_row[:16].tolist(),
+                    "actual_last16": actual[-16:].tolist(),
+                    "expected_last16": expected_row[-16:].tolist(),
+                    "source_rows": source_matches,
+                }
+            )
+        descriptor_heads = []
+        get_indices_cpu = get_indices.cpu()
+        get_offsets_cpu = get_offsets.cpu()
+        get_output_indices_cpu = get_output_indices.cpu()
+        get_mask_cpu = get_mask.cpu()
+        for lane in range(GET_LANE_COUNT):
+            descriptor_heads.append(
+                {
+                    "lane": lane,
+                    "indices": get_indices_cpu[lane, :8].tolist(),
+                    "offsets": get_offsets_cpu[lane, :8].tolist(),
+                    "output_indices": get_output_indices_cpu[lane, :8].tolist(),
+                    "mask": get_mask_cpu[lane, :8].tolist(),
+                }
+            )
+        print(
+            "A5_EXACT_SCAN_SPECULATIVE_GET_PAYLOAD_DIAGNOSTIC "
+            f"mismatch_rows={mismatch_rows.numel()} "
+            f"zero_rows={int(torch.all(payload == 0, dim=1).sum())} "
+            f"get_stats={get.tolist()} "
+            f"samples={samples} "
+            f"descriptor_heads={descriptor_heads}"
+        )
         raise AssertionError("full Direct-HCCP Get payload mismatch")
 
 
@@ -351,6 +446,7 @@ def main() -> None:
         output_indices_cpu,
         expected,
         expected_misses,
+        lane_output_rows,
     ) = build_exact_scan_inputs(args)
     output_rows = expected_misses
     entry_payload_cpu, expected_payload_cpu = build_ddr_payload(
@@ -370,7 +466,9 @@ def main() -> None:
             f"producer_aiv=62 get_aiv=2 chunk_records=32 "
             f"get_task_lanes=0,1 producer_task_lanes=2..63 "
             f"get_bootstrap_records=64 full_get_dma_cq_wait=1 "
-            f"schedule_mode=batch ring_cacheline_isolated=1"
+            f"schedule_mode=batch ring_cacheline_isolated=1 "
+            f"output_layout=lane_private_64B_aligned "
+            f"lane_rows={lane_output_rows}"
         )
         runtime.initialize(ddr_bytes, ENTRY_BYTES)
         source = entry_payload_cpu.to(device)
@@ -475,6 +573,8 @@ def main() -> None:
             expected,
             expected_misses,
             expected_payload_cpu,
+            entry_payload_cpu,
+            lane_output_rows,
         )
         producer_stats = outputs[3].cpu()
         get_stats = outputs[4].cpu()
