@@ -29,7 +29,10 @@ PACKED_ENTRY_BYTES = 656
 ENTRY_BYTES = ROWS_PER_ENTRY * PACKED_ENTRY_BYTES
 RING_SLOTS = 2
 RECORDS_PER_RING_SLOT = 32
-PIPELINE_WORDS_PER_RING = RING_SLOTS * (2 + RECORDS_PER_RING_SLOT * 3) + 1
+CACHE_LINE_WORDS = 8
+RING_SLOT_RECORD_WORD = 2 * CACHE_LINE_WORDS
+RING_WORDS_PER_SLOT = RING_SLOT_RECORD_WORD + RECORDS_PER_RING_SLOT * 3
+PIPELINE_WORDS_PER_RING = RING_SLOTS * RING_WORDS_PER_SLOT + CACHE_LINE_WORDS
 PIPELINE_RING_COUNT = PRODUCER_COUNT * GET_LANE_COUNT
 
 CANDIDATE_HBM_HIT = 0
@@ -244,6 +247,18 @@ def validate_result(
     expected_selected = len(expected[0])
     expected_hits = sum(item.kind == CANDIDATE_HBM_HIT for item in expected[0])
     expected_miss_per_producer = expected_selected - expected_hits
+    selected_bad = torch.nonzero(
+        stats[:, 0] != expected_selected, as_tuple=False
+    ).flatten()
+    if selected_bad.numel() != 0:
+        print(
+            "A5_EXACT_SCAN_SPECULATIVE_GET_DIAGNOSTIC "
+            f"producer_selected_bad_count={selected_bad.numel()} "
+            f"producer_ids={selected_bad.tolist()} "
+            f"selected_values={stats[selected_bad, 0].tolist()} "
+            f"get_errors={get[:, 2].tolist()} "
+            f"role_trace={trace.tolist()}"
+        )
     torch.testing.assert_close(
         stats[:, 0], torch.full((PRODUCER_COUNT,), expected_selected, dtype=torch.int64)
     )
@@ -334,7 +349,8 @@ def main() -> None:
             f"table_capacity={args.table_capacity} output_rows={output_rows} "
             f"producer_aiv=62 get_aiv=2 chunk_records=32 "
             f"get_task_lanes=0,1 producer_task_lanes=2..63 "
-            f"get_bootstrap_records=64 full_get_dma_cq_wait=1"
+            f"get_bootstrap_records=64 full_get_dma_cq_wait=1 "
+            f"schedule_mode=batch ring_cacheline_isolated=1"
         )
         runtime.initialize(ddr_bytes, ENTRY_BYTES)
         source = entry_payload_cpu.to(device)

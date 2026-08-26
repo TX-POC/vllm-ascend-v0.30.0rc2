@@ -31,20 +31,31 @@ constexpr uint32_t kGetLaneCount = 2;
 // disjoint ExactScan producers.  This is a task-lane partition, not an
 // unsupported claim about public physical-core affinity.
 constexpr uint32_t kProducerAivBegin = kGetLaneCount;
+constexpr uint32_t kCacheLineBytes = 64;
+constexpr uint32_t kCacheLineWords = kCacheLineBytes / sizeof(int64_t);
 constexpr uint32_t kRingSlots = 2;
 constexpr uint32_t kRecordsPerRingSlot = 32;
 constexpr uint32_t kRecordWords = 3;
+// A producer and its Get lane exchange these words through DCCI.  Give the
+// ready state, record count, payload, and close epoch separate cache lines.
+// In particular, do not let a DCCI of one producer's partial line clean or
+// invalidate a neighbor producer's state.
+constexpr uint32_t kRingSlotStateWord = 0U;
+constexpr uint32_t kRingSlotCountWord = kCacheLineWords;
+constexpr uint32_t kRingSlotRecordWord = 2U * kCacheLineWords;
 constexpr uint32_t kRingWordsPerSlot =
-    2 + kRecordsPerRingSlot * kRecordWords;
-constexpr uint32_t kRingWords = kRingSlots * kRingWordsPerSlot + 1;
+    kRingSlotRecordWord + kRecordsPerRingSlot * kRecordWords;
 constexpr uint32_t kRingClosedWord = kRingSlots * kRingWordsPerSlot;
+constexpr uint32_t kRingWords = kRingClosedWord + kCacheLineWords;
 constexpr uint32_t kGetBootstrapRecords = 64;
 constexpr uint32_t kGetWaveRecords = 256;
 constexpr uint32_t kProducerStatColumns = 7;
 constexpr uint32_t kGetStatColumns = 8;
 constexpr uint32_t kPackedEntryBytes = 656;
-constexpr uint64_t kCacheLineBytes = 64;
 constexpr uint32_t kConsumerIdlePollLimit = 16U * 1024U * 1024U;
+
+static_assert(kRingWords % kCacheLineWords == 0U,
+              "each SPSC ring must start on a cache-line boundary");
 
 constexpr int32_t kRoleTraceExactScanBase = 1000;
 constexpr int32_t kRoleTraceGetBase = 2000;
@@ -98,18 +109,19 @@ struct RingView {
 
     __aicore__ inline __gm__ int64_t* SlotState(uint32_t slot) const
     {
-        return words + slot * kRingWordsPerSlot;
+        return words + slot * kRingWordsPerSlot + kRingSlotStateWord;
     }
 
     __aicore__ inline __gm__ int64_t* SlotCount(uint32_t slot) const
     {
-        return SlotState(slot) + 1;
+        return words + slot * kRingWordsPerSlot + kRingSlotCountWord;
     }
 
     __aicore__ inline __gm__ int64_t* RecordWord(
         uint32_t slot, uint32_t record, uint32_t word) const
     {
-        return SlotState(slot) + 2 + record * kRecordWords + word;
+        return words + slot * kRingWordsPerSlot + kRingSlotRecordWord +
+               record * kRecordWords + word;
     }
 
     __aicore__ inline __gm__ int64_t* ClosedEpoch() const
@@ -370,8 +382,10 @@ private:
         stats[4] = static_cast<int64_t>(deferred);
         stats[5] = static_cast<int64_t>(firstPublish);
         stats[6] = static_cast<int64_t>(scanDone);
-        FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(stats),
-                     kProducerStatColumns * sizeof(int64_t));
+        // This is terminal output, not a producer/consumer handoff.  A row
+        // contains seven int64 values (56 B), so a DCCI here would touch a
+        // neighboring producer row and can overwrite that producer's store.
+        // Stream completion provides output visibility to the host.
     }
 
     __aicore__ inline bool AllRingsClosed(uint32_t lane, uint64_t epoch) const
@@ -603,8 +617,8 @@ private:
         stats[5] = static_cast<int64_t>(idlePolls);
         stats[6] = static_cast<int64_t>(consumedChunks);
         stats[7] = static_cast<int64_t>(GetSystemCycle());
-        FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(stats),
-                     kGetStatColumns * sizeof(int64_t));
+        // As with producerStats, this is terminal output.  It has no
+        // cross-AIV reader and must not participate in the DCCI handoff path.
     }
 
 private:

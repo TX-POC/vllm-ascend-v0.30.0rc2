@@ -14,8 +14,12 @@ constexpr int64_t kGetLaneCount = 2;
 constexpr int64_t kRingSlots = 2;
 constexpr int64_t kRecordsPerRingSlot = 32;
 constexpr int64_t kRecordWords = 3;
+constexpr int64_t kCacheLineWords = 8;
+constexpr int64_t kRingSlotRecordWord = 2 * kCacheLineWords;
+constexpr int64_t kRingWordsPerSlot =
+    kRingSlotRecordWord + kRecordsPerRingSlot * kRecordWords;
 constexpr int64_t kPipelineWordsPerRing =
-    kRingSlots * (2 + kRecordsPerRingSlot * kRecordWords) + 1;
+    kRingSlots * kRingWordsPerSlot + kCacheLineWords;
 constexpr int64_t kPipelineRingCount = kProducerCount * kGetLaneCount;
 constexpr int64_t kGetWaveRecords = 256;
 constexpr int64_t kProducerStatColumns = 7;

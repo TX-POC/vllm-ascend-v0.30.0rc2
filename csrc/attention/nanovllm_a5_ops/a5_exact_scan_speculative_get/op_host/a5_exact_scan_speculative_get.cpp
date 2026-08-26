@@ -51,13 +51,15 @@ constexpr size_t kPipelineStateOut = 10;
 constexpr uint32_t kAivCount = 64;
 constexpr uint32_t kGetLaneCount = 2;
 constexpr uint32_t kProducerCount = kAivCount - kGetLaneCount;
+constexpr uint32_t kCacheLineWords = 8;
 constexpr uint32_t kRingSlots = 2;
 constexpr uint32_t kRecordsPerRingSlot = 32;
 constexpr uint32_t kRecordWords = 3;
+constexpr uint32_t kRingSlotRecordWord = 2 * kCacheLineWords;
 constexpr uint32_t kRingWordsPerSlot =
-    2 + kRecordsPerRingSlot * kRecordWords;  // state + count + records
+    kRingSlotRecordWord + kRecordsPerRingSlot * kRecordWords;
 constexpr uint32_t kPipelineWordsPerRing =
-    kRingSlots * kRingWordsPerSlot + 1;  // producer closed epoch
+    kRingSlots * kRingWordsPerSlot + kCacheLineWords;
 constexpr uint32_t kGetBootstrapRecords = 64;
 constexpr uint32_t kGetWaveRecords = 256;
 constexpr uint32_t kFusedGetControlWords = 16;
@@ -166,6 +168,13 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     const uint32_t aivOnlyBlockDim =
         platform.CalcTschBlockDim(aivCount, 0U, aivCount);
     if (aivOnlyBlockDim != kAivCount) {
+        return ge::GRAPH_FAILED;
+    }
+    // Task lanes 0/1 are persistent Get consumers while lanes 2..63 publish
+    // their SPSC rings.  Batch mode is the launch contract that starts the
+    // whole cooperative AIV set together; default wave scheduling can run the
+    // consumers first and starve producers they are waiting for.
+    if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
