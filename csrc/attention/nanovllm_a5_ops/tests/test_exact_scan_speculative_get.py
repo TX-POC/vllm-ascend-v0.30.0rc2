@@ -38,6 +38,8 @@ PIPELINE_RING_COUNT = PRODUCER_COUNT * GET_LANE_COUNT
 CANDIDATE_HBM_HIT = 0
 CANDIDATE_DDR_ENQUEUED = 1
 CANDIDATE_DDR_DEFERRED = 2
+FUSED_CONTROL_MAGIC = 0x4B56414646555345
+FUSED_CONTROL_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -387,16 +389,28 @@ def main() -> None:
         address_table = device_table.addresses
         valid_table = device_table.valid
         torch.npu.synchronize()
-        packed_output = torch.zeros(
+        # KVAF owns every byte of this output after the cold bind, and writes
+        # every requested row through Direct-HCCP.  Do not queue a pointless
+        # torch.zeros on the producer stream: a raw ACL control publication is
+        # outside normal PyTorch stream ordering until the bind establishes its
+        # cold boundary.
+        packed_output = torch.empty(
             (output_rows, PACKED_ENTRY_BYTES), dtype=torch.uint8, device=device
         )
+        # Keep this asynchronous zero-fill intentionally.  It is the exact
+        # producer-side write that a cold KVAF bind must order before publishing
+        # its 16-word ABI; otherwise the producer can overwrite the raw ACL
+        # copy after BindFusedBatchGetControl returns.
         fused_get_control = torch.zeros(16, dtype=torch.int64, device=device)
         pipeline_state = torch.zeros(
             (PIPELINE_RING_COUNT, PIPELINE_WORDS_PER_RING),
             dtype=torch.int64,
             device=device,
         )
-        runtime.bind_fused_batch_get_control(packed_output, fused_get_control)
+        bind_stream = torch.npu.current_stream()
+        runtime.bind_fused_batch_get_control(
+            packed_output, fused_get_control, bind_stream
+        )
         control_bound = True
         torch.npu.synchronize()
         control_snapshot = [int(value) for value in fused_get_control.cpu().tolist()]
@@ -411,6 +425,33 @@ def main() -> None:
             f"output_data_ptr={packed_output.data_ptr()} "
             f"output_rows={packed_output.shape[0]}"
         )
+        control_mismatch = []
+        if control_snapshot[0] != FUSED_CONTROL_MAGIC:
+            control_mismatch.append("magic")
+        if control_snapshot[1] != FUSED_CONTROL_VERSION:
+            control_mismatch.append("version")
+        for index, name in (
+            (2, "channel_entity"),
+            (3, "queue_state"),
+            (4, "core_status"),
+        ):
+            if control_snapshot[index] == 0:
+                control_mismatch.append(name)
+        if control_snapshot[5] != packed_output.data_ptr():
+            control_mismatch.append("output")
+        if control_snapshot[6] != output_rows:
+            control_mismatch.append("output_rows")
+        if control_snapshot[7] != GET_LANE_COUNT:
+            control_mismatch.append("block_count")
+        if control_snapshot[8] != 1:
+            control_mismatch.append("jettys_per_core")
+        if control_snapshot[9] != PACKED_ENTRY_BYTES:
+            control_mismatch.append("block_bytes")
+        if control_mismatch:
+            raise RuntimeError(
+                "KVAF fused control was not published before P1 launch: "
+                + ",".join(control_mismatch)
+            )
 
         outputs = torch.ops.a5_exact_scan_get.exact_scan_speculative_get(
             scores_cpu.to(device),
