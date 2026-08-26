@@ -25,6 +25,8 @@ import nanovllm_exact_scan_get  # noqa: F401
 
 PRODUCER_COUNT = 62
 GET_LANE_COUNT = 2
+GET_DESCRIPTOR_BUFFER_COUNT = 2
+GET_WAVE_RECORDS = 256
 ROWS_PER_ENTRY = 128
 PACKED_ENTRY_BYTES = 656
 ENTRY_BYTES = ROWS_PER_ENTRY * PACKED_ENTRY_BYTES
@@ -293,6 +295,22 @@ def validate_result(
         raise AssertionError("CANN packed_output_out did not alias the bound HBM output")
     if pipeline_state_out.data_ptr() != pipeline_state.data_ptr():
         raise AssertionError("CANN pipeline_state_out did not alias graph-stable state")
+    expected_descriptor_shape = (
+        GET_LANE_COUNT,
+        GET_DESCRIPTOR_BUFFER_COUNT,
+        GET_WAVE_RECORDS,
+    )
+    for name, value in (
+        ("get_indices", get_indices),
+        ("get_offsets", get_offsets),
+        ("get_output_indices", get_output_indices),
+        ("get_mask", get_mask),
+    ):
+        if tuple(value.shape) != expected_descriptor_shape:
+            raise AssertionError(
+                f"{name} P2 double-buffer shape={tuple(value.shape)} "
+                f"expected={expected_descriptor_shape}"
+            )
 
     candidate_indices_cpu = candidate_indices.cpu()
     candidate_kind_cpu = candidate_kind.cpu()
@@ -432,10 +450,12 @@ def validate_result(
             descriptor_heads.append(
                 {
                     "lane": lane,
-                    "indices": get_indices_cpu[lane, :8].tolist(),
-                    "offsets": get_offsets_cpu[lane, :8].tolist(),
-                    "output_indices": get_output_indices_cpu[lane, :8].tolist(),
-                    "mask": get_mask_cpu[lane, :8].tolist(),
+                    "buffer0_indices": get_indices_cpu[lane, 0, :8].tolist(),
+                    "buffer0_offsets": get_offsets_cpu[lane, 0, :8].tolist(),
+                    "buffer0_output_indices": get_output_indices_cpu[
+                        lane, 0, :8
+                    ].tolist(),
+                    "buffer0_mask": get_mask_cpu[lane, 0, :8].tolist(),
                 }
             )
         print(
@@ -489,7 +509,8 @@ def main() -> None:
             f"table_capacity={args.table_capacity} output_rows={output_rows} "
             f"producer_aiv=62 get_aiv=2 chunk_records=32 "
             f"get_task_lanes=0,1 producer_task_lanes=2..63 "
-            f"get_bootstrap_records=64 full_get_dma_cq_wait=1 "
+            f"get_bootstrap_records=64 descriptor_buffers={GET_DESCRIPTOR_BUFFER_COUNT} "
+            "parallel_post_only_try_retire=1 serial_blocking_helper=1 "
             f"schedule_mode=batch ring_cacheline_isolated=1 "
             f"output_layout=lane_private_64B_aligned "
             f"lane_rows={lane_output_rows}"

@@ -398,6 +398,7 @@ def _check_c8_attention_inputs(
     block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
+    selected_slot_lengths: torch.Tensor,
 ) -> None:
     if query.ndim != 3 or query.shape[-1] != 576:
         raise ValueError(
@@ -425,6 +426,8 @@ def _check_c8_attention_inputs(
         actual_seq_lengths_query.ndim != 1
         or resident_seq_lengths.ndim != 1
         or resident_seq_lengths.numel() != batch
+        or selected_slot_lengths.ndim != 1
+        or selected_slot_lengths.numel() != batch
         or block_table.ndim != 2
         or block_table.shape[0] != batch
     ):
@@ -433,6 +436,7 @@ def _check_c8_attention_inputs(
         ("block_table", block_table),
         ("actual_seq_lengths_query", actual_seq_lengths_query),
         ("resident_seq_lengths", resident_seq_lengths),
+        ("selected_slot_lengths", selected_slot_lengths),
     ):
         if tensor.dtype != torch.int32:
             raise TypeError(f"C8 QSFA {name} must be int32")
@@ -464,6 +468,7 @@ def _sparse_and_tail_attention_c8(
     block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
+    selected_slot_lengths: torch.Tensor,
     scale_value: float,
 ) -> torch.Tensor:
     # The A5 QSFA TND kernel reads query as a dense row-major tensor. Match
@@ -476,6 +481,7 @@ def _sparse_and_tail_attention_c8(
         block_table,
         actual_seq_lengths_query,
         resident_seq_lengths,
+        selected_slot_lengths,
     )
 
     # Pin resident C8 decode to the repository kernel used by the reference
@@ -490,6 +496,7 @@ def _sparse_and_tail_attention_c8(
         block_table,
         actual_seq_lengths_query,
         resident_seq_lengths,
+        selected_slot_lengths,
     )
     attention_out = result[0] if isinstance(result, tuple) else result
     if not isinstance(attention_out, torch.Tensor):
@@ -511,6 +518,7 @@ def _sparse_and_tail_attention_c8_fake(
     block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
+    selected_slot_lengths: torch.Tensor,
     scale_value: float,
 ) -> torch.Tensor:
     del (
@@ -519,6 +527,7 @@ def _sparse_and_tail_attention_c8_fake(
         block_table,
         actual_seq_lengths_query,
         resident_seq_lengths,
+        selected_slot_lengths,
         scale_value,
     )
     if query.ndim != 3 or query.shape[-1] != 576:

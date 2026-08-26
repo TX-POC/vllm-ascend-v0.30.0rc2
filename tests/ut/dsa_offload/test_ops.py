@@ -144,6 +144,7 @@ def test_c8_metadata_width_covers_sparse_suffix_and_dense_rows() -> None:
         _a5_candidate_lens=_Buffer(2),
         _a5_logical_seq_lengths=_Buffer(2),
         _a5_resident_seq_lengths=_Buffer(2),
+        _a5_c8_selected_slot_lengths=_Buffer(2),
         _a5_c8_attention_widths=np.empty(2, dtype=np.int32),
         _a5_c8_max_tail_tokens=8192,
         _a5_c8_last_range_log=None,
@@ -169,6 +170,7 @@ def test_c8_metadata_width_covers_sparse_suffix_and_dense_rows() -> None:
     assert runtime._a5_logical_seq_lengths.np.tolist() == [5100, 3000]
     assert runtime._a5_resident_seq_lengths.np.tolist() == [4204, 3000]
     assert runtime._a5_c8_attention_widths.tolist() == [2156, 3000]
+    assert runtime._a5_c8_selected_slot_lengths.np.tolist() == [2156, 3000]
     assert runtime._a5_c8_active_attention_width == 3000
 
 
@@ -527,8 +529,10 @@ def test_c8_sfa_no_clone_no_sync(monkeypatch) -> None:
     captured = {}
 
     def fake_sfa_c8(query, packed_kv, attention_slots, block_table,
-                    actual_seq_lengths_query, resident_seq_lengths, scale):
+                    actual_seq_lengths_query, resident_seq_lengths,
+                    selected_slot_lengths, scale):
         captured["packed_kv"] = packed_kv
+        captured["selected_slot_lengths"] = selected_slot_lengths
         return torch.zeros(*query.shape[:-1], 512, dtype=query.dtype)
 
     # `sparse_and_tail_attention_c8` is a custom op registered only when the A5
@@ -545,6 +549,7 @@ def test_c8_sfa_no_clone_no_sync(monkeypatch) -> None:
     block_table = torch.zeros((1, 2), dtype=torch.int32)
     actual_q = torch.zeros((1,), dtype=torch.int32)
     resident_l = torch.zeros((1,), dtype=torch.int32)
+    selected_l = torch.full((1,), _SPARSE_COUNT, dtype=torch.int32)
 
     out = sparse_flash_attention_for_offload_c8(
         query=query,
@@ -553,6 +558,7 @@ def test_c8_sfa_no_clone_no_sync(monkeypatch) -> None:
         block_table=block_table,
         actual_seq_lengths_query=actual_q,
         resident_seq_lengths=resident_l,
+        selected_slot_lengths=selected_l,
         scale_value=1.0,
     )
 
@@ -560,4 +566,5 @@ def test_c8_sfa_no_clone_no_sync(monkeypatch) -> None:
     if orig_sync is not None:
         assert not sync_called, "C8 QSFA 热路不得调用 torch.npu.synchronize()"
     assert captured["packed_kv"] is packed_kv  # 直接使用传入 packed view
+    assert captured["selected_slot_lengths"] is selected_l
     assert out.shape == (1, 4, 512)

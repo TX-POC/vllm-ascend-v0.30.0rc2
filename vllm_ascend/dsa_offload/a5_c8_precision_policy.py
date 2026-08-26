@@ -140,6 +140,7 @@ def sparse_flash_attention_for_offload_c8(
     block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
+    selected_slot_lengths: torch.Tensor,
     scale_value: float,
 ) -> torch.Tensor:
     """Run C8 QSFA against the canonical byte-packed KV storage."""
@@ -157,6 +158,7 @@ def sparse_flash_attention_for_offload_c8(
         block_table,
         actual_seq_lengths_query,
         resident_seq_lengths,
+        selected_slot_lengths,
         float(scale_value),
     )
 

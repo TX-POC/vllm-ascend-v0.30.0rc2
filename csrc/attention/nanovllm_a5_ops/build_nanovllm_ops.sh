@@ -180,6 +180,17 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
         echo "[nanovllm_a5_ops] abi=${KVAF_ABI_HEADER}" >&2
         exit 2
     fi
+    # P2's parallel Get lane relies on the split transaction API.  Rejecting
+    # an older KVAF checkout here is much clearer than compiling the custom
+    # operator against a blocking-only helper and silently losing the intended
+    # descriptor/H2D overlap.
+    if ! grep -q 'BeginKvafDenseBatchGetPostOnly' "${KVAF_FUSED_SOURCE}" || \
+       ! grep -q 'TryRetireKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}" || \
+       ! grep -q 'FinishKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: A5ExactScanSpeculativeGet P2 requires KVAF split PostOnly/TryRetire/Finish helpers." >&2
+        echo "[nanovllm_a5_ops] source=${KVAF_FUSED_SOURCE}" >&2
+        exit 2
+    fi
     cp -f "${KVAF_FUSED_HEADER}" "${OP_DEV}/op_kernel/kvaf_fused_full_get_device.h"
     cp -f "${KVAF_FUSED_SOURCE}" "${OP_DEV}/op_kernel/execute_batch_get_aiv.asc"
     cp -f "${KVAF_ABI_HEADER}" "${OP_DEV}/op_kernel/batch_get_abi.h"

@@ -4,11 +4,13 @@
  * The P1 full-Get path contains no AIC work.  It therefore launches a single
  * 64-lane AIV task:
  *
- *   task lanes 0..1:  the two existing KVAF Direct-HCCP workers
+ *   task lanes 0..1:  the two existing KVAF Direct-HCCP queue owners
  *   task lanes 2..63: ExactScan producers
  *
  * This preserves the task-lane positions used by the verified standalone
- * two-worker Get launch.  It is stronger than the old MIX logical layout but
+ * two-worker Get launch.  In P2 parallel mode each owner may compact the next
+ * exact descriptor wave while its current one is in flight; strict serial
+ * retains the blocking helper.  It is stronger than the old MIX logical layout but
  * is deliberately not described as a public physical-AIV affinity API.
  */
 
@@ -63,6 +65,7 @@ constexpr uint32_t kPipelineWordsPerRing =
     kRingSlots * kRingWordsPerSlot + kCacheLineWords;
 constexpr uint32_t kGetBootstrapRecords = 64;
 constexpr uint32_t kGetWaveRecords = 256;
+constexpr uint32_t kGetDescriptorBufferCount = 2;
 constexpr uint32_t kFusedGetControlWords = 16;
 constexpr uint32_t kPackedEntryBytes = 656;
 // ExactScan emits its normal five counters plus first-chunk, scan-done and
@@ -71,9 +74,8 @@ constexpr uint32_t kPackedEntryBytes = 656;
 constexpr uint32_t kProducerStatColumns = 8;
 // Get telemetry has the original eight lifecycle fields plus the strict
 // serial-gate timestamp, the mode observed by the device, and a commutative
-// descriptor fingerprint.  The latter lets the benchmark prove that the
-// serial and streaming modes issued the same descriptor multiset even though
-// their arrival order may differ.
+// descriptor fingerprint.  Words 14/15 additionally make the P2
+// nonblocking CQ probes and alternate-buffer descriptor work observable.
 constexpr uint32_t kGetStatColumns = 16;
 
 bool IsVectorWithPositiveLength(const gert::Shape& shape)
@@ -259,9 +261,10 @@ static ge::graphStatus InferA5ExactScanSpeculativeGetShape(
     context->GetOutputShape(kRoleTrace)->SetDim(0, kAivCount);
     for (size_t output : {kGetIndices, kGetOffsets, kGetOutputIndices,
                           kGetMask}) {
-        context->GetOutputShape(output)->SetDimNum(2);
+        context->GetOutputShape(output)->SetDimNum(3);
         context->GetOutputShape(output)->SetDim(0, kGetLaneCount);
-        context->GetOutputShape(output)->SetDim(1, kGetWaveRecords);
+        context->GetOutputShape(output)->SetDim(1, kGetDescriptorBufferCount);
+        context->GetOutputShape(output)->SetDim(2, kGetWaveRecords);
     }
     *context->GetOutputShape(kPipelineStateOut) = pipelineState;
     return ge::GRAPH_SUCCESS;

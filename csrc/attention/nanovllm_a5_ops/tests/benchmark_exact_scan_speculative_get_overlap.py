@@ -2,18 +2,21 @@
 """Strict same-input P1 comparison: serial Get versus chunk-pipelined Get.
 
 The P1 operator is one AIV-only, 64-block batch-mode launch.  Logical task
-lanes 0/1 run the two blocking Direct-HCCP full-Get workers, while task lanes
-2..63 run ExactScan.  This script uses one immutable score/resident/descriptor
+lanes 0/1 own the two Direct-HCCP full-Get queues, while task lanes 2..63 run
+ExactScan.  This script uses one immutable score/resident/descriptor
 fixture for both modes and changes only two graph-stable control scalars:
 
 * ``frame_epoch``: monotonically advances the reusable SPSC-ring epoch;
-* ``execution_mode``: ``0`` is streaming, ``1`` delays every Get consumer
-  until all 124 producer rings have terminally closed.
+* ``execution_mode``: ``0`` is P2 streaming (PostOnly/TryRetire with a
+  double-buffered next descriptor wave), ``1`` delays every Get consumer
+  until all 124 producer rings have terminally closed and uses the blocking
+  helper.
 
-It therefore measures the causal effect of allowing the existing blocking Get
-to consume ready chunks while ExactScan is still running.  The prototype's
-payload is a known all-zero failure, so the script validates control/CQ work
-only and intentionally makes no H2D-bandwidth or end-to-end claim.
+It therefore measures the causal effect of allowing an already-posted Get to
+retire asynchronously while its owner compacts the next exact descriptor wave.
+The prototype's payload is a known all-zero failure, so the script validates
+control/CQ work only and intentionally makes no H2D-bandwidth or end-to-end
+claim.
 
 The primary latency is deliberately measured from host submission through a
 device-wide terminal fence.  A raw ACLNN custom-op launch can fall outside the
@@ -33,6 +36,7 @@ import torch
 import torch_npu  # noqa: F401
 
 from test_exact_scan_speculative_get import (
+    CANDIDATE_DDR_ENQUEUED,
     CANDIDATE_HBM_HIT,
     ENTRY_BYTES,
     FUSED_CONTROL_MAGIC,
@@ -67,6 +71,8 @@ GET_STAT_FIRST_CONSUMED_CHUNK = 10
 GET_STAT_SERIAL_GATE_POLLS = 11
 GET_STAT_DESCRIPTOR_SUM = 12
 GET_STAT_DESCRIPTOR_XOR = 13
+GET_STAT_NONBLOCKING_RETIRE_POLLS = 14
+GET_STAT_OVERLAPPED_DESCRIPTOR_RECORDS = 15
 
 PRODUCER_STAT_SELECTED = 0
 PRODUCER_STAT_HIT = 1
@@ -159,18 +165,70 @@ def expected_batch_count(per_lane_requested: int) -> int:
     return 1 + (remaining + 255) // 256
 
 
-def candidate_signature(
+@dataclass(frozen=True)
+class CandidateEquivalence:
+    """Canonical, semantic records emitted by one P1 replay.
+
+    ``candidates`` retains the ExactScan publication order: rank-major, then
+    producer-major.  ``miss_descriptors`` has that same canonical order after
+    dropping HBM hits.  It deliberately does *not* claim that the two HCCP
+    queues issued WQEs in this order: streaming is allowed to consume an
+    already-ready producer before a lower-numbered producer becomes ready.
+    The final output index makes that transport order unobservable to the
+    mathematical result.  What must stay exact is the logical candidate stream
+    and its descriptor mapping, which this structure compares element by
+    element rather than through a commutative hash alone.
+    """
+
+    candidates: tuple[tuple[int, int, int, int], ...]
+    miss_descriptors: tuple[tuple[int, int, int, int, int, int], ...]
+    candidate_hash: int
+    descriptor_hash: int
+
+
+def stable_record_hash(records: tuple[tuple[int, ...], ...]) -> int:
+    """Return a compact, deterministic log fingerprint for exact records.
+
+    The caller first performs an exact tuple comparison.  This hash is only a
+    copy-friendly report field, not the proof of equivalence.
+    """
+
+    value = 0xCBF29CE484222325
+    for record in records:
+        value ^= len(record)
+        value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        for word in record:
+            value ^= word & 0xFFFFFFFFFFFFFFFF
+            value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def canonical_candidate_equivalence(
     label: str,
     candidate_indices: torch.Tensor,
     candidate_kind: torch.Tensor,
     expected: list[list[Any]],
-) -> tuple[int, int]:
-    """Verify exactly the selected candidate entries and return a signature."""
+    table_indices: torch.Tensor,
+    offsets: torch.Tensor,
+    output_indices: torch.Tensor,
+) -> CandidateEquivalence:
+    """Verify and materialize the exact logical candidate/descriptor order.
+
+    The P1 output tensor is rank-major by construction, so ``(rank, producer)``
+    is the stable order visible to ExactTopK/Reconcile.  The HCCP submission
+    order is intentionally not a semantic contract and can differ in streaming
+    mode.  We derive every miss descriptor from the same source index that P1
+    published, making a wrong source-to-(table, offset, output) mapping visible
+    even while the current Direct-HCCP payload is known-bad.
+    """
 
     indices = candidate_indices.cpu()
     kinds = candidate_kind.cpu()
-    signature_sum = 0
-    signature_xor = 0
+    table = table_indices.cpu()
+    offset = offsets.cpu()
+    output = output_indices.cpu()
+    candidates: list[tuple[int, int, int, int]] = []
+    miss_descriptors: list[tuple[int, int, int, int, int, int]] = []
     for producer, entries in enumerate(expected):
         for rank, item in enumerate(entries):
             slot = rank * PRODUCER_COUNT + producer
@@ -182,10 +240,51 @@ def candidate_signature(
                     f"actual=({actual_source},{actual_kind}) "
                     f"expected=({item.source},{item.kind})"
                 )
-            fingerprint = ((actual_source & 0xFFFFFFFF) << 8) ^ actual_kind
-            signature_sum += fingerprint
-            signature_xor ^= fingerprint
-    return signature_sum, signature_xor
+            candidates.append((rank, producer, actual_source, actual_kind))
+            if actual_kind == CANDIDATE_DDR_ENQUEUED:
+                descriptor = (
+                    rank,
+                    producer,
+                    actual_source,
+                    int(table[actual_source]),
+                    int(offset[actual_source]),
+                    int(output[actual_source]),
+                )
+                if descriptor[3] < 0 or descriptor[4] < 0 or descriptor[5] < 0:
+                    raise AssertionError(
+                        f"{label}: invalid miss descriptor at rank={rank} "
+                        f"producer={producer}: {descriptor}"
+                    )
+                miss_descriptors.append(descriptor)
+            elif actual_kind != CANDIDATE_HBM_HIT:
+                raise AssertionError(
+                    f"{label}: unexpected candidate kind={actual_kind} "
+                    f"at rank={rank} producer={producer}"
+                )
+    frozen_candidates = tuple(candidates)
+    frozen_descriptors = tuple(miss_descriptors)
+    expected_candidate_count = sum(len(entries) for entries in expected)
+    expected_miss_count = sum(
+        item.kind == CANDIDATE_DDR_ENQUEUED
+        for entries in expected
+        for item in entries
+    )
+    if len(frozen_candidates) != expected_candidate_count:
+        raise AssertionError(
+            f"{label}: logical candidate count={len(frozen_candidates)} "
+            f"expected={expected_candidate_count}"
+        )
+    if len(frozen_descriptors) != expected_miss_count:
+        raise AssertionError(
+            f"{label}: logical miss descriptor count={len(frozen_descriptors)} "
+            f"expected={expected_miss_count}"
+        )
+    return CandidateEquivalence(
+        candidates=frozen_candidates,
+        miss_descriptors=frozen_descriptors,
+        candidate_hash=stable_record_hash(frozen_candidates),
+        descriptor_hash=stable_record_hash(frozen_descriptors),
+    )
 
 
 @dataclass(frozen=True)
@@ -204,6 +303,8 @@ class Telemetry:
     producer_closed: int
     descriptor_sum: int
     descriptor_xor: int
+    nonblocking_retire_polls: int
+    overlapped_descriptor_records: int
 
 
 @dataclass(frozen=True)
@@ -294,6 +395,10 @@ def validate_sample(
     if mode == PIPELINE_MODE_PARALLEL:
         if not bool(torch.all(get[:, GET_STAT_SERIAL_GATE_OPEN] == 0)):
             raise AssertionError(f"{label}: parallel mode unexpectedly opened serial gate")
+        if not bool(torch.all(get[:, GET_STAT_NONBLOCKING_RETIRE_POLLS] > 0)):
+            raise AssertionError(
+                f"{label}: P2 parallel mode never executed a nonblocking CQ probe"
+            )
     else:
         if not bool(torch.all(get[:, GET_STAT_SERIAL_GATE_OPEN] > 0)):
             raise AssertionError(f"{label}: serial mode did not open both gates")
@@ -317,6 +422,12 @@ def validate_sample(
         producer_closed=int(producer[:, PRODUCER_STAT_CLOSED].max()),
         descriptor_sum=int(get[:, GET_STAT_DESCRIPTOR_SUM].sum()),
         descriptor_xor=int(get[0, GET_STAT_DESCRIPTOR_XOR]) ^ int(get[1, GET_STAT_DESCRIPTOR_XOR]),
+        nonblocking_retire_polls=int(
+            get[:, GET_STAT_NONBLOCKING_RETIRE_POLLS].sum()
+        ),
+        overlapped_descriptor_records=int(
+            get[:, GET_STAT_OVERLAPPED_DESCRIPTOR_RECORDS].sum()
+        ),
     )
 
 
@@ -588,26 +699,57 @@ def main() -> None:
             samples[PIPELINE_MODE_PARALLEL],
             samples[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED],
         )
-        parallel_candidate_signature = candidate_signature(
+        parallel_candidate_equivalence = canonical_candidate_equivalence(
             "parallel-final",
             last_outputs[PIPELINE_MODE_PARALLEL][1],
             last_outputs[PIPELINE_MODE_PARALLEL][2],
             expected,
+            table_indices_cpu,
+            offsets_cpu,
+            output_indices_cpu,
         )
-        serial_candidate_signature = candidate_signature(
+        serial_candidate_equivalence = canonical_candidate_equivalence(
             "serial-final",
             last_outputs[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED][1],
             last_outputs[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED][2],
             expected,
+            table_indices_cpu,
+            offsets_cpu,
+            output_indices_cpu,
         )
-        if parallel_candidate_signature != serial_candidate_signature:
+        if (
+            parallel_candidate_equivalence.candidates
+            != serial_candidate_equivalence.candidates
+        ):
             raise AssertionError(
-                "strict modes produced different selected candidate signatures"
+                "strict modes produced different ordered logical candidates"
+            )
+        if (
+            parallel_candidate_equivalence.miss_descriptors
+            != serial_candidate_equivalence.miss_descriptors
+        ):
+            raise AssertionError(
+                "strict modes produced different ordered logical miss descriptors"
             )
         if parallel.first_doorbell >= parallel.producer_scan_done:
             raise AssertionError("parallel mode did not form a pre-scan Get window")
         if serial.first_doorbell < serial.serial_gate_open:
             raise AssertionError("serial mode opened doorbell before strict gate")
+
+        # This is an observability record, not a performance claim by itself.
+        # A nonzero descriptor count proves that P2's Get owner compacted a
+        # later exact descriptor wave while its previous Direct-HCCP wave was
+        # still live.  A zero count is valid on an unusually fast CQ, but then
+        # the run must not be described as measured descriptor/H2D overlap.
+        print(
+            "P1_P2_ASYNC_OBSERVABILITY "
+            f"parallel_nonblocking_retire_polls={parallel.nonblocking_retire_polls} "
+            f"parallel_overlapped_descriptor_records="
+            f"{parallel.overlapped_descriptor_records} "
+            "payload_integrity=known_failed "
+            "mathematical_scope=logical_candidate_and_descriptor_mapping_only",
+            flush=True,
+        )
 
         parallel_timings = timings[PIPELINE_MODE_PARALLEL]
         serial_timings = timings[PIPELINE_MODE_SERIAL_WAIT_ALL_CLOSED]
@@ -697,7 +839,26 @@ def main() -> None:
             and parallel.consumed_chunks == serial.consumed_chunks
             and (parallel.descriptor_sum, parallel.descriptor_xor)
             == (serial.descriptor_sum, serial.descriptor_xor)
-            and parallel_candidate_signature == serial_candidate_signature
+            and parallel_candidate_equivalence.candidates
+            == serial_candidate_equivalence.candidates
+            and parallel_candidate_equivalence.miss_descriptors
+            == serial_candidate_equivalence.miss_descriptors
+        )
+        print(
+            "P1_STRICT_SAME_INPUT_EQUIVALENCE "
+            "exact_order_scope=final_timed_replay "
+            "logical_candidate_order_exact=1 "
+            "logical_miss_descriptor_order_exact=1 "
+            f"candidate_count={len(parallel_candidate_equivalence.candidates)} "
+            f"miss_descriptor_count="
+            f"{len(parallel_candidate_equivalence.miss_descriptors)} "
+            f"candidate_sequence_fnv64=0x"
+            f"{parallel_candidate_equivalence.candidate_hash:016x} "
+            f"miss_descriptor_sequence_fnv64=0x"
+            f"{parallel_candidate_equivalence.descriptor_hash:016x} "
+            "transport_wqe_issue_order_semantic_contract=0 "
+            "device_consumed_descriptor_multiset=telemetry_sum_xor "
+            "payload_equivalence=known_failed_not_evaluated"
         )
         print(
             "P1_STRICT_SAME_INPUT_RESULT "
@@ -709,8 +870,10 @@ def main() -> None:
             f"serial_minus_parallel_terminal_p90_us={percentile(pair_saved_us, 0.90):.3f} "
             f"parallel_reduction_vs_serial_pct={saved_pct:.2f} "
             f"same_descriptor_work={same_work} "
-            f"candidate_sum={parallel_candidate_signature[0]} "
-            f"candidate_xor={parallel_candidate_signature[1]} "
+            f"candidate_sequence_fnv64=0x"
+            f"{parallel_candidate_equivalence.candidate_hash:016x} "
+            f"miss_descriptor_sequence_fnv64=0x"
+            f"{parallel_candidate_equivalence.descriptor_hash:016x} "
             "physical_id_affinity_claim=0 "
             "result_meaning=execution_scoped_role_partition_control_cq_path_only"
         )

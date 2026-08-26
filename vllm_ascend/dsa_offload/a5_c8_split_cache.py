@@ -452,6 +452,7 @@ def install_a5_c8_split_cache_policy() -> None:
                 "_a5_candidate_lens",
                 "_a5_logical_seq_lengths",
                 "_a5_resident_seq_lengths",
+                "_a5_c8_selected_slot_lengths",
             )
         ):
             raise RuntimeError(
@@ -467,6 +468,7 @@ def install_a5_c8_split_cache_policy() -> None:
             self._a5_candidate_lens,
             self._a5_logical_seq_lengths,
             self._a5_resident_seq_lengths,
+            self._a5_c8_selected_slot_lengths,
         ):
             buffer.np[start:end] = 0
             buffer.gpu[start:end].copy_(

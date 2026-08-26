@@ -26,6 +26,7 @@ constexpr int64_t kPipelineWordsPerRing =
     kRingSlots * kRingWordsPerSlot + kCacheLineWords;
 constexpr int64_t kPipelineRingCount = kProducerCount * kGetLaneCount;
 constexpr int64_t kGetWaveRecords = 256;
+constexpr int64_t kGetDescriptorBufferCount = 2;
 constexpr int64_t kProducerStatColumns = 8;
 constexpr int64_t kGetStatColumns = 16;
 constexpr int64_t kControlWords = 16;
@@ -207,11 +208,21 @@ Result ExactScanSpeculativeGetNpu(
                                    int64Options);
     auto getStats = at::empty({kGetLaneCount, kGetStatColumns}, int64Options);
     auto roleTrace = at::empty({kProducerCount + kGetLaneCount}, int32Options);
-    auto getIndices = at::empty({kGetLaneCount, kGetWaveRecords}, int32Options);
-    auto getOffsets = at::empty({kGetLaneCount, kGetWaveRecords}, int32Options);
+    // P2 retains a posted wave's descriptor storage until its CQ terminal
+    // state and compacts the next exact miss wave into the alternate buffer.
+    auto getIndices = at::empty(
+        {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+        int32Options);
+    auto getOffsets = at::empty(
+        {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+        int32Options);
     auto getOutputIndices =
-        at::empty({kGetLaneCount, kGetWaveRecords}, int32Options);
-    auto getMask = at::empty({kGetLaneCount, kGetWaveRecords}, uint8Options);
+        at::empty(
+            {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+            int32Options);
+    auto getMask = at::empty(
+        {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+        uint8Options);
 
     // One opt-in, bounded diagnostic bundle for failures raised inside the
     // generated GetWorkspaceSize call.  It includes all 13 inputs and 11
@@ -284,10 +295,18 @@ Result ExactScanSpeculativeGetMeta(
         at::empty({kProducerCount, kProducerStatColumns}, int64Options),
         at::empty({kGetLaneCount, kGetStatColumns}, int64Options),
         at::empty({kProducerCount + kGetLaneCount}, int32Options),
-        at::empty({kGetLaneCount, kGetWaveRecords}, int32Options),
-        at::empty({kGetLaneCount, kGetWaveRecords}, int32Options),
-        at::empty({kGetLaneCount, kGetWaveRecords}, int32Options),
-        at::empty({kGetLaneCount, kGetWaveRecords}, uint8Options),
+        at::empty(
+            {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+            int32Options),
+        at::empty(
+            {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+            int32Options),
+        at::empty(
+            {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+            int32Options),
+        at::empty(
+            {kGetLaneCount, kGetDescriptorBufferCount, kGetWaveRecords},
+            uint8Options),
         pipelineState);
 }
 }  // namespace

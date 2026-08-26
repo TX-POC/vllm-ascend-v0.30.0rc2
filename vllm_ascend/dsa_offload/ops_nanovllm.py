@@ -1395,6 +1395,7 @@ def sparse_flash_attention_for_offload_c8(
     block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
+    selected_slot_lengths: torch.Tensor,
     scale_value: float,
 ) -> torch.Tensor:
     """C8 SFA：对 packed KV 执行量化 sparse+tail attention。"""
@@ -1412,6 +1413,7 @@ def sparse_flash_attention_for_offload_c8(
         block_table,
         actual_seq_lengths_query,
         resident_seq_lengths,
+        selected_slot_lengths,
         float(scale_value),
     )
     if envs.VLLM_ASCEND_DSA_A5_C8_DEBUG_DIAG:  # 显式 debug 开关，默认关闭

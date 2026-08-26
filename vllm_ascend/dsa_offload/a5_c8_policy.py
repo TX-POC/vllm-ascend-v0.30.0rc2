@@ -159,10 +159,20 @@ def _ensure_fixed_metadata(runtime: Any) -> None:
         device=runtime.device,
         pin_memory=pin_memory,
     )
+    # This is the logical end of each row's fixed-shape QSFA slot tensor.
+    # It is intentionally distinct from resident_seq_lengths: sparse rows
+    # contain TopK slots plus only their materialized tail.
+    runtime._a5_c8_selected_slot_lengths = CpuGpuBuffer(
+        runtime.max_num_reqs,
+        dtype=torch.int32,
+        device=runtime.device,
+        pin_memory=pin_memory,
+    )
     for buffer in (
         runtime._a5_candidate_lens,
         runtime._a5_logical_seq_lengths,
         runtime._a5_resident_seq_lengths,
+        runtime._a5_c8_selected_slot_lengths,
     ):
         buffer.np.fill(0)
         buffer.gpu.zero_()
@@ -264,6 +274,10 @@ def _refresh_fixed_metadata(
             f"capacity={max_attention_width}"
         )
     runtime._a5_c8_active_attention_width = active_attention_width
+    np.copyto(
+        runtime._a5_c8_selected_slot_lengths.np[:num_reqs],
+        attention_widths,
+    )
 
     runtime._a5_candidate_lens.gpu[:num_reqs].copy_(
         runtime._a5_candidate_lens.cpu[:num_reqs],
@@ -275,6 +289,10 @@ def _refresh_fixed_metadata(
     )
     runtime._a5_resident_seq_lengths.gpu[:num_reqs].copy_(
         runtime._a5_resident_seq_lengths.cpu[:num_reqs],
+        non_blocking=True,
+    )
+    runtime._a5_c8_selected_slot_lengths.gpu[:num_reqs].copy_(
+        runtime._a5_c8_selected_slot_lengths.cpu[:num_reqs],
         non_blocking=True,
     )
 
@@ -453,6 +471,11 @@ def install_a5_c8_runtime_policy() -> None:
             cache_tokens[:row_count]
         )
         self._a5_resident_seq_lengths.gpu[:row_count].add_(1)
+        # The graph dummy carries TopK slots and exactly one decode-tail slot.
+        # Its static slot capacity may be larger, so pass the true boundary.
+        self._a5_c8_selected_slot_lengths.gpu[:row_count].fill_(
+            DSA_SFA_COMPUTE_TOPK + 1
+        )
         logger.info(
             "[DSA_A5_C8_GRAPH] event=CAPTURE_METADATA_READY rows=%d "
             "candidate=budget logical=budget+1 resident=budget+1 "

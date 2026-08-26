@@ -8,13 +8,16 @@
  *
  *   compacted miss descriptors -> WQE/SQ -> doorbell -> CQ terminal wait.
  *
- * Therefore a Get AIV stays occupied while its H2D DMA is in flight.  The LI
- * producers do not wait for it in streaming mode: a full ring marks overflow
- * and leaves final correctness to later Guaranteed Recall rather than
- * deadlocking the scan.  A strict serial mode uses the same launch, inputs,
- * queues, and WQE segmentation, but makes both Get lanes wait until every
- * producer has closed both rings before their first consume/doorbell.  That
- * is the fair reference for measuring chunk-pipeline overlap.
+ * P2 changes only the parallel transport timing: each Get lane double-buffers
+ * its compacted descriptor waves, posts one Direct-HCCP wave, then compacts
+ * the next wave into the alternate buffer while that one is in flight.  The
+ * one-in-flight-per-queue contract is retained.  A strict serial mode retains
+ * the old blocking helper and therefore remains the same-engine reference.
+ *
+ * This is still a P1 scalar score/resident seam, not the product C8 LI path.
+ * It must not be enabled by the default runtime.  Its logical candidate and
+ * source-to-(table, offset, output) mapping are unchanged; only the timing of
+ * materializing the already-selected miss descriptors differs.
  */
 
 #include "kernel_operator.h"
@@ -54,6 +57,11 @@ constexpr uint32_t kRingClosedWord = kRingSlots * kRingWordsPerSlot;
 constexpr uint32_t kRingWords = kRingClosedWord + kCacheLineWords;
 constexpr uint32_t kGetBootstrapRecords = 64;
 constexpr uint32_t kGetWaveRecords = 256;
+// P2 keeps each posted descriptor wave immutable until its CQ terminal state
+// is observed.  The WQEs are already materialized into SQ at PostOnly return,
+// but retaining the source buffer gives the fused path a simple auditable
+// lifetime rule and lets the Get lane compact the next exact wave safely.
+constexpr uint32_t kGetDescriptorBufferCount = 2;
 constexpr uint32_t kProducerStatColumns = 8;
 constexpr uint32_t kGetStatColumns = 16;
 constexpr uint32_t kPackedEntryBytes = 656;
@@ -238,6 +246,38 @@ private:
         return RingView{pipelineState_ +
                         static_cast<uint64_t>(ringIndex) *
                             tiling_->pipelineWordsPerRing};
+    }
+
+    __aicore__ inline uint64_t DescriptorBufferOffset(
+        uint32_t lane, uint32_t buffer) const
+    {
+        return (static_cast<uint64_t>(lane) * kGetDescriptorBufferCount +
+                buffer) *
+               kGetWaveRecords;
+    }
+
+    __aicore__ inline __gm__ int32_t* GetIndicesBuffer(
+        uint32_t lane, uint32_t buffer) const
+    {
+        return getIndices_ + DescriptorBufferOffset(lane, buffer);
+    }
+
+    __aicore__ inline __gm__ int32_t* GetOffsetsBuffer(
+        uint32_t lane, uint32_t buffer) const
+    {
+        return getOffsets_ + DescriptorBufferOffset(lane, buffer);
+    }
+
+    __aicore__ inline __gm__ int32_t* GetOutputIndicesBuffer(
+        uint32_t lane, uint32_t buffer) const
+    {
+        return getOutputIndices_ + DescriptorBufferOffset(lane, buffer);
+    }
+
+    __aicore__ inline __gm__ uint8_t* GetMaskBuffer(
+        uint32_t lane, uint32_t buffer) const
+    {
+        return getMask_ + DescriptorBufferOffset(lane, buffer);
     }
 
     __aicore__ inline void PublishRingSlot(
@@ -500,20 +540,23 @@ private:
     }
 
     __aicore__ inline uint32_t ConsumeReadyRings(
-        uint32_t lane, uint64_t epoch, uint32_t queued,
+        uint32_t lane, uint32_t descriptorBuffer, uint64_t epoch, uint32_t queued,
         uint32_t consumeLimit, uint64_t* consumedChunks,
         uint64_t* firstConsumedChunkCycle, uint64_t* descriptorHashSum,
         uint64_t* descriptorHashXor, uint64_t* protocolError,
         bool* deferredReady)
     {
+        if (descriptorBuffer >= kGetDescriptorBufferCount) {
+            *protocolError = kGetResultRingRecordError;
+            return queued;
+        }
         __gm__ int32_t* laneIndices =
-            getIndices_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
+            GetIndicesBuffer(lane, descriptorBuffer);
         __gm__ int32_t* laneOffsets =
-            getOffsets_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
+            GetOffsetsBuffer(lane, descriptorBuffer);
         __gm__ int32_t* laneOutputIndices =
-            getOutputIndices_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
-        __gm__ uint8_t* laneMask =
-            getMask_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
+            GetOutputIndicesBuffer(lane, descriptorBuffer);
+        __gm__ uint8_t* laneMask = GetMaskBuffer(lane, descriptorBuffer);
 
         for (uint32_t producer = 0U;
              producer < kProducerCount && queued < consumeLimit;
@@ -643,12 +686,14 @@ private:
                               : kGetResultProtocolError | (mismatch << 16U);
     }
 
-    __aicore__ inline uint64_t IssueFullGet(
-        uint32_t lane, uint32_t requestCount, uint64_t* firstDoorbell,
-        uint64_t* completionCycle)
+    // Materialize exactly the existing Direct-HCCP request ABI.  `buffer` is
+    // part of the descriptor-storage lifetime only; it never changes the
+    // logical source/table/offset/output tuple that ExactScan selected.
+    __aicore__ inline uint64_t BuildFullGetArgs(
+        uint32_t lane, uint32_t buffer, KvafExecuteBatchGetKernelArgs* args)
     {
-        if (requestCount == 0U) {
-            return 0U;
+        if (args == nullptr || buffer >= kGetDescriptorBufferCount) {
+            return kGetResultProtocolError;
         }
         const FusedGetControlSnapshot control = LoadFusedGetControl();
         const uint64_t controlError = ValidateControl(control, lane);
@@ -663,12 +708,10 @@ private:
         const uint64_t coreStatusAddress = control.coreStatus;
         const uint64_t channelEntityAddress = control.channelEntity;
         const uint64_t queueStateAddress = control.queueState;
-        __gm__ int32_t* laneIndices =
-            getIndices_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
-        __gm__ int32_t* laneOffsets =
-            getOffsets_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
+        __gm__ int32_t* laneIndices = GetIndicesBuffer(lane, buffer);
+        __gm__ int32_t* laneOffsets = GetOffsetsBuffer(lane, buffer);
         __gm__ int32_t* laneOutputIndices =
-            getOutputIndices_ + static_cast<uint64_t>(lane) * kGetWaveRecords;
+            GetOutputIndicesBuffer(lane, buffer);
         __gm__ KvafBatchGetCoreStatus* status =
             reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(
                 coreStatusAddress +
@@ -679,33 +722,53 @@ private:
         FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(status),
                      sizeof(KvafBatchGetCoreStatus));
 
-        KvafExecuteBatchGetKernelArgs args{};
-        args.address_table = reinterpret_cast<uint64_t>(addressTable_);
-        args.valid_table = reinterpret_cast<uint64_t>(validTable_);
-        args.indices = reinterpret_cast<uint64_t>(laneIndices);
-        args.offsets = reinterpret_cast<uint64_t>(laneOffsets);
+        *args = KvafExecuteBatchGetKernelArgs{};
+        args->address_table = reinterpret_cast<uint64_t>(addressTable_);
+        args->valid_table = reinterpret_cast<uint64_t>(validTable_);
+        args->indices = reinterpret_cast<uint64_t>(laneIndices);
+        args->offsets = reinterpret_cast<uint64_t>(laneOffsets);
         // The dense helper consumes only [0, requestCount).  `getMask_` is
         // retained as a debug output of the producer/consumer bridge, but it
         // is deliberately not part of this Direct-HCCP submission path.
-        args.mask = 0U;
-        args.output_indices = reinterpret_cast<uint64_t>(laneOutputIndices);
-        args.output = outputAddress;
-        args.core_status = reinterpret_cast<uint64_t>(status);
-        args.channel_entity = channelEntityAddress +
-                              static_cast<uint64_t>(lane) *
-                                  sizeof(KvafBatchGetDirectUrmaEntity);
-        args.queue_state = queueStateAddress +
-                           static_cast<uint64_t>(lane) *
-                               sizeof(KvafBatchGetQueueState);
-        args.table_capacity = tiling_->tableCapacity;
-        args.request_capacity = kGetWaveRecords;
-        args.output_rows = tiling_->outputRows;
-        args.block_bytes = kPackedEntryBytes;
-        args.block_count = 1U;
-        args.jettys_per_core = 1U;
+        args->mask = 0U;
+        args->output_indices = reinterpret_cast<uint64_t>(laneOutputIndices);
+        args->output = outputAddress;
+        args->core_status = reinterpret_cast<uint64_t>(status);
+        args->channel_entity = channelEntityAddress +
+                               static_cast<uint64_t>(lane) *
+                                   sizeof(KvafBatchGetDirectUrmaEntity);
+        args->queue_state = queueStateAddress +
+                            static_cast<uint64_t>(lane) *
+                                sizeof(KvafBatchGetQueueState);
+        args->table_capacity = tiling_->tableCapacity;
+        args->request_capacity = kGetWaveRecords;
+        args->output_rows = tiling_->outputRows;
+        args->block_bytes = kPackedEntryBytes;
+        args->block_count = 1U;
+        args->jettys_per_core = 1U;
+        return 0U;
+    }
+
+    // The strict serial reference retains the historical blocking helper.
+    // It now explicitly names descriptor buffer zero only because the P2
+    // parallel path owns a second buffer; no serial execution ordering changes.
+    __aicore__ inline uint64_t IssueFullGet(
+        uint32_t lane, uint32_t requestCount, uint64_t* firstDoorbell,
+        uint64_t* completionCycle)
+    {
+        if (requestCount == 0U) {
+            return 0U;
+        }
+        KvafExecuteBatchGetKernelArgs args{};
+        const uint64_t buildError = BuildFullGetArgs(lane, 0U, &args);
+        if (buildError != 0U) {
+            return buildError;
+        }
 
         kvaf_fused_get::RunKvafDenseBatchGetCore256(
             args, requestCount, 0U);
+        __gm__ KvafBatchGetCoreStatus* status =
+            reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
         FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(status),
                      sizeof(KvafBatchGetCoreStatus));
         if (*firstDoorbell == 0U) {
@@ -715,19 +778,255 @@ private:
         return status->result;
     }
 
+    // Post one wave, retain its descriptor buffer, then let the caller run
+    // useful descriptor-compaction work until it observes a terminal CQE.
+    // The transaction remains private to this lane, so the pre-existing
+    // one-writer/one-in-flight queue contract is unchanged.
+    __aicore__ inline uint64_t BeginFullGet(
+        uint32_t lane, uint32_t buffer, uint32_t requestCount,
+        KvafExecuteBatchGetKernelArgs* args,
+        kvaf_fused_get::KvafDenseBatchGetTransaction* transaction,
+        uint64_t* firstDoorbell)
+    {
+        if (requestCount == 0U || args == nullptr || transaction == nullptr) {
+            return requestCount == 0U ? 0U : kGetResultProtocolError;
+        }
+        const uint64_t buildError = BuildFullGetArgs(lane, buffer, args);
+        if (buildError != 0U) {
+            return buildError;
+        }
+        kvaf_fused_get::BeginKvafDenseBatchGetPostOnly(
+            *args, requestCount, 0U, transaction);
+        if (*firstDoorbell == 0U && transaction->first_doorbell_cycle != 0U) {
+            *firstDoorbell = transaction->first_doorbell_cycle;
+        }
+        return transaction->result;
+    }
+
+    __aicore__ inline uint64_t FinishFullGet(
+        const KvafExecuteBatchGetKernelArgs& args,
+        kvaf_fused_get::KvafDenseBatchGetTransaction* transaction,
+        uint64_t* completionCycle)
+    {
+        if (transaction == nullptr) {
+            return kGetResultProtocolError;
+        }
+        kvaf_fused_get::FinishKvafDenseBatchGet(args, transaction);
+        __gm__ KvafBatchGetCoreStatus* status =
+            reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args.core_status);
+        if (status != nullptr) {
+            FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(status),
+                         sizeof(KvafBatchGetCoreStatus));
+        }
+        if (transaction->profile_completion_done_cycle != 0U) {
+            *completionCycle = transaction->profile_completion_done_cycle;
+        } else if (status != nullptr) {
+            *completionCycle = status->profile.completion_done_cycle;
+        }
+        return transaction->result;
+    }
+
+    __aicore__ inline void WriteGetStats(
+        uint32_t lane, uint64_t requested, uint64_t batches, uint64_t error,
+        uint64_t firstDoorbell, uint64_t completionCycle, uint64_t idlePolls,
+        uint64_t consumedChunks, uint64_t pipelineMode,
+        uint64_t serialGateOpenCycle, uint64_t firstConsumedChunkCycle,
+        uint64_t serialGatePolls, uint64_t descriptorHashSum,
+        uint64_t descriptorHashXor, uint64_t nonBlockingRetirePolls,
+        uint64_t overlappedDescriptorRecords)
+    {
+        __gm__ int64_t* stats = getStats_ +
+                                static_cast<uint64_t>(lane) *
+                                    kGetStatColumns;
+        WriteGmByPassDCache<int64_t>(stats + 0U,
+                                     static_cast<int64_t>(requested));
+        WriteGmByPassDCache<int64_t>(stats + 1U,
+                                     static_cast<int64_t>(batches));
+        WriteGmByPassDCache<int64_t>(stats + 2U,
+                                     static_cast<int64_t>(error));
+        WriteGmByPassDCache<int64_t>(stats + 3U,
+                                     static_cast<int64_t>(firstDoorbell));
+        WriteGmByPassDCache<int64_t>(stats + 4U,
+                                     static_cast<int64_t>(completionCycle));
+        WriteGmByPassDCache<int64_t>(stats + 5U,
+                                     static_cast<int64_t>(idlePolls));
+        WriteGmByPassDCache<int64_t>(stats + 6U,
+                                     static_cast<int64_t>(consumedChunks));
+        WriteGmByPassDCache<int64_t>(stats + 7U,
+                                     static_cast<int64_t>(GetSystemCycle()));
+        WriteGmByPassDCache<int64_t>(stats + 8U,
+                                     static_cast<int64_t>(pipelineMode));
+        WriteGmByPassDCache<int64_t>(stats + 9U,
+                                     static_cast<int64_t>(serialGateOpenCycle));
+        WriteGmByPassDCache<int64_t>(stats + 10U,
+                                     static_cast<int64_t>(firstConsumedChunkCycle));
+        WriteGmByPassDCache<int64_t>(stats + 11U,
+                                     static_cast<int64_t>(serialGatePolls));
+        WriteGmByPassDCache<int64_t>(stats + 12U,
+                                     static_cast<int64_t>(descriptorHashSum));
+        WriteGmByPassDCache<int64_t>(stats + 13U,
+                                     static_cast<int64_t>(descriptorHashXor));
+        // P2-only diagnostics.  Word 14 counts genuine nonblocking CQ
+        // probes; word 15 counts descriptor records compacted into the
+        // alternate HBM buffer while the preceding H2D wave was in flight.
+        WriteGmByPassDCache<int64_t>(stats + 14U,
+                                     static_cast<int64_t>(nonBlockingRetirePolls));
+        WriteGmByPassDCache<int64_t>(stats + 15U,
+                                     static_cast<int64_t>(overlappedDescriptorRecords));
+        DataSyncBarrier<MemDsbT::DDR>();
+    }
+
+    // P2's parallel path owns exactly one Direct-HCCP transaction per lane.
+    // `fillBuffer` is never the buffer referenced by `activeArgs`: while one
+    // DMA uses buffer A, this lane compacts the next *already selected* miss
+    // descriptors into buffer B.  The value-level candidate stream remains
+    // owned by ProcessExactScanProducer and is unaffected by this overlap.
+    __aicore__ inline void ProcessParallelFullGetLane(
+        uint32_t lane, uint64_t epoch)
+    {
+        uint64_t requested = 0U;
+        uint64_t batches = 0U;
+        uint64_t error = epoch == 0U ? kGetResultProtocolError : 0U;
+        uint64_t firstDoorbell = 0U;
+        uint64_t completionCycle = 0U;
+        uint64_t idlePolls = 0U;
+        uint64_t consumedChunks = 0U;
+        uint64_t firstConsumedChunkCycle = 0U;
+        uint64_t descriptorHashSum = 0U;
+        uint64_t descriptorHashXor = 0U;
+        uint64_t nonBlockingRetirePolls = 0U;
+        uint64_t overlappedDescriptorRecords = 0U;
+        uint32_t fillBuffer = 0U;
+        uint32_t queued = 0U;
+        bool inFlight = false;
+        KvafExecuteBatchGetKernelArgs activeArgs{};
+        kvaf_fused_get::KvafDenseBatchGetTransaction transaction{};
+
+        while (error == 0U) {
+            if (inFlight) {
+                // A probe has no side effect while the CQ is not ready.  It
+                // may therefore be issued around descriptor work without
+                // changing this queue's WQE/CQE order.
+                kvaf_fused_get::TryRetireKvafDenseBatchGet(
+                    activeArgs, &transaction);
+                ++nonBlockingRetirePolls;
+                if (transaction.state != kvaf_fused_get::kDenseBatchGetInFlight) {
+                    const uint64_t result = FinishFullGet(
+                        activeArgs, &transaction, &completionCycle);
+                    inFlight = false;
+                    if (result != 0U) {
+                        error = result;
+                        break;
+                    }
+                }
+            }
+
+            // The fixed [64, 256, ..., tail] sequence is retained exactly.
+            // `batches` counts waves already posted, including an in-flight
+            // wave, so the alternate buffer is always sized for the next
+            // canonical wave.
+            const uint32_t target = batches == 0U ? kGetBootstrapRecords
+                                                   : kGetWaveRecords;
+            const uint32_t before = queued;
+            bool deferredReady = false;
+            if (queued < target) {
+                queued = ConsumeReadyRings(
+                    lane, fillBuffer, epoch, queued, target, &consumedChunks,
+                    &firstConsumedChunkCycle, &descriptorHashSum,
+                    &descriptorHashXor, &error, &deferredReady);
+                if (inFlight && queued > before) {
+                    // These stores are ExactScan's selected descriptor work,
+                    // not synthetic delay: they are the next Direct-HCCP
+                    // wave and are flushed before it can be posted.
+                    overlappedDescriptorRecords += queued - before;
+                }
+            }
+            const bool allClosed = AllRingsClosed(lane, epoch);
+            if (error != 0U) {
+                break;
+            }
+
+            if (!inFlight &&
+                (queued >= target ||
+                 (allClosed && queued != 0U) ||
+                 (deferredReady && queued != 0U) ||
+                 (queued == kGetWaveRecords))) {
+                const uint32_t requestCount = queued;
+                const uint64_t result = BeginFullGet(
+                    lane, fillBuffer, requestCount, &activeArgs, &transaction,
+                    &firstDoorbell);
+                requested += requestCount;
+                ++batches;
+                queued = 0U;
+                fillBuffer = 1U - fillBuffer;
+                if (result != 0U ||
+                    transaction.state != kvaf_fused_get::kDenseBatchGetInFlight) {
+                    const uint64_t finalResult = FinishFullGet(
+                        activeArgs, &transaction, &completionCycle);
+                    error = result != 0U ? result
+                                          : (finalResult != 0U
+                                                 ? finalResult
+                                                 : kGetResultProtocolError);
+                    break;
+                }
+                inFlight = true;
+                idlePolls = 0U;
+                continue;
+            }
+
+            if (!inFlight && allClosed && queued == 0U) {
+                break;
+            }
+            if (inFlight) {
+                // CQ timeout is governed by the transaction's own exact
+                // poll budget.  Do not label a live H2D wave as a consumer
+                // idle timeout merely because the alternate buffer is full.
+                idlePolls = 0U;
+                continue;
+            }
+            if (queued == before) {
+                ++idlePolls;
+                if (idlePolls >= kConsumerIdlePollLimit) {
+                    error = kGetResultConsumerTimeout;
+                    break;
+                }
+            } else {
+                idlePolls = 0U;
+            }
+        }
+
+        // No caller may leave a posted wave unretired.  If a descriptor or
+        // ring error happened after a successful post, drain that wave before
+        // publishing the terminal P2 telemetry.
+        if (inFlight) {
+            const uint64_t result = FinishFullGet(
+                activeArgs, &transaction, &completionCycle);
+            if (error == 0U && result != 0U) {
+                error = result;
+            }
+        }
+        WriteGetStats(lane, requested, batches, error, firstDoorbell,
+                      completionCycle, idlePolls, consumedChunks,
+                      kPipelineModeParallel, 0U, firstConsumedChunkCycle,
+                      0U, descriptorHashSum, descriptorHashXor,
+                      nonBlockingRetirePolls, overlappedDescriptorRecords);
+    }
+
     __aicore__ inline void ProcessFullGetLane(uint32_t lane)
     {
         const uint64_t epoch = LoadColdEpoch(frameEpoch_);
         const uint64_t pipelineMode = LoadColdEpoch(executionMode_);
         WriteRoleTrace(lane, kRoleTraceGetBase + static_cast<int32_t>(lane));
-        __gm__ int64_t* stats = getStats_ +
-                                static_cast<uint64_t>(lane) * kGetStatColumns;
         uint64_t requested = 0U;
         uint64_t batches = 0U;
         uint64_t error = epoch == 0U ? kGetResultProtocolError : 0U;
         if (pipelineMode != kPipelineModeParallel &&
             pipelineMode != kPipelineModeSerialWaitAllClosed) {
             error = kGetResultInvalidPipelineMode;
+        }
+        if (error == 0U && pipelineMode == kPipelineModeParallel) {
+            ProcessParallelFullGetLane(lane, epoch);
+            return;
         }
         uint64_t firstDoorbell = 0U;
         uint64_t completionCycle = 0U;
@@ -769,7 +1068,7 @@ private:
             const uint32_t before = queued;
             bool deferredReady = false;
             queued = ConsumeReadyRings(
-                lane, epoch, queued, target, &consumedChunks,
+                lane, 0U, epoch, queued, target, &consumedChunks,
                 &firstConsumedChunkCycle, &descriptorHashSum,
                 &descriptorHashXor, &error, &deferredReady);
             const bool allClosed = AllRingsClosed(lane, epoch);
@@ -803,38 +1102,11 @@ private:
             }
         }
 
-        WriteGmByPassDCache<int64_t>(stats + 0U,
-                                     static_cast<int64_t>(requested));
-        WriteGmByPassDCache<int64_t>(stats + 1U,
-                                     static_cast<int64_t>(batches));
-        WriteGmByPassDCache<int64_t>(stats + 2U,
-                                     static_cast<int64_t>(error));
-        WriteGmByPassDCache<int64_t>(stats + 3U,
-                                     static_cast<int64_t>(firstDoorbell));
-        WriteGmByPassDCache<int64_t>(stats + 4U,
-                                     static_cast<int64_t>(completionCycle));
-        WriteGmByPassDCache<int64_t>(stats + 5U,
-                                     static_cast<int64_t>(idlePolls));
-        WriteGmByPassDCache<int64_t>(stats + 6U,
-                                     static_cast<int64_t>(consumedChunks));
-        WriteGmByPassDCache<int64_t>(stats + 7U,
-                                     static_cast<int64_t>(GetSystemCycle()));
-        WriteGmByPassDCache<int64_t>(stats + 8U,
-                                     static_cast<int64_t>(pipelineMode));
-        WriteGmByPassDCache<int64_t>(stats + 9U,
-                                     static_cast<int64_t>(serialGateOpenCycle));
-        WriteGmByPassDCache<int64_t>(stats + 10U,
-                                     static_cast<int64_t>(firstConsumedChunkCycle));
-        WriteGmByPassDCache<int64_t>(stats + 11U,
-                                     static_cast<int64_t>(serialGatePolls));
-        WriteGmByPassDCache<int64_t>(stats + 12U,
-                                     static_cast<int64_t>(descriptorHashSum));
-        WriteGmByPassDCache<int64_t>(stats + 13U,
-                                     static_cast<int64_t>(descriptorHashXor));
-        WriteGmByPassDCache<int64_t>(stats + 14U, 0);
-        WriteGmByPassDCache<int64_t>(stats + 15U, 0);
-        // Same terminal-publish boundary for the Get lane's telemetry.
-        DataSyncBarrier<MemDsbT::DDR>();
+        WriteGetStats(lane, requested, batches, error, firstDoorbell,
+                      completionCycle, idlePolls, consumedChunks,
+                      pipelineMode, serialGateOpenCycle,
+                      firstConsumedChunkCycle, serialGatePolls,
+                      descriptorHashSum, descriptorHashXor, 0U, 0U);
     }
 
 private:

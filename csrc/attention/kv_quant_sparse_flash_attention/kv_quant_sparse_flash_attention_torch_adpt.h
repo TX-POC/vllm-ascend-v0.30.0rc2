@@ -173,7 +173,8 @@ at::Tensor npu_dsa_a5_sparse_tail_attention_c8(
     double scale_value,
     const at::Tensor &block_table,
     const at::Tensor &actual_seq_lengths_query,
-    const at::Tensor &resident_seq_lengths)
+    const at::Tensor &resident_seq_lengths,
+    const at::Tensor &selected_slot_lengths)
 {
     constexpr int64_t C8_QUERY_DIM = 576;
     constexpr int64_t C8_OUTPUT_DIM = 512;
@@ -217,19 +218,26 @@ at::Tensor npu_dsa_a5_sparse_tail_attention_c8(
     TORCH_CHECK(
         block_table.scalar_type() == at::kInt &&
             actual_seq_lengths_query.scalar_type() == at::kInt &&
-            resident_seq_lengths.scalar_type() == at::kInt,
+            resident_seq_lengths.scalar_type() == at::kInt &&
+            selected_slot_lengths.scalar_type() == at::kInt,
         "C8 sparse+tail attention metadata must be int32.");
+    TORCH_CHECK(
+        selected_slot_lengths.dim() == 1 &&
+            selected_slot_lengths.numel() == batch,
+        "C8 sparse+tail attention selected_slot_lengths must be int32 [T].");
     TORCH_CHECK(
         query.is_privateuseone() && packed_kv.device() == query.device() &&
             sparse_and_tail_slots.device() == query.device() &&
             block_table.device() == query.device() &&
             actual_seq_lengths_query.device() == query.device() &&
-            resident_seq_lengths.device() == query.device(),
+            resident_seq_lengths.device() == query.device() &&
+            selected_slot_lengths.device() == query.device(),
         "C8 sparse+tail attention inputs must be on one NPU.");
     TORCH_CHECK(
         query.is_contiguous() && packed_kv.is_contiguous() &&
             sparse_and_tail_slots.is_contiguous() && block_table.is_contiguous() &&
-            actual_seq_lengths_query.is_contiguous() && resident_seq_lengths.is_contiguous(),
+            actual_seq_lengths_query.is_contiguous() && resident_seq_lengths.is_contiguous() &&
+            selected_slot_lengths.is_contiguous(),
         "C8 sparse+tail attention inputs must be contiguous.");
 
     at::Tensor attention_output = at::empty(
@@ -238,8 +246,13 @@ at::Tensor npu_dsa_a5_sparse_tail_attention_c8(
     at::Tensor softmax_sum = at::empty({1}, query.options().dtype(at::kFloat));
 
     // Repository mode reads quant scales from packed_kv, but the A5 tiler
-    // still requires non-null external scale inputs. The kernel does not read
-    // these pointers in repository mode.
+    // still requires non-null external scale inputs. The C8 A5 kernel does
+    // not read key_dequant_scale as a quant scale in this mode; reuse that
+    // otherwise-unused pointer to carry the per-row selected slot boundary.
+    // This keeps graph's fixed sparse_indices shape from turning trailing
+    // -1 sentinels into a partially uninitialized final BMM tile.
+    const at::Tensor selected_slot_lengths_placeholder =
+        selected_slot_lengths.view(at::kFloat);
     const at::Tensor dequant_scale_placeholder =
         resident_seq_lengths.view(at::kFloat);
     constexpr int64_t key_quant_mode = 2;
@@ -262,7 +275,7 @@ at::Tensor npu_dsa_a5_sparse_tail_attention_c8(
         packed_kv,
         packed_kv,
         sparse_and_tail_slots,
-        dequant_scale_placeholder,
+        selected_slot_lengths_placeholder,
         dequant_scale_placeholder,
         block_table,
         actual_seq_lengths_query,
@@ -294,7 +307,8 @@ TORCH_LIBRARY_FRAGMENT(_C_ascend, dsa_a5_sparse_tail_attention_c8_ops)
         "npu_dsa_a5_sparse_tail_attention_c8("
         "Tensor query, Tensor packed_kv, Tensor sparse_and_tail_slots, "
         "float scale_value, Tensor block_table, "
-        "Tensor actual_seq_lengths_query, Tensor resident_seq_lengths) -> Tensor");
+        "Tensor actual_seq_lengths_query, Tensor resident_seq_lengths, "
+        "Tensor selected_slot_lengths) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(_C_ascend, PrivateUse1, dsa_a5_sparse_tail_attention_c8_impl)

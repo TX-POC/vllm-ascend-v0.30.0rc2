@@ -25,6 +25,7 @@ def test_c8_qsfa_uses_repository_resident_kernel(monkeypatch) -> None:
         block_table: torch.Tensor,
         actual_query_lengths: torch.Tensor,
         resident_seq_lengths: torch.Tensor,
+        selected_slot_lengths: torch.Tensor,
     ) -> torch.Tensor:
         captured.update(
             query=query,
@@ -34,6 +35,7 @@ def test_c8_qsfa_uses_repository_resident_kernel(monkeypatch) -> None:
             block_table=block_table,
             actual_query_lengths=actual_query_lengths,
             resident_seq_lengths=resident_seq_lengths,
+            selected_slot_lengths=selected_slot_lengths,
         )
         return torch.empty(
             (*query.shape[:-1], 512),
@@ -55,6 +57,9 @@ def test_c8_qsfa_uses_repository_resident_kernel(monkeypatch) -> None:
     block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
     actual_query_lengths = torch.ones((1,), dtype=torch.int32, device=device)
     resident_seq_lengths = torch.ones((1,), dtype=torch.int32, device=device)
+    selected_slot_lengths = torch.full(
+        (1,), 2048, dtype=torch.int32, device=device
+    )
 
     output = a5_extension._sparse_and_tail_attention_c8(
         query,
@@ -63,6 +68,7 @@ def test_c8_qsfa_uses_repository_resident_kernel(monkeypatch) -> None:
         block_table,
         actual_query_lengths,
         resident_seq_lengths,
+        selected_slot_lengths,
         1.0,
     )
 
@@ -76,3 +82,4 @@ def test_c8_qsfa_uses_repository_resident_kernel(monkeypatch) -> None:
     assert captured["block_table"] is block_table
     assert captured["actual_query_lengths"] is actual_query_lengths
     assert captured["resident_seq_lengths"] is resident_seq_lengths
+    assert captured["selected_slot_lengths"] is selected_slot_lengths

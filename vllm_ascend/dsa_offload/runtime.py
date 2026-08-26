@@ -1323,6 +1323,11 @@ class DSALayerOffloadContext:
                 sparse_flash_attention_for_offload_c8 as sfa_c8,
             )
             c8_query = torch.cat([query, query_rope], dim=-1)
+            selected_slot_lengths = (
+                self.runtime._a5_c8_selected_slot_lengths.gpu[
+                    : int(query.shape[0])
+                ]
+            )
             return sfa_c8(
                 query=c8_query,
                 packed_kv=resident_nope_cache,
@@ -1330,6 +1335,7 @@ class DSALayerOffloadContext:
                 block_table=resident_block_table,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 resident_seq_lengths=selection.resident_seq_lengths,
+                selected_slot_lengths=selected_slot_lengths,
                 scale_value=scale_value,
             )
         if self.runtime.op_backend == DSA_OP_BACKEND_NANOVLLM_A5:
