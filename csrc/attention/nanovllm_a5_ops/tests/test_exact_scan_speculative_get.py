@@ -39,6 +39,11 @@ RING_SLOT_RECORD_WORD = 2 * CACHE_LINE_WORDS
 RING_WORDS_PER_SLOT = RING_SLOT_RECORD_WORD + RECORDS_PER_RING_SLOT * 3
 PIPELINE_WORDS_PER_RING = RING_SLOTS * RING_WORDS_PER_SLOT + CACHE_LINE_WORDS
 PIPELINE_RING_COUNT = PRODUCER_COUNT * GET_LANE_COUNT
+# ``source = producer + step * 62`` preserves the two-lane route when step is
+# shifted by 128: 128 * 62 is an integer multiple of the source lane's 256
+# token period.  The performance fixture uses this to move the same candidate
+# pattern late without changing its lane or candidate-kind order.
+CANDIDATE_PLACEMENT_PERIOD_STEPS = 128
 
 CANDIDATE_HBM_HIT = 0
 CANDIDATE_DDR_ENQUEUED = 1
@@ -129,6 +134,7 @@ def create_runtime(args: argparse.Namespace, device_id: int) -> object:
 
 def build_exact_scan_inputs(
     args: argparse.Namespace,
+    candidate_placement: str = "early",
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -139,12 +145,20 @@ def build_exact_scan_inputs(
     int,
     int,
 ]:
-    """Build a sparse score stream with one full chunk per producer/lane.
+    """Build one full miss chunk per producer/lane at a chosen scan position.
 
-    Each producer publishes 32 DDR misses per lane early in its own scan.  It
-    then continues scanning low-score entries, giving each Get lane a useful
-    window to complete a full H2D batch before the final producer finishes.
+    ``early`` publishes each lane's 32-miss chunk near the beginning of its
+    producer scan.  ``late`` retains the identical score count, hit/miss
+    count, descriptors, and lane-private output layout, but moves the same
+    32 misses followed by two hits to the end of each producer scan.  The
+    latter is used only by the performance benchmark as a delayed reference
+    for the same unified 2-Get/62-ExactScan launch; it is not strict serial.
     """
+    if candidate_placement not in ("early", "late"):
+        raise ValueError(
+            "candidate_placement must be 'early' or 'late', got "
+            f"{candidate_placement!r}"
+        )
 
     score_count = PRODUCER_COUNT * args.scan_per_producer
     scores = torch.zeros(score_count, dtype=torch.float32)
@@ -167,13 +181,50 @@ def build_exact_scan_inputs(
     lane_output_counts = [0, 0]
 
     for producer in range(PRODUCER_COUNT):
+        lane_scan_counts = [0, 0]
+        lane_seen = [0, 0]
+        selected_per_lane = args.misses_per_lane + args.hits_per_lane
+        selected_by_step: dict[int, int] = {}
+        for step in range(args.scan_per_producer):
+            source = producer + step * PRODUCER_COUNT
+            lane = (source >> 7) & 1
+            lane_scan_counts[lane] += 1
+            rank_in_lane = lane_seen[lane]
+            lane_seen[lane] += 1
+            if rank_in_lane < args.misses_per_lane:
+                selected_by_step[step] = CANDIDATE_DDR_ENQUEUED
+            elif rank_in_lane < selected_per_lane:
+                selected_by_step[step] = CANDIDATE_HBM_HIT
+        if min(lane_scan_counts) < selected_per_lane:
+            raise AssertionError(
+                "scan is too short to place the requested candidates in both "
+                f"lanes for producer={producer}: counts={lane_scan_counts}"
+            )
+        if candidate_placement == "late":
+            # Preserve the exact global candidate-kind stream by shifting the
+            # early pattern by a whole source-lane period.  The remaining tail
+            # is fewer than 128 low-score steps, so Get becomes ready only at
+            # the end of the producer scan without changing candidate order.
+            max_selected_step = max(selected_by_step)
+            shift = (
+                (args.scan_per_producer - 1 - max_selected_step)
+                // CANDIDATE_PLACEMENT_PERIOD_STEPS
+            ) * CANDIDATE_PLACEMENT_PERIOD_STEPS
+            if shift == 0:
+                raise AssertionError(
+                    "scan is too short to construct a delayed candidate "
+                    f"placement for producer={producer}"
+                )
+            selected_by_step = {
+                step + shift: kind for step, kind in selected_by_step.items()
+            }
         misses = [0, 0]
         hits = [0, 0]
         for step in range(args.scan_per_producer):
             source = producer + step * PRODUCER_COUNT
             lane = (source >> 7) & 1
-            is_miss = False
-            if misses[lane] < args.misses_per_lane:
+            kind = selected_by_step.get(step)
+            if kind == CANDIDATE_DDR_ENQUEUED:
                 output_row = lane * lane_output_rows + lane_output_counts[lane]
                 scores[source] = 1.0
                 resident[source] = 0
@@ -186,17 +237,12 @@ def build_exact_scan_inputs(
                     Candidate(source, CANDIDATE_DDR_ENQUEUED)
                 )
                 lane_output_counts[lane] += 1
-                is_miss = True
-            elif hits[lane] < args.hits_per_lane:
+                misses[lane] += 1
+            elif kind == CANDIDATE_HBM_HIT:
                 scores[source] = 1.0
                 resident[source] = 1
                 expected[producer].append(Candidate(source, CANDIDATE_HBM_HIT))
                 hits[lane] += 1
-            # Do not stop after both chunks become full: the rest of this
-            # producer's long low-score scan creates the timing window that
-            # distinguishes a real chunk pipeline from a post-scan Get.
-            if is_miss:
-                misses[lane] += 1
         if misses != [args.misses_per_lane, args.misses_per_lane] or hits != [
             args.hits_per_lane,
             args.hits_per_lane,
