@@ -38,6 +38,10 @@ setup(
             extra_compile_args=[
                 f"-I{TORCH_NPU_ROOT / 'include' / 'third_party' / 'acl' / 'inc'}",
                 f"-I{COMMON_CSRC}",
+                # op_api_common.h uses dladdr() to identify the actual DSO
+                # backing a generated ACLNN symbol in the one-shot P1 debug
+                # bundle.  Dl_info is a GNU extension on glibc.
+                "-D_GNU_SOURCE",
                 "-O3",
                 "-std=c++17",
                 "-fvisibility=hidden",
