@@ -334,7 +334,15 @@ def require_source_contract() -> None:
     assert "NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE" in build_script
     assert "P3 streaming hook mode:" in build_script
     assert "P3 generated hook-mode header:" in build_script
-    assert "scoreSourceLensGm.SetValue(" in vector
+    # A5 cannot reliably publish adjacent int32 side-output rows from paired
+    # AIVs through scalar GM stores.  The P3-only receipt therefore uses its
+    # own 32B UB line and S<->MTE3 DMA publication, leaving C8 TopK itself
+    # untouched.
+    assert "WriteScoreSourceLen" in vector
+    assert "scoreSourceLensBuf_" in vector
+    assert "DataCopyPad(scoreSourceLensGm[outputRow]" in vector
+    assert "SetFlag<HardEvent::S_MTE3>(EVENT_ID1)" in vector
+    assert "SetFlag<HardEvent::MTE3_S>(EVENT_ID1)" in vector
     assert "outputRow, validS2Len > 0 ? validS2Len : 0" in vector
     assert "ProcessTopK" in vector
     assert vector.index("BatchMulWeightAndReduceSum") < vector.index("streamingKvafHook_.Emit")
@@ -360,7 +368,9 @@ def require_source_contract() -> None:
     # short-row / invalid output path or normal official TopK branch. It is a
     # source-score S bound, not a host approximation of logical KV L.
     valid_formula = topk_body.index("validS2Len = ((int32_t)i + cuRealAcSeq)")
-    source_len_store = topk_body.index("scoreSourceLensGm.SetValue(")
+    source_len_store = topk_body.index(
+        "WriteScoreSourceLen(outputRow, validS2Len > 0 ? validS2Len : 0)"
+    )
     invalid_branch = topk_body.index("if (validS2Len <= 0)")
     assert valid_formula < source_len_store < invalid_branch
     clean_body = vector[vector.index(
@@ -368,7 +378,7 @@ def require_source_contract() -> None:
     ):vector.index(
         "__aicore__ inline void QLIVector<QLIT>::GetKeyScale"
     )]
-    assert "scoreSourceLensGm.SetValue" in clean_body
+    assert "WriteScoreSourceLen" in clean_body
     for symbol in (
         "TryAcquireKvafStreamingBatchGetQueueFromAicore",
         "PublishKvafStreamingBatchGetDescriptorScratch",
