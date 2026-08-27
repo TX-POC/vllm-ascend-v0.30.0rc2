@@ -78,10 +78,11 @@ def _cpu_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
 def _audit_receipt(
     result: dict[str, Any],
     transaction: dict[str, torch.Tensor],
-) -> dict[str, int]:
-    """Validate audit's side-effect boundary and count fixed-map records."""
+) -> dict[str, Any]:
+    """Validate audit's side-effect boundary before decoding output 2."""
     marker = int(result["candidate_marker"])
     sentinel = int(result["audit_lease_sentinel"])
+    receipt_kind = str(result["audit_receipt_kind"])
     source_map = result["candidate_source_to_slot"].detach().cpu().contiguous()
     queue_leases = result["queue_leases"].detach().cpu().contiguous()
     ready = result["private_ready_table"].detach().cpu().contiguous()
@@ -99,16 +100,22 @@ def _audit_receipt(
         raise RuntimeError("P4 audit wrote the private packed payload arena")
     if int(torch.count_nonzero(telemetry).item()) != 0:
         raise RuntimeError("P4 audit wrote queue-owned transport telemetry")
-    candidate_count = int(torch.count_nonzero(source_map == marker).item())
-    if candidate_count <= 0:
-        raise RuntimeError("P4 audit produced no score-time candidate markers")
-    if bool(torch.any((source_map != -1) & (source_map != marker))):
-        raise RuntimeError("P4 audit produced a non-candidate private-slot value")
+    if receipt_kind == "candidate":
+        candidate_count = int(torch.count_nonzero(source_map == marker).item())
+        if candidate_count <= 0:
+            raise RuntimeError("P4 audit produced no score-time candidate markers")
+        if bool(torch.any((source_map != -1) & (source_map != marker))):
+            raise RuntimeError("P4 audit produced a non-candidate private-slot value")
+    elif receipt_kind == "score":
+        candidate_count = -1
+    else:
+        raise RuntimeError(f"P4 audit has an unknown receipt kind: {receipt_kind!r}")
     return {
         "candidate_count": candidate_count,
         "candidate_overflow": 0,
         "candidate_marker": marker,
         "lease_sentinel": sentinel,
+        "receipt_kind": receipt_kind,
     }
 
 
@@ -404,19 +411,72 @@ def _install_resident_snapshot(
     )
 
 
-def _assert_authoritative_cold_coverage(
+def _block_histogram(mask: torch.Tensor, *, block_size: int = BLOCK_SIZE) -> str:
+    """Return a compact, deterministic ``block:count`` summary for a row mask."""
+    parts: list[str] = []
+    for block in range((int(mask.numel()) + block_size - 1) // block_size):
+        start = block * block_size
+        count = int(torch.count_nonzero(mask[start:start + block_size]).item())
+        if count:
+            parts.append(f"{block}:{count}")
+    return ",".join(parts) if parts else "none"
+
+
+def _source_receipt(
+    sources: torch.Tensor,
+    *,
+    pool_row: int,
+    object_map: torch.Tensor,
+    slots: torch.Tensor,
+    receipt_u32: torch.Tensor | None = None,
+    receipt_encoding: dict[str, int] | None = None,
+    limit: int = 12,
+) -> str:
+    """Return bounded mapping/score evidence that is practical to paste back."""
+    selected = torch.nonzero(sources, as_tuple=False).flatten().tolist()
+    entries: list[str] = []
+    for source in selected[:limit]:
+        kv_object = int(object_map[pool_row, source].item())
+        slot = int(slots[pool_row, kv_object].item())
+        prefix = f"{source}(t{source // BLOCK_SIZE}i{source % BLOCK_SIZE})>{kv_object}@{slot}"
+        if receipt_u32 is not None and receipt_encoding is not None:
+            raw = int(receipt_u32[source].item()) & 0xFFFFFFFF
+            if (raw & receipt_encoding["tag_mask"]) == receipt_encoding["tag"]:
+                entries.append(
+                    f"{prefix}#s={raw & receipt_encoding['score_mask']}"
+                    f"/tp={int(bool(raw & receipt_encoding['threshold_pass_bit']))}"
+                    f"/mv={int(bool(raw & receipt_encoding['mapping_valid_bit']))}"
+                    f"/cold={int(bool(raw & receipt_encoding['cold_bit']))}"
+                    f"/unmapped={int(bool(raw & receipt_encoding['source_unmapped_bit']))}"
+                    f"/cand={int(bool(raw & receipt_encoding['candidate_bit']))}"
+                )
+            else:
+                entries.append(f"{prefix}#unwritten=1/raw=0x{raw:08x}")
+        else:
+            entries.append(prefix)
+    suffix = "" if len(selected) <= limit else f",+{len(selected) - limit}"
+    return "[" + ",".join(entries) + suffix + "]"
+
+
+def _collect_authoritative_cold_coverage(
     official_indices: torch.Tensor,
     candidate_map: torch.Tensor,
     transaction: dict[str, torch.Tensor],
     score_source_lens: torch.Tensor,
     marker: int,
-) -> dict[str, int]:
+    resident_threshold: torch.Tensor,
+    receipt_kind: str,
+    receipt_encoding: dict[str, int] | None,
+) -> dict[str, Any]:
     """Prove `official TopK ∩ cold ⊆ score-time candidates`.
 
     This is the actual prefetch safety condition.  It intentionally does not
     consume the clone's final Top-K output: official C8 remains the unique
     selection authority, and equal-score ties may make the candidate set a
-    strict superset of the required cold set.
+    strict superset of the required cold set.  This collector deliberately
+    returns failures as facts instead of raising immediately, so the strict
+    wrapper can report both clone equivalence and candidate coverage from the
+    same single device launch.
     """
     official = official_indices.detach().cpu().contiguous().reshape(BATCH_SIZE, SPARSE_COUNT)
     candidates = candidate_map.detach().cpu().contiguous()
@@ -425,9 +485,13 @@ def _assert_authoritative_cold_coverage(
     object_map = transaction["kv_object_map"].detach().cpu().contiguous()
     object_lens = transaction["kv_object_lens"].detach().cpu().contiguous()
     source_lens = score_source_lens.detach().cpu().contiguous()
+    thresholds = resident_threshold.detach().cpu().contiguous()
     required_mask = torch.zeros_like(candidates, dtype=torch.bool)
     eligible_cold_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    mapping_valid_mask = torch.zeros_like(candidates, dtype=torch.bool)
     mapping_difference_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    valid_domain_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    outside_domain_mask = torch.zeros_like(candidates, dtype=torch.bool)
     selected = 0
     mapping_discriminator_selected = 0
     mapping_discriminator_sources = 0
@@ -441,11 +505,7 @@ def _assert_authoritative_cold_coverage(
             raise RuntimeError(
                 f"invalid KV-object length: row={row} object_len={object_len}"
             )
-        if int(torch.count_nonzero(candidates[row, valid:] == marker).item()) != 0:
-            raise RuntimeError(
-                "P4 audit emitted a candidate outside the exact score-source domain: "
-                f"row={row} source_len={valid}"
-            )
+        valid_domain_mask[row, :valid] = True
         mapped_active = object_map[pool_row, :valid]
         if bool(torch.any((mapped_active < 0) | (mapped_active >= object_len))):
             raise RuntimeError(
@@ -455,6 +515,7 @@ def _assert_authoritative_cold_coverage(
         correct_cold = slots[pool_row, mapped_active] < 0
         legacy_identity_cold = slots[row, :valid] < 0
         eligible_cold_mask[row, :valid] = correct_cold
+        mapping_valid_mask[row, :valid] = True
         mapping_difference_mask[row, :valid] = (
             correct_cold != legacy_identity_cold
         )
@@ -482,16 +543,90 @@ def _assert_authoritative_cold_coverage(
                 mapping_discriminator_selected += 1
             if is_cold:
                 required_mask[row, source] = True
-    candidate_mask = candidates == marker
+
+    score_receipt = receipt_kind == "score"
+    receipt_u32: torch.Tensor | None = None
+    written_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    score_values = torch.zeros_like(candidates, dtype=torch.int64)
+    threshold_bit_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    mapping_bit_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    cold_bit_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    source_unmapped_bit_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    candidate_bit_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    unwritten_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    malformed_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    threshold_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    mapping_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    cold_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    source_unmapped_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    candidate_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    if score_receipt:
+        if receipt_encoding is None:
+            raise RuntimeError("score receipt has no encoding specification")
+        receipt_u32 = candidates.to(torch.int64) & 0xFFFFFFFF
+        written_mask = (
+            receipt_u32 & receipt_encoding["tag_mask"]
+        ) == receipt_encoding["tag"]
+        score_values = receipt_u32 & receipt_encoding["score_mask"]
+        threshold_bit_mask = written_mask & (
+            (receipt_u32 & receipt_encoding["threshold_pass_bit"]) != 0
+        )
+        mapping_bit_mask = written_mask & (
+            (receipt_u32 & receipt_encoding["mapping_valid_bit"]) != 0
+        )
+        cold_bit_mask = written_mask & (
+            (receipt_u32 & receipt_encoding["cold_bit"]) != 0
+        )
+        source_unmapped_bit_mask = written_mask & (
+            (receipt_u32 & receipt_encoding["source_unmapped_bit"]) != 0
+        )
+        candidate_bit_mask = written_mask & (
+            (receipt_u32 & receipt_encoding["candidate_bit"]) != 0
+        )
+        unwritten_mask = valid_domain_mask & ~written_mask
+        malformed_mask = valid_domain_mask & ~written_mask & (candidates != -1)
+        outside_domain_mask = written_mask & ~valid_domain_mask
+        expected_threshold_pass = torch.zeros_like(candidates, dtype=torch.bool)
+        for row in range(BATCH_SIZE):
+            valid = int(source_lens[row].item())
+            tau = int(thresholds[row].item()) & 0xFFFF
+            tau_valid = int(
+                transaction["resident_threshold_valid"].detach().cpu()[row].item()
+            ) == 1
+            expected_threshold_pass[row, :valid] = (
+                score_values[row, :valid] >= tau
+            ) & tau_valid
+        expected_source_unmapped = valid_domain_mask
+        expected_candidate = (
+            expected_threshold_pass & mapping_valid_mask & eligible_cold_mask &
+            expected_source_unmapped
+        )
+        threshold_bit_mismatch_mask = (
+            valid_domain_mask & written_mask &
+            (threshold_bit_mask != expected_threshold_pass)
+        )
+        mapping_bit_mismatch_mask = (
+            valid_domain_mask & written_mask &
+            (mapping_bit_mask != mapping_valid_mask)
+        )
+        cold_bit_mismatch_mask = (
+            valid_domain_mask & written_mask &
+            (cold_bit_mask != eligible_cold_mask)
+        )
+        source_unmapped_bit_mismatch_mask = (
+            valid_domain_mask & written_mask &
+            (source_unmapped_bit_mask != expected_source_unmapped)
+        )
+        candidate_bit_mismatch_mask = (
+            valid_domain_mask & written_mask &
+            (candidate_bit_mask != expected_candidate)
+        )
+        candidate_mask = candidate_bit_mask
+    else:
+        candidate_mask = candidates == marker
+        outside_domain_mask = candidate_mask & ~valid_domain_mask
     invalid_candidate_mask = candidate_mask & ~eligible_cold_mask
     invalid_candidate_count = int(torch.count_nonzero(invalid_candidate_mask).item())
-    if invalid_candidate_count:
-        first = torch.nonzero(invalid_candidate_mask, as_tuple=False)[0].tolist()
-        raise RuntimeError(
-            "P4 audit emitted a candidate that is not a valid cold KV object: "
-            f"count={invalid_candidate_count} first_row={first[0]} "
-            f"first_source={first[1]}"
-        )
     candidate_discriminator_count = int(
         torch.count_nonzero(candidate_mask & mapping_difference_mask).item()
     )
@@ -510,24 +645,84 @@ def _assert_authoritative_cold_coverage(
         cold_capacity += int(
             torch.count_nonzero(slots[pool_row, mapped_active] < 0).item()
         )
-    if required <= 0:
-        raise RuntimeError("resident fixture produced no authoritative cold Top-K source")
-    if mapping_discriminator_sources <= 0:
-        raise RuntimeError(
-            "P4 audit fixture did not distinguish runtime S->O mapping from "
-            "the legacy identity address; adjust the source-mapping fixture"
-        )
-    if missing:
-        first = torch.nonzero(missing_mask, as_tuple=False)[0].tolist()
-        raise RuntimeError(
-            "P4 audit missed an authoritative cold Top-K source: "
-            f"required={required} covered={covered} missing={missing} "
-            f"first_row={first[0]} first_source={first[1]}"
-        )
-    if candidate_count >= cold_capacity:
-        raise RuntimeError(
-            "resident threshold was not selective: "
-            f"candidate_count={candidate_count} cold_capacity={cold_capacity}"
+    outside_domain_count = int(torch.count_nonzero(outside_domain_mask).item())
+    receipt_written_count = int(torch.count_nonzero(written_mask & valid_domain_mask).item())
+    receipt_unwritten_count = int(torch.count_nonzero(unwritten_mask).item())
+    receipt_malformed_count = int(torch.count_nonzero(malformed_mask).item())
+    threshold_bit_mismatch_count = int(
+        torch.count_nonzero(threshold_bit_mismatch_mask).item()
+    )
+    mapping_bit_mismatch_count = int(
+        torch.count_nonzero(mapping_bit_mismatch_mask).item()
+    )
+    cold_bit_mismatch_count = int(torch.count_nonzero(cold_bit_mismatch_mask).item())
+    source_unmapped_bit_mismatch_count = int(
+        torch.count_nonzero(source_unmapped_bit_mismatch_mask).item()
+    )
+    candidate_bit_mismatch_count = int(
+        torch.count_nonzero(candidate_bit_mismatch_mask).item()
+    )
+    row_diagnostics: list[dict[str, Any]] = []
+    for row in range(BATCH_SIZE):
+        valid = int(source_lens[row].item())
+        pool_row = int(pools[row].item())
+        row_candidate = candidate_mask[row, :valid]
+        row_required = required_mask[row, :valid]
+        row_covered = covered_mask[row, :valid]
+        row_missing = missing_mask[row, :valid]
+        row_invalid = invalid_candidate_mask[row, :valid]
+        row_outside = outside_domain_mask[row]
+        row_diagnostics.append(
+            {
+                "row": row,
+                "source_len": valid,
+                "pool_row": pool_row,
+                "tau": int(thresholds[row].item()) & 0xFFFF,
+                "candidate": int(torch.count_nonzero(row_candidate).item()),
+                "required": int(torch.count_nonzero(row_required).item()),
+                "covered": int(torch.count_nonzero(row_covered).item()),
+                "missing": int(torch.count_nonzero(row_missing).item()),
+                "invalid": int(torch.count_nonzero(row_invalid).item()),
+                "outside_domain": int(torch.count_nonzero(row_outside).item()),
+                "written": int(torch.count_nonzero(written_mask[row, :valid]).item()),
+                "unwritten": int(torch.count_nonzero(unwritten_mask[row, :valid]).item()),
+                "threshold_bit_mismatch": int(
+                    torch.count_nonzero(threshold_bit_mismatch_mask[row, :valid]).item()
+                ),
+                "mapping_bit_mismatch": int(
+                    torch.count_nonzero(mapping_bit_mismatch_mask[row, :valid]).item()
+                ),
+                "cold_bit_mismatch": int(
+                    torch.count_nonzero(cold_bit_mismatch_mask[row, :valid]).item()
+                ),
+                "source_unmapped_bit_mismatch": int(
+                    torch.count_nonzero(
+                        source_unmapped_bit_mismatch_mask[row, :valid]
+                    ).item()
+                ),
+                "candidate_bit_mismatch": int(
+                    torch.count_nonzero(candidate_bit_mismatch_mask[row, :valid]).item()
+                ),
+                "candidate_blocks": _block_histogram(row_candidate),
+                "required_blocks": _block_histogram(row_required),
+                "missing_blocks": _block_histogram(row_missing),
+                "missing_sources": _source_receipt(
+                    row_missing,
+                    pool_row=pool_row,
+                    object_map=object_map,
+                    slots=slots,
+                    receipt_u32=None if receipt_u32 is None else receipt_u32[row],
+                    receipt_encoding=receipt_encoding,
+                ),
+                "invalid_sources": _source_receipt(
+                    row_invalid,
+                    pool_row=pool_row,
+                    object_map=object_map,
+                    slots=slots,
+                    receipt_u32=None if receipt_u32 is None else receipt_u32[row],
+                    receipt_encoding=receipt_encoding,
+                ),
+            }
         )
     return {
         "official_selected": selected,
@@ -541,6 +736,21 @@ def _assert_authoritative_cold_coverage(
         "mapping_discriminator_selected": mapping_discriminator_selected,
         "mapping_discriminator_sources": mapping_discriminator_sources,
         "candidate_discriminator_count": candidate_discriminator_count,
+        "outside_domain_count": outside_domain_count,
+        "coverage_complete": missing == 0,
+        "candidate_selective": candidate_count < cold_capacity,
+        "fixture_has_required_cold": required > 0,
+        "mapping_fixture_discriminates": mapping_discriminator_sources > 0,
+        "receipt_kind": receipt_kind,
+        "receipt_written_count": receipt_written_count,
+        "receipt_unwritten_count": receipt_unwritten_count,
+        "receipt_malformed_count": receipt_malformed_count,
+        "threshold_bit_mismatch_count": threshold_bit_mismatch_count,
+        "mapping_bit_mismatch_count": mapping_bit_mismatch_count,
+        "cold_bit_mismatch_count": cold_bit_mismatch_count,
+        "source_unmapped_bit_mismatch_count": source_unmapped_bit_mismatch_count,
+        "candidate_bit_mismatch_count": candidate_bit_mismatch_count,
+        "row_diagnostics": row_diagnostics,
     }
 
 
@@ -607,9 +817,27 @@ def run_p4_fused_audit() -> dict[str, Any]:
     # target opapi path has been set.  It does not load vllm_ascend.
     _bind_isolated_target_opp(target_opapi)
     from nanovllm_p4_fused_streaming_li_get import (  # noqa: PLC0415
-        AUDIT_QUEUE_LEASE_SENTINEL,
+        AUDIT_SCORE_RECEIPT_QUEUE_LEASE_SENTINEL,
+        SCORE_RECEIPT_CANDIDATE_BIT,
+        SCORE_RECEIPT_COLD_BIT,
+        SCORE_RECEIPT_MAPPING_VALID_BIT,
+        SCORE_RECEIPT_SCORE_MASK,
+        SCORE_RECEIPT_SOURCE_UNMAPPED_BIT,
+        SCORE_RECEIPT_TAG,
+        SCORE_RECEIPT_TAG_MASK,
+        SCORE_RECEIPT_THRESHOLD_PASS_BIT,
         launch,
     )
+    score_receipt_encoding = {
+        "tag": int(SCORE_RECEIPT_TAG),
+        "tag_mask": int(SCORE_RECEIPT_TAG_MASK),
+        "candidate_bit": int(SCORE_RECEIPT_CANDIDATE_BIT),
+        "mapping_valid_bit": int(SCORE_RECEIPT_MAPPING_VALID_BIT),
+        "cold_bit": int(SCORE_RECEIPT_COLD_BIT),
+        "threshold_pass_bit": int(SCORE_RECEIPT_THRESHOLD_PASS_BIT),
+        "source_unmapped_bit": int(SCORE_RECEIPT_SOURCE_UNMAPPED_BIT),
+        "score_mask": int(SCORE_RECEIPT_SCORE_MASK),
+    }
 
     transaction = _make_no_post_transaction(
         device,
@@ -624,10 +852,15 @@ def run_p4_fused_audit() -> dict[str, Any]:
         raise RuntimeError("resident fixture did not mark any HBM-resident object")
     if not bool(torch.any(transaction["kv_object_slots_snapshot"] < 0)):
         raise RuntimeError("resident fixture did not leave any cold object")
+    if not bool(torch.all(transaction["private_source_to_slot"] == -1)):
+        raise RuntimeError(
+            "score-receipt fixture requires every private_source_to_slot cell "
+            "to begin as the normal unmapped sentinel"
+        )
     # The sentinel is a graph input value, deliberately installed before the
     # one cloned LI launch.  There is no second scan or host-side candidate
     # reconstruction.
-    transaction["queue_leases"].fill_(AUDIT_QUEUE_LEASE_SENTINEL)
+    transaction["queue_leases"].fill_(AUDIT_SCORE_RECEIPT_QUEUE_LEASE_SENTINEL)
     torch.npu.synchronize()
 
     print(
@@ -636,8 +869,8 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"reference_opapi={reference_opapi} resident_seed_opapi={seed_opapi} "
         f"target_opapi={target_opapi} "
         "raw_qk_scan_count=1 clone_topk_authority=0 "
-        "candidate_output=private_source_to_slot[R,S] "
-        f"mode=audit resident_blocks={RESIDENT_BLOCKS} "
+        "score_receipt_output=private_source_to_slot[R,S] "
+        f"mode=audit_score_receipt resident_blocks={RESIDENT_BLOCKS} "
         "threshold_fixture=resident_seed_exact_sortable_uint16 "
         "h2d_result=not_exercised",
         flush=True,
@@ -646,7 +879,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
     result = launch(
         inputs,
         transaction,
-        mode="audit",
+        mode="audit_score_receipt",
         # The adversarial fixture deliberately uses a source -> compressed
         # KV-object permutation.  It is therefore C8_COMPRESSED_OBJECT,
         # rather than the raw-token identity domain used by legacy LIDU.
@@ -693,11 +926,10 @@ def run_p4_fused_audit() -> dict[str, Any]:
         flush=True,
     )
     print(
-        "P4_FUSED_AUDIT_MARKERS "
-        f"candidate_marker={receipt['candidate_marker']} "
-        f"candidate_count={receipt['candidate_count']} "
-        f"candidate_overflow={receipt['candidate_overflow']} "
+        "P4_FUSED_AUDIT_RECEIPT_CONFIG "
+        f"kind={receipt['receipt_kind']} "
         f"queue_lease_sentinel={receipt['lease_sentinel']} "
+        "encoding=tag31_21_score15_0_unmapped16_threshold17_cold18_mapping19_candidate20 "
         f"score_source_lens={score_source_lens.tolist()} "
         "score_source_lens_independent=bitwise_equal "
         "transaction_output_aliases=verified "
@@ -706,12 +938,49 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"elapsed_us={elapsed_us:.3f}",
         flush=True,
     )
-    coverage = _assert_authoritative_cold_coverage(
+    coverage = _collect_authoritative_cold_coverage(
         official_indices,
         result["candidate_source_to_slot"],
         transaction,
         score_source_lens,
         receipt["candidate_marker"],
+        resident_tau,
+        receipt["receipt_kind"],
+        score_receipt_encoding,
+    )
+    for row_diag in coverage["row_diagnostics"]:
+        print(
+            "P4_FUSED_AUDIT_COVERAGE_DIAG "
+            f"row={row_diag['row']} source_len={row_diag['source_len']} "
+            f"pool_row={row_diag['pool_row']} tau={row_diag['tau']} "
+            f"candidate={row_diag['candidate']} required={row_diag['required']} "
+            f"covered={row_diag['covered']} missing={row_diag['missing']} "
+            f"invalid={row_diag['invalid']} outside_domain={row_diag['outside_domain']} "
+            f"written={row_diag['written']} unwritten={row_diag['unwritten']} "
+            f"threshold_bit_mismatch={row_diag['threshold_bit_mismatch']} "
+            f"mapping_bit_mismatch={row_diag['mapping_bit_mismatch']} "
+            f"cold_bit_mismatch={row_diag['cold_bit_mismatch']} "
+            f"source_unmapped_bit_mismatch={row_diag['source_unmapped_bit_mismatch']} "
+            f"candidate_bit_mismatch={row_diag['candidate_bit_mismatch']} "
+            f"candidate_blocks={row_diag['candidate_blocks']} "
+            f"required_blocks={row_diag['required_blocks']} "
+            f"missing_blocks={row_diag['missing_blocks']} "
+            f"missing_sources={row_diag['missing_sources']} "
+            f"invalid_sources={row_diag['invalid_sources']}",
+            flush=True,
+        )
+    print(
+        "P4_FUSED_AUDIT_SCORE_RECEIPT "
+        f"kind={coverage['receipt_kind']} "
+        f"written={coverage['receipt_written_count']} "
+        f"unwritten={coverage['receipt_unwritten_count']} "
+        f"malformed={coverage['receipt_malformed_count']} "
+        f"threshold_bit_mismatch={coverage['threshold_bit_mismatch_count']} "
+        f"mapping_bit_mismatch={coverage['mapping_bit_mismatch_count']} "
+        f"cold_bit_mismatch={coverage['cold_bit_mismatch_count']} "
+        f"source_unmapped_bit_mismatch={coverage['source_unmapped_bit_mismatch_count']} "
+        f"candidate_bit_mismatch={coverage['candidate_bit_mismatch_count']}",
+        flush=True,
     )
     print(
         "P4_FUSED_AUDIT_OFFICIAL_COVERAGE "
@@ -723,9 +992,14 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"candidate_count={coverage['candidate_count']} "
         f"cold_capacity={coverage['cold_capacity']} "
         f"invalid_candidate_count={coverage['invalid_candidate_count']} "
+        f"outside_domain_count={coverage['outside_domain_count']} "
         f"mapping_discriminator_selected={coverage['mapping_discriminator_selected']} "
         f"mapping_discriminator_sources={coverage['mapping_discriminator_sources']} "
         f"candidate_discriminator_count={coverage['candidate_discriminator_count']} "
+        f"coverage_complete={int(coverage['coverage_complete'])} "
+        f"candidate_selective={int(coverage['candidate_selective'])} "
+        f"fixture_has_required_cold={int(coverage['fixture_has_required_cold'])} "
+        f"mapping_fixture_discriminates={int(coverage['mapping_fixture_discriminates'])} "
         "candidate_recall=official_topk_cold_only "
         "h2d_result=not_exercised",
         flush=True,
@@ -742,6 +1016,22 @@ def run_p4_fused_audit() -> dict[str, Any]:
         "mapping_discriminator_sources": coverage["mapping_discriminator_sources"],
         "candidate_discriminator_count": coverage["candidate_discriminator_count"],
         "invalid_candidate_count": coverage["invalid_candidate_count"],
+        "outside_domain_count": coverage["outside_domain_count"],
+        "coverage_complete": coverage["coverage_complete"],
+        "candidate_selective": coverage["candidate_selective"],
+        "fixture_has_required_cold": coverage["fixture_has_required_cold"],
+        "mapping_fixture_discriminates": coverage["mapping_fixture_discriminates"],
+        "receipt_kind": coverage["receipt_kind"],
+        "receipt_written_count": coverage["receipt_written_count"],
+        "receipt_unwritten_count": coverage["receipt_unwritten_count"],
+        "receipt_malformed_count": coverage["receipt_malformed_count"],
+        "threshold_bit_mismatch_count": coverage["threshold_bit_mismatch_count"],
+        "mapping_bit_mismatch_count": coverage["mapping_bit_mismatch_count"],
+        "cold_bit_mismatch_count": coverage["cold_bit_mismatch_count"],
+        "source_unmapped_bit_mismatch_count": coverage[
+            "source_unmapped_bit_mismatch_count"
+        ],
+        "candidate_bit_mismatch_count": coverage["candidate_bit_mismatch_count"],
         "expected_score_source_lens": expected_score_source_lens,
         "derived_score_source_lens": result["score_source_lens"],
     }

@@ -50,16 +50,60 @@ def main() -> int:
     _assert_bitwise_equal(
         result["official_indices"], result["clone_indices"], "full_topk"
     )
+    print(
+        "P4_STRICT_MATH_GATE_PROGRESS check=full_topk status=bitwise_equal",
+        flush=True,
+    )
     _assert_bitwise_equal(
         result["expected_score_source_lens"],
         result["derived_score_source_lens"],
         "score_source_lens",
+    )
+    print(
+        "P4_STRICT_MATH_GATE_PROGRESS check=score_source_lens status=bitwise_equal",
+        flush=True,
+    )
+    receipt_kind = str(result["receipt_kind"])
+    receipt_unwritten_count = int(result["receipt_unwritten_count"])
+    receipt_malformed_count = int(result["receipt_malformed_count"])
+    threshold_bit_mismatch_count = int(result["threshold_bit_mismatch_count"])
+    mapping_bit_mismatch_count = int(result["mapping_bit_mismatch_count"])
+    cold_bit_mismatch_count = int(result["cold_bit_mismatch_count"])
+    source_unmapped_bit_mismatch_count = int(
+        result["source_unmapped_bit_mismatch_count"]
+    )
+    candidate_bit_mismatch_count = int(result["candidate_bit_mismatch_count"])
+    if (
+        receipt_kind != "score"
+        or receipt_unwritten_count != 0
+        or receipt_malformed_count != 0
+        or threshold_bit_mismatch_count != 0
+        or mapping_bit_mismatch_count != 0
+        or cold_bit_mismatch_count != 0
+        or source_unmapped_bit_mismatch_count != 0
+        or candidate_bit_mismatch_count != 0
+    ):
+        raise AssertionError(
+            "P4_STRICT_MATH_GATE_FAIL "
+            "check=score_receipt "
+            f"kind={receipt_kind} unwritten={receipt_unwritten_count} "
+            f"malformed={receipt_malformed_count} "
+            f"threshold_bit_mismatch={threshold_bit_mismatch_count} "
+            f"mapping_bit_mismatch={mapping_bit_mismatch_count} "
+            f"cold_bit_mismatch={cold_bit_mismatch_count} "
+            f"source_unmapped_bit_mismatch={source_unmapped_bit_mismatch_count} "
+            f"candidate_bit_mismatch={candidate_bit_mismatch_count}"
+        )
+    print(
+        "P4_STRICT_MATH_GATE_PROGRESS check=score_receipt status=bitwise_equal",
+        flush=True,
     )
     required_cold = int(result["required_cold"])
     covered_cold = int(result["covered_cold"])
     missing_cold = int(result["missing_cold"])
     candidate_count = int(result["candidate_count"])
     invalid_candidate_count = int(result["invalid_candidate_count"])
+    outside_domain_count = int(result["outside_domain_count"])
     mapping_discriminator_selected = int(result["mapping_discriminator_selected"])
     candidate_discriminator_count = int(result["candidate_discriminator_count"])
     if (
@@ -68,6 +112,7 @@ def main() -> int:
         or missing_cold != 0
         or candidate_count < required_cold
         or invalid_candidate_count != 0
+        or outside_domain_count != 0
         or mapping_discriminator_selected <= 0
         or candidate_discriminator_count <= 0
     ):
@@ -77,6 +122,7 @@ def main() -> int:
             f"required_cold={required_cold} covered_cold={covered_cold} "
             f"missing_cold={missing_cold} candidate_count={candidate_count} "
             f"invalid_candidate_count={invalid_candidate_count} "
+            f"outside_domain_count={outside_domain_count} "
             f"mapping_discriminator_selected={mapping_discriminator_selected} "
             f"candidate_discriminator_count={candidate_discriminator_count}"
         )

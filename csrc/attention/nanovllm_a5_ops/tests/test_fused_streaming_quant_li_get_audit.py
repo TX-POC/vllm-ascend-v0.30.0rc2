@@ -25,6 +25,42 @@ def main() -> int:
     result = run_p4_fused_audit()
     official = _bytes(result["official_indices"])
     clone = _bytes(result["clone_indices"])
+    coverage_ok = (
+        int(result["required_cold"]) > 0
+        and int(result["covered_cold"]) == int(result["required_cold"])
+        and int(result["missing_cold"]) == 0
+        and int(result["invalid_candidate_count"]) == 0
+        and int(result["outside_domain_count"]) == 0
+        and str(result["receipt_kind"]) == "score"
+        and int(result["receipt_unwritten_count"]) == 0
+        and int(result["receipt_malformed_count"]) == 0
+        and int(result["threshold_bit_mismatch_count"]) == 0
+        and int(result["mapping_bit_mismatch_count"]) == 0
+        and int(result["cold_bit_mismatch_count"]) == 0
+        and int(result["source_unmapped_bit_mismatch_count"]) == 0
+        and int(result["candidate_bit_mismatch_count"]) == 0
+        and bool(result["candidate_selective"])
+        and bool(result["mapping_fixture_discriminates"])
+    )
+    if not coverage_ok:
+        raise RuntimeError(
+            "P4_FUSED_AUDIT_CANDIDATE_GATE status=blocked "
+            f"required_cold={result['required_cold']} "
+            f"covered_cold={result['covered_cold']} "
+            f"missing_cold={result['missing_cold']} "
+            f"invalid_candidate_count={result['invalid_candidate_count']} "
+            f"outside_domain_count={result['outside_domain_count']} "
+            f"receipt_kind={result['receipt_kind']} "
+            f"receipt_unwritten_count={result['receipt_unwritten_count']} "
+            f"receipt_malformed_count={result['receipt_malformed_count']} "
+            f"threshold_bit_mismatch_count={result['threshold_bit_mismatch_count']} "
+            f"mapping_bit_mismatch_count={result['mapping_bit_mismatch_count']} "
+            f"cold_bit_mismatch_count={result['cold_bit_mismatch_count']} "
+            f"source_unmapped_bit_mismatch_count={result['source_unmapped_bit_mismatch_count']} "
+            f"candidate_bit_mismatch_count={result['candidate_bit_mismatch_count']} "
+            f"candidate_selective={int(bool(result['candidate_selective']))} "
+            f"mapping_fixture_discriminates={int(bool(result['mapping_fixture_discriminates']))}"
+        )
     print(
         "P4_FUSED_AUDIT_CANDIDATE_GATE status=pass "
         "authority=official_c8 "

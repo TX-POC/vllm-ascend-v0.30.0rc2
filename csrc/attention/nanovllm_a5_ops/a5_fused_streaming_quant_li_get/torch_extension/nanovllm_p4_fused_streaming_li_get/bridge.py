@@ -15,8 +15,18 @@ from typing import Any
 
 
 AUDIT_QUEUE_LEASE_SENTINEL = -(1 << 31)
+AUDIT_SCORE_RECEIPT_QUEUE_LEASE_SENTINEL = AUDIT_QUEUE_LEASE_SENTINEL + 1
 AUDIT_CANDIDATE_MARKER = -3
+SCORE_RECEIPT_TAG = 0x80000000
+SCORE_RECEIPT_TAG_MASK = 0xFFE00000
+SCORE_RECEIPT_CANDIDATE_BIT = 1 << 20
+SCORE_RECEIPT_MAPPING_VALID_BIT = 1 << 19
+SCORE_RECEIPT_COLD_BIT = 1 << 18
+SCORE_RECEIPT_THRESHOLD_PASS_BIT = 1 << 17
+SCORE_RECEIPT_SOURCE_UNMAPPED_BIT = 1 << 16
+SCORE_RECEIPT_SCORE_MASK = 0xFFFF
 _AUDIT = "audit"
+_AUDIT_SCORE_RECEIPT = "audit_score_receipt"
 _POST = "post"
 _TRANSACTION_KEYS = (
     "resident_threshold",
@@ -83,14 +93,19 @@ def launch(
     """Launch exactly one raw-Q/K scan and return non-authoritative receipts.
 
     Audit is selected solely by the caller's graph-static lease input: every
-    lease cell must already equal ``AUDIT_QUEUE_LEASE_SENTINEL``.  The bridge
+    lease cell must already equal the sentinel for ``mode``.  The bridge
     intentionally does not perform a host-side fill or synchronization, since
     that would hide a graph dependency and turn the test into two executions.
+    ``audit_score_receipt`` is an isolated diagnostic form of audit: output 2
+    carries a tagged score/decision receipt instead of candidate marker -3.
     ``post`` uses the normal lease table but remains fail-closed unless the
     explicit environment gate is enabled.
     """
-    if mode not in (_AUDIT, _POST):
-        raise ValueError(f"P4.1 mode must be {_AUDIT!r} or {_POST!r}, got {mode!r}")
+    if mode not in (_AUDIT, _AUDIT_SCORE_RECEIPT, _POST):
+        raise ValueError(
+            "P4.1 mode must be one of "
+            f"{_AUDIT!r}, {_AUDIT_SCORE_RECEIPT!r}, {_POST!r}; got {mode!r}"
+        )
     _require_transaction(transaction)
     if mode == _POST and not _allow_post():
         raise RuntimeError(
@@ -143,8 +158,8 @@ def launch(
         # This result intentionally cannot be fed to QSFA by this bridge.
         "non_authoritative_sparse_indices": outputs[0],
         "non_authoritative_sparse_values": outputs[1],
-        # In audit mode the fixed [R,S] receipt contains -3 candidates;
-        # in post mode it retains the existing private-slot receipt ABI.
+        # Candidate audit uses -3 records. Score-receipt audit uses a tagged
+        # diagnostic encoding. Post retains the existing private-slot ABI.
         "candidate_source_to_slot": outputs[2],
         "private_ready_table": outputs[3],
         "private_arena_head": outputs[4],
@@ -153,8 +168,18 @@ def launch(
         "telemetry": outputs[7],
         "score_source_lens": outputs[8],
         "mode": mode,
+        "audit_receipt_kind": (
+            "score" if mode == _AUDIT_SCORE_RECEIPT else "candidate"
+        ),
         "candidate_marker": AUDIT_CANDIDATE_MARKER,
-        "audit_lease_sentinel": AUDIT_QUEUE_LEASE_SENTINEL,
+        "audit_lease_sentinel": (
+            AUDIT_SCORE_RECEIPT_QUEUE_LEASE_SENTINEL
+            if mode == _AUDIT_SCORE_RECEIPT
+            else AUDIT_QUEUE_LEASE_SENTINEL
+        ),
         "topk_authority": "non_authoritative_pending_strict_equivalence",
-        "h2d_claim": "none" if mode == _AUDIT else "payload_unverified",
+        "h2d_claim": (
+            "none" if mode in (_AUDIT, _AUDIT_SCORE_RECEIPT)
+            else "payload_unverified"
+        ),
     }

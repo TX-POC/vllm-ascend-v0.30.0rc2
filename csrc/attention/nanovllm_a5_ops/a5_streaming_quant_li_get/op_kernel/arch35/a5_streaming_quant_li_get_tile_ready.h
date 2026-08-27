@@ -31,11 +31,30 @@ constexpr int32_t kSourceClaiming = -2;
 // arena.  A negative owner is invalid for the transport ABI, so this cannot
 // be confused with a real queue owner (which is strictly positive).
 constexpr int32_t kAuditQueueLeaseSentinel = (-2147483647 - 1);
+// P4.2 diagnostic mode is intentionally a different all-lease sentinel.  It
+// never exists on the product path; it turns the existing audit-only [R,S]
+// map into a complete score receipt so one launch can prove the seam between
+// C8 reduction and the threshold/mapping predicate.
+constexpr int32_t kAuditScoreReceiptQueueLeaseSentinel = -2147483647;
 // `private_source_to_slot` is the existing graph-static [R,S] transaction
 // map.  In P4.1 audit mode -3 is a candidate marker, not an HBM slot and not
 // a published cache mapping.  It is intentionally separate from -1
 // (unmapped) and -2 (a transient post-path claim).
 constexpr int32_t kSourceAuditCandidate = -3;
+// Audit score receipt encoding, stored only when every lease equals
+// kAuditScoreReceiptQueueLeaseSentinel.  Bits [31:21] tag a written record;
+// the remaining bits carry the exact sortable score and the decisions made
+// at the device-side predicate.  No product/private-slot value can be
+// confused with this representation because regular values are nonnegative
+// slots, -1/-2 are local sentinels and -3 is candidate-only audit.
+constexpr uint32_t kAuditScoreReceiptTag = 0x80000000U;
+constexpr uint32_t kAuditScoreReceiptTagMask = 0xFFE00000U;
+constexpr uint32_t kAuditScoreReceiptCandidateBit = 1U << 20;
+constexpr uint32_t kAuditScoreReceiptMappingValidBit = 1U << 19;
+constexpr uint32_t kAuditScoreReceiptColdBit = 1U << 18;
+constexpr uint32_t kAuditScoreReceiptThresholdPassBit = 1U << 17;
+constexpr uint32_t kAuditScoreReceiptSourceUnmappedBit = 1U << 16;
+constexpr uint32_t kAuditScoreReceiptScoreMask = 0xFFFFU;
 constexpr int32_t kPrivateReadyFree = 0;
 constexpr int32_t kPrivateReadyPending = 1;
 constexpr int32_t kPrivateReadyReady = 2;
@@ -72,6 +91,18 @@ struct PrivateArenaClaimResult {
 };
 static_assert(sizeof(PrivateArenaClaimResult) == 24U,
               "private claim UB hand-off ABI changed");
+
+// The candidate-marker audit and the full score-receipt audit must execute
+// exactly the same threshold / S->O / resident test.  Keeping the decision in
+// one helper prevents a diagnostic-only branch from accidentally proving a
+// different predicate than the marker used by the staged product design.
+struct AuditScoreDecision {
+    uint32_t threshold_pass;
+    uint32_t mapping_valid;
+    uint32_t cold;
+    uint32_t source_unmapped;
+    uint32_t candidate;
+};
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(1)
 inline void ClaimStreamingPrivateArenaSimt(
@@ -204,6 +235,7 @@ public:
         producerId_ = producer_id;
         enabled_ = false;
         auditMode_ = false;
+        auditScoreReceiptMode_ = false;
         hasWave_ = false;
         stagedCount_ = 0U;
         if (resident_threshold == nullptr || resident_threshold_valid == nullptr ||
@@ -236,7 +268,8 @@ public:
             AddTelemetry(0U, kControlRejected, 1);
             return;
         }
-        auditMode_ = IsAuditLeaseTable();
+        auditScoreReceiptMode_ = IsAuditScoreReceiptLeaseTable();
+        auditMode_ = auditScoreReceiptMode_ || IsAuditLeaseTable();
         enabled_ = true;
     }
 
@@ -277,8 +310,13 @@ public:
             return;
         }
         if (auditMode_) {
-            EmitAuditCandidates(out_base, info, cur_aiv_s1_idx,
-                                cur_aiv_s1_proc_num, cur_s2_idx);
+            if (auditScoreReceiptMode_) {
+                EmitAuditScoreReceipt(out_base, info, cur_aiv_s1_idx,
+                                      cur_aiv_s1_proc_num, cur_s2_idx);
+            } else {
+                EmitAuditCandidates(out_base, info, cur_aiv_s1_idx,
+                                    cur_aiv_s1_proc_num, cur_s2_idx);
+            }
             return;
         }
         RetireAndReleaseIfTerminal(false);
@@ -406,6 +444,20 @@ private:
         return queueCount_ != 0U;
     }
 
+    __aicore__ inline bool IsAuditScoreReceiptLeaseTable()
+    {
+        // This separate sentinel makes the all-score receipt impossible to
+        // activate accidentally from the normal candidate-only audit or from
+        // the product post path.
+        for (uint32_t queueId = 0U; queueId < queueCount_; ++queueId) {
+            if (queueLeases_.GetValue(queueId) !=
+                kAuditScoreReceiptQueueLeaseSentinel) {
+                return false;
+            }
+        }
+        return queueCount_ != 0U;
+    }
+
     __aicore__ inline uint64_t OutputRow(const QLICommon::RunInfo &info,
                                           int64_t s1_index) const
     {
@@ -457,34 +509,48 @@ private:
     // predicates in TryStageCandidate(), but ends at the fixed source map.
     // Each (row, source_index) is owned by exactly one C8 score tile, so this
     // path does not need a queue claim or a private-arena allocation.
-    __aicore__ inline void TryRecordAuditCandidate(
+    __aicore__ inline AuditScoreDecision EvaluateAuditScore(
         uint16_t score, uint64_t row, uint32_t source_index)
     {
-        if (residentThresholdValid_.GetValue(row) != 1) {
-            return;
-        }
+        AuditScoreDecision decision{0U, 0U, 0U, 0U, 0U};
         const uint16_t threshold = static_cast<uint16_t>(
-            static_cast<uint32_t>(residentThreshold_.GetValue(row)) & 0xffffU);
-        if (score < threshold) {
-            return;
-        }
+            static_cast<uint32_t>(residentThreshold_.GetValue(row)) &
+            kAuditScoreReceiptScoreMask);
+        decision.threshold_pass =
+            residentThresholdValid_.GetValue(row) == 1 && score >= threshold;
         const int32_t poolRow = reqPoolEntries_.GetValue(row);
-        if (poolRow < 0 || static_cast<uint32_t>(poolRow) >= poolSize_) {
-            return;
+        const int32_t kvObjectLen = kvObjectLens_.GetValue(row);
+        if (poolRow < 0 || static_cast<uint32_t>(poolRow) >= poolSize_ ||
+            kvObjectLen <= 0 ||
+            static_cast<uint32_t>(kvObjectLen) > kvObjectCapacity_) {
+            return decision;
         }
         const int32_t kvObject = kvObjectMap_.GetValue(
             static_cast<uint64_t>(poolRow) * sourceCapacity_ + source_index);
-        const int32_t kvObjectLen = kvObjectLens_.GetValue(row);
-        if (kvObjectLen <= 0 ||
-            static_cast<uint32_t>(kvObjectLen) > kvObjectCapacity_ ||
-            kvObject < 0 ||
+        if (kvObject < 0 ||
             static_cast<uint32_t>(kvObject) >=
                 static_cast<uint32_t>(kvObjectLen)) {
-            return;
+            return decision;
         }
-        if (kvObjectSlots_.GetValue(
-                static_cast<uint64_t>(poolRow) * kvObjectCapacity_ +
-                static_cast<uint32_t>(kvObject)) >= 0) {
+        decision.mapping_valid = 1U;
+        decision.cold = kvObjectSlots_.GetValue(
+            static_cast<uint64_t>(poolRow) * kvObjectCapacity_ +
+            static_cast<uint32_t>(kvObject)) < 0;
+        const uint64_t sourceOffset = row * sourceCapacity_ + source_index;
+        decision.source_unmapped =
+            sourceToSlot_.GetValue(sourceOffset) == kSourceUnmapped;
+        decision.candidate =
+            decision.threshold_pass != 0U && decision.cold != 0U &&
+            decision.source_unmapped != 0U;
+        return decision;
+    }
+
+    __aicore__ inline void TryRecordAuditCandidate(
+        uint16_t score, uint64_t row, uint32_t source_index)
+    {
+        const AuditScoreDecision decision =
+            EvaluateAuditScore(score, row, source_index);
+        if (decision.candidate == 0U) {
             return;
         }
         const uint64_t sourceOffset = row * sourceCapacity_ + source_index;
@@ -525,6 +591,58 @@ private:
         // concurrent AIV read/modify/write telemetry updates would make a
         // count nondeterministic.  The exact audit count is instead the
         // host-visible number of -3 entries in this fixed [R,S] output map.
+    }
+
+    // P4.2 audit-only diagnostic.  This is deliberately not a second score
+    // calculation and not a product state transition: it serializes the
+    // value already produced by BatchMulWeightAndReduceSum plus each exact
+    // branch decision into the existing fixed [R,S] audit receipt.  Every
+    // valid score coordinate is owned by one LI tile, so non-atomic stores
+    // are sufficient and make a skipped tile visible as the original -1.
+    __aicore__ inline void EmitAuditScoreReceipt(
+        const LocalTensor<uint16_t> &out_base,
+        const QLICommon::RunInfo &info,
+        int64_t cur_aiv_s1_idx,
+        int64_t cur_aiv_s1_proc_num,
+        int64_t cur_s2_idx)
+    {
+        const int64_t curS1ProcNum = cur_aiv_s1_proc_num;
+        for (int64_t localRow = 0; localRow < curS1ProcNum; ++localRow) {
+            const uint64_t row = OutputRow(info, cur_aiv_s1_idx + localRow);
+            if (row >= rowCount_) {
+                continue;
+            }
+            const int32_t validInTile = ValidInTile(
+                info, cur_aiv_s1_idx, localRow, cur_s2_idx);
+            const uint64_t outRowOffset = static_cast<uint64_t>(localRow) *
+                (UB_BANK_DEPTH_STRIDE / sizeof(uint16_t));
+            for (int32_t inTile = 0; inTile < validInTile; ++inTile) {
+                const uint16_t score = out_base.GetValue(outRowOffset + inTile);
+                const uint32_t sourceIndex = static_cast<uint32_t>(
+                    cur_s2_idx + inTile);
+                const AuditScoreDecision decision =
+                    EvaluateAuditScore(score, row, sourceIndex);
+                uint32_t receipt = kAuditScoreReceiptTag |
+                    (static_cast<uint32_t>(score) & kAuditScoreReceiptScoreMask);
+                if (decision.threshold_pass != 0U) {
+                    receipt |= kAuditScoreReceiptThresholdPassBit;
+                }
+                if (decision.source_unmapped != 0U) {
+                    receipt |= kAuditScoreReceiptSourceUnmappedBit;
+                }
+                if (decision.cold != 0U) {
+                    receipt |= kAuditScoreReceiptColdBit;
+                }
+                if (decision.mapping_valid != 0U) {
+                    receipt |= kAuditScoreReceiptMappingValidBit;
+                }
+                if (decision.candidate != 0U) {
+                    receipt |= kAuditScoreReceiptCandidateBit;
+                }
+                const uint64_t sourceOffset = row * sourceCapacity_ + sourceIndex;
+                sourceToSlot_.SetValue(sourceOffset, static_cast<int32_t>(receipt));
+            }
+        }
     }
 
     __aicore__ inline uint32_t PrivateOutputRowBase(uint32_t queue_id) const
@@ -750,6 +868,7 @@ private:
     uint32_t stagedCount_ = 0U;
     bool enabled_ = false;
     bool auditMode_ = false;
+    bool auditScoreReceiptMode_ = false;
     bool hasWave_ = false;
 };
 

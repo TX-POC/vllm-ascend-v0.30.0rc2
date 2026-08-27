@@ -45,10 +45,15 @@ def main() -> int:
     build = BUILD.read_text(encoding="utf-8")
 
     assert "kAuditQueueLeaseSentinel = (-2147483647 - 1)" in hook
+    assert "kAuditScoreReceiptQueueLeaseSentinel = -2147483647" in hook
     assert "kSourceAuditCandidate = -3" in hook
-    assert "auditMode_ = IsAuditLeaseTable();" in hook
+    assert "kAuditScoreReceiptTag = 0x80000000U" in hook
+    assert "auditScoreReceiptMode_ = IsAuditScoreReceiptLeaseTable();" in hook
+    assert "auditMode_ = auditScoreReceiptMode_ || IsAuditLeaseTable();" in hook
     assert "if (auditMode_) {\n            return true;" in hook
     assert "EmitAuditCandidates(out_base" in hook
+    assert "EmitAuditScoreReceipt(out_base" in hook
+    assert "EvaluateAuditScore(" in hook
 
     audit = _body(hook, "void EmitAuditCandidates(", "void TryStageCandidate(")
     assert "TryRecordAuditCandidate(" in audit
@@ -76,6 +81,8 @@ def main() -> int:
     assert "AUDIT_QUEUE_LEASE_SENTINEL" in bridge
     assert "A5StreamingQuantLiGet" in build
     assert "NANOVLLM_A5_OPS_ONLY=A5StreamingQuantLiGet" in bridge
+    assert "_AUDIT_SCORE_RECEIPT = \"audit_score_receipt\"" in bridge
+    assert "SCORE_RECEIPT_CANDIDATE_BIT" in bridge
     assert "official C8" in readme
     assert "non-authoritative" in readme
     assert "no ring\noverflow" in readme
@@ -84,7 +91,7 @@ def main() -> int:
     # sparse_values output or a host-derived proxy.
     assert "NANOVLLM_A5_RESIDENT_SEED_OPP" in audit_adapter
     assert "resident_seed_exact_sortable_uint16" in audit_adapter
-    assert "_assert_authoritative_cold_coverage" in audit_adapter
+    assert "_collect_authoritative_cold_coverage" in audit_adapter
     assert "object_mapping=\"permuted_pool\"" in audit_adapter
     assert "row -> req_pool_entries -> kv_object_map" in audit_adapter
     assert "_assert_transaction_output_aliases" in audit_adapter
@@ -93,6 +100,9 @@ def main() -> int:
     assert "mapping_discriminator_selected" in audit_adapter
     assert "candidate_discriminator_count" in audit_adapter
     assert "invalid_candidate_mask" in audit_adapter
+    assert "P4_FUSED_AUDIT_COVERAGE_DIAG" in audit_adapter
+    assert "P4_FUSED_AUDIT_SCORE_RECEIPT" in audit_adapter
+    assert "mode=\"audit_score_receipt\"" in audit_adapter
     assert "official TopK ∩ cold" in audit_adapter
     assert "npu_a5_c8_resident_seed" in resident_seed_bridge
     assert "aclnnA5C8ResidentSeed" in resident_seed_bridge
