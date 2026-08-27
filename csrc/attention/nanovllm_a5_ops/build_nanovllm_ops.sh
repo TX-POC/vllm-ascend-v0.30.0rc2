@@ -327,9 +327,72 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* || \
         echo "[nanovllm_a5_ops] source=${KVAF_FUSED_SOURCE}" >&2
         exit 2
     fi
+    # The P3 LI hook reads the queue control from GM while the embedded Get
+    # helper also materializes a descriptor in GM.  AscendC does not allow an
+    # implicit aggregate copy across that address-space boundary.  The KVAF
+    # helper therefore has an explicit, field-wise ABI bridge.  Earlier KVAF
+    # revisions already exposed the split Get lifecycle above, so checking
+    # only that lifecycle would still allow a stale header to reach CANN and
+    # fail minutes later with opaque __gm__/Local-Memory diagnostics.
+    #
+    # Fail before msopgen/CANN and print the exact checkout used for staging.
+    # This is a build-closure guard only: it neither changes LI score/Top-K
+    # math nor the Direct-HCCP command/CQ ordering.
+    KVAF_FUSED_HEAD="unavailable"
+    if [[ -e "${KVAF_FUSED_GET_SOURCE}/.git" ]]; then
+        KVAF_FUSED_HEAD="$(git -C "${KVAF_FUSED_GET_SOURCE}" rev-parse HEAD 2>/dev/null || echo unavailable)"
+    fi
+    for required_token in \
+        'using ::KvafStreamingBatchGetControl;' \
+        'using ::KvafStreamingBatchGetDescriptorScratch;' \
+        'LoadKvafStreamingBatchGetControlFromGmForAicore' \
+        'LoadKvafStreamingBatchGetControlFromGmForSimt' \
+        'LoadKvafStreamingBatchGetDescriptorScratchFromGm' \
+        'StoreKvafStreamingBatchGetDescriptorScratchToGm'; do
+        if ! grep -Fq "${required_token}" "${KVAF_FUSED_HEADER}"; then
+            echo "[nanovllm_a5_ops] ERROR: ${KVAF_CONSUMER_NAMES[*]} requires KVAF GM/local ABI bridge." >&2
+            echo "[nanovllm_a5_ops] kvaf_head=${KVAF_FUSED_HEAD} helper=${KVAF_FUSED_HEADER}" >&2
+            echo "[nanovllm_a5_ops] missing_token=${required_token}" >&2
+            exit 2
+        fi
+    done
+    for forbidden_token in \
+        'const KvafStreamingBatchGetControl control = *control_gm;' \
+        '*descriptor = *source;' \
+        '*scratch = descriptor;'; do
+        if grep -Fq "${forbidden_token}" "${KVAF_FUSED_HEADER}"; then
+            echo "[nanovllm_a5_ops] ERROR: stale implicit GM/local aggregate copy in KVAF helper." >&2
+            echo "[nanovllm_a5_ops] kvaf_head=${KVAF_FUSED_HEAD} helper=${KVAF_FUSED_HEADER}" >&2
+            echo "[nanovllm_a5_ops] forbidden_token=${forbidden_token}" >&2
+            exit 2
+        fi
+    done
+    # The source-derived LI hook is below op_kernel/arch35 and includes the
+    # helper as ../kvaf_device/..., not as a flat op_kernel header.  Keep the
+    # flat copies for the P1 closure, but overwrite the relative include
+    # closure as well.  Otherwise a checked-in, older KVAF helper below
+    # kvaf_device/ silently wins and the CANN build mixes new LI code with an
+    # old GM/local ABI implementation.
+    KVAF_STAGE_DIR="${OP_DEV}/op_kernel/kvaf_device"
+    mkdir -p "${KVAF_STAGE_DIR}"
     cp -f "${KVAF_FUSED_HEADER}" "${OP_DEV}/op_kernel/kvaf_fused_full_get_device.h"
     cp -f "${KVAF_FUSED_SOURCE}" "${OP_DEV}/op_kernel/execute_batch_get_aiv.asc"
     cp -f "${KVAF_ABI_HEADER}" "${OP_DEV}/op_kernel/batch_get_abi.h"
+    cp -f "${KVAF_FUSED_HEADER}" "${KVAF_STAGE_DIR}/kvaf_fused_full_get_device.h"
+    cp -f "${KVAF_FUSED_SOURCE}" "${KVAF_STAGE_DIR}/execute_batch_get_aiv.asc"
+    cp -f "${KVAF_ABI_HEADER}" "${KVAF_STAGE_DIR}/batch_get_abi.h"
+    for staged_pair in \
+        "${KVAF_FUSED_HEADER}:${KVAF_STAGE_DIR}/kvaf_fused_full_get_device.h" \
+        "${KVAF_FUSED_SOURCE}:${KVAF_STAGE_DIR}/execute_batch_get_aiv.asc" \
+        "${KVAF_ABI_HEADER}:${KVAF_STAGE_DIR}/batch_get_abi.h"; do
+        KVAF_SOURCE_FILE="${staged_pair%%:*}"
+        KVAF_STAGED_FILE="${staged_pair#*:}"
+        if ! cmp -s "${KVAF_SOURCE_FILE}" "${KVAF_STAGED_FILE}"; then
+            echo "[nanovllm_a5_ops] ERROR: staged KVAF relative include closure differs from selected source." >&2
+            echo "[nanovllm_a5_ops] source=${KVAF_SOURCE_FILE} staged=${KVAF_STAGED_FILE}" >&2
+            exit 2
+        fi
+    done
     # The embedded KVAF implementation uses SIMT atomics.  msopgen's
     # generated CCEC include list does not inherit KVAF's CMake discovery, so
     # stage the exact CANN SIMT headers next to the fused kernel instead of
@@ -373,6 +436,8 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* || \
     rm -rf "${OP_DEV}/op_kernel/simt_api"
     cp -a "${KVAF_SIMT_ROOT}/simt_api" "${OP_DEV}/op_kernel/simt_api"
     echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} KVAF source: ${KVAF_FUSED_GET_SOURCE}"
+    echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} KVAF GM/local ABI bridge: head=${KVAF_FUSED_HEAD} verified=1"
+    echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} KVAF relative include closure: ${KVAF_STAGE_DIR} verified=1"
     echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} SIMT root: ${KVAF_SIMT_ROOT}"
 fi
 
@@ -419,6 +484,27 @@ done
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
 rm -f "${GENERATED}/op_host/lightning_indexer_decode_update_a5_def.cpp"
+
+# `build.sh` compiles from GENERATED, rather than from OP_DEV.  Prove that
+# the exact KVAF header selected above survived the final overlay at the
+# relative path used by the source-derived LI hook.  This makes a future
+# staging/order regression fail before CANN starts compiling kernels.
+if [[ -n "${KVAF_STAGE_DIR:-}" ]]; then
+    KVAF_GENERATED_STAGE_DIR="${GENERATED}/op_kernel/kvaf_device"
+    for generated_pair in \
+        "${KVAF_FUSED_HEADER}:${KVAF_GENERATED_STAGE_DIR}/kvaf_fused_full_get_device.h" \
+        "${KVAF_FUSED_SOURCE}:${KVAF_GENERATED_STAGE_DIR}/execute_batch_get_aiv.asc" \
+        "${KVAF_ABI_HEADER}:${KVAF_GENERATED_STAGE_DIR}/batch_get_abi.h"; do
+        KVAF_SOURCE_FILE="${generated_pair%%:*}"
+        KVAF_GENERATED_FILE="${generated_pair#*:}"
+        if ! cmp -s "${KVAF_SOURCE_FILE}" "${KVAF_GENERATED_FILE}"; then
+            echo "[nanovllm_a5_ops] ERROR: generated KVAF relative include closure differs from selected source." >&2
+            echo "[nanovllm_a5_ops] source=${KVAF_SOURCE_FILE} generated=${KVAF_GENERATED_FILE}" >&2
+            exit 2
+        fi
+    done
+    echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} generated KVAF relative include closure: ${KVAF_GENERATED_STAGE_DIR} verified=1"
+fi
 
 # `msopgen` creates an all-in-one host source named
 # `a5_streaming_quant_li_get.cpp`.  P3 deliberately replaces that generated

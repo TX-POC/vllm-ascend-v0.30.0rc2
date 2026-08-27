@@ -295,6 +295,21 @@ def require_source_contract() -> None:
     assert 'rm -f "${P3_GENERATED_HOST_STUB}"' in build_script
     assert "P3_OPDEF_SOURCES" in build_script
     assert "P3 host registration closure:" in build_script
+    # The C8 hook reaches the KVAF helper through the relative include
+    # `../kvaf_device/...`.  The build must therefore overwrite that nested
+    # closure, not merely place a fresh helper at op_kernel/.  Otherwise a
+    # stale checked-in copy can compile alongside a new hook and fail only
+    # deep inside CANN's device compiler.
+    assert 'KVAF_STAGE_DIR="${OP_DEV}/op_kernel/kvaf_device"' in build_script
+    for staged_file in (
+        "kvaf_fused_full_get_device.h",
+        "execute_batch_get_aiv.asc",
+        "batch_get_abi.h",
+    ):
+        assert f'"${{KVAF_STAGE_DIR}}/{staged_file}"' in build_script
+    assert "KVAF relative include closure:" in build_script
+    assert "KVAF_GENERATED_STAGE_DIR" in build_script
+    assert "generated KVAF relative include closure:" in build_script
     # The queue control lives in GM.  AscendC rejects an implicit aggregate
     # copy from `__gm__ T` to local memory, so the P3 hook must use KVAF's
     # explicit field-wise AIC loader.  This is representation-only plumbing:
