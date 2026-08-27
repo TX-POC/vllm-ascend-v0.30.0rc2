@@ -28,6 +28,19 @@ The 656-byte packed KV representation is a QSFA payload format, **not** an LI ke
 
 `query`, `weights`, and `query_dequant_scale` retain the official C8 ABI.  The default is the decode-relevant `layout_query=TND`, `layout_key=PA_BSND`.  The copied tiling closure still validates official compatible layout variants, but this probe is Ascend-950-only.
 
+### Why the JSON says `int8` although the operator consumes FP8
+
+The CANN 9.1 `msopgen` parser accepts `int8` in its generic JSON `TypeRange`,
+but rejects the JSON spelling `float8_e4m3fn`.  For that bootstrap-only
+metadata, `ops.json` therefore declares `query` and `resident_index_key` as
+`int8`, exactly as the official/P3 C8 route does.  This is **not** a cast or a
+conversion: the Ascend-950 `AICoreConfig` in
+`op_host/a5_c8_resident_seed_def.cpp` requires `DT_FLOAT8_E4M3FN` for both
+tensors, and the independent Torch bridge rejects every dtype except
+`torch.float8_e4m3fn`.  The generated JSON can therefore be understood as a
+CANN-generator compatibility envelope; the compiled target ABI and the bytes
+seen by the C8 score kernel remain FP8 E4M3FN.
+
 ## Outputs and graph contract
 
 `resident_tau` and `tau_valid` are flat `int32 [selection_row_count]` tensors.  Row `r` corresponds to `sparse_indices.reshape(-1, 2048)[r]`.

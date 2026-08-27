@@ -30,6 +30,10 @@ def main() -> None:
     ):
         require(name in inputs, f"explicit resident index ABI missing {name}")
     require("packed_kv" not in inputs and "packed_output" not in inputs, "packed QSFA payload must not be LI input")
+    require(inputs["query"]["type"] == ["int8"],
+            "generic CANN JSON must use the supported int8 bootstrap TypeRange")
+    require(inputs["resident_index_key"]["type"] == ["int8"],
+            "generic CANN JSON must use the supported int8 bootstrap TypeRange")
     require(outputs["resident_tau"]["type"] == ["int32"], "tau must be int32 graph ABI")
     require(outputs["tau_valid"]["type"] == ["int32"], "tau_valid must be int32 graph ABI")
 
@@ -56,6 +60,14 @@ def main() -> None:
             "tiling must reject non-2048 threshold semantics")
     require("AddConfig(\"ascend950\"" in op_def and "AddConfig(\"ascend910b\"" not in op_def,
             "probe must be A5-only")
+    require("aicore_config_950.Input(\"query\")" in op_def and
+            "aicore_config_950.Input(\"resident_index_key\")" in op_def and
+            "ge::DT_FLOAT8_E4M3FN" in op_def,
+            "Ascend950 OpDef must retain the real FP8 E4M3FN ABI")
+
+    bridge = (OP / "torch_extension" / "csrc" / "a5_c8_resident_seed.cpp").read_text()
+    require("at::kFloat8_e4m3fn" in bridge,
+            "typed bridge must reject a non-FP8 input despite generic JSON int8")
 
     normal_build = (ROOT / "build_nanovllm_ops.sh").read_text()
     all_ops = normal_build.split("ALL_OP_NAMES=(", 1)[1].split(")", 1)[0]
@@ -63,6 +75,8 @@ def main() -> None:
     isolated = (OP / "build_isolated_a5_c8_resident_seed.sh").read_text()
     require("A5C8ResidentSeed" in isolated and "build_nanovllm_ops.sh" not in isolated,
             "only independent isolated build is allowed")
+    require("CANN-bootstrap/FP8 ABI contract" in isolated,
+            "isolated builder must fail early with the three-layer ABI diagnostic")
 
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 

@@ -26,6 +26,24 @@ if ! command -v msopgen >/dev/null 2>&1; then
   echo "[a5_c8_resident_seed] ERROR: msopgen is unavailable; source the CANN 9.1 environment first." >&2
   exit 2
 fi
+SPEC="${ROOT}/ops.json"
+OP_DEF="${ROOT}/op_host/a5_c8_resident_seed_def.cpp"
+BRIDGE="${ROOT}/torch_extension/csrc/a5_c8_resident_seed.cpp"
+# CANN 9.1's generic msopgen TypeRange parser does not accept the JSON
+# spelling `float8_e4m3fn`.  Match the official/P3 two-layer contract:
+# bootstrap JSON says int8; the target-only OpDef and typed bridge remain the
+# fail-closed FP8 E4M3FN ABI guards.  Check all three before invoking
+# msopgen, so a wrong schema is diagnosed in one short, actionable message.
+if ! grep -Eq '"name": "query".*"type": \["int8"\]' "${SPEC}" || \
+   ! grep -Eq '"name": "resident_index_key".*"type": \["int8"\]' "${SPEC}" || \
+   ! grep -q 'aicore_config_950.Input("query")' "${OP_DEF}" || \
+   ! grep -q 'aicore_config_950.Input("resident_index_key")' "${OP_DEF}" || \
+   ! grep -q 'ge::DT_FLOAT8_E4M3FN' "${OP_DEF}" || \
+   ! grep -q 'at::kFloat8_e4m3fn' "${BRIDGE}"; then
+  echo "[a5_c8_resident_seed] ERROR: CANN-bootstrap/FP8 ABI contract is incomplete." >&2
+  echo "[a5_c8_resident_seed] expected: ops.json query/index-key=int8; Ascend950 OpDef and bridge=FP8 E4M3FN." >&2
+  exit 2
+fi
 if [[ -e "${BUILD_ROOT}/op_dev" || -e "${BUILD_ROOT}/custom_op" || -e "${BUILD_ROOT}/opp" ]]; then
   echo "[a5_c8_resident_seed] ERROR: ${BUILD_ROOT} already contains an isolated build; choose a fresh timestamped A5_C8_RESIDENT_SEED_BUILD_ROOT." >&2
   exit 2
@@ -36,7 +54,7 @@ GENERATED="${BUILD_ROOT}/custom_op"
 LOCAL_OPP="${BUILD_ROOT}/opp"
 mkdir -p "${OP_DEV}/op_host" "${OP_DEV}/op_kernel"
 
-cp "${ROOT}/ops.json" "${OP_DEV}/ops.json"
+cp "${SPEC}" "${OP_DEV}/ops.json"
 cp -a "${ROOT}/op_host/." "${OP_DEV}/op_host/"
 cp -a "${ROOT}/op_kernel/." "${OP_DEV}/op_kernel/"
 
