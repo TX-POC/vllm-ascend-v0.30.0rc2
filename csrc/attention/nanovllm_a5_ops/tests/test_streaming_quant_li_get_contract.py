@@ -365,6 +365,18 @@ def require_source_contract() -> None:
         "control_.output_rows != privatePackedRows_",
     ):
         assert symbol in hook, symbol
+    # A fully leased queue pool must bypass the AIV<->SIMT acquire service.
+    # That service is needed only when there is a possible real speculative
+    # post; otherwise it adds one VF_CALL per score tile while changing no
+    # C8 score, Top-K, private mapping, or required-recall result.
+    emit_body = hook[hook.index(
+        "__aicore__ inline void Emit"
+    ):hook.index("__aicore__ inline void Finish")]
+    assert "AnyQueueMayBeFree" in hook
+    assert emit_body.index("AnyQueueMayBeFree()") < emit_body.index(
+        "TryAcquireKvafStreamingBatchGetQueueFromAicore"
+    )
+    assert "queueLeases_.GetValue(queueId) == 0" in hook
     assert "official_score_tiles" not in hook
     assert "exact_sparse_indices" not in hook
 

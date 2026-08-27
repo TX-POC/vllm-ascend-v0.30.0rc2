@@ -37,6 +37,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+from time import monotonic
 from pathlib import Path
 from typing import Any
 
@@ -539,6 +540,8 @@ def run_target_equivalence() -> dict[str, Any]:
         "product_route=disabled h2d_result=not_exercised",
         flush=True,
     )
+    derived_started = monotonic()
+    print("P3_DERIVED_STAGE stage=call_begin", flush=True)
     outputs = derived_op(
         inputs["query"],
         inputs["key"],
@@ -576,11 +579,22 @@ def run_target_equivalence() -> dict[str, Any]:
         scale_stride=int(inputs["key_dequant_scale"].stride(0)),
         kvaf_rows_per_entry=BLOCK_SIZE,
     )
+    print(
+        "P3_DERIVED_STAGE stage=call_return "
+        f"elapsed_ms={(monotonic() - derived_started) * 1000.0:.3f}",
+        flush=True,
+    )
     if not isinstance(outputs, tuple) or len(outputs) != 9:
         raise RuntimeError(
             "derived A5StreamingQuantLiGet did not return its 9-output ABI"
         )
+    print("P3_DERIVED_STAGE stage=synchronize_begin", flush=True)
     torch.npu.synchronize()
+    print(
+        "P3_DERIVED_STAGE stage=synchronize_end "
+        f"elapsed_ms={(monotonic() - derived_started) * 1000.0:.3f}",
+        flush=True,
+    )
 
     return {
         "official_indices": official_indices,

@@ -74,6 +74,13 @@ def require_source_matched_reference_contract() -> None:
     assert 'torch.device(f"npu:{requested_id}")' in adapter
     assert "unset ASCEND_VISIBLE_DEVICES" in adapter
     assert "P3_TARGET_NPU" in adapter
+    # Keep target-call boundaries visible in remote timeout logs.  A derived
+    # OPP launch may be asynchronous, so call-return and synchronize markers
+    # distinguish host-side ACLNN setup from an AICore task timeout.
+    assert "P3_DERIVED_STAGE stage=call_begin" in adapter
+    assert "P3_DERIVED_STAGE stage=call_return" in adapter
+    assert "P3_DERIVED_STAGE stage=synchronize_begin" in adapter
+    assert "P3_DERIVED_STAGE stage=synchronize_end" in adapter
 
     print(
         "P3_OFFICIAL_C8_REFERENCE_CONTRACT_PASS "

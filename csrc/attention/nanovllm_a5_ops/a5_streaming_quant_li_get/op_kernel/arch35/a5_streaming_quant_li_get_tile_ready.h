@@ -241,6 +241,22 @@ public:
             AddTelemetry(wave_.lease.queue_id, kSuppressedNoQueueOrArena, 1);
             return;
         }
+        // The no-idle-queue case is both common and intentionally harmless:
+        // ExactScan still produces the unchanged official score/Top-K path,
+        // while Guaranteed Recall later covers any cold item that was not
+        // speculatively promoted.  Do this inexpensive GM snapshot before
+        // entering the AIV<->SIMT atomic service.  In particular, an
+        // all-busy graph replay must not invoke one VF_CALL per C8 score tile
+        // merely to rediscover that every queue is already leased.
+        //
+        // This is deliberately only a conservative precheck.  A queue can
+        // become free immediately after the read; then this tile skips a
+        // *speculative* Get, never a required read.  If any queue appears
+        // idle, the existing atomic acquire below remains the ownership
+        // authority and preserves the real concurrent path.
+        if (!AnyQueueMayBeFree()) {
+            return;
+        }
         kvaf_fused_get::KvafStreamingBatchGetLease lease{};
         if (!kvaf_fused_get::TryAcquireKvafStreamingBatchGetQueueFromAicore(
                 controlGm_, producerId_, static_cast<uint32_t>(cur_s2_idx),
@@ -316,6 +332,20 @@ public:
 
 private:
     static constexpr event_t kStreamingSimtEvent = EVENT_ID0;
+
+    __aicore__ inline bool AnyQueueMayBeFree()
+    {
+        // `queueLeases_` is the graph-visible ownership table.  This scan is
+        // bounded by the preconfigured Direct-HCCP queue count (at most the
+        // existing KVAF AIV worker limit), so it is cheaper than a SIMT
+        // service round trip on every rejected score tile.
+        for (uint32_t queueId = 0U; queueId < queueCount_; ++queueId) {
+            if (queueLeases_.GetValue(queueId) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     __aicore__ inline uint64_t OutputRow(const QLICommon::RunInfo &info,
                                           int64_t s1_index) const
