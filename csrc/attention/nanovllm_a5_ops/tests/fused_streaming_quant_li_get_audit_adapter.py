@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Target runner for the P4.1 non-authoritative fused audit harness.
+"""Target runner for the P4 resident-threshold candidate-safety harness.
 
-It launches one source-derived raw-Q/K C8 clone with the P4 audit lease
-sentinel.  The clone computes its own final Top-K and records score-qualified
-cold sources in a fixed [R,S] candidate map, but the test treats those Top-K
-indices as non-authoritative.  A source-matched official C8 call is made only
-as the strict mathematical reference.
+The device-side path exercised here has the same two scans the product path
+needs: a resident-only C8 scan produces an exact sortable Top-2048 threshold,
+then one full raw-Q/K scan records threshold-qualified cold sources in a fixed
+``[R,S]`` candidate map.  It never posts H2D in this audit mode.
+
+The full official C8 result remains the only final-Top-K authority.  We use it
+only in this validation program to prove that every *officially selected cold*
+source is covered by the device-side candidate map.  The source-derived P3
+clone's own Top-K stays diagnostic and cannot route QSFA.
 """
 
 from __future__ import annotations
 
 import os
 from time import monotonic
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -34,6 +39,34 @@ from streaming_quant_li_get_target_adapter import (
     _require_source_matched_official_c8_ops,
     _resolve_single_opp,
 )
+
+
+RESIDENT_SEED_OPP_ENV = "NANOVLLM_A5_RESIDENT_SEED_OPP"
+RESIDENT_SEED_OPAPI_ENV = "NANOVLLM_A5_RESIDENT_SEED_OPAPI_LIB"
+# 24 C8 pages provide 3072 resident keys: enough to define an exact Top-2048
+# threshold while deliberately leaving a meaningful cold suffix in the 4096
+# / 3968-token full source rows.  Keeping whole pages makes the resident
+# block-table ABI identical to the future runtime representation.
+RESIDENT_BLOCKS = 24
+
+
+def _resolve_resident_seed_opp(root_value: str | None) -> tuple[Path, Path]:
+    """Resolve exactly one independently built ResidentSeed OPP."""
+    if not root_value:
+        raise RuntimeError(
+            f"set {RESIDENT_SEED_OPP_ENV} to the isolated A5C8ResidentSeed OPP root"
+        )
+    root = Path(root_value).expanduser().resolve()
+    candidates = [root / "op_api" / "lib" / "libcust_opapi.so"]
+    candidates.extend(root.glob("vendors/*/op_api/lib/libcust_opapi.so"))
+    opapis = tuple(sorted({item.resolve() for item in candidates if item.is_file()}))
+    if len(opapis) != 1:
+        raise RuntimeError(
+            "expected exactly one A5C8ResidentSeed libcust_opapi.so below "
+            f"{root}, found={len(opapis)}"
+        )
+    opapi = opapis[0]
+    return opapi, opapi.parents[2]
 
 
 def _cpu_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -77,48 +110,254 @@ def _audit_receipt(
     }
 
 
-def _assert_clone_candidate_coverage(
-    clone_indices: torch.Tensor,
+def _build_resident_index_view(
+    inputs: dict[str, torch.Tensor],
+    metadata_op: Any,
+) -> dict[str, torch.Tensor]:
+    """Build an independent resident-index view for this isolated test.
+
+    Production will maintain this view incrementally with HBM residency.  The
+    validation fixture instead clones the source FP8 index store and exposes
+    its first 24 *logical* pages through a separate block table.  The clone is
+    important: passing the packed QSFA payload or reusing a host reconstruction
+    would test a different score domain.  The logical resident prefix leaves a
+    cold suffix, so the result is not the old all-cold/zero-threshold case.
+    """
+    resident_tokens = RESIDENT_BLOCKS * BLOCK_SIZE
+    if resident_tokens < SPARSE_COUNT:
+        raise RuntimeError("resident fixture must contain at least Top-2048 keys")
+    if SOURCE_TOKENS // BLOCK_SIZE <= RESIDENT_BLOCKS:
+        raise RuntimeError("resident fixture must leave at least one cold page")
+
+    resident_lengths = torch.full(
+        (BATCH_SIZE,), resident_tokens, dtype=torch.int32, device=inputs["query"].device
+    )
+    resident_key = inputs["key"].clone(memory_format=torch.preserve_format)
+    resident_scale = inputs["key_dequant_scale"].clone(memory_format=torch.preserve_format)
+    resident_block_table = inputs["block_table"][:, :RESIDENT_BLOCKS].clone().contiguous()
+    resident_metadata = metadata_op(
+        num_heads_q=64,
+        num_heads_k=1,
+        head_dim=128,
+        query_quant_mode=0,
+        key_quant_mode=0,
+        actual_seq_lengths_query=inputs["actual_seq_lengths_query"],
+        actual_seq_lengths_key=resident_lengths,
+        batch_size=BATCH_SIZE,
+        max_seqlen_q=1,
+        max_seqlen_k=resident_tokens,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=SPARSE_COUNT,
+        sparse_mode=3,
+        pre_tokens=INT64_MAX,
+        next_tokens=INT64_MAX,
+        cmp_ratio=1,
+        device=str(inputs["query"].device),
+    )
+    if resident_metadata.dtype != torch.int32 or not resident_metadata.is_contiguous():
+        raise RuntimeError("resident C8 metadata has an invalid ABI")
+    return {
+        "resident_index_key": resident_key,
+        "resident_index_key_dequant_scale": resident_scale,
+        "resident_seq_lengths": resident_lengths,
+        "resident_index_block_table": resident_block_table,
+        "metadata": resident_metadata,
+    }
+
+
+def _bind_resident_seed_opp(opapi: Any) -> None:
+    """Load the independent resident-seed resolver without touching P3."""
+    os.environ[RESIDENT_SEED_OPAPI_ENV] = str(opapi)
+    import nanovllm_a5_resident_seed  # noqa: F401, PLC0415
+
+
+def _launch_resident_seed(
+    inputs: dict[str, torch.Tensor], resident: dict[str, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    namespace = getattr(torch.ops, "a5_c8_resident_seed", None)
+    seed_op = (
+        getattr(namespace, "npu_a5_c8_resident_seed", None) if namespace else None
+    )
+    if seed_op is None:
+        raise RuntimeError("isolated A5C8ResidentSeed bridge did not register")
+    result = seed_op(
+        query=inputs["query"],
+        resident_index_key=resident["resident_index_key"],
+        weights=inputs["weights"],
+        query_dequant_scale=inputs["query_dequant_scale"],
+        resident_index_key_dequant_scale=resident["resident_index_key_dequant_scale"],
+        actual_seq_lengths_query=inputs["actual_seq_lengths_query"],
+        resident_seq_lengths=resident["resident_seq_lengths"],
+        resident_index_block_table=resident["resident_index_block_table"],
+        metadata=resident["metadata"],
+        query_quant_mode=0,
+        key_quant_mode=0,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=SPARSE_COUNT,
+        sparse_mode=3,
+        pre_tokens=INT64_MAX,
+        next_tokens=INT64_MAX,
+        cmp_ratio=1,
+        return_values=False,
+    )
+    if not isinstance(result, tuple) or len(result) != 4:
+        raise RuntimeError("A5C8ResidentSeed returned an unexpected ABI")
+    sparse_indices, sparse_values, resident_tau, tau_valid = result
+    row_count = BATCH_SIZE
+    if (
+        sparse_indices.dtype != torch.int32
+        or tuple(sparse_indices.shape) != (BATCH_SIZE, 1, SPARSE_COUNT)
+        or sparse_values.dtype != torch.float32
+        or resident_tau.dtype != torch.int32
+        or tuple(resident_tau.shape) != (row_count,)
+        or tau_valid.dtype != torch.int32
+        or tuple(tau_valid.shape) != (row_count,)
+    ):
+        raise RuntimeError(
+            "A5C8ResidentSeed output ABI mismatch: "
+            f"indices={tuple(sparse_indices.shape)}/{sparse_indices.dtype} "
+            f"values={tuple(sparse_values.shape)}/{sparse_values.dtype} "
+            f"tau={tuple(resident_tau.shape)}/{resident_tau.dtype} "
+            f"valid={tuple(tau_valid.shape)}/{tau_valid.dtype}"
+        )
+    return sparse_indices, sparse_values, resident_tau, tau_valid
+
+
+def _call_official_resident_reference(
+    official: Any,
+    inputs: dict[str, torch.Tensor],
+    resident: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Validate the copied seed's selection domain against official C8."""
+    result = official(
+        query=inputs["query"],
+        key=resident["resident_index_key"],
+        weights=inputs["weights"],
+        query_dequant_scale=inputs["query_dequant_scale"],
+        key_dequant_scale=resident["resident_index_key_dequant_scale"],
+        actual_seq_lengths_query=inputs["actual_seq_lengths_query"],
+        actual_seq_lengths_key=resident["resident_seq_lengths"],
+        block_table=resident["resident_index_block_table"],
+        metadata=resident["metadata"],
+        query_quant_mode=0,
+        key_quant_mode=0,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=SPARSE_COUNT,
+        sparse_mode=3,
+        pre_tokens=INT64_MAX,
+        next_tokens=INT64_MAX,
+        cmp_ratio=1,
+        return_value=False,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError("official resident C8 call returned an unexpected ABI")
+    return result[0]
+
+
+def _install_resident_snapshot(
+    transaction: dict[str, torch.Tensor], resident: dict[str, torch.Tensor]
+) -> None:
+    """Mark exactly the seed's logical resident view as already in HBM."""
+    lengths = resident["resident_seq_lengths"].detach().cpu().tolist()
+    slots = transaction["kv_object_slots_snapshot"]
+    for pool_row, length in enumerate(lengths):
+        slots[pool_row, : int(length)] = 0
+
+
+def _assert_authoritative_cold_coverage(
+    official_indices: torch.Tensor,
     candidate_map: torch.Tensor,
+    transaction: dict[str, torch.Tensor],
     score_source_lens: torch.Tensor,
     marker: int,
-) -> tuple[int, int]:
-    """Check coverage only for the clone's own result, never official Top-K."""
-    indices = clone_indices.detach().cpu().contiguous().reshape(BATCH_SIZE, SPARSE_COUNT)
+) -> dict[str, int]:
+    """Prove `official TopK ∩ cold ⊆ score-time candidates`.
+
+    This is the actual prefetch safety condition.  It intentionally does not
+    consume the clone's final Top-K output: official C8 remains the unique
+    selection authority, and equal-score ties may make the candidate set a
+    strict superset of the required cold set.
+    """
+    official = official_indices.detach().cpu().contiguous().reshape(BATCH_SIZE, SPARSE_COUNT)
     candidates = candidate_map.detach().cpu().contiguous()
-    lengths = score_source_lens.detach().cpu().contiguous()
+    slots = transaction["kv_object_slots_snapshot"].detach().cpu().contiguous()
+    source_lens = score_source_lens.detach().cpu().contiguous()
+    required_mask = torch.zeros_like(candidates, dtype=torch.bool)
     selected = 0
-    missing = 0
     for row in range(BATCH_SIZE):
-        valid = int(lengths[row].item())
-        for source in indices[row].tolist():
+        valid = int(source_lens[row].item())
+        for source in official[row].tolist():
             if source < 0:
                 continue
             if source >= valid:
                 raise RuntimeError(
-                    f"clone Top-K produced source outside its score length: row={row} "
-                    f"source={source} valid={valid}"
+                    "official C8 Top-K contains an invalid source: "
+                    f"row={row} source={source} valid={valid}"
                 )
             selected += 1
-            if int(candidates[row, source].item()) != marker:
-                missing += 1
-    if missing:
-        raise RuntimeError(
-            "P4 audit candidate map does not cover clone-selected cold sources: "
-            f"selected={selected} missing={missing}"
+            if int(slots[row, source].item()) < 0:
+                required_mask[row, source] = True
+    candidate_mask = candidates == marker
+    covered_mask = candidate_mask & required_mask
+    missing_mask = required_mask & ~candidate_mask
+    covered = int(torch.count_nonzero(covered_mask).item())
+    required = int(torch.count_nonzero(required_mask).item())
+    missing = int(torch.count_nonzero(missing_mask).item())
+    candidate_count = int(torch.count_nonzero(candidate_mask).item())
+    false_positive = int(torch.count_nonzero(candidate_mask & ~required_mask).item())
+    cold_capacity = 0
+    for row in range(BATCH_SIZE):
+        cold_capacity += int(
+            torch.count_nonzero(slots[row, : int(source_lens[row].item())] < 0).item()
         )
-    return selected, missing
+    if required <= 0:
+        raise RuntimeError("resident fixture produced no authoritative cold Top-K source")
+    if missing:
+        first = torch.nonzero(missing_mask, as_tuple=False)[0].tolist()
+        raise RuntimeError(
+            "P4 audit missed an authoritative cold Top-K source: "
+            f"required={required} covered={covered} missing={missing} "
+            f"first_row={first[0]} first_source={first[1]}"
+        )
+    if candidate_count >= cold_capacity:
+        raise RuntimeError(
+            "resident threshold was not selective: "
+            f"candidate_count={candidate_count} cold_capacity={cold_capacity}"
+        )
+    return {
+        "official_selected": selected,
+        "required_cold": required,
+        "covered_cold": covered,
+        "missing_cold": missing,
+        "candidate_count": candidate_count,
+        "false_positive": false_positive,
+        "cold_capacity": cold_capacity,
+    }
 
 
 def run_p4_fused_audit() -> dict[str, Any]:
-    """Run one P4.1 clone scan and return official/clone outputs for a gate."""
+    """Run resident seed + one full score-time candidate scan.
+
+    The extra resident-only scan is the planned Stage-5 threshold-estimation
+    step, not a score dump and not a second full scan.  The following full
+    scan is the single raw-Q/K traversal that creates candidates while C8
+    computes its normal (currently diagnostic) clone output.
+    """
     reference_opapi, reference_vendor = _resolve_single_opp(
         os.getenv(REFERENCE_OPP_ENV), "reference"
     )
     target_opapi, target_vendor = _resolve_single_opp(
         os.getenv(TARGET_OPP_ENV), "target"
     )
-    _prepend_unique_path("ASCEND_CUSTOM_OPP_PATH", (reference_vendor, target_vendor))
+    seed_opapi, seed_vendor = _resolve_resident_seed_opp(
+        os.getenv(RESIDENT_SEED_OPP_ENV)
+    )
+    _prepend_unique_path(
+        "ASCEND_CUSTOM_OPP_PATH", (reference_vendor, seed_vendor, target_vendor)
+    )
     official, metadata, _ = _require_source_matched_official_c8_ops(
         reference_opapi, reference_vendor
     )
@@ -127,6 +366,28 @@ def run_p4_fused_audit() -> dict[str, Any]:
     inputs["metadata"] = _official_metadata(metadata, inputs)
     official_indices = _call_official(official, inputs)
     torch.npu.synchronize()
+
+    # Build a separate C8 index-key view for the resident threshold scan.  It
+    # contains only the first 24 logical pages per request, whereas the full
+    # C8 scan below keeps all 32/31 pages.  This establishes a nonzero,
+    # selective threshold and a real resident/cold split.
+    resident = _build_resident_index_view(inputs, metadata)
+    _bind_resident_seed_opp(seed_opapi)
+    seed_indices, _, resident_tau, tau_valid = _launch_resident_seed(inputs, resident)
+    torch.npu.synchronize()
+    official_resident_indices = _call_official_resident_reference(
+        official, inputs, resident
+    )
+    torch.npu.synchronize()
+    if not _cpu_equal(seed_indices, official_resident_indices):
+        raise RuntimeError(
+            "A5C8ResidentSeed selection is not bitwise equal to source-matched "
+            "official C8 on the resident index view"
+        )
+    if not bool(torch.all(tau_valid == 1)):
+        raise RuntimeError(
+            "resident fixture did not produce a valid Top-2048 threshold for every row"
+        )
 
     # The P4 bridge loads the existing P3 typed ACLNN resolver after its
     # target opapi path has been set.  It does not load vllm_ascend.
@@ -139,18 +400,13 @@ def run_p4_fused_audit() -> dict[str, Any]:
     transaction = _make_no_post_transaction(
         device, BATCH_SIZE, HOOK_CONTROL_MODE_ALL_BUSY
     )
-    # This first execution deliberately uses the strongest no-false-negative
-    # fixture: tau=0 and every source is nonresident.  It makes every valid
-    # source score-qualified, so the fixed-map receipt can prove that the
-    # score-time write path covers the clone's selected sources.  It does not
-    # claim that zero is a useful production prefetch threshold; production
-    # will feed the resident-seed estimate here.
-    if not bool(torch.all(transaction["resident_threshold"] == 0)):
-        raise RuntimeError("P4 audit fixture requires tau=0")
-    if not bool(torch.all(transaction["resident_threshold_valid"] == 1)):
-        raise RuntimeError("P4 audit fixture requires valid resident tau rows")
-    if not bool(torch.all(transaction["kv_object_slots_snapshot"] < 0)):
-        raise RuntimeError("P4 audit fixture requires every source to be cold")
+    transaction["resident_threshold"].copy_(resident_tau)
+    transaction["resident_threshold_valid"].copy_(tau_valid)
+    _install_resident_snapshot(transaction, resident)
+    if not bool(torch.any(transaction["kv_object_slots_snapshot"] >= 0)):
+        raise RuntimeError("resident fixture did not mark any HBM-resident object")
+    if not bool(torch.any(transaction["kv_object_slots_snapshot"] < 0)):
+        raise RuntimeError("resident fixture did not leave any cold object")
     # The sentinel is a graph input value, deliberately installed before the
     # one cloned LI launch.  There is no second scan or host-side candidate
     # reconstruction.
@@ -160,10 +416,12 @@ def run_p4_fused_audit() -> dict[str, Any]:
     print(
         "P4_FUSED_AUDIT_CONFIG "
         f"device={device} physical_npu={device.index} "
-        f"reference_opapi={reference_opapi} target_opapi={target_opapi} "
+        f"reference_opapi={reference_opapi} resident_seed_opapi={seed_opapi} "
+        f"target_opapi={target_opapi} "
         "raw_qk_scan_count=1 clone_topk_authority=0 "
         "candidate_output=private_source_to_slot[R,S] "
-        "mode=audit threshold_fixture=zero_all_cold_coverage "
+        f"mode=audit resident_blocks={RESIDENT_BLOCKS} "
+        "threshold_fixture=resident_seed_exact_sortable_uint16 "
         "h2d_result=not_exercised",
         flush=True,
     )
@@ -192,6 +450,17 @@ def run_p4_fused_audit() -> dict[str, Any]:
 
     receipt = _audit_receipt(result, transaction)
     score_source_lens = result["score_source_lens"].detach().cpu().contiguous()
+    tau_values = resident_tau.detach().cpu().contiguous().tolist()
+    tau_valid_values = tau_valid.detach().cpu().contiguous().tolist()
+    print(
+        "P4_FUSED_AUDIT_RESIDENT_SEED "
+        "resident_index_view=independent_fp8_clone "
+        f"resident_seq_lengths={resident['resident_seq_lengths'].detach().cpu().tolist()} "
+        f"resident_tau={tau_values} tau_valid={tau_valid_values} "
+        "official_resident_topk=bitwise_equal "
+        "threshold_domain=c8_sortable_uint16",
+        flush=True,
+    )
     print(
         "P4_FUSED_AUDIT_MARKERS "
         f"candidate_marker={receipt['candidate_marker']} "
@@ -203,23 +472,34 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"elapsed_us={elapsed_us:.3f}",
         flush=True,
     )
-    selected, missing = _assert_clone_candidate_coverage(
-        result["non_authoritative_sparse_indices"],
+    coverage = _assert_authoritative_cold_coverage(
+        official_indices,
         result["candidate_source_to_slot"],
+        transaction,
         score_source_lens,
         receipt["candidate_marker"],
     )
     print(
-        "P4_FUSED_AUDIT_RECEIPT "
-        f"clone_selected={selected} clone_missing={missing} "
-        "candidate_coverage=clone_only h2d_result=not_exercised",
+        "P4_FUSED_AUDIT_OFFICIAL_COVERAGE "
+        f"official_selected={coverage['official_selected']} "
+        f"required_cold={coverage['required_cold']} "
+        f"covered_cold={coverage['covered_cold']} "
+        f"missing_cold={coverage['missing_cold']} "
+        f"false_positive={coverage['false_positive']} "
+        f"candidate_count={coverage['candidate_count']} "
+        f"cold_capacity={coverage['cold_capacity']} "
+        "candidate_recall=official_topk_cold_only "
+        "h2d_result=not_exercised",
         flush=True,
     )
     return {
         "official_indices": official_indices,
         "clone_indices": result["non_authoritative_sparse_indices"],
-        "candidate_count": receipt["candidate_count"],
+        "candidate_count": coverage["candidate_count"],
         "candidate_marker": receipt["candidate_marker"],
+        "required_cold": coverage["required_cold"],
+        "covered_cold": coverage["covered_cold"],
+        "missing_cold": coverage["missing_cold"],
     }
 
 

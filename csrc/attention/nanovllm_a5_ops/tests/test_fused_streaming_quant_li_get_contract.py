@@ -20,6 +20,11 @@ BRIDGE = (
     / "a5_fused_streaming_quant_li_get/torch_extension"
     / "nanovllm_p4_fused_streaming_li_get/bridge.py"
 )
+AUDIT_ADAPTER = OPS / "tests/fused_streaming_quant_li_get_audit_adapter.py"
+RESIDENT_SEED_BRIDGE = (
+    OPS
+    / "a5_c8_resident_seed/torch_extension/csrc/a5_c8_resident_seed.cpp"
+)
 README = OPS / "a5_fused_streaming_quant_li_get/README.md"
 BUILD = OPS / "build_nanovllm_ops.sh"
 
@@ -34,6 +39,8 @@ def main() -> int:
     hook = HOOK.read_text(encoding="utf-8")
     vector = VECTOR.read_text(encoding="utf-8")
     bridge = BRIDGE.read_text(encoding="utf-8")
+    audit_adapter = AUDIT_ADAPTER.read_text(encoding="utf-8")
+    resident_seed_bridge = RESIDENT_SEED_BRIDGE.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
     build = BUILD.read_text(encoding="utf-8")
 
@@ -72,12 +79,26 @@ def main() -> int:
     assert "official C8" in readme
     assert "non-authoritative" in readme
     assert "no ring\noverflow" in readme
+    # The threshold must be a real C8 sortable boundary generated from the
+    # separate resident index view, rather than the unsupported float
+    # sparse_values output or a host-derived proxy.
+    assert "NANOVLLM_A5_RESIDENT_SEED_OPP" in audit_adapter
+    assert "resident_seed_exact_sortable_uint16" in audit_adapter
+    assert "_assert_authoritative_cold_coverage" in audit_adapter
+    assert "official TopK ∩ cold" in audit_adapter
+    assert "npu_a5_c8_resident_seed" in resident_seed_bridge
+    assert "aclnnA5C8ResidentSeed" in resident_seed_bridge
+    assert "NANOVLLM_A5_RESIDENT_SEED_OPAPI_LIB" in resident_seed_bridge
+    assert "AllowStridedAclTensor(resident_index_key)" in resident_seed_bridge
+    assert "A5C8ResidentSeed does not expose sparse_values" in resident_seed_bridge
+    assert "cmp_ratio=1" in resident_seed_bridge
 
     print(
         "P4_FUSED_SINGLE_SCAN_CONTRACT_PASS "
         "raw_qk_score_tile=1 final_clone_topk=1 candidate_map=fixed_RxS "
         "audit_no_post=1 post_runtime_guard=1 "
-        "official_c8_authority=required_until_bitwise_equivalence",
+        "official_c8_authority=required_until_bitwise_equivalence "
+        "resident_threshold=source_derived_sortable_c8",
         flush=True,
     )
     return 0
