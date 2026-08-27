@@ -13,12 +13,16 @@ vLLM product route.  It performs one controlled target-NPU comparison:
 4. return the strict dictionary consumed by
    ``test_streaming_quant_li_get_target_equivalence.py``.
 
-The transaction control deliberately marks its one queue busy.  That gives
-the device hook a structurally valid, graph-shaped transaction ABI while
+The default transaction control deliberately marks its one queue busy.  That
+gives the device hook a structurally valid, graph-shaped transaction ABI while
 preventing it from dereferencing an invented KVAF transport descriptor or
-posting a fabricated H2D request.  Therefore this adapter proves target C8
-score/Top-K equivalence, output-alias wiring, and exact score-source lengths;
-it does *not* claim Direct-HCCP correctness or H2D performance.
+posting a fabricated H2D request. ``P3_HOOK_CONTROL_MODE=reject_all_busy``
+uses the same safe busy lease table but deliberately invalidates the control
+magic; this proves that hook initialization reached its reject path without
+ever allowing a fabricated H2D post. Therefore this adapter proves target C8
+score/Top-K equivalence, output-alias wiring, exact score-source lengths, and
+the selected safe hook-control path; it does *not* claim Direct-HCCP
+correctness or H2D performance.
 
 Before importing this module, build the two isolated OPPs and set:
 
@@ -72,6 +76,16 @@ REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"
 REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
 REFERENCE_OPAPI_ENV = "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"
 TARGET_NPU_ENV = "P3_NPU_ID"
+HOOK_CONTROL_MODE_ENV = "P3_HOOK_CONTROL_MODE"
+HOOK_CONTROL_MODE_ALL_BUSY = "valid_all_busy"
+HOOK_CONTROL_MODE_REJECT_BUSY = "reject_all_busy"
+NO_POST_TRANSACTION_NAMES = (
+    "private_source_to_slot",
+    "private_ready_table",
+    "private_arena_head",
+    "private_packed_output",
+    "queue_leases",
+)
 
 
 def _require_a5_npu() -> torch.device:
@@ -387,9 +401,21 @@ def _bind_isolated_target_opp(opapi: Path) -> Path:
     return opapi
 
 
+def _resolve_hook_control_mode() -> str:
+    mode = os.getenv(HOOK_CONTROL_MODE_ENV, HOOK_CONTROL_MODE_ALL_BUSY)
+    if mode not in (HOOK_CONTROL_MODE_ALL_BUSY, HOOK_CONTROL_MODE_REJECT_BUSY):
+        raise RuntimeError(
+            f"{HOOK_CONTROL_MODE_ENV} must be one of "
+            f"{HOOK_CONTROL_MODE_ALL_BUSY!r}, {HOOK_CONTROL_MODE_REJECT_BUSY!r}; "
+            f"got {mode!r}"
+        )
+    return mode
+
+
 def _make_no_post_transaction(
     device: torch.device,
     row_count: int,
+    control_mode: str,
 ) -> dict[str, torch.Tensor]:
     """Build a valid-shape transaction whose queue cannot be leased.
 
@@ -403,15 +429,28 @@ def _make_no_post_transaction(
     kv_object_map = torch.arange(
         SOURCE_TOKENS, dtype=torch.int32, device=device
     ).repeat(pool_rows, 1).contiguous()
-    private_packed_output = torch.empty(
+    # A sentinel makes the no-post assertion meaningful: a mistaken write is
+    # visible even if the accelerator allocator would otherwise return a
+    # zeroed allocation.
+    private_packed_output = torch.full(
         (QUEUE_COUNT * PRIVATE_ARENA_CAPACITY, PACKED_KV_ROW_BYTES),
+        0xA5,
         dtype=torch.uint8,
         device=device,
     )
+    # Keep the lease busy in both diagnostic modes. This remains safe even if
+    # a future control validator regresses: no fabricated descriptor can be
+    # acquired or posted. The reject mode differs only in that Init must set
+    # enabled_=false and increment kControlRejected telemetry.
     queue_leases = torch.ones(QUEUE_COUNT, dtype=torch.int32, device=device)
     safe_nonzero_pointer = int(private_packed_output.data_ptr())
+    control_magic = (
+        STREAMING_CONTROL_MAGIC
+        if control_mode == HOOK_CONTROL_MODE_ALL_BUSY
+        else 0
+    )
     control_words = [
-        STREAMING_CONTROL_MAGIC,
+        control_magic,
         STREAMING_CONTROL_VERSION,
         safe_nonzero_pointer,  # channel_entity, never dereferenced: queue busy
         safe_nonzero_pointer,  # queue_state, never dereferenced: queue busy
@@ -464,6 +503,78 @@ def _make_no_post_transaction(
             device=device,
         ),
     }
+
+
+def _snapshot_no_post_transaction(
+    transaction: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Copy the small graph-visible mutable state before the derived call."""
+    return {
+        name: transaction[name].detach().cpu().contiguous().clone()
+        for name in NO_POST_TRANSACTION_NAMES
+    }
+
+
+def _assert_no_post_transaction_unchanged(
+    transaction: dict[str, torch.Tensor],
+    snapshot: dict[str, torch.Tensor],
+) -> None:
+    changed = [
+        name
+        for name in NO_POST_TRANSACTION_NAMES
+        if not torch.equal(transaction[name].detach().cpu().contiguous(), snapshot[name])
+    ]
+    if changed:
+        raise RuntimeError(
+            "no-post transaction mutated graph-visible state: "
+            f"changed={','.join(changed)}"
+        )
+
+
+def _prove_safe_hook_control(
+    outputs: tuple[torch.Tensor, ...],
+    transaction: dict[str, torch.Tensor],
+    snapshot: dict[str, torch.Tensor],
+    control_mode: str,
+) -> None:
+    """Print one compact proof after the target stream has completed."""
+    _assert_no_post_transaction_unchanged(transaction, snapshot)
+    telemetry = outputs[7].detach().cpu().contiguous()
+    expected_shape = (QUEUE_COUNT, 13)
+    if tuple(telemetry.shape) != expected_shape:
+        raise RuntimeError(
+            "unexpected P3 telemetry shape: "
+            f"got={tuple(telemetry.shape)} expected={expected_shape}"
+        )
+    control_rejected = int(telemetry[:, 12].sum().item())
+    doorbell_posted = int(telemetry[:, 8].sum().item())
+    if doorbell_posted != 0:
+        raise RuntimeError(
+            "safe no-post control unexpectedly posted Direct-HCCP: "
+            f"doorbell_posted={doorbell_posted}"
+        )
+    if control_mode == HOOK_CONTROL_MODE_REJECT_BUSY:
+        if control_rejected < 1:
+            raise RuntimeError(
+                "reject_all_busy did not observe hook control rejection: "
+                f"control_rejected={control_rejected}"
+            )
+        hook_state = "control_rejected"
+    else:
+        if control_rejected != 0:
+            raise RuntimeError(
+                "valid_all_busy unexpectedly rejected the hook control: "
+                f"control_rejected={control_rejected}"
+            )
+        hook_state = "enabled_all_busy"
+    print(
+        "P3_HOOK_CONTROL_PROOF "
+        f"mode={control_mode} hook_state={hook_state} "
+        f"control_rejected={control_rejected} doorbell_posted={doorbell_posted} "
+        "transaction_unchanged=1 packed_output_prefill=0xa5 "
+        "h2d_result=not_exercised",
+        flush=True,
+    )
 
 
 def _expected_score_source_lens(device: torch.device) -> torch.Tensor:
@@ -529,14 +640,16 @@ def run_target_equivalence() -> dict[str, Any]:
         )
 
     row_count = BATCH_SIZE
-    transaction = _make_no_post_transaction(device, row_count)
+    control_mode = _resolve_hook_control_mode()
+    transaction = _make_no_post_transaction(device, row_count, control_mode)
+    transaction_snapshot = _snapshot_no_post_transaction(transaction)
     print(
         "P3_STREAMING_LI_GET_TARGET_ADAPTER "
         f"device={device} physical_npu={device.index} "
         f"batch={BATCH_SIZE} source_tokens={SOURCE_TOKENS} "
         f"heads={INDEX_HEADS} metadata_words={inputs['metadata'].numel()} "
         f"reference_opapi={reference_opapi} target_opapi={target_opapi} "
-        "queue_mode=all_busy_no_post "
+        f"queue_mode={control_mode} "
         "product_route=disabled h2d_result=not_exercised",
         flush=True,
     )
@@ -595,6 +708,7 @@ def run_target_equivalence() -> dict[str, Any]:
         f"elapsed_ms={(monotonic() - derived_started) * 1000.0:.3f}",
         flush=True,
     )
+    _prove_safe_hook_control(outputs, transaction, transaction_snapshot, control_mode)
 
     return {
         "official_indices": official_indices,

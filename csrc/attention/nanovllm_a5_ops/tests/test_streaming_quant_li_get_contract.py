@@ -345,6 +345,22 @@ def require_source_contract() -> None:
     assert "SetFlag<HardEvent::MTE3_S>(EVENT_ID1)" in vector
     assert "outputRow, validS2Len > 0 ? validS2Len : 0" in vector
     assert "ProcessTopK" in vector
+    # The no-capacity/no-local-wave path must decide before the official score
+    # reduction and skip the entire score-observation seam.  This preserves
+    # the original C8 reduction -> score-DMA vector schedule when speculation
+    # is impossible, while an in-flight local wave still reaches Emit for CQ
+    # retirement.
+    assert "MayNeedScoreObservation" in hook
+    assert "return hasWave_ || AnyQueueMayBeFree();" in hook
+    decision = vector.index("mayNeedScoreObservation =")
+    reduction = vector.index("BatchMulWeightAndReduceSum")
+    emit_guard = vector.index("if (mayNeedScoreObservation)")
+    emit = vector.index("streamingKvafHook_.Emit")
+    score_dma = vector.index("DataCopyPad(scoreGm")
+    assert decision < reduction < emit_guard < emit < score_dma
+    guarded_seam = vector[emit_guard:score_dma]
+    assert guarded_seam.count("PipeBarrier<PIPE_V>();") == 1
+    assert "streamingKvafHook_.Emit" in guarded_seam
     assert vector.index("BatchMulWeightAndReduceSum") < vector.index("streamingKvafHook_.Emit")
     assert vector.index("streamingKvafHook_.Emit") < vector.index("DataCopyPad(scoreGm")
     topk_body = vector[vector.index(

@@ -225,6 +225,27 @@ public:
         enabled_ = true;
     }
 
+    // Decide before the official score reduction whether this tile needs the
+    // P3 observation seam at all.  The common saturated case has no local
+    // in-flight wave and every lease is held by another producer.  It cannot
+    // post a speculative Get, so it must also avoid adding a V-pipeline
+    // barrier between the official reduction and score DMA.
+    //
+    // This is deliberately a conservative snapshot, not an ownership
+    // decision.  If a lease changes after this read, we can miss one
+    // *speculative* opportunity but Exact Top-K plus Guaranteed Recall still
+    // supplies every required KV.  When a lease looks free, `Emit()` repeats
+    // the real atomic acquire and remains the only ownership authority.
+    __aicore__ inline bool MayNeedScoreObservation()
+    {
+        if (!enabled_) {
+            return false;
+        }
+        // A locally posted wave must reach Emit even while all queues are
+        // busy: Emit polls its CQ and may retire/release that lease.
+        return hasWave_ || AnyQueueMayBeFree();
+    }
+
     __aicore__ inline void Emit(const LocalTensor<uint16_t> &out_base,
                                 const QLICommon::RunInfo &info,
                                 int64_t cur_aiv_s1_idx,

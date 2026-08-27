@@ -523,6 +523,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(QK_T))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(QK_T)) / 2 * constInfo_.mBaseSize;
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
+    // Take the capacity snapshot before the official score reduction.  If
+    // every speculative-Get queue is already leased and this producer has no
+    // local in-flight wave, the official reduction-to-score-DMA seam has no
+    // P3 barrier or score observation inserted. This is a runtime ordering
+    // guarantee; it does not claim the hook-on kernel has identical compiled
+    // register or UB layout to the standalone official C8 kernel.
+    const bool mayNeedScoreObservation =
+        streamingKvafHook_.MayNeedScoreObservation();
+    #endif
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(QK_T)),
                                         weightBase, UB_BANK_DEPTH_STRIDE / sizeof(float),
@@ -533,9 +543,13 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     // Exact seam: official C8 score production is complete, but its normal
     // score-GM copy has not begun. The hook only observes uint16 scores and
     // submits a bounded speculative Direct-HCCP wave; it cannot alter TopK.
-    PipeBarrier<PIPE_V>();
-    streamingKvafHook_.Emit(outBase, info, curAivS1Idx, curAivS1ProcNum,
-                            curS2Idx);
+    // In the saturated/no-local-wave case, `mayNeedScoreObservation` is
+    // false, so there is no extra operation at this seam.
+    if (mayNeedScoreObservation) {
+        PipeBarrier<PIPE_V>();
+        streamingKvafHook_.Emit(outBase, info, curAivS1Idx, curAivS1ProcNum,
+                                curS2Idx);
+    }
     #endif
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT + pingpong);
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);

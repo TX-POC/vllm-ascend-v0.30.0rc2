@@ -55,6 +55,7 @@ official reference configuration exposes them.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import sys
 from typing import Any, Callable
@@ -103,7 +104,44 @@ def _assert_bitwise_equal(lhs: Any, rhs: Any, label: str) -> None:
     assert lhs_dtype == rhs_dtype, (
         f"{label} dtype mismatch: official={lhs_dtype}, derived={rhs_dtype}"
     )
-    assert lhs_bytes == rhs_bytes, f"{label} byte mismatch"
+    if lhs_bytes == rhs_bytes:
+        return
+    first_byte = next(
+        offset
+        for offset, (left, right) in enumerate(zip(lhs_bytes, rhs_bytes, strict=True))
+        if left != right
+    )
+    differing_bytes = sum(
+        left != right
+        for left, right in zip(lhs_bytes, rhs_bytes, strict=True)
+    )
+    detail = (
+        "P3_EQ_DIFF "
+        f"label={label} shape={lhs_shape} dtype={lhs_dtype} "
+        f"total_bytes={len(lhs_bytes)} differing_bytes={differing_bytes} "
+        f"first_byte={first_byte} "
+        f"official_sha256={hashlib.sha256(lhs_bytes).hexdigest()[:16]} "
+        f"derived_sha256={hashlib.sha256(rhs_bytes).hexdigest()[:16]}"
+    )
+    if lhs_dtype.endswith("int32") and first_byte + 4 <= len(lhs_bytes):
+        element = first_byte // 4
+        element_offset = element * 4
+        official_value = int.from_bytes(
+            lhs_bytes[element_offset:element_offset + 4],
+            byteorder=sys.byteorder,
+            signed=True,
+        )
+        derived_value = int.from_bytes(
+            rhs_bytes[element_offset:element_offset + 4],
+            byteorder=sys.byteorder,
+            signed=True,
+        )
+        detail += (
+            f" first_int32_flat={element} "
+            f"official_value={official_value} derived_value={derived_value}"
+        )
+    print(detail, file=sys.stderr, flush=True)
+    raise AssertionError(f"{label} byte mismatch; see P3_EQ_DIFF")
 
 
 def _data_pointer(value: Any, label: str) -> int:
