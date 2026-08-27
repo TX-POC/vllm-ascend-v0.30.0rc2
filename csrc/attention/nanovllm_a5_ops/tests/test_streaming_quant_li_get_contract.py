@@ -32,7 +32,7 @@ OPS = ROOT / "ops.json"
 ROOT_CMAKE = ROOT / "CMakeLists.txt"
 METADATA_COMPANION = ROOT / "metadata_companion.md"
 BUILD_SCRIPT = ROOT.parent / "build_nanovllm_ops.sh"
-COMMON_OPS_ERR = ROOT.parents[2] / "common/include/err/ops_err.h"
+HOST_COMPAT = ROOT / "op_host/a5_streaming_host_compat.h"
 
 # These are the public CANN-generated operator parameter names.  The isolated
 # Torch bridge is deliberately required to use the same names and positional
@@ -265,12 +265,26 @@ def require_source_contract() -> None:
     assert "descriptor_stage_only" not in OPS.read_text()
     assert "descriptor_stage_only" not in ROOT_CMAKE.read_text()
     assert METADATA_COMPANION.is_file()
-    # An isolated msopgen project does not inherit the normal repository-wide
-    # csrc/common/include path.  The official C8 tiler needs this one error
-    # shim, which the P3 build script must stage beside op_host sources.
-    assert COMMON_OPS_ERR.is_file()
-    assert "STREAMING_LI_OPS_ERR" in build_script
+    # An isolated msopgen project must not inherit the normal repository-wide
+    # csrc/common/include path: that err header in turn includes a private
+    # log/log.h.  The P3-local header closes both quoted include paths while
+    # preserving all validation early-return macros.
+    assert HOST_COMPAT.is_file()
+    host_compat = HOST_COMPAT.read_text()
+    assert '#include "log/log.h"' not in host_compat
+    for macro in (
+        "OP_LOGE",
+        "OP_LOGI",
+        "OP_LOGD",
+        "OP_CHECK_IF",
+        "OP_CHECK_NULL_WITH_CONTEXT",
+        "REPORT_INNER_ERR_MSG",
+        "OPS_INNER_ERR_STUB",
+    ):
+        assert macro in host_compat
+    assert "STREAMING_LI_HOST_COMPAT" in build_script
     assert '"${OP_DEV}/op_host/err/ops_err.h"' in build_script
+    assert '"${OP_DEV}/op_host/log/log.h"' in build_script
     assert "BatchMulWeightAndReduceSum" in vector
     assert "streamingKvafHook_.Emit" in vector
     assert "streamingKvafHook_.Finish" in vector
