@@ -70,17 +70,69 @@ TARGET_OPP_ENV = "NANOVLLM_A5_STREAMING_LI_OPP"
 REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"
 REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
 REFERENCE_OPAPI_ENV = "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"
+TARGET_NPU_ENV = "P3_NPU_ID"
 
 
 def _require_a5_npu() -> torch.device:
-    device = torch.device("npu:0")
+    requested_text = os.getenv(TARGET_NPU_ENV)
+    if requested_text is None:
+        raise RuntimeError(
+            f"set {TARGET_NPU_ENV} to the explicit physical A5 NPU id; "
+            "this target test must not silently use logical npu:0"
+        )
+    try:
+        requested_id = int(requested_text)
+    except ValueError as error:
+        raise RuntimeError(
+            f"{TARGET_NPU_ENV} must be a non-negative integer, "
+            f"got {requested_text!r}"
+        ) from error
+    if requested_id < 0:
+        raise RuntimeError(
+            f"{TARGET_NPU_ENV} must be a non-negative integer, "
+            f"got {requested_id}"
+        )
+
+    # A single-card ASCEND_VISIBLE_DEVICES mapping makes physical card 7 look
+    # like logical npu:0.  That is useful for product isolation but unsuitable
+    # for this bring-up: it obscures which card actually executed the C8 proof.
+    # Fail closed instead of printing an ambiguous logical id in the evidence.
+    visible_mapping = os.getenv("ASCEND_VISIBLE_DEVICES")
+    if visible_mapping:
+        raise RuntimeError(
+            "P3 target equivalence requires an unmasked physical device; "
+            "unset ASCEND_VISIBLE_DEVICES and use "
+            f"{TARGET_NPU_ENV}={requested_id}, got "
+            f"ASCEND_VISIBLE_DEVICES={visible_mapping!r}"
+        )
+
+    device_count = int(torch.npu.device_count())
+    if requested_id >= device_count:
+        raise RuntimeError(
+            f"{TARGET_NPU_ENV}={requested_id} is outside the visible NPU "
+            f"range [0,{device_count})"
+        )
+    torch.npu.set_device(requested_id)
+    current_id = int(torch.npu.current_device())
+    if current_id != requested_id:
+        raise RuntimeError(
+            "failed to select requested physical NPU: "
+            f"requested={requested_id} current={current_id}"
+        )
+    device = torch.device(f"npu:{requested_id}")
     getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = str(getter(0))
+    name = str(getter(requested_id))
     if "950" not in name.lower():
         raise RuntimeError(
             "target equivalence requires an Ascend 950 NPU, "
             f"got {name!r}"
         )
+    print(
+        "P3_TARGET_NPU "
+        f"requested_physical={requested_id} current_device={current_id} "
+        f"device={device} visible_mapping=<unset> device_name={name!r}",
+        flush=True,
+    )
     return device
 
 
@@ -479,7 +531,8 @@ def run_target_equivalence() -> dict[str, Any]:
     transaction = _make_no_post_transaction(device, row_count)
     print(
         "P3_STREAMING_LI_GET_TARGET_ADAPTER "
-        f"device={device} batch={BATCH_SIZE} source_tokens={SOURCE_TOKENS} "
+        f"device={device} physical_npu={device.index} "
+        f"batch={BATCH_SIZE} source_tokens={SOURCE_TOKENS} "
         f"heads={INDEX_HEADS} metadata_words={inputs['metadata'].numel()} "
         f"reference_opapi={reference_opapi} target_opapi={target_opapi} "
         "queue_mode=all_busy_no_post "

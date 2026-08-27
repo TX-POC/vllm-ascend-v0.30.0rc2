@@ -67,6 +67,13 @@ def require_source_matched_reference_contract() -> None:
     assert "P3_REFERENCE_PROVENANCE" in adapter
     assert "ASCEND_CUSTOM_OPP_PATH" in adapter
     assert "nanovllm_official_c8_reference" in adapter
+    # Target hardware selection must be explicit.  A single-card
+    # ASCEND_VISIBLE_DEVICES mapping would turn physical card 7 into npu:0
+    # and make the validation log ambiguous.
+    assert 'TARGET_NPU_ENV = "P3_NPU_ID"' in adapter
+    assert 'torch.device(f"npu:{requested_id}")' in adapter
+    assert "unset ASCEND_VISIBLE_DEVICES" in adapter
+    assert "P3_TARGET_NPU" in adapter
 
     print(
         "P3_OFFICIAL_C8_REFERENCE_CONTRACT_PASS "
