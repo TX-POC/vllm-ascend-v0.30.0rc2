@@ -54,6 +54,7 @@ def main() -> int:
     assert "EmitAuditCandidates(out_base" in hook
     assert "EmitAuditScoreReceipt(out_base" in hook
     assert "EvaluateAuditScore(" in hook
+    assert "static_cast<int64_t>(receipt) - (1LL << 32)" in hook
 
     audit = _body(hook, "void EmitAuditCandidates(", "void TryStageCandidate(")
     assert "TryRecordAuditCandidate(" in audit
@@ -103,6 +104,7 @@ def main() -> int:
     assert "P4_FUSED_AUDIT_COVERAGE_DIAG" in audit_adapter
     assert "P4_FUSED_AUDIT_SCORE_RECEIPT" in audit_adapter
     assert "mode=\"audit_score_receipt\"" in audit_adapter
+    assert "_read_target_provenance" in audit_adapter
     assert "official TopK ∩ cold" in audit_adapter
     assert "npu_a5_c8_resident_seed" in resident_seed_bridge
     assert "aclnnA5C8ResidentSeed" in resident_seed_bridge
@@ -116,6 +118,13 @@ def main() -> int:
     assert "P4_STRICT_MATH_GATE_PASS" in strict_math_test
     assert "P4_STRICT_MATH_GATE_FAIL" in strict_math_test
     assert "_assert_bitwise_equal" in strict_math_test
+    target_adapter = (OPS / "tests/streaming_quant_li_get_target_adapter.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"' in target_adapter
+    assert 'TARGET_EXPECTED_HEAD_ENV = "P3_TARGET_EXPECTED_SOURCE_HEAD"' in target_adapter
+    assert "_read_target_provenance" in target_adapter
+    assert "P3 target provenance" in build
 
     print(
         "P4_FUSED_SINGLE_SCAN_CONTRACT_PASS "

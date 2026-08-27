@@ -73,7 +73,9 @@ INT64_MAX = (1 << 63) - 1
 REFERENCE_OPP_ENV = "NANOVLLM_A5_REFERENCE_C8_OPP"
 TARGET_OPP_ENV = "NANOVLLM_A5_STREAMING_LI_OPP"
 REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"
+TARGET_EXPECTED_HEAD_ENV = "P3_TARGET_EXPECTED_SOURCE_HEAD"
 REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
+TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"
 REFERENCE_OPAPI_ENV = "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"
 TARGET_NPU_ENV = "P3_NPU_ID"
 HOOK_CONTROL_MODE_ENV = "P3_HOOK_CONTROL_MODE"
@@ -224,6 +226,44 @@ def _read_reference_provenance(vendor: Path) -> dict[str, str]:
         raise RuntimeError(
             "reference OPP was built from a different source revision: "
             f"actual={values['source_head']} expected={expected_head}"
+        )
+    return values
+
+
+def _read_target_provenance(vendor: Path) -> dict[str, str]:
+    """Reject a stale or hook-off P3 OPP before its static bridge loads it."""
+    path = vendor / TARGET_PROVENANCE_NAME
+    if not path.is_file():
+        raise RuntimeError(
+            "isolated P3 target OPP has no provenance manifest: " f"{path}"
+        )
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key:
+            values[key] = value
+    required = ("kind", "source_root", "source_head", "hook_mode", "operators")
+    missing = tuple(key for key in required if not values.get(key))
+    if missing:
+        raise RuntimeError(
+            "isolated P3 target provenance is incomplete: "
+            f"path={path} missing={missing}"
+        )
+    if values["kind"] != "source_derived_streaming_quant_li_get":
+        raise RuntimeError(
+            "isolated P3 target provenance has an unexpected kind: "
+            f"got={values['kind']!r}"
+        )
+    expected_head = os.getenv(TARGET_EXPECTED_HEAD_ENV)
+    if expected_head and values["source_head"] != expected_head:
+        raise RuntimeError(
+            "isolated P3 target OPP was built from a different source revision: "
+            f"actual={values['source_head']} expected={expected_head}"
+        )
+    if values["hook_mode"] != "on":
+        raise RuntimeError(
+            "isolated P3 target OPP does not contain the score-observation hook: "
+            f"hook_mode={values['hook_mode']!r}"
         )
     return values
 
@@ -397,6 +437,11 @@ def _bind_isolated_target_opp(opapi: Path) -> Path:
     # ``nanovllm_a5_opapi::RepositoryCustomHandle`` is static per extension,
     # not process-global.  The source-matched bridge already cached its DSO,
     # so this cannot redirect the completed reference call.
+    if "nanovllm_streaming_quant_li_get" in sys.modules:
+        raise RuntimeError(
+            "run target equivalence in a fresh Python process: the isolated "
+            "P3 bridge resolver was already initialized"
+        )
     os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(opapi)
     return opapi
 
@@ -635,6 +680,7 @@ def run_target_equivalence() -> dict[str, Any]:
     target_opapi, target_vendor = _resolve_single_opp(
         os.getenv(TARGET_OPP_ENV), "target"
     )
+    target_provenance = _read_target_provenance(target_vendor)
     # CANN discovers the binary config for an op on its first ACLNN call.  Both
     # OPP vendors must be visible before either the reference or P3 target
     # executes; switching this path after the reference is too late.
@@ -643,6 +689,15 @@ def run_target_equivalence() -> dict[str, Any]:
     )
     official_op, metadata_op, _ = _require_source_matched_official_c8_ops(
         reference_opapi, reference_vendor
+    )
+    print(
+        "P3_TARGET_PROVENANCE "
+        f"source_root={target_provenance['source_root']} "
+        f"source_head={target_provenance['source_head']} "
+        f"expected_head={os.getenv(TARGET_EXPECTED_HEAD_ENV, '<unset>')} "
+        f"hook_mode={target_provenance['hook_mode']} ready=1 "
+        f"vendor={target_vendor} opapi={target_opapi}",
+        flush=True,
     )
     device = _require_a5_npu()
     inputs = _build_official_inputs(device)
@@ -653,11 +708,6 @@ def run_target_equivalence() -> dict[str, Any]:
     # product execution dependency.
     torch.npu.synchronize()
 
-    if "nanovllm_streaming_quant_li_get" in sys.modules:
-        raise RuntimeError(
-            "run target equivalence in a fresh Python process: the isolated "
-            "bridge resolver was already initialized"
-        )
     target_opapi = _bind_isolated_target_opp(target_opapi)
     importlib.import_module("nanovllm_streaming_quant_li_get")
     namespace = getattr(torch.ops, "a5_streaming_quant_li_get", None)

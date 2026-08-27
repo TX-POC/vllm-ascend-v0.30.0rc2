@@ -39,6 +39,7 @@ from streaming_quant_li_get_target_adapter import (
     _prepend_unique_path,
     _require_a5_npu,
     _require_source_matched_official_c8_ops,
+    _read_target_provenance,
     _resolve_single_opp,
 )
 
@@ -768,6 +769,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
     target_opapi, target_vendor = _resolve_single_opp(
         os.getenv(TARGET_OPP_ENV), "target"
     )
+    target_provenance = _read_target_provenance(target_vendor)
     seed_opapi, seed_vendor = _resolve_resident_seed_opp(
         os.getenv(RESIDENT_SEED_OPP_ENV)
     )
@@ -776,6 +778,16 @@ def run_p4_fused_audit() -> dict[str, Any]:
     )
     official, metadata, _ = _require_source_matched_official_c8_ops(
         reference_opapi, reference_vendor
+    )
+    print(
+        "P3_TARGET_PROVENANCE "
+        f"source_root={target_provenance['source_root']} "
+        f"source_head={target_provenance['source_head']} "
+        "expected_head="
+        f"{os.getenv('P3_TARGET_EXPECTED_SOURCE_HEAD', '<unset>')} "
+        f"hook_mode={target_provenance['hook_mode']} ready=1 "
+        f"vendor={target_vendor} opapi={target_opapi}",
+        flush=True,
     )
     device = _require_a5_npu()
     inputs = _build_official_inputs(device)

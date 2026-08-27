@@ -626,6 +626,39 @@ for op_name in "${OP_NAMES[@]}"; do
     fi
 done
 
+# The source-derived P3 OPP is deliberately built in a fresh, isolated
+# directory for every equivalence/audit run.  Its ACLNN bridge keeps a static
+# resolver handle, so accepting an arbitrary old libcust_opapi.so here would
+# make a later test appear to exercise the current source while actually
+# executing an older hook binary.  Stamp the installed vendor with the exact
+# worktree revision and the compile-time hook mode.  The Python adapters read
+# this before importing the P3 bridge and fail closed on any mismatch.
+if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
+    P3_PROVENANCE_HEAD="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || true)"
+    if [[ ! "${P3_PROVENANCE_HEAD}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "[nanovllm_a5_ops] ERROR: cannot record P3 OPP provenance; source HEAD is unavailable." >&2
+        exit 1
+    fi
+    cat > "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" <<EOF
+format=1
+kind=source_derived_streaming_quant_li_get
+source_root=${ROOT}
+source_head=${P3_PROVENANCE_HEAD}
+hook_mode=${STREAMING_LI_HOOK_MODE,,}
+operators=${OP_NAMES[*]}
+EOF
+    if ! grep -Fqx 'kind=source_derived_streaming_quant_li_get' \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
+       ! grep -Fqx "source_head=${P3_PROVENANCE_HEAD}" \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
+       ! grep -Fqx "hook_mode=${STREAMING_LI_HOOK_MODE,,}" \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE"; then
+        echo "[nanovllm_a5_ops] ERROR: P3 OPP provenance manifest is incomplete." >&2
+        exit 1
+    fi
+    echo "[nanovllm_a5_ops] P3 target provenance: ${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE"
+fi
+
 if [[ "${SKIP_TORCH_EXTENSION}" != "1" ]]; then
     # Legacy standalone mode retained for local operator development only.
     # The normal vLLM-Ascend package build sets SKIP_TORCH_EXTENSION=1 and

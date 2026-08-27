@@ -640,7 +640,13 @@ private:
                     receipt |= kAuditScoreReceiptCandidateBit;
                 }
                 const uint64_t sourceOffset = row * sourceCapacity_ + sourceIndex;
-                sourceToSlot_.SetValue(sourceOffset, static_cast<int32_t>(receipt));
+                // The tag always sets bit 31.  Converting that uint32_t
+                // directly to int32_t is implementation-defined in C++17;
+                // express the two's-complement bit pattern through int64_t
+                // so the graph-visible int32 receipt is portable and exact.
+                const int32_t signedReceipt = static_cast<int32_t>(
+                    static_cast<int64_t>(receipt) - (1LL << 32));
+                sourceToSlot_.SetValue(sourceOffset, signedReceipt);
             }
         }
     }
