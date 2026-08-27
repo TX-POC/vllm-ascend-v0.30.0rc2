@@ -62,6 +62,12 @@ def main() -> None:
     require("GetLastKthValue" in topk, "must expose official final TopK boundary")
     require("DataCopyPad(residentTauGm" in vector, "tau must be AIV DMA output, not host shadow")
     require("DataCopyPad(tauValidGm" in vector, "tau validity must be AIV DMA output")
+    require("InitBuffer(residentSeedBuf_, 16 * sizeof(int32_t));" in vector,
+            "tau and tau_valid need two 32-byte MTE3 source lines")
+    require("residentSeedLocal_.SetValue(8, tauValid);" in vector and
+            "DataCopyPad(tauValidGm[outputRow], residentSeedLocal_[8], scalarCopy);" in vector and
+            "residentSeedLocal_[1]" not in vector,
+            "second scalar MTE3 source must start at the next 32-byte UB line")
     # CANN 9.1's InitGlobalMemory takes a non-const GlobalTensor lvalue.
     # Keep the GM slice's address and row offset unchanged, but materialize
     # the slice as a named view before the fail-closed zero fill.
@@ -94,6 +100,10 @@ def main() -> None:
     bridge = (OP / "torch_extension" / "csrc" / "a5_c8_resident_seed.cpp").read_text()
     require("at::kFloat8_e4m3fn" in bridge,
             "typed bridge must reject a non-FP8 input despite generic JSON int8")
+    require("resident_index_key.stride(0)" in bridge and
+            "resident_index_key_scale.stride(0)" in bridge and
+            "physical_stride, physical_scale_stride" in bridge,
+            "ResidentSeed must pass PA_BSND's actual page strides exactly like official C8")
 
     host_compat = (OP / "op_host" / "a5_c8_resident_seed_host_compat.h").read_text()
     for macro in ("OP_CHECK_NULL_WITH_CONTEXT", "OP_CHECK_IF", "OP_LOGE", "REPORT_INNER_ERR_MSG"):
@@ -173,6 +183,9 @@ def main() -> None:
             "target gate must identify which NPU launch failed")
     require("sparse_values=bitwise_equal_empty_fp32_return_values_false" in target_equivalence,
             "target gate must compare the official and Seed empty-value outputs")
+    require("stage=resident_stride_contract" in target_equivalence and
+            'stride=int(resident["resident_index_key"].stride(0))' in audit_adapter,
+            "target gate must make the resident PA_BSND stride contract visible")
 
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 

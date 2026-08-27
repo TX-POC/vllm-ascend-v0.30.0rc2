@@ -72,6 +72,15 @@ def main() -> int:
         f"{resident['resident_seq_lengths'].detach().cpu().tolist()}",
         flush=True,
     )
+    print(
+        "A5_C8_RESIDENT_SEED_TARGET_STAGE "
+        "stage=resident_stride_contract "
+        "key_stride="
+        f"{int(resident['resident_index_key'].stride(0))} "
+        "scale_stride="
+        f"{int(resident['resident_index_key_dequant_scale'].stride(0))}",
+        flush=True,
+    )
     _bind_resident_seed_opp(seed_opapi)
     print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=seed_launch", flush=True)
     seed_indices, seed_values, resident_tau, tau_valid = _launch_resident_seed(

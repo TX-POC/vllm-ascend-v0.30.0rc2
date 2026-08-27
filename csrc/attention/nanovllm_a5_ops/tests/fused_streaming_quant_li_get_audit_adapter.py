@@ -248,6 +248,10 @@ def _launch_resident_seed(
         next_tokens=INT64_MAX,
         cmp_ratio=1,
         return_values=False,
+        stride=int(resident["resident_index_key"].stride(0)),
+        scale_stride=int(
+            resident["resident_index_key_dequant_scale"].stride(0)
+        ),
     )
     if not isinstance(result, tuple) or len(result) != 4:
         raise RuntimeError("A5C8ResidentSeed returned an unexpected ABI")

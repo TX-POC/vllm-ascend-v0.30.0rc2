@@ -174,6 +174,22 @@ Result AllocateAndLaunch(
     const auto sparse_shape = SparseOutputShape(
         query, resident_index_key, layout_query, layout_key, sparse_count);
     const int64_t rows = SelectionRows(sparse_shape);
+    // PA_BSND is physically paged.  The copied A5 C8 cube/vector kernels
+    // dereference physical page ids through these two element strides, so a
+    // default attribute value of 1 would not describe this tensor's layout.
+    // Match the official C8 bridge: reject a mismatched caller contract rather
+    // than silently producing a different score domain.
+    const int64_t physical_stride = resident_index_key.stride(0);
+    const int64_t physical_scale_stride = resident_index_key_scale.stride(0);
+    TORCH_CHECK(physical_stride > 0 && physical_scale_stride > 0,
+                "A5C8ResidentSeed PA_BSND strides must be positive.");
+    TORCH_CHECK(stride == physical_stride,
+                "A5C8ResidentSeed stride must equal resident_index_key.stride(0): "
+                "got ", stride, " expected ", physical_stride, ".");
+    TORCH_CHECK(scale_stride == physical_scale_stride,
+                "A5C8ResidentSeed scale_stride must equal "
+                "resident_index_key_dequant_scale.stride(0): got ",
+                scale_stride, " expected ", physical_scale_stride, ".");
     auto int_options = query.options().dtype(at::kInt);
     auto float_options = query.options().dtype(at::kFloat);
     auto sparse_indices = at::empty(sparse_shape, int_options);
@@ -196,7 +212,8 @@ Result AllocateAndLaunch(
         actual_query_lengths, resident_seq_lengths, resident_index_block_table,
         metadata, query_quant_mode, key_quant_mode, layout_query_ptr,
         layout_key_ptr, sparse_count, sparse_mode, pre_tokens, next_tokens,
-        cmp_ratio, return_values, stride, scale_stride, sparse_indices,
+        cmp_ratio, return_values, physical_stride, physical_scale_stride,
+        sparse_indices,
         sparse_values, resident_tau, tau_valid);
     return std::make_tuple(sparse_indices, sparse_values, resident_tau,
                            tau_valid);
@@ -245,6 +262,12 @@ Result A5C8ResidentSeedMeta(
     const auto sparse_shape = SparseOutputShape(
         query, resident_index_key, layout_query, layout_key, sparse_count);
     const int64_t rows = SelectionRows(sparse_shape);
+    TORCH_CHECK(stride == resident_index_key.stride(0),
+                "A5C8ResidentSeed meta stride must equal "
+                "resident_index_key.stride(0).");
+    TORCH_CHECK(scale_stride == resident_index_key_scale.stride(0),
+                "A5C8ResidentSeed meta scale_stride must equal "
+                "resident_index_key_dequant_scale.stride(0).");
     auto int_options = query.options().dtype(at::kInt);
     auto float_options = query.options().dtype(at::kFloat);
     return std::make_tuple(

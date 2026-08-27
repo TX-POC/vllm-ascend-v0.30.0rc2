@@ -123,8 +123,10 @@ private:
     TBuf<TPosition::VECCALC> outInvalidBuf_;
     LocalTensor<int32_t> outInvalidLocal_;
 
-    // Two scalar int32 values: {sortable-u16 tau in low bits, tau_valid}.
-    // Kept separate from index UB so the receipt cannot change TopK output.
+    // Two independently DMA-published int32 values: {sortable-u16 tau in low
+    // bits, tau_valid}.  Each source begins on its own 32-byte UB line.  MTE3
+    // scalar copies cannot safely use a +4-byte sub-line source address.
+    // Keeping this receipt separate from index UB leaves TopK math unchanged.
     TBuf<TPosition::VECCALC> residentSeedBuf_;
     LocalTensor<int32_t> residentSeedLocal_;
 
@@ -181,7 +183,8 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     //刷-1
     pipe->InitBuffer(outInvalidBuf_, topkCount_ * sizeof(int32_t));
     outInvalidLocal_ = outInvalidBuf_.Get<int32_t>();
-    pipe->InitBuffer(residentSeedBuf_, 8 * sizeof(int32_t));
+    // Two 32-byte DMA source lines: tau at [0], tau_valid at [8].
+    pipe->InitBuffer(residentSeedBuf_, 16 * sizeof(int32_t));
     residentSeedLocal_ = residentSeedBuf_.Get<int32_t>();
     Duplicate(kScaleUB_, float(0), 2 * s2BaseSize_);
 }
@@ -231,7 +234,7 @@ __aicore__ inline void QLIVector<QLIT>::WriteResidentSeed(
     uint64_t outputRow, uint16_t tau, int32_t tauValid)
 {
     residentSeedLocal_.SetValue(0, static_cast<int32_t>(tau));
-    residentSeedLocal_.SetValue(1, tauValid);
+    residentSeedLocal_.SetValue(8, tauValid);
     PipeBarrier<PIPE_V>();
 
     // This is a real AIV-side DMA write, issued only after final TopK data is
@@ -241,7 +244,7 @@ __aicore__ inline void QLIVector<QLIT>::WriteResidentSeed(
     SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
     WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
     DataCopyPad(residentTauGm[outputRow], residentSeedLocal_, scalarCopy);
-    DataCopyPad(tauValidGm[outputRow], residentSeedLocal_[1], scalarCopy);
+    DataCopyPad(tauValidGm[outputRow], residentSeedLocal_[8], scalarCopy);
     SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
 }

@@ -60,6 +60,10 @@ fi
 # named views used by the source closure.
 if grep -qF 'InitGlobalMemory(residentTauGm[rowOffset]' "${VECTOR_KERNEL}" || \
    grep -qF 'InitGlobalMemory(tauValidGm[rowOffset]' "${VECTOR_KERNEL}" || \
+   grep -qF 'residentSeedLocal_[1]' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'InitBuffer(residentSeedBuf_, 16 * sizeof(int32_t));' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'residentSeedLocal_.SetValue(8, tauValid);' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'DataCopyPad(tauValidGm[outputRow], residentSeedLocal_[8], scalarCopy);' "${VECTOR_KERNEL}" || \
    ! grep -qF 'GlobalTensor<int32_t> residentTauOutput = residentTauGm[rowOffset];' "${VECTOR_KERNEL}" || \
    ! grep -qF 'GlobalTensor<int32_t> tauValidOutput = tauValidGm[rowOffset];' "${VECTOR_KERNEL}" || \
    ! grep -qF 'InitGlobalMemory(residentTauOutput, rowCount, 0);' "${VECTOR_KERNEL}" || \
