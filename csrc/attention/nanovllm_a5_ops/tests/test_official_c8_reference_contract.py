@@ -39,6 +39,7 @@ def require_source_matched_reference_contract() -> None:
     assert "P3_REFERENCE_PROVENANCE" in build_script
     assert "source_head=${SOURCE_HEAD}" in build_script
     assert "-newer \"${BUILD_MARKER}\"" in build_script
+    assert '! -e "${SOURCE_ROOT}/.git"' in build_script
 
     # Both real ACLNN calls retain the canonical names from torch_binding.cpp.
     # The reference bridge gets a private resolver slot so changing the P3

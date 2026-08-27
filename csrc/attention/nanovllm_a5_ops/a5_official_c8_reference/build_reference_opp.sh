@@ -19,7 +19,10 @@ OP_LIST="vllm_quant_lightning_indexer,vllm_quant_lightning_indexer_metadata"
 printf 'P3_REFERENCE_BUILD source_root=%s install_root=%s ops=%s jobs=%s\n' \
   "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${OP_LIST}" "${BUILD_JOBS}"
 
-if [[ ! -d "${SOURCE_ROOT}/.git" || ! -f "${SOURCE_ROOT}/csrc/build.sh" ]]; then
+# A linked Git worktree stores .git as a file pointing back to the primary
+# repository, while a normal checkout stores it as a directory.  Both are
+# valid source roots for the provenance gate.
+if [[ ! -e "${SOURCE_ROOT}/.git" || ! -f "${SOURCE_ROOT}/csrc/build.sh" ]]; then
   printf 'P3_REFERENCE_BUILD_FAIL reason=invalid_source_root path=%s\n' \
     "${SOURCE_ROOT}" >&2
   exit 2
