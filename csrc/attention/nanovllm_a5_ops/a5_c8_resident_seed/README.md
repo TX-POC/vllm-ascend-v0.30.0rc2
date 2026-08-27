@@ -33,8 +33,9 @@ The 656-byte packed KV representation is a QSFA payload format, **not** an LI ke
 The CANN 9.1 `msopgen` parser accepts `int8` in its generic JSON `TypeRange`,
 but rejects the JSON spelling `float8_e4m3fn`.  For that bootstrap-only
 metadata, `ops.json` therefore declares `query` and `resident_index_key` as
-`int8`, exactly as the official/P3 C8 route does.  This is **not** a cast or a
-conversion: the Ascend-950 `AICoreConfig` in
+`int8`; the generic `OpDef` uses the same generator-facing type.  This is
+exactly the official/P3 C8 pattern.  It is **not** a cast or a conversion: the
+Ascend-950 `AICoreConfig` in
 `op_host/a5_c8_resident_seed_def.cpp` requires `DT_FLOAT8_E4M3FN` for both
 tensors, and the independent Torch bridge rejects every dtype except
 `torch.float8_e4m3fn`.  The generated JSON can therefore be understood as a

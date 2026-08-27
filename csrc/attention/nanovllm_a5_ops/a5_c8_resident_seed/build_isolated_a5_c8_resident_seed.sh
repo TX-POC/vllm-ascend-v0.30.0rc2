@@ -36,12 +36,14 @@ BRIDGE="${ROOT}/torch_extension/csrc/a5_c8_resident_seed.cpp"
 # msopgen, so a wrong schema is diagnosed in one short, actionable message.
 if ! grep -Eq '"name": "query".*"type": \["int8"\]' "${SPEC}" || \
    ! grep -Eq '"name": "resident_index_key".*"type": \["int8"\]' "${SPEC}" || \
+   ! grep -A3 'this->Input("query")' "${OP_DEF}" | grep -q 'ge::DT_INT8' || \
+   ! grep -A3 'this->Input("resident_index_key")' "${OP_DEF}" | grep -q 'ge::DT_INT8' || \
    ! grep -q 'aicore_config_950.Input("query")' "${OP_DEF}" || \
    ! grep -q 'aicore_config_950.Input("resident_index_key")' "${OP_DEF}" || \
    ! grep -q 'ge::DT_FLOAT8_E4M3FN' "${OP_DEF}" || \
    ! grep -q 'at::kFloat8_e4m3fn' "${BRIDGE}"; then
   echo "[a5_c8_resident_seed] ERROR: CANN-bootstrap/FP8 ABI contract is incomplete." >&2
-  echo "[a5_c8_resident_seed] expected: ops.json query/index-key=int8; Ascend950 OpDef and bridge=FP8 E4M3FN." >&2
+  echo "[a5_c8_resident_seed] expected: JSON/generic OpDef query/index-key=int8; Ascend950 OpDef and bridge=FP8 E4M3FN." >&2
   exit 2
 fi
 if [[ -e "${BUILD_ROOT}/op_dev" || -e "${BUILD_ROOT}/custom_op" || -e "${BUILD_ROOT}/opp" ]]; then

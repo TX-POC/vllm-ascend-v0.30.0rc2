@@ -64,6 +64,9 @@ def main() -> None:
             "aicore_config_950.Input(\"resident_index_key\")" in op_def and
             "ge::DT_FLOAT8_E4M3FN" in op_def,
             "Ascend950 OpDef must retain the real FP8 E4M3FN ABI")
+    require('this->Input("query")\n            .ParamType(REQUIRED)\n            .DataType({ge::DT_INT8})' in op_def and
+            'this->Input("resident_index_key")\n            .ParamType(REQUIRED)\n            .DataType({ge::DT_INT8})' in op_def,
+            "generic OpDef must agree with the CANN JSON bootstrap TypeRange")
 
     bridge = (OP / "torch_extension" / "csrc" / "a5_c8_resident_seed.cpp").read_text()
     require("at::kFloat8_e4m3fn" in bridge,
