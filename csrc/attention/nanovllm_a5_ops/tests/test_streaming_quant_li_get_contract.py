@@ -31,6 +31,8 @@ BRIDGE = ROOT / "torch_extension/csrc/streaming_quant_li_get.cpp"
 OPS = ROOT / "ops.json"
 ROOT_CMAKE = ROOT / "CMakeLists.txt"
 METADATA_COMPANION = ROOT / "metadata_companion.md"
+BUILD_SCRIPT = ROOT.parent / "build_nanovllm_ops.sh"
+COMMON_OPS_ERR = ROOT.parents[2] / "common/include/err/ops_err.h"
 
 # These are the public CANN-generated operator parameter names.  The isolated
 # Torch bridge is deliberately required to use the same names and positional
@@ -204,6 +206,7 @@ def require_source_contract() -> None:
     tiling = TILING.read_text()
     tiling_header = TILING_HEADER.read_text()
     bridge = BRIDGE.read_text()
+    build_script = BUILD_SCRIPT.read_text()
     ops = json.loads(OPS.read_text())
     assert len(ops) == 1 and ops[0]["op"] == "A5StreamingQuantLiGet"
     assert len(ops[0]["input_desc"]) == 21
@@ -262,6 +265,12 @@ def require_source_contract() -> None:
     assert "descriptor_stage_only" not in OPS.read_text()
     assert "descriptor_stage_only" not in ROOT_CMAKE.read_text()
     assert METADATA_COMPANION.is_file()
+    # An isolated msopgen project does not inherit the normal repository-wide
+    # csrc/common/include path.  The official C8 tiler needs this one error
+    # shim, which the P3 build script must stage beside op_host sources.
+    assert COMMON_OPS_ERR.is_file()
+    assert "STREAMING_LI_OPS_ERR" in build_script
+    assert '"${OP_DEV}/op_host/err/ops_err.h"' in build_script
     assert "BatchMulWeightAndReduceSum" in vector
     assert "streamingKvafHook_.Emit" in vector
     assert "streamingKvafHook_.Finish" in vector
