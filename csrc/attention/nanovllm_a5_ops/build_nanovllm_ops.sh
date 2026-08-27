@@ -153,6 +153,30 @@ fi
 # add_op_to_compiled_list().
 rm -rf "${GENERATED}" "${OP_DEV}"
 mkdir -p "${BUILD_ROOT}" "${OP_DEV}/op_host" "${OP_DEV}/op_kernel"
+
+# msopgen generates the only CMake scaffold that is valid for this CANN
+# version.  Strict single-op staging used to copy every file verbatim, which
+# accidentally reintroduced a checked-in operator CMakeLists.txt and made the
+# later leak guard reject the staging area before compilation.  Keep the
+# source closure complete while deliberately excluding repository build files.
+copy_tree_without_repository_cmake() {
+    local source_dir="$1"
+    local destination_dir="$2"
+    local file
+    local rel
+    local dst
+
+    while IFS= read -r -d '' file; do
+        rel="${file#${source_dir}/}"
+        if [[ "${rel}" == "CMakeLists.txt" || "${rel}" == */CMakeLists.txt ]]; then
+            continue
+        fi
+        dst="${destination_dir}/${rel}"
+        mkdir -p "$(dirname "${dst}")"
+        cp -f "${file}" "${dst}"
+    done < <(find "${source_dir}" -type f -print0)
+}
+
 if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
     cp "${ROOT}/a5_exact_scan_speculative_get/ops.json" \
         "${OP_DEV}/ops.json"
@@ -176,9 +200,12 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         exit 2
     fi
     cp "${STREAMING_LI_SPEC}" "${OP_DEV}/ops.json"
-    cp -a "${STREAMING_LI_DIR}/op_host/." "${OP_DEV}/op_host/"
-    cp -a "${STREAMING_LI_DIR}/op_kernel/." "${OP_DEV}/op_kernel/"
+    copy_tree_without_repository_cmake "${STREAMING_LI_DIR}/op_host" \
+        "${OP_DEV}/op_host"
+    copy_tree_without_repository_cmake "${STREAMING_LI_DIR}/op_kernel" \
+        "${OP_DEV}/op_kernel"
     echo "[nanovllm_a5_ops] strict P3 staging: A5StreamingQuantLiGet official C8 closure only"
+    echo "[nanovllm_a5_ops] strict P3 staging: repository CMakeLists.txt excluded"
     echo "[nanovllm_a5_ops] metadata companion: VllmQuantLightningIndexerMetadata must already be registered at runtime; this isolated OPP consumes its [1024] output and does not package a duplicate AICPU producer"
     echo "[nanovllm_a5_ops] layout contract: source-derived tiling preserves official layout_query=TND and BSND behavior; production decode uses TND with layout_key=PA_BSND"
 elif [[ "${STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY}" == "1" ]]; then
