@@ -535,6 +535,24 @@ if [[ -n "${KVAF_STAGE_DIR:-}" ]]; then
     echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} generated KVAF relative include closure: ${KVAF_GENERATED_STAGE_DIR} verified=1"
 fi
 
+# The hook-mode header is generated after the P3 kernel closure has been
+# staged, then overlaid onto msopgen's generated project.  The source-derived
+# vector header reaches it through `../` from arch35, so validate that exact
+# final path before invoking CANN.  This turns a missing staging overlay into
+# an immediate, concise build error rather than an opaque device-compiler
+# include failure several minutes later.
+if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
+    P3_GENERATED_HOOK_MODE="${GENERATED}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
+    if [[ ! -f "${P3_GENERATED_HOOK_MODE}" ]] || \
+       ! grep -Eq '^#define A5_STREAMING_LI_GET_ENABLE_HOOK [01]$' \
+            "${P3_GENERATED_HOOK_MODE}"; then
+        echo "[nanovllm_a5_ops] ERROR: generated P3 hook-mode header is missing or invalid." >&2
+        echo "[nanovllm_a5_ops] expected=${P3_GENERATED_HOOK_MODE}" >&2
+        exit 2
+    fi
+    echo "[nanovllm_a5_ops] P3 generated hook-mode header: ${P3_GENERATED_HOOK_MODE} verified=1"
+fi
+
 # `msopgen` creates an all-in-one host source named
 # `a5_streaming_quant_li_get.cpp`.  P3 deliberately replaces that generated
 # implementation with the source-derived C8 host closure, whose OpDef lives

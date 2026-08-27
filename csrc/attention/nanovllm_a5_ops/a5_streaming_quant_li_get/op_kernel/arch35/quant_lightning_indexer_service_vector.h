@@ -21,7 +21,7 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "quant_lightning_indexer_common.h"
-#include "a5_streaming_quant_li_get_hook_mode.h"
+#include "../a5_streaming_quant_li_get_hook_mode.h"
 #if A5_STREAMING_LI_GET_ENABLE_HOOK
 #include "a5_streaming_quant_li_get_tile_ready.h"
 #endif

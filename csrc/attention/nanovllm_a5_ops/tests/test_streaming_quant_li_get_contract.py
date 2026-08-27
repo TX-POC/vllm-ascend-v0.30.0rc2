@@ -329,10 +329,11 @@ def require_source_contract() -> None:
     # relying on CANN CMAKE flag propagation.  The conditional must remove
     # the helper include, its UB, its score-tile barrier/call, and the TopK
     # terminal wait/finish as one unit.
-    assert '#include "a5_streaming_quant_li_get_hook_mode.h"' in vector
+    assert '#include "../a5_streaming_quant_li_get_hook_mode.h"' in vector
     assert "#if A5_STREAMING_LI_GET_ENABLE_HOOK" in vector
     assert "NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE" in build_script
     assert "P3 streaming hook mode:" in build_script
+    assert "P3 generated hook-mode header:" in build_script
     assert "scoreSourceLensGm.SetValue(" in vector
     assert "outputRow, validS2Len > 0 ? validS2Len : 0" in vector
     assert "ProcessTopK" in vector
