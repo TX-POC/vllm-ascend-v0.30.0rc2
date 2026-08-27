@@ -295,6 +295,12 @@ def require_source_contract() -> None:
     assert 'rm -f "${P3_GENERATED_HOST_STUB}"' in build_script
     assert "P3_OPDEF_SOURCES" in build_script
     assert "P3 host registration closure:" in build_script
+    # The queue control lives in GM.  AscendC rejects an implicit aggregate
+    # copy from `__gm__ T` to local memory, so the P3 hook must use KVAF's
+    # explicit field-wise AIC loader.  This is representation-only plumbing:
+    # it cannot alter score/Top-K math or the Direct-HCCP transaction order.
+    assert "LoadKvafStreamingBatchGetControlFromGmForAicore" in hook
+    assert "control_ = *controlGm_" not in hook
     assert "BatchMulWeightAndReduceSum" in vector
     assert "streamingKvafHook_.Emit" in vector
     assert "streamingKvafHook_.Finish" in vector

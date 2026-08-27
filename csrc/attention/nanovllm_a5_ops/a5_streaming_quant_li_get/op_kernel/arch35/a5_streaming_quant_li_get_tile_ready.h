@@ -201,8 +201,9 @@ public:
             queueCount_ == 0U || rowsPerEntry_ == 0U) {
             return;
         }
-        control_ = *controlGm_;
-        if (!kvaf_fused_get::IsKvafStreamingBatchGetControlValidForAicore(control_) ||
+        if (!kvaf_fused_get::LoadKvafStreamingBatchGetControlFromGmForAicore(
+                controlGm_, &control_) ||
+            !kvaf_fused_get::IsKvafStreamingBatchGetControlValidForAicore(control_) ||
             control_.queue_count != queueCount_ ||
             control_.queue_leases != reinterpret_cast<uint64_t>(queueLeasesRaw_) ||
             control_.output != reinterpret_cast<uint64_t>(privatePackedOutputRaw_) ||
