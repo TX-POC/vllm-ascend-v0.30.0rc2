@@ -42,7 +42,14 @@ import torch_npu  # noqa: F401  # Registers the NPU backend and FP8 quantizer.
 
 BLOCK_SIZE = 128
 HEAD_DIM = 128
-INDEX_HEADS = 32
+# This fixture must be accepted by the real official A5 C8 tiler before it
+# can serve as a reference for the derived operator.  For PA_BSND, that
+# tiler requires the exact grouping N1 / N2 == 64; it also currently accepts
+# only N2 == 1.  Keep these two dimensions explicit so a future fixture edit
+# fails at construction time instead of after an expensive target launch.
+INDEX_HEADS = 64
+KEY_HEADS = 1
+A5_C8_QUERY_TO_KEY_GROUP = 64
 SPARSE_COUNT = 2048
 BATCH_SIZE = 2
 SOURCE_TOKENS = 4096
@@ -109,6 +116,11 @@ def _build_official_inputs(device: torch.device) -> dict[str, torch.Tensor]:
     """Create one real TND/PA_BSND C8 case shared byte-for-byte by both ops."""
     if SOURCE_TOKENS % BLOCK_SIZE:
         raise AssertionError("SOURCE_TOKENS must be page aligned")
+    if KEY_HEADS != 1 or INDEX_HEADS != KEY_HEADS * A5_C8_QUERY_TO_KEY_GROUP:
+        raise AssertionError(
+            "official A5 C8 PA_BSND fixture requires N2=1 and N1/N2=64; "
+            f"got N1={INDEX_HEADS}, N2={KEY_HEADS}"
+        )
     blocks = SOURCE_TOKENS // BLOCK_SIZE
     torch.manual_seed(20260826)
     torch.npu.manual_seed_all(20260826)
@@ -117,7 +129,9 @@ def _build_official_inputs(device: torch.device) -> dict[str, torch.Tensor]:
         (BATCH_SIZE, INDEX_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
     ).uniform_(-1.0, 1.0)
     key_fp = torch.empty(
-        (blocks, BLOCK_SIZE, 1, HEAD_DIM), dtype=torch.bfloat16, device=device
+        (blocks, BLOCK_SIZE, KEY_HEADS, HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
     ).uniform_(-1.0, 1.0)
     query, query_scale = _quantize_fp8(query_fp)
     key, key_scale = _quantize_fp8(key_fp)
@@ -150,7 +164,7 @@ def _official_metadata(metadata_op: Any, inputs: dict[str, torch.Tensor]) -> tor
     """Use the registered official metadata companion, never a host stand-in."""
     metadata = metadata_op(
         num_heads_q=INDEX_HEADS,
-        num_heads_k=1,
+        num_heads_k=KEY_HEADS,
         head_dim=HEAD_DIM,
         query_quant_mode=0,
         key_quant_mode=0,
@@ -212,7 +226,7 @@ def _call_official(reference_op: Any, inputs: dict[str, torch.Tensor]) -> torch.
     indices = result[0]
     if not isinstance(indices, torch.Tensor) or indices.dtype != torch.int32:
         raise RuntimeError("official A5 C8 LI returned no int32 sparse_indices")
-    expected_shape = (BATCH_SIZE, 1, SPARSE_COUNT)
+    expected_shape = (BATCH_SIZE, KEY_HEADS, SPARSE_COUNT)
     if tuple(indices.shape) != expected_shape:
         raise RuntimeError(
             "official A5 C8 LI sparse_indices shape mismatch: "
