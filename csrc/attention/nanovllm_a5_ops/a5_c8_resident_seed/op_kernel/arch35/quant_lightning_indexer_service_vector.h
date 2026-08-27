@@ -304,8 +304,14 @@ __aicore__ inline void QLIVector<QLIT>::CleanInvalidResidentSeed(
 {
     // No score/topk result exists for the globally disabled-core case.  Make
     // that fail-closed state graph-visible instead of leaving a stale tau.
-    AscendC::InitGlobalMemory(residentTauGm[rowOffset], rowCount, 0);
-    AscendC::InitGlobalMemory(tauValidGm[rowOffset], rowCount, 0);
+    // CANN 9.1 requires InitGlobalMemory's destination to be an lvalue
+    // GlobalTensor.  `gm[rowOffset]` is a temporary view, so first retain the
+    // exact same GM address+offset in a named view.  This changes neither the
+    // row range nor the fail-closed value written to it.
+    GlobalTensor<int32_t> residentTauOutput = residentTauGm[rowOffset];
+    GlobalTensor<int32_t> tauValidOutput = tauValidGm[rowOffset];
+    AscendC::InitGlobalMemory(residentTauOutput, rowCount, 0);
+    AscendC::InitGlobalMemory(tauValidOutput, rowCount, 0);
 }
 
 template <typename QLIT>

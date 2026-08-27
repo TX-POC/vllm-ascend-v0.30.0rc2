@@ -62,6 +62,20 @@ def main() -> None:
     require("GetLastKthValue" in topk, "must expose official final TopK boundary")
     require("DataCopyPad(residentTauGm" in vector, "tau must be AIV DMA output, not host shadow")
     require("DataCopyPad(tauValidGm" in vector, "tau validity must be AIV DMA output")
+    # CANN 9.1's InitGlobalMemory takes a non-const GlobalTensor lvalue.
+    # Keep the GM slice's address and row offset unchanged, but materialize
+    # the slice as a named view before the fail-closed zero fill.
+    require("GlobalTensor<int32_t> residentTauOutput = residentTauGm[rowOffset];" in vector,
+            "resident tau zero-fill must materialize its GM slice as an lvalue")
+    require("GlobalTensor<int32_t> tauValidOutput = tauValidGm[rowOffset];" in vector,
+            "tau-valid zero-fill must materialize its GM slice as an lvalue")
+    require("AscendC::InitGlobalMemory(residentTauOutput, rowCount, 0);" in vector,
+            "resident tau zero-fill must use the named lvalue view")
+    require("AscendC::InitGlobalMemory(tauValidOutput, rowCount, 0);" in vector,
+            "tau-valid zero-fill must use the named lvalue view")
+    require("InitGlobalMemory(residentTauGm[rowOffset]" not in vector and
+            "InitGlobalMemory(tauValidGm[rowOffset]" not in vector,
+            "CANN 9.1 rejects temporary indexed GM views in InitGlobalMemory")
     require("WriteResidentSeed(outputRow, kthTau, hasExactTau)" in vector, "final TopK must feed tau write")
     require(vector.rindex("topkOp_(mrgValueLocal_") < vector.index("WriteResidentSeed(outputRow, kthTau, hasExactTau)"),
             "tau write must follow the final official TopK reduction")
@@ -126,6 +140,9 @@ def main() -> None:
             "builder order must be msopgen, overlay, stub removal, unique OP_ADD check, then build")
     require("INI is diagnostic-only and was not modified" in isolated,
             "duplicate registration diagnostics must never patch CANN's generated INI")
+    require("CANN 9.1 InitGlobalMemory lvalue contract" in isolated and
+            "direct indexed GM view" in isolated,
+            "isolated builder must reject the known temporary-GM InitGlobalMemory form before msopgen")
 
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 

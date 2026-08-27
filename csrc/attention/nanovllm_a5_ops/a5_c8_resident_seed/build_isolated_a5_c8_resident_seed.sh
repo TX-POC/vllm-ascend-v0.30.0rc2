@@ -30,6 +30,7 @@ SPEC="${ROOT}/ops.json"
 OP_DEF="${ROOT}/op_host/a5_c8_resident_seed_def.cpp"
 BRIDGE="${ROOT}/torch_extension/csrc/a5_c8_resident_seed.cpp"
 HOST_COMPAT="${ROOT}/op_host/a5_c8_resident_seed_host_compat.h"
+VECTOR_KERNEL="${ROOT}/op_kernel/arch35/quant_lightning_indexer_service_vector.h"
 # CANN 9.1's generic msopgen TypeRange parser does not accept the JSON
 # spelling `float8_e4m3fn`.  Match the official/P3 two-layer contract:
 # bootstrap JSON says int8; the target-only OpDef and typed bridge remain the
@@ -50,6 +51,20 @@ if ! grep -Eq '"name": "query".*"type": \["int8"\]' "${SPEC}" || \
    ! grep -q 'REPORT_INNER_ERR_MSG' "${HOST_COMPAT}"; then
   echo "[a5_c8_resident_seed] ERROR: CANN-bootstrap/FP8 ABI contract is incomplete." >&2
   echo "[a5_c8_resident_seed] expected: JSON/generic OpDef query/index-key=int8; Ascend950 OpDef/bridge=FP8 E4M3FN; standalone err/ops_err.h + log/log.h compatibility source." >&2
+  exit 2
+fi
+# CANN 9.1 declares InitGlobalMemory with a writable GlobalTensor lvalue.
+# Indexing a GlobalTensor produces a temporary view; a direct indexed GM view
+# therefore fails only late in the multi-variant kernel build.  Reject the
+# two resident-seed instances before msopgen and require the address-identical
+# named views used by the source closure.
+if grep -qF 'InitGlobalMemory(residentTauGm[rowOffset]' "${VECTOR_KERNEL}" || \
+   grep -qF 'InitGlobalMemory(tauValidGm[rowOffset]' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'GlobalTensor<int32_t> residentTauOutput = residentTauGm[rowOffset];' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'GlobalTensor<int32_t> tauValidOutput = tauValidGm[rowOffset];' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'InitGlobalMemory(residentTauOutput, rowCount, 0);' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'InitGlobalMemory(tauValidOutput, rowCount, 0);' "${VECTOR_KERNEL}"; then
+  echo "[a5_c8_resident_seed] ERROR: CANN 9.1 InitGlobalMemory lvalue contract is incomplete (direct indexed GM view is invalid)." >&2
   exit 2
 fi
 if [[ -e "${BUILD_ROOT}/op_dev" || -e "${BUILD_ROOT}/custom_op" || -e "${BUILD_ROOT}/opp" ]]; then
@@ -184,6 +199,12 @@ if ! (
     P4_INI_SECTIONS=0
   fi
   echo "[a5_c8_resident_seed] build failure diagnostic: generated_ini=${P4_AUTOGEN_INI} resident_seed_sections=${P4_INI_SECTIONS} (INI is diagnostic-only and was not modified)." >&2
+  P4_DIRECT_INDEXED_INIT="$(grep -RnhE 'InitGlobalMemory\([^,]*Gm\[[^]]+\]' "${GENERATED}/op_kernel" 2>/dev/null || true)"
+  if [[ -n "${P4_DIRECT_INDEXED_INIT}" ]]; then
+    printf '[a5_c8_resident_seed] build failure diagnostic: direct_indexed_InitGlobalMemory_calls=\n%s\n' "${P4_DIRECT_INDEXED_INIT}" >&2
+  else
+    echo "[a5_c8_resident_seed] build failure diagnostic: direct_indexed_InitGlobalMemory_calls=<none>." >&2
+  fi
   exit 1
 fi
 
