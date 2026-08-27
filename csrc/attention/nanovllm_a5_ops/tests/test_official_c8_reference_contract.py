@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Static gate for the source-matched official C8 reference bundle.
+
+The P3 equivalence test must not silently load an editable ``vllm_ascend``
+package from an unrelated checkout.  This probe deliberately has no NPU or
+CANN dependency; it protects the source/OPP/bridge boundaries that make the
+target test a valid mathematical comparison.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+OPS_ROOT = Path(__file__).resolve().parents[1]
+REFERENCE_ROOT = OPS_ROOT / "a5_official_c8_reference"
+BUILD_SCRIPT = REFERENCE_ROOT / "build_reference_opp.sh"
+REFERENCE_BRIDGE = (
+    REFERENCE_ROOT / "torch_extension/csrc/official_c8_reference.cpp"
+)
+TARGET_ADAPTER = OPS_ROOT / "tests/streaming_quant_li_get_target_adapter.py"
+COMMON_OPAPI = OPS_ROOT / "torch_extension/csrc/op_api_common.h"
+
+
+def require_source_matched_reference_contract() -> None:
+    build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+    reference_bridge = REFERENCE_BRIDGE.read_text(encoding="utf-8")
+    adapter = TARGET_ADAPTER.read_text(encoding="utf-8")
+    common_opapi = COMMON_OPAPI.read_text(encoding="utf-8")
+
+    # The only upstream build inputs are the two official C8 operators.  This
+    # prevents a full vLLM build or a stale product package from becoming the
+    # hidden reference implementation.
+    assert "vllm_quant_lightning_indexer,vllm_quant_lightning_indexer_metadata" in build_script
+    assert "--soc=ascend950" in build_script
+    assert "pip install" not in build_script
+    assert "setup.py" not in build_script
+    assert "cmake --build" not in build_script
+    assert "P3_REFERENCE_PROVENANCE" in build_script
+    assert "source_head=${SOURCE_HEAD}" in build_script
+    assert "-newer \"${BUILD_MARKER}\"" in build_script
+
+    # Both real ACLNN calls retain the canonical names from torch_binding.cpp.
+    # The reference bridge gets a private resolver slot so changing the P3
+    # target DSO later in the same process cannot redirect it.
+    assert '#define NANOVLLM_A5_OPAPI_ENV "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"' in reference_bridge
+    assert "aclnnVllmQuantLightningIndexerMetadata" in reference_bridge
+    assert "aclnnVllmQuantLightningIndexer" in reference_bridge
+    assert "TORCH_LIBRARY(a5_official_c8_reference" in reference_bridge
+    assert "#ifndef NANOVLLM_A5_OPAPI_ENV" in common_opapi
+
+    # The test adapter must not import the normal editable package at all.
+    # It validates the source revision from the reference OPP manifest before
+    # the first ACLNN call and makes both vendors visible at process startup.
+    assert "import vllm_ascend" not in adapter
+    assert "a5_dsa_registration" not in adapter
+    assert 'REFERENCE_OPP_ENV = "NANOVLLM_A5_REFERENCE_C8_OPP"' in adapter
+    assert 'REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"' in adapter
+    assert "P3_REFERENCE_PROVENANCE" in adapter
+    assert "ASCEND_CUSTOM_OPP_PATH" in adapter
+    assert "nanovllm_official_c8_reference" in adapter
+
+    print(
+        "P3_OFFICIAL_C8_REFERENCE_CONTRACT_PASS "
+        "source_matched_opp_only=1 standalone_bridge=1 "
+        "editable_vllm_reference_forbidden=1 dual_dso_resolver=1"
+    )
+
+
+if __name__ == "__main__":
+    require_source_matched_reference_contract()

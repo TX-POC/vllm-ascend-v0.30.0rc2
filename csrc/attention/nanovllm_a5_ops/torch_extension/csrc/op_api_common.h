@@ -27,6 +27,15 @@
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
+// Each standalone validation bridge owns a distinct resolver domain.  The
+// production/P3 bridge keeps the historical default, while the source-matched
+// C8 reference defines this macro before including the header.  Do not share
+// one process-global environment slot: the two bridges intentionally load
+// different OPP DSOs in the same equivalence process.
+#ifndef NANOVLLM_A5_OPAPI_ENV
+#define NANOVLLM_A5_OPAPI_ENV "NANOVLLM_CUST_OPAPI_LIB"
+#endif
+
 typedef struct aclOpExecutor aclOpExecutor;
 typedef struct aclTensor aclTensor;
 
@@ -73,7 +82,7 @@ inline void *OpenLibraryOnce(const char *path) {
 
 inline void *RepositoryCustomHandle() {
   static void *handle = []() -> void * {
-    const char *path = std::getenv("NANOVLLM_CUST_OPAPI_LIB");
+    const char *path = std::getenv(NANOVLLM_A5_OPAPI_ENV);
     if (path == nullptr || path[0] == '\0') {
       return nullptr;
     }
@@ -280,12 +289,13 @@ inline void LogResolvedOpApi(
   Dl_info launch_info{};
   const int workspace_ok = dladdr(workspace_addr, &workspace_info);
   const int launch_ok = dladdr(launch_addr, &launch_info);
-  const char *custom = std::getenv("NANOVLLM_CUST_OPAPI_LIB");
+  const char *custom = std::getenv(NANOVLLM_A5_OPAPI_ENV);
   std::fprintf(
       stderr,
-      "NANOVLLM_A5_OPAPI_RESOLVE api=%s custom_env=%s workspace_dso=%s "
+      "NANOVLLM_A5_OPAPI_RESOLVE api=%s custom_env_name=%s custom_env=%s workspace_dso=%s "
       "launch_dso=%s workspace_addr=%p launch_addr=%p\n",
       api,
+      NANOVLLM_A5_OPAPI_ENV,
       custom == nullptr || custom[0] == '\0' ? "<unset>" : custom,
       workspace_ok && workspace_info.dli_fname != nullptr
           ? workspace_info.dli_fname : "<unknown>",

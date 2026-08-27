@@ -20,12 +20,16 @@ posting a fabricated H2D request.  Therefore this adapter proves target C8
 score/Top-K equivalence, output-alias wiring, and exact score-source lengths;
 it does *not* claim Direct-HCCP correctness or H2D performance.
 
-Before importing this module, build/install the isolated bridge and set
-``NANOVLLM_A5_STREAMING_LI_OPP`` to either the matching OPP output root or
-its printed ``vendors/customize`` directory.  The normal A5 registration is
-loaded first so the reference ACLNN symbols are resolved from its normal
-packaged OPP before this module selects the isolated target OPP for the new
-bridge.
+Before importing this module, build the two isolated OPPs and set:
+
+* ``NANOVLLM_A5_REFERENCE_C8_OPP`` to the source-matched official C8 OPP;
+* ``NANOVLLM_A5_STREAMING_LI_OPP`` to the derived P3 OPP; and
+* ``P3_REFERENCE_EXPECTED_SOURCE_HEAD`` to the current P3 source revision.
+
+The reference is then launched through a standalone ACLNN bridge compiled
+from this worktree's ``csrc/torch_binding.cpp`` contract.  In particular, this
+adapter does **not** import ``vllm_ascend`` or reuse an editable package from
+another worktree.
 """
 
 from __future__ import annotations
@@ -61,6 +65,11 @@ STREAMING_CONTROL_WORDS = 16
 STREAMING_CONTROL_MAGIC = 0x4B5641465354524D  # "KVAFSTRM"
 STREAMING_CONTROL_VERSION = 1
 INT64_MAX = (1 << 63) - 1
+REFERENCE_OPP_ENV = "NANOVLLM_A5_REFERENCE_C8_OPP"
+TARGET_OPP_ENV = "NANOVLLM_A5_STREAMING_LI_OPP"
+REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"
+REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
+REFERENCE_OPAPI_ENV = "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"
 
 
 def _require_a5_npu() -> torch.device:
@@ -86,14 +95,85 @@ def _quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def _require_official_c8_ops() -> tuple[Any, Any]:
-    """Load only the normal A5 operator registrar, not DSA runtime policy."""
-    # This module intentionally imports the narrow registrar described by its
-    # own docstring.  It loads vllm_ascend_C and normal A5 OPP paths, but does
-    # not import dsa_offload.ops_nanovllm or select a product execution path.
-    import vllm_ascend.a5_dsa_registration  # noqa: F401
+def _resolve_single_opp(root_value: str | None, label: str) -> tuple[Path, Path]:
+    """Return exactly one ``(opapi, vendor)`` pair below an isolated OPP root."""
+    if not root_value:
+        raise RuntimeError(
+            f"set {REFERENCE_OPP_ENV if label == 'reference' else TARGET_OPP_ENV} "
+            f"to the built isolated {label} OPP root or vendor directory"
+        )
+    root = Path(root_value).expanduser().resolve()
+    candidates = [root / "op_api" / "lib" / "libcust_opapi.so"]
+    candidates.extend(root.glob("vendors/*/op_api/lib/libcust_opapi.so"))
+    opapis = tuple(
+        sorted({candidate.resolve() for candidate in candidates if candidate.is_file()})
+    )
+    if len(opapis) != 1:
+        raise RuntimeError(
+            f"expected exactly one {label} libcust_opapi.so below {root}, "
+            f"found={len(opapis)}"
+        )
+    opapi = opapis[0]
+    vendor = opapi.parents[2]
+    if not vendor.is_dir():
+        raise RuntimeError(f"{label} OPP vendor path is invalid: {vendor}")
+    return opapi, vendor
 
-    namespace = getattr(torch.ops, "_C_ascend", None)
+
+def _prepend_unique_path(name: str, paths: tuple[Path, ...]) -> None:
+    """Install both isolated vendors before the first ACLNN custom-op call."""
+    existing = [entry for entry in os.getenv(name, "").split(":") if entry]
+    ordered = [str(path) for path in paths]
+    os.environ[name] = ":".join(
+        [*ordered, *(entry for entry in existing if entry not in ordered)]
+    )
+
+
+def _read_reference_provenance(vendor: Path) -> dict[str, str]:
+    path = vendor / REFERENCE_PROVENANCE_NAME
+    if not path.is_file():
+        raise RuntimeError(
+            "source-matched reference OPP has no provenance manifest: " f"{path}"
+        )
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key:
+            values[key] = value
+    required = ("kind", "source_root", "source_head", "operators")
+    missing = tuple(key for key in required if not values.get(key))
+    if missing:
+        raise RuntimeError(
+            "source-matched reference provenance is incomplete: "
+            f"path={path} missing={missing}"
+        )
+    if values["kind"] != "source_matched_official_c8":
+        raise RuntimeError(
+            "reference OPP provenance kind is not source-matched official C8: "
+            f"got={values['kind']!r}"
+        )
+    expected_head = os.getenv(REFERENCE_EXPECTED_HEAD_ENV)
+    if expected_head and values["source_head"] != expected_head:
+        raise RuntimeError(
+            "reference OPP was built from a different source revision: "
+            f"actual={values['source_head']} expected={expected_head}"
+        )
+    return values
+
+
+def _require_source_matched_official_c8_ops(
+    reference_opapi: Path, reference_vendor: Path
+) -> tuple[Any, Any, dict[str, str]]:
+    """Load the current-source official C8 bridge, never ``vllm_ascend``."""
+    provenance = _read_reference_provenance(reference_vendor)
+    if "nanovllm_official_c8_reference" in sys.modules:
+        raise RuntimeError(
+            "run target equivalence in a fresh Python process: the source-matched "
+            "official C8 bridge resolver was already initialized"
+        )
+    os.environ[REFERENCE_OPAPI_ENV] = str(reference_opapi)
+    importlib.import_module("nanovllm_official_c8_reference")
+    namespace = getattr(torch.ops, "a5_official_c8_reference", None)
     reference = (
         getattr(namespace, "npu_vllm_quant_lightning_indexer", None)
         if namespace is not None
@@ -106,10 +186,20 @@ def _require_official_c8_ops() -> tuple[Any, Any]:
     )
     if reference is None or metadata is None:
         raise RuntimeError(
-            "the installed vllm_ascend_C does not expose the required official "
-            "A5 VllmQuantLightningIndexer and metadata companion"
+            "standalone source-matched official C8 bridge did not register both "
+            "VllmQuantLightningIndexer operators"
         )
-    return reference, metadata
+    print(
+        "P3_REFERENCE_PROVENANCE "
+        "implementation=standalone_source_opp "
+        f"source_root={provenance['source_root']} "
+        f"source_head={provenance['source_head']} "
+        f"expected_head={os.getenv(REFERENCE_EXPECTED_HEAD_ENV, '<unset>')} "
+        "ready=1 "
+        f"vendor={reference_vendor} opapi={reference_opapi}",
+        flush=True,
+    )
+    return reference, metadata, provenance
 
 
 def _build_official_inputs(device: torch.device) -> dict[str, torch.Tensor]:
@@ -235,37 +325,11 @@ def _call_official(reference_op: Any, inputs: dict[str, torch.Tensor]) -> torch.
     return indices
 
 
-def _bind_isolated_target_opp() -> Path:
-    """Select exactly one separately built target OPP after the reference ran."""
-    root_value = os.getenv("NANOVLLM_A5_STREAMING_LI_OPP")
-    if not root_value:
-        raise RuntimeError(
-            "set NANOVLLM_A5_STREAMING_LI_OPP to the built "
-            "A5StreamingQuantLiGet OPP root or vendor directory before "
-            "running this adapter"
-        )
-    root = Path(root_value).expanduser().resolve()
-    # The standalone build log prints the vendor directory, while callers
-    # often retain the enclosing OPP root.  Both identify the same artifact;
-    # accept either spelling but fail if it is ambiguous.
-    candidates = [root / "op_api" / "lib" / "libcust_opapi.so"]
-    candidates.extend(root.glob("vendors/*/op_api/lib/libcust_opapi.so"))
-    opapis = tuple(
-        sorted({candidate.resolve() for candidate in candidates if candidate.is_file()})
-    )
-    if len(opapis) != 1:
-        raise RuntimeError(
-            "expected exactly one target libcust_opapi.so below or at "
-            f"{root}, found={len(opapis)}"
-        )
-    opapi = opapis[0].resolve()
-    vendor = opapi.parents[2]
-    if not vendor.is_dir():
-        raise RuntimeError(f"target OPP vendor path is invalid: {vendor}")
-    # The target bridge uses a process-local static resolver on its first
-    # launch.  The official C8 call above has already resolved its own normal
-    # APIs, so this switch cannot redirect that reference call.
-    os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(vendor)
+def _bind_isolated_target_opp(opapi: Path) -> Path:
+    """Switch only the target bridge's resolver after the reference launch."""
+    # ``nanovllm_a5_opapi::RepositoryCustomHandle`` is static per extension,
+    # not process-global.  The source-matched bridge already cached its DSO,
+    # so this cannot redirect the completed reference call.
     os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(opapi)
     return opapi
 
@@ -368,8 +432,22 @@ def _expected_score_source_lens(device: torch.device) -> torch.Tensor:
 
 def run_target_equivalence() -> dict[str, Any]:
     """Run one real official/derived C8 comparison for the harness."""
+    reference_opapi, reference_vendor = _resolve_single_opp(
+        os.getenv(REFERENCE_OPP_ENV), "reference"
+    )
+    target_opapi, target_vendor = _resolve_single_opp(
+        os.getenv(TARGET_OPP_ENV), "target"
+    )
+    # CANN discovers the binary config for an op on its first ACLNN call.  Both
+    # OPP vendors must be visible before either the reference or P3 target
+    # executes; switching this path after the reference is too late.
+    _prepend_unique_path(
+        "ASCEND_CUSTOM_OPP_PATH", (reference_vendor, target_vendor)
+    )
+    official_op, metadata_op, _ = _require_source_matched_official_c8_ops(
+        reference_opapi, reference_vendor
+    )
     device = _require_a5_npu()
-    official_op, metadata_op = _require_official_c8_ops()
     inputs = _build_official_inputs(device)
     inputs["metadata"] = _official_metadata(metadata_op, inputs)
     official_indices = _call_official(official_op, inputs)
@@ -383,7 +461,7 @@ def run_target_equivalence() -> dict[str, Any]:
             "run target equivalence in a fresh Python process: the isolated "
             "bridge resolver was already initialized"
         )
-    target_opapi = _bind_isolated_target_opp()
+    target_opapi = _bind_isolated_target_opp(target_opapi)
     importlib.import_module("nanovllm_streaming_quant_li_get")
     namespace = getattr(torch.ops, "a5_streaming_quant_li_get", None)
     derived_op = (
@@ -403,7 +481,8 @@ def run_target_equivalence() -> dict[str, Any]:
         "P3_STREAMING_LI_GET_TARGET_ADAPTER "
         f"device={device} batch={BATCH_SIZE} source_tokens={SOURCE_TOKENS} "
         f"heads={INDEX_HEADS} metadata_words={inputs['metadata'].numel()} "
-        f"target_opapi={target_opapi} queue_mode=all_busy_no_post "
+        f"reference_opapi={reference_opapi} target_opapi={target_opapi} "
+        "queue_mode=all_busy_no_post "
         "product_route=disabled h2d_result=not_exercised",
         flush=True,
     )
