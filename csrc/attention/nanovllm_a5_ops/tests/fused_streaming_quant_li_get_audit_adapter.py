@@ -35,6 +35,7 @@ from streaming_quant_li_get_target_adapter import (
     _call_official,
     _make_no_post_transaction,
     _official_metadata,
+    _expected_score_source_lens,
     _prepend_unique_path,
     _require_a5_npu,
     _require_source_matched_official_c8_ops,
@@ -109,6 +110,53 @@ def _audit_receipt(
         "candidate_marker": marker,
         "lease_sentinel": sentinel,
     }
+
+
+def _assert_transaction_output_aliases(
+    result: dict[str, Any], transaction: dict[str, torch.Tensor]
+) -> None:
+    """Require graph-visible receipts to reuse their transaction allocations."""
+    output_names = {
+        "private_source_to_slot": "candidate_source_to_slot",
+        "private_ready_table": "private_ready_table",
+        "private_arena_head": "private_arena_head",
+        "private_packed_output": "private_packed_output",
+        "queue_leases": "queue_leases",
+    }
+    for transaction_name, result_name in output_names.items():
+        expected = transaction[transaction_name]
+        actual = result[result_name]
+        if int(expected.data_ptr()) != int(actual.data_ptr()):
+            raise RuntimeError(
+                "P4 audit returned a copied transaction receipt: "
+                f"name={transaction_name} "
+                f"input=0x{int(expected.data_ptr()):x} "
+                f"output=0x{int(actual.data_ptr()):x}"
+            )
+
+
+def _assert_clone_source_domain(
+    clone_indices: torch.Tensor, score_source_lens: torch.Tensor
+) -> None:
+    """Reject an apparently equal Top-K tensor with an invalid S-domain."""
+    indices = clone_indices.detach().cpu().contiguous().reshape(BATCH_SIZE, SPARSE_COUNT)
+    source_lens = score_source_lens.detach().cpu().contiguous().reshape(BATCH_SIZE)
+    for row in range(BATCH_SIZE):
+        source_len = int(source_lens[row].item())
+        if source_len <= 0:
+            raise RuntimeError(
+                f"P4 audit has a nonpositive score-source length: row={row} length={source_len}"
+            )
+        invalid = (indices[row] != -1) & (
+            (indices[row] < 0) | (indices[row] >= source_len)
+        )
+        if bool(torch.any(invalid)):
+            first = int(torch.nonzero(invalid, as_tuple=False)[0].item())
+            raise RuntimeError(
+                "P4 audit clone Top-K contains an out-of-domain score source: "
+                f"row={row} topk_offset={first} source={int(indices[row, first].item())} "
+                f"length={source_len}"
+            )
 
 
 def _build_resident_index_view(
@@ -316,11 +364,44 @@ def _call_official_resident_reference(
 def _install_resident_snapshot(
     transaction: dict[str, torch.Tensor], resident: dict[str, torch.Tensor]
 ) -> None:
-    """Mark exactly the seed's logical resident view as already in HBM."""
+    """Mark exactly the seed's logical resident view as already in HBM.
+
+    The slot snapshot is addressed in the runtime's physical object domain,
+    not in the score-source domain.  Resolve every resident logical source
+    through ``row -> req_pool_entries -> kv_object_map`` here, so the audit
+    exercises the same indirection used by the device hook.
+    """
     lengths = resident["resident_seq_lengths"].detach().cpu().tolist()
-    slots = transaction["kv_object_slots_snapshot"]
-    for pool_row, length in enumerate(lengths):
-        slots[pool_row, : int(length)] = 0
+    slots = transaction["kv_object_slots_snapshot"].detach().cpu().contiguous()
+    pools = transaction["req_pool_entries"].detach().cpu().contiguous()
+    object_map = transaction["kv_object_map"].detach().cpu().contiguous()
+    object_lens = transaction["kv_object_lens"].detach().cpu().contiguous()
+    for row, length in enumerate(lengths):
+        pool_row = int(pools[row].item())
+        object_len = int(object_lens[row].item())
+        resident_length = int(length)
+        if pool_row < 0 or pool_row >= slots.shape[0]:
+            raise RuntimeError(f"resident snapshot has invalid pool row {pool_row}")
+        if resident_length > object_len:
+            raise RuntimeError(
+                "resident fixture exceeds the active KV-object prefix: "
+                f"row={row} resident_length={resident_length} object_len={object_len}"
+            )
+        mapped_objects = object_map[pool_row, :resident_length]
+        if bool(torch.any((mapped_objects < 0) | (mapped_objects >= object_len))):
+            raise RuntimeError(
+                "resident snapshot contains an invalid logical-source to KV-object map: "
+                f"row={row} pool_row={pool_row}"
+            )
+        if int(torch.unique(mapped_objects).numel()) != resident_length:
+            raise RuntimeError(
+                "resident snapshot mapping is not one-to-one over its resident prefix: "
+                f"row={row}"
+            )
+        slots[pool_row, mapped_objects] = 0
+    transaction["kv_object_slots_snapshot"].copy_(
+        slots.to(transaction["kv_object_slots_snapshot"].device)
+    )
 
 
 def _assert_authoritative_cold_coverage(
@@ -340,11 +421,46 @@ def _assert_authoritative_cold_coverage(
     official = official_indices.detach().cpu().contiguous().reshape(BATCH_SIZE, SPARSE_COUNT)
     candidates = candidate_map.detach().cpu().contiguous()
     slots = transaction["kv_object_slots_snapshot"].detach().cpu().contiguous()
+    pools = transaction["req_pool_entries"].detach().cpu().contiguous()
+    object_map = transaction["kv_object_map"].detach().cpu().contiguous()
+    object_lens = transaction["kv_object_lens"].detach().cpu().contiguous()
     source_lens = score_source_lens.detach().cpu().contiguous()
     required_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    eligible_cold_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    mapping_difference_mask = torch.zeros_like(candidates, dtype=torch.bool)
     selected = 0
+    mapping_discriminator_selected = 0
+    mapping_discriminator_sources = 0
     for row in range(BATCH_SIZE):
         valid = int(source_lens[row].item())
+        pool_row = int(pools[row].item())
+        object_len = int(object_lens[row].item())
+        if pool_row < 0 or pool_row >= slots.shape[0]:
+            raise RuntimeError(f"invalid request pool entry: row={row} pool_row={pool_row}")
+        if object_len <= 0 or object_len > slots.shape[1]:
+            raise RuntimeError(
+                f"invalid KV-object length: row={row} object_len={object_len}"
+            )
+        if int(torch.count_nonzero(candidates[row, valid:] == marker).item()) != 0:
+            raise RuntimeError(
+                "P4 audit emitted a candidate outside the exact score-source domain: "
+                f"row={row} source_len={valid}"
+            )
+        mapped_active = object_map[pool_row, :valid]
+        if bool(torch.any((mapped_active < 0) | (mapped_active >= object_len))):
+            raise RuntimeError(
+                "P4 audit has an invalid active logical-source to KV-object map: "
+                f"row={row} pool_row={pool_row} source_len={valid}"
+            )
+        correct_cold = slots[pool_row, mapped_active] < 0
+        legacy_identity_cold = slots[row, :valid] < 0
+        eligible_cold_mask[row, :valid] = correct_cold
+        mapping_difference_mask[row, :valid] = (
+            correct_cold != legacy_identity_cold
+        )
+        mapping_discriminator_sources += int(
+            torch.count_nonzero(correct_cold != legacy_identity_cold).item()
+        )
         for source in official[row].tolist():
             if source < 0:
                 continue
@@ -354,9 +470,31 @@ def _assert_authoritative_cold_coverage(
                     f"row={row} source={source} valid={valid}"
                 )
             selected += 1
-            if int(slots[row, source].item()) < 0:
+            kv_object = int(object_map[pool_row, source].item())
+            if kv_object < 0 or kv_object >= object_len:
+                raise RuntimeError(
+                    "P4 audit has no valid logical-source to KV-object mapping: "
+                    f"row={row} pool_row={pool_row} source={source} "
+                    f"kv_object={kv_object} object_len={object_len}"
+                )
+            is_cold = bool(correct_cold[source].item())
+            if is_cold != bool(legacy_identity_cold[source].item()):
+                mapping_discriminator_selected += 1
+            if is_cold:
                 required_mask[row, source] = True
     candidate_mask = candidates == marker
+    invalid_candidate_mask = candidate_mask & ~eligible_cold_mask
+    invalid_candidate_count = int(torch.count_nonzero(invalid_candidate_mask).item())
+    if invalid_candidate_count:
+        first = torch.nonzero(invalid_candidate_mask, as_tuple=False)[0].tolist()
+        raise RuntimeError(
+            "P4 audit emitted a candidate that is not a valid cold KV object: "
+            f"count={invalid_candidate_count} first_row={first[0]} "
+            f"first_source={first[1]}"
+        )
+    candidate_discriminator_count = int(
+        torch.count_nonzero(candidate_mask & mapping_difference_mask).item()
+    )
     covered_mask = candidate_mask & required_mask
     missing_mask = required_mask & ~candidate_mask
     covered = int(torch.count_nonzero(covered_mask).item())
@@ -366,11 +504,19 @@ def _assert_authoritative_cold_coverage(
     false_positive = int(torch.count_nonzero(candidate_mask & ~required_mask).item())
     cold_capacity = 0
     for row in range(BATCH_SIZE):
+        pool_row = int(pools[row].item())
+        valid = int(source_lens[row].item())
+        mapped_active = object_map[pool_row, :valid]
         cold_capacity += int(
-            torch.count_nonzero(slots[row, : int(source_lens[row].item())] < 0).item()
+            torch.count_nonzero(slots[pool_row, mapped_active] < 0).item()
         )
     if required <= 0:
         raise RuntimeError("resident fixture produced no authoritative cold Top-K source")
+    if mapping_discriminator_sources <= 0:
+        raise RuntimeError(
+            "P4 audit fixture did not distinguish runtime S->O mapping from "
+            "the legacy identity address; adjust the source-mapping fixture"
+        )
     if missing:
         first = torch.nonzero(missing_mask, as_tuple=False)[0].tolist()
         raise RuntimeError(
@@ -391,6 +537,10 @@ def _assert_authoritative_cold_coverage(
         "candidate_count": candidate_count,
         "false_positive": false_positive,
         "cold_capacity": cold_capacity,
+        "invalid_candidate_count": invalid_candidate_count,
+        "mapping_discriminator_selected": mapping_discriminator_selected,
+        "mapping_discriminator_sources": mapping_discriminator_sources,
+        "candidate_discriminator_count": candidate_discriminator_count,
     }
 
 
@@ -462,7 +612,10 @@ def run_p4_fused_audit() -> dict[str, Any]:
     )
 
     transaction = _make_no_post_transaction(
-        device, BATCH_SIZE, HOOK_CONTROL_MODE_ALL_BUSY
+        device,
+        BATCH_SIZE,
+        HOOK_CONTROL_MODE_ALL_BUSY,
+        object_mapping="permuted_pool",
     )
     transaction["resident_threshold"].copy_(resident_tau)
     transaction["resident_threshold_valid"].copy_(tau_valid)
@@ -494,7 +647,10 @@ def run_p4_fused_audit() -> dict[str, Any]:
         inputs,
         transaction,
         mode="audit",
-        kv_object_domain=0,
+        # The adversarial fixture deliberately uses a source -> compressed
+        # KV-object permutation.  It is therefore C8_COMPRESSED_OBJECT,
+        # rather than the raw-token identity domain used by legacy LIDU.
+        kv_object_domain=1,
         query_quant_mode=0,
         key_quant_mode=0,
         layout_query="TND",
@@ -512,8 +668,19 @@ def run_p4_fused_audit() -> dict[str, Any]:
     torch.npu.synchronize()
     elapsed_us = (monotonic() - started) * 1_000_000.0
 
+    _assert_transaction_output_aliases(result, transaction)
     receipt = _audit_receipt(result, transaction)
     score_source_lens = result["score_source_lens"].detach().cpu().contiguous()
+    expected_score_source_lens = _expected_score_source_lens(device)
+    if not _cpu_equal(expected_score_source_lens, result["score_source_lens"]):
+        raise RuntimeError(
+            "P4 audit score-source lengths differ from the independent C8 formula: "
+            f"expected={expected_score_source_lens.detach().cpu().tolist()} "
+            f"derived={score_source_lens.tolist()}"
+        )
+    _assert_clone_source_domain(
+        result["non_authoritative_sparse_indices"], result["score_source_lens"]
+    )
     tau_values = resident_tau.detach().cpu().contiguous().tolist()
     tau_valid_values = tau_valid.detach().cpu().contiguous().tolist()
     print(
@@ -532,6 +699,9 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"candidate_overflow={receipt['candidate_overflow']} "
         f"queue_lease_sentinel={receipt['lease_sentinel']} "
         f"score_source_lens={score_source_lens.tolist()} "
+        "score_source_lens_independent=bitwise_equal "
+        "transaction_output_aliases=verified "
+        "object_mapping=permuted_pool_reverse_compressed "
         "doorbell_posted=0 private_payload_unchanged=1 telemetry_unchanged=1 "
         f"elapsed_us={elapsed_us:.3f}",
         flush=True,
@@ -552,6 +722,10 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"false_positive={coverage['false_positive']} "
         f"candidate_count={coverage['candidate_count']} "
         f"cold_capacity={coverage['cold_capacity']} "
+        f"invalid_candidate_count={coverage['invalid_candidate_count']} "
+        f"mapping_discriminator_selected={coverage['mapping_discriminator_selected']} "
+        f"mapping_discriminator_sources={coverage['mapping_discriminator_sources']} "
+        f"candidate_discriminator_count={coverage['candidate_discriminator_count']} "
         "candidate_recall=official_topk_cold_only "
         "h2d_result=not_exercised",
         flush=True,
@@ -564,6 +738,12 @@ def run_p4_fused_audit() -> dict[str, Any]:
         "required_cold": coverage["required_cold"],
         "covered_cold": coverage["covered_cold"],
         "missing_cold": coverage["missing_cold"],
+        "mapping_discriminator_selected": coverage["mapping_discriminator_selected"],
+        "mapping_discriminator_sources": coverage["mapping_discriminator_sources"],
+        "candidate_discriminator_count": coverage["candidate_discriminator_count"],
+        "invalid_candidate_count": coverage["invalid_candidate_count"],
+        "expected_score_source_lens": expected_score_source_lens,
+        "derived_score_source_lens": result["score_source_lens"],
     }
 
 

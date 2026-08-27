@@ -85,6 +85,14 @@ def main() -> int:
     assert "NANOVLLM_A5_RESIDENT_SEED_OPP" in audit_adapter
     assert "resident_seed_exact_sortable_uint16" in audit_adapter
     assert "_assert_authoritative_cold_coverage" in audit_adapter
+    assert "object_mapping=\"permuted_pool\"" in audit_adapter
+    assert "row -> req_pool_entries -> kv_object_map" in audit_adapter
+    assert "_assert_transaction_output_aliases" in audit_adapter
+    assert "_assert_clone_source_domain" in audit_adapter
+    assert "kv_object_domain=1" in audit_adapter
+    assert "mapping_discriminator_selected" in audit_adapter
+    assert "candidate_discriminator_count" in audit_adapter
+    assert "invalid_candidate_mask" in audit_adapter
     assert "official TopK ∩ cold" in audit_adapter
     assert "npu_a5_c8_resident_seed" in resident_seed_bridge
     assert "aclnnA5C8ResidentSeed" in resident_seed_bridge
@@ -92,6 +100,12 @@ def main() -> int:
     assert "AllowStridedAclTensor(resident_index_key)" in resident_seed_bridge
     assert "A5C8ResidentSeed does not expose sparse_values" in resident_seed_bridge
     assert "cmp_ratio=1" in resident_seed_bridge
+    strict_math_test = (
+        OPS / "tests/test_fused_streaming_quant_li_get_strict_math_equivalence.py"
+    ).read_text(encoding="utf-8")
+    assert "P4_STRICT_MATH_GATE_PASS" in strict_math_test
+    assert "P4_STRICT_MATH_GATE_FAIL" in strict_math_test
+    assert "_assert_bitwise_equal" in strict_math_test
 
     print(
         "P4_FUSED_SINGLE_SCAN_CONTRACT_PASS "

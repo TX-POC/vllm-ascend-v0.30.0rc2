@@ -416,6 +416,8 @@ def _make_no_post_transaction(
     device: torch.device,
     row_count: int,
     control_mode: str,
+    *,
+    object_mapping: str = "identity",
 ) -> dict[str, torch.Tensor]:
     """Build a valid-shape transaction whose queue cannot be leased.
 
@@ -426,9 +428,46 @@ def _make_no_post_transaction(
     the A5 hook remains explicit and testable.
     """
     pool_rows = BATCH_SIZE
-    kv_object_map = torch.arange(
-        SOURCE_TOKENS, dtype=torch.int32, device=device
-    ).repeat(pool_rows, 1).contiguous()
+    if object_mapping not in ("identity", "permuted_pool"):
+        raise ValueError(
+            "object_mapping must be 'identity' or 'permuted_pool', got "
+            f"{object_mapping!r}"
+        )
+    if row_count != BATCH_SIZE or pool_rows != BATCH_SIZE:
+        raise RuntimeError(
+            "the controlled C8 fixture requires exactly its fixed batch size: "
+            f"rows={row_count} batch={BATCH_SIZE}"
+        )
+    kv_object_lens = torch.tensor(
+        (SOURCE_TOKENS, SOURCE_TOKENS - BLOCK_SIZE),
+        dtype=torch.int32,
+        device=device,
+    )
+    if object_mapping == "identity":
+        req_pool_entries = torch.arange(
+            row_count, dtype=torch.int32, device=device
+        )
+        kv_object_map = torch.arange(
+            SOURCE_TOKENS, dtype=torch.int32, device=device
+        ).repeat(pool_rows, 1).contiguous()
+    else:
+        # Exercise the same row -> pool -> KV-object indirection as the real
+        # transaction.  This is deliberately not a source-index identity
+        # map: an audit that accidentally reads slots[row, source] must fail.
+        # Each active row remains a bijection over its own active object
+        # prefix, while the unused static tail stays invalid.
+        req_pool_entries = torch.arange(
+            row_count, dtype=torch.int32, device=device
+        ).flip(0)
+        kv_object_map = torch.full(
+            (pool_rows, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
+        )
+        for row, object_len in enumerate((SOURCE_TOKENS, SOURCE_TOKENS - BLOCK_SIZE)):
+            pool_row = int(req_pool_entries[row].item())
+            source = torch.arange(object_len, dtype=torch.int32, device=device)
+            # A reverse permutation is easy to audit in a compact log while
+            # ensuring both source zero and the request pool are nonidentity.
+            kv_object_map[pool_row, :object_len] = object_len - 1 - source
     # A sentinel makes the no-post assertion meaningful: a mistaken write is
     # visible even if the accelerator allocator would otherwise return a
     # zeroed allocation.
@@ -479,9 +518,7 @@ def _make_no_post_transaction(
         "kv_object_slots_snapshot": torch.full(
             (pool_rows, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
         ),
-        "req_pool_entries": torch.arange(
-            row_count, dtype=torch.int32, device=device
-        ),
+        "req_pool_entries": req_pool_entries,
         "kv_object_map": kv_object_map,
         "private_source_to_slot": torch.full(
             (row_count, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
@@ -497,11 +534,7 @@ def _make_no_post_transaction(
             control_words, dtype=torch.int64, device=device
         ),
         "queue_leases": queue_leases,
-        "kv_object_lens": torch.tensor(
-            (SOURCE_TOKENS, SOURCE_TOKENS - BLOCK_SIZE),
-            dtype=torch.int32,
-            device=device,
-        ),
+        "kv_object_lens": kv_object_lens,
     }
 
 
