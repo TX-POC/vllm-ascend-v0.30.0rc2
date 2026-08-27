@@ -49,6 +49,13 @@ def require_source_matched_reference_contract() -> None:
     assert "aclnnVllmQuantLightningIndexer" in reference_bridge
     assert "TORCH_LIBRARY(a5_official_c8_reference" in reference_bridge
     assert "#ifndef NANOVLLM_A5_OPAPI_ENV" in common_opapi
+    # aclDataType values are C++ enum identifiers, rather than preprocessor
+    # macros.  Do not silently turn valid FP8 E4M3FN tensors into
+    # ACL_DT_UNDEFINED before the source-matched reference reaches its tiler.
+    assert "kAclFloat8E4M3Fn = ACL_FLOAT8_E4M3FN" in common_opapi
+    assert "static_assert(kAclFloat8E4M3Fn != ACL_DT_UNDEFINED" in common_opapi
+    assert "#define ACL_FLOAT8_E4M3FN ACL_DT_UNDEFINED" not in common_opapi
+    assert "NANOVLLM_A5_ACL_TENSOR" in common_opapi
 
     # The test adapter must not import the normal editable package at all.
     # It validates the source revision from the reference OPP manifest before

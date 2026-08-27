@@ -39,19 +39,16 @@
 typedef struct aclOpExecutor aclOpExecutor;
 typedef struct aclTensor aclTensor;
 
-// Older CANN headers expose the FP8 enum through the C API spelling while
-// newer headers publish ACL_FLOAT8_E4M3FN directly.  The source-derived C8
-// LI bridge needs the real FP8 type; silently downgrading it to byte/int8
-// would break the official score arithmetic rather than merely slow it down.
-#ifndef ACL_FLOAT8_E4M3FN
-#ifdef C_DT_FLOAT8_E4M3FN
-#define ACL_FLOAT8_E4M3FN C_DT_FLOAT8_E4M3FN
-#else
-#define ACL_FLOAT8_E4M3FN ACL_DT_UNDEFINED
-#endif
-#endif
-
 namespace nanovllm_a5_opapi {
+
+// ``ACL_FLOAT8_E4M3FN`` is an aclDataType *enumerator*, not a preprocessor
+// macro.  Testing it with ``#ifdef`` therefore always evaluates false and
+// used to rewrite a valid CANN 9.1 FP8 enum to ACL_DT_UNDEFINED.  That made
+// the first official C8 ACLNN call fail before tiling.  A5 is intentionally
+// built against CANN 9.1, where this enumerator is a required public ABI.
+inline constexpr aclDataType kAclFloat8E4M3Fn = ACL_FLOAT8_E4M3FN;
+static_assert(kAclFloat8E4M3Fn != ACL_DT_UNDEFINED,
+              "CANN must expose ACL_FLOAT8_E4M3FN for A5 C8 LI.");
 
 using AclCreateTensorFn = aclTensor *(*)(
     const int64_t *view_dims,
@@ -141,7 +138,7 @@ inline aclDataType ToAclDataType(at::ScalarType dtype) {
     case at::kBFloat16:
       return ACL_BF16;
     case at::kFloat8_e4m3fn:
-      return ACL_FLOAT8_E4M3FN;
+      return kAclFloat8E4M3Fn;
     default:
       TORCH_CHECK(
           false,
@@ -177,12 +174,28 @@ inline aclTensor *ConvertTensor(
   // points at the logical first element, so ACL offset is zero. Keeping the
   // storage shape equal to the logical shape also avoids any dependency on
   // torch_npu's private NPUStorageImpl ABI.
+  const aclDataType acl_dtype = ToAclDataType(tensor.scalar_type());
+  TORCH_CHECK(acl_dtype != ACL_DT_UNDEFINED,
+              "NPU ACL tensor dtype resolved to ACL_DT_UNDEFINED: ",
+              tensor.scalar_type());
+  const char *debug_value = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
+  const bool debug_enabled = debug_value != nullptr && debug_value[0] != '\0' &&
+      !(debug_value[0] == '0' && debug_value[1] == '\0');
+  if (debug_enabled && tensor.scalar_type() == at::kFloat8_e4m3fn) {
+    std::fprintf(stderr,
+                 "NANOVLLM_A5_ACL_TENSOR aten_dtype=%s acl_dtype=%d "
+                 "shape_rank=%zu data=%p\n",
+                 c10::toString(tensor.scalar_type()),
+                 static_cast<int>(acl_dtype),
+                 static_cast<size_t>(tensor.dim()), tensor.data_ptr());
+    std::fflush(stderr);
+  }
   std::vector<int64_t> storage_dims(
       tensor.sizes().begin(), tensor.sizes().end());
   return create_tensor(
       tensor.sizes().data(),
       static_cast<uint64_t>(tensor.dim()),
-      ToAclDataType(tensor.scalar_type()),
+      acl_dtype,
       tensor.strides().data(),
       0,
       ACL_FORMAT_ND,
