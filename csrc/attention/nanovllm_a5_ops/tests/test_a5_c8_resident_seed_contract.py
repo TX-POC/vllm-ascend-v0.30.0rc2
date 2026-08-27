@@ -72,6 +72,10 @@ def main() -> None:
     require("at::kFloat8_e4m3fn" in bridge,
             "typed bridge must reject a non-FP8 input despite generic JSON int8")
 
+    host_compat = (OP / "op_host" / "a5_c8_resident_seed_host_compat.h").read_text()
+    for macro in ("OP_CHECK_NULL_WITH_CONTEXT", "OP_CHECK_IF", "OP_LOGE", "REPORT_INNER_ERR_MSG"):
+        require(macro in host_compat, f"isolated host compatibility header misses {macro}")
+
     normal_build = (ROOT / "build_nanovllm_ops.sh").read_text()
     all_ops = normal_build.split("ALL_OP_NAMES=(", 1)[1].split(")", 1)[0]
     require("A5C8ResidentSeed" not in all_ops, "probe must not enter ALL_OP_NAMES")
@@ -80,6 +84,10 @@ def main() -> None:
             "only independent isolated build is allowed")
     require("CANN-bootstrap/FP8 ABI contract" in isolated,
             "isolated builder must fail early with the three-layer ABI diagnostic")
+    require('op_host/err/ops_err.h' in isolated and 'op_host/log/log.h' in isolated,
+            "isolated builder must stage the full host-header closure before msopgen")
+    require('generated host closure is incomplete' in isolated,
+            "isolated builder must verify the generated CMake input also has the header closure")
 
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 

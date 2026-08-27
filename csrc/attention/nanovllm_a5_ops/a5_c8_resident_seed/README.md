@@ -56,6 +56,12 @@ All pointers and shapes must be stable before graph capture.  During replay the 
 
 Run `build_isolated_a5_c8_resident_seed.sh` after sourcing the CANN 9.1 environment.  It creates a fresh, caller-selected staging directory, invokes `msopgen` for only `A5C8ResidentSeed`, and installs the resulting OPP below that same staging directory.  It neither calls the normal `nanovllm_a5_ops` build nor builds vLLM-Ascend.
 
+The isolated project also stages a local diagnostics-only compatibility header
+as both `err/ops_err.h` and `log/log.h`.  Those are normally supplied by the
+repository-wide vLLM-Ascend include graph, which an isolated `msopgen` project
+does not inherit.  The compatibility layer preserves all source-derived host
+validation return paths; it does not change C8 math or device code.
+
 The static contract check can run without an NPU:
 
 ```bash
