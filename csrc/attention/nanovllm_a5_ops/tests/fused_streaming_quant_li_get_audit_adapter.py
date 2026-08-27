@@ -126,15 +126,32 @@ def _build_resident_index_view(
     resident_tokens = RESIDENT_BLOCKS * BLOCK_SIZE
     if resident_tokens < SPARSE_COUNT:
         raise RuntimeError("resident fixture must contain at least Top-2048 keys")
-    if SOURCE_TOKENS // BLOCK_SIZE <= RESIDENT_BLOCKS:
+    # Do not reach back to the source fixture's module-level length constant:
+    # this helper receives the concrete FP8/key-table allocations that both
+    # the official reference and ResidentSeed will consume.  Deriving capacity
+    # here keeps the guard correct if a target test changes its source length.
+    block_table = inputs["block_table"]
+    if block_table.ndim != 2:
+        raise RuntimeError(
+            "resident fixture block_table must be [batch, source_blocks], "
+            f"got shape={tuple(block_table.shape)}"
+        )
+    source_blocks = int(block_table.shape[1])
+    if source_blocks <= RESIDENT_BLOCKS:
         raise RuntimeError("resident fixture must leave at least one cold page")
+    key_blocks = int(inputs["key"].shape[0])
+    if key_blocks < source_blocks:
+        raise RuntimeError(
+            "resident fixture key allocation has fewer blocks than its block table: "
+            f"key_blocks={key_blocks} source_blocks={source_blocks}"
+        )
 
     resident_lengths = torch.full(
         (BATCH_SIZE,), resident_tokens, dtype=torch.int32, device=inputs["query"].device
     )
     resident_key = inputs["key"].clone(memory_format=torch.preserve_format)
     resident_scale = inputs["key_dequant_scale"].clone(memory_format=torch.preserve_format)
-    resident_block_table = inputs["block_table"][:, :RESIDENT_BLOCKS].clone().contiguous()
+    resident_block_table = block_table[:, :RESIDENT_BLOCKS].clone().contiguous()
     resident_metadata = metadata_op(
         num_heads_q=64,
         num_heads_k=1,

@@ -156,6 +156,13 @@ def main() -> None:
             "threshold_functional_proof=next_p4_candidate_audit" in target_equivalence,
             "target gate must not overclaim a public official tau comparator")
 
+    audit_adapter = (ROOT / "tests" / "fused_streaming_quant_li_get_audit_adapter.py").read_text()
+    require('block_table = inputs["block_table"]' in audit_adapter and
+            "source_blocks = int(block_table.shape[1])" in audit_adapter,
+            "resident fixture must derive source capacity from the concrete input view")
+    require("SOURCE_TOKENS // BLOCK_SIZE <= RESIDENT_BLOCKS" not in audit_adapter,
+            "resident fixture must not depend on an unimported source-length global")
+
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 
 
