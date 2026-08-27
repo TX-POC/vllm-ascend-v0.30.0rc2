@@ -101,16 +101,91 @@ if [[ ! -s "${GENERATED}/op_host/err/ops_err.h" ]] || \
   echo "[a5_c8_resident_seed] ERROR: generated host closure is incomplete (expected custom_op/op_host/{err/ops_err.h,log/log.h})." >&2
   exit 2
 fi
+# `msopgen` creates an all-in-one host source named
+# `a5_c8_resident_seed.cpp`, while the source-derived C8 closure supplies its
+# real OpDef in `a5_c8_resident_seed_def.cpp`.  Those filenames differ, so a
+# plain overlay leaves two `OP_ADD(A5C8ResidentSeed)` registrations.  CANN
+# then emits two same-named sections in aic-*-ops-info.ini and fails before
+# kernel compilation.  This is the exact P3 failure mode: retain the generated
+# CMake scaffold, remove only its generated host stub, and prove that the
+# source-derived OpDef is now the one and only registration.
+P4_GENERATED_HOST_STUB="${GENERATED}/op_host/a5_c8_resident_seed.cpp"
+P4_SOURCE_OPDEF="${GENERATED}/op_host/a5_c8_resident_seed_def.cpp"
+P4_OPADD_REGEX='OP_ADD[[:space:]]*\([[:space:]]*A5C8ResidentSeed[[:space:]]*\)'
+if [[ ! -f "${P4_GENERATED_HOST_STUB}" ]]; then
+  echo "[a5_c8_resident_seed] ERROR: expected msopgen host stub is missing: ${P4_GENERATED_HOST_STUB}" >&2
+  exit 1
+fi
+if [[ ! -f "${P4_SOURCE_OPDEF}" ]] || ! cmp -s "${OP_DEF}" "${P4_SOURCE_OPDEF}"; then
+  echo "[a5_c8_resident_seed] ERROR: generated source OpDef is missing or differs from the staged source: ${P4_SOURCE_OPDEF}" >&2
+  exit 1
+fi
+P4_STUB_REGISTRATIONS="$(grep -Ec "${P4_OPADD_REGEX}" "${P4_GENERATED_HOST_STUB}" || true)"
+if [[ "${P4_STUB_REGISTRATIONS}" -ne 1 ]]; then
+  echo "[a5_c8_resident_seed] ERROR: generated host stub must contain exactly one A5C8ResidentSeed OP_ADD; found ${P4_STUB_REGISTRATIONS}." >&2
+  exit 1
+fi
+P4_SOURCE_REGISTRATIONS="$(grep -Ec "${P4_OPADD_REGEX}" "${P4_SOURCE_OPDEF}" || true)"
+if [[ "${P4_SOURCE_REGISTRATIONS}" -ne 1 ]]; then
+  echo "[a5_c8_resident_seed] ERROR: source-derived OpDef must contain exactly one A5C8ResidentSeed OP_ADD; found ${P4_SOURCE_REGISTRATIONS}." >&2
+  exit 1
+fi
+rm -f "${P4_GENERATED_HOST_STUB}"
+if [[ -e "${P4_GENERATED_HOST_STUB}" ]]; then
+  echo "[a5_c8_resident_seed] ERROR: failed to remove generated host stub: ${P4_GENERATED_HOST_STUB}" >&2
+  exit 1
+fi
+
+P4_OPDEF_SOURCES=()
+P4_OPDEF_COUNTS=()
+P4_TOTAL_REGISTRATIONS=0
+while IFS= read -r -d '' P4_HOST_SOURCE; do
+  P4_MATCH_COUNT="$(grep -Ec "${P4_OPADD_REGEX}" "${P4_HOST_SOURCE}" || true)"
+  if [[ "${P4_MATCH_COUNT}" -gt 0 ]]; then
+    P4_OPDEF_SOURCES+=("${P4_HOST_SOURCE}")
+    P4_OPDEF_COUNTS+=("${P4_MATCH_COUNT}")
+    P4_TOTAL_REGISTRATIONS=$((P4_TOTAL_REGISTRATIONS + P4_MATCH_COUNT))
+  fi
+done < <(find "${GENERATED}/op_host" -type f \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+
+if [[ "${P4_TOTAL_REGISTRATIONS}" -ne 1 || \
+      "${#P4_OPDEF_SOURCES[@]}" -ne 1 || \
+      "${P4_OPDEF_SOURCES[0]:-}" != "${P4_SOURCE_OPDEF}" ]]; then
+  echo "[a5_c8_resident_seed] ERROR: expected exactly one source-derived A5C8ResidentSeed OP_ADD registration; total=${P4_TOTAL_REGISTRATIONS}, files=${#P4_OPDEF_SOURCES[@]}." >&2
+  if [[ "${#P4_OPDEF_SOURCES[@]}" -eq 0 ]]; then
+    echo "[a5_c8_resident_seed] OP_ADD source: <none>" >&2
+  else
+    for P4_OPDEF_INDEX in "${!P4_OPDEF_SOURCES[@]}"; do
+      printf '[a5_c8_resident_seed] OP_ADD source: count=%s path=%s\n' \
+        "${P4_OPDEF_COUNTS[P4_OPDEF_INDEX]}" "${P4_OPDEF_SOURCES[P4_OPDEF_INDEX]}" >&2
+    done
+  fi
+  exit 1
+fi
+echo "[a5_c8_resident_seed] host registration closure: total=${P4_TOTAL_REGISTRATIONS} source=${P4_OPDEF_SOURCES[0]}"
+
 if ! grep -Rqs 'GetLastKthValue' "${GENERATED}/op_kernel" || \
    ! grep -Rqs 'DataCopyPad(residentTauGm' "${GENERATED}/op_kernel"; then
   echo "[a5_c8_resident_seed] ERROR: generated tree lost the real resident threshold write." >&2
   exit 1
 fi
 
-(
+if ! (
   cd "${GENERATED}"
   OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh
-)
+); then
+  # Do not edit this generated INI to hide a registration bug.  If CANN ever
+  # reports the same class of failure again, print its section count once so
+  # the retained build log immediately identifies the broken closure.
+  P4_AUTOGEN_INI="${GENERATED}/build_out/autogen/aic-${TARGET_SOC}-ops-info.ini"
+  if [[ -f "${P4_AUTOGEN_INI}" ]]; then
+    P4_INI_SECTIONS="$(grep -Ec '^\[A5C8ResidentSeed\]$' "${P4_AUTOGEN_INI}" || true)"
+  else
+    P4_INI_SECTIONS=0
+  fi
+  echo "[a5_c8_resident_seed] build failure diagnostic: generated_ini=${P4_AUTOGEN_INI} resident_seed_sections=${P4_INI_SECTIONS} (INI is diagnostic-only and was not modified)." >&2
+  exit 1
+fi
 
 RUN_PKG="$(find "${GENERATED}/build_out" -maxdepth 1 -type f -name '*.run' -print -quit)"
 if [[ -z "${RUN_PKG}" ]]; then

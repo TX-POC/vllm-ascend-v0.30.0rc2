@@ -62,6 +62,15 @@ repository-wide vLLM-Ascend include graph, which an isolated `msopgen` project
 does not inherit.  The compatibility layer preserves all source-derived host
 validation return paths; it does not change C8 math or device code.
 
+`msopgen` also creates a generic host stub named
+`a5_c8_resident_seed.cpp`.  The source-derived C8 implementation has its
+actual `OP_ADD(A5C8ResidentSeed)` in a differently named
+`a5_c8_resident_seed_def.cpp`.  Keeping both would create duplicate
+`[A5C8ResidentSeed]` sections in CANN's generated INI file.  The isolated
+builder therefore deletes only the generated stub, retains CANN's generated
+CMake scaffold, and verifies that exactly the source-derived registration
+remains before compiling.
+
 The static contract check can run without an NPU:
 
 ```bash

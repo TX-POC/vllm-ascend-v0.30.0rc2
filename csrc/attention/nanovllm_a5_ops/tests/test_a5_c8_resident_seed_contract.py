@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 
@@ -47,6 +48,14 @@ def main() -> None:
     topk = (OP / "op_kernel" / "arch35" / "vf" / "quant_lightning_indexer_topk.h").read_text()
     op_def = (OP / "op_host" / "a5_c8_resident_seed_def.cpp").read_text()
     tiling = (OP / "op_host" / "a5_c8_resident_seed_tiling.cpp").read_text()
+    op_add_pattern = r"OP_ADD\s*\(\s*A5C8ResidentSeed\s*\)"
+    host_registration_sources = []
+    for source in sorted((OP / "op_host").glob("*.cpp")):
+        match_count = len(re.findall(op_add_pattern, source.read_text()))
+        if match_count:
+            host_registration_sources.append((source.name, match_count))
+    require(host_registration_sources == [("a5_c8_resident_seed_def.cpp", 1)],
+            "checked-in host closure must have exactly one ResidentSeed OP_ADD")
 
     require("residentTau" in root_kernel and "tauValid" in root_kernel, "tau must be real kernel outputs")
     require("BatchMulWeightAndReduceSum" in vector, "must retain official C8 score closure")
@@ -88,6 +97,35 @@ def main() -> None:
             "isolated builder must stage the full host-header closure before msopgen")
     require('generated host closure is incomplete' in isolated,
             "isolated builder must verify the generated CMake input also has the header closure")
+    # `msopgen` creates an all-in-one host stub with an OP_ADD registration.
+    # The source-derived C8 OpDef has a different filename, so merely
+    # overlaying it leaves duplicate INI sections.  ResidentSeed must use the
+    # same remove-and-count closure that made P3's isolated build reliable.
+    require("P4_GENERATED_HOST_STUB" in isolated,
+            "isolated builder must identify the msopgen ResidentSeed host stub")
+    require('rm -f "${P4_GENERATED_HOST_STUB}"' in isolated,
+            "isolated builder must remove the generated duplicate OP_ADD stub")
+    require("P4_STUB_REGISTRATIONS" in isolated and
+            "failed to remove generated host stub" in isolated,
+            "isolated builder must prove the removed stub was the expected single registration")
+    require("P4_OPDEF_SOURCES" in isolated and
+            "host registration closure:" in isolated,
+            "isolated builder must prove exactly one source-derived OP_ADD remains")
+    require("P4_TOTAL_REGISTRATIONS" in isolated and
+            "P4_SOURCE_REGISTRATIONS" in isolated,
+            "isolated builder must count OP_ADD occurrences, not only matching files")
+    build_sequence = (
+        isolated.index("msopgen gen"),
+        isolated.index('cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"'),
+        isolated.index("P4_GENERATED_HOST_STUB"),
+        isolated.index('rm -f "${P4_GENERATED_HOST_STUB}"'),
+        isolated.index("P4_OPDEF_SOURCES=()"),
+        isolated.index('OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh'),
+    )
+    require(build_sequence == tuple(sorted(build_sequence)),
+            "builder order must be msopgen, overlay, stub removal, unique OP_ADD check, then build")
+    require("INI is diagnostic-only and was not modified" in isolated,
+            "duplicate registration diagnostics must never patch CANN's generated INI")
 
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 
