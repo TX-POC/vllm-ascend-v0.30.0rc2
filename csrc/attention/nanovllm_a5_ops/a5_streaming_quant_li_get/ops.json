@@ -3,8 +3,8 @@
     "op": "A5StreamingQuantLiGet",
     "language": "cpp",
     "input_desc": [
-      {"name": "query", "param_type": "required", "format": ["ND"], "type": ["float8_e4m3fn"]},
-      {"name": "key", "param_type": "required", "format": ["ND"], "type": ["float8_e4m3fn"]},
+      {"name": "query", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+      {"name": "key", "param_type": "required", "format": ["ND"], "type": ["int8"]},
       {"name": "weights", "param_type": "required", "format": ["ND"], "type": ["float"]},
       {"name": "query_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
       {"name": "key_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},

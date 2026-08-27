@@ -219,6 +219,11 @@ def require_source_contract() -> None:
         "param_type": "required",
         "type": "int",
     }
+    # CANN 9.1's msopgen TypeRange does not accept a FP8 JSON spelling.  Match
+    # the official C8 schema: generic metadata uses int8 while the target
+    # Ascend950 AICoreConfig and the bridge below must still require E4M3FN.
+    assert inputs[0]["type"] == ["int8"]
+    assert inputs[1]["type"] == ["int8"]
     assert inputs[9]["name"] == "resident_threshold"
     # ResidentSeed exports int32 (low 16 bits are the exact C8 sortable kth
     # score), so this must stay int32 to preserve the direct graph edge.
@@ -324,6 +329,13 @@ def require_source_contract() -> None:
         position = public_def.index(f'this->Output("{name}")')
         assert position > previous, name
         previous = position
+    target_def = op_def[op_def.index("OpAICoreConfig"):]
+    query_target = target_def.index('aicore_config_950.Input("query")')
+    key_target = target_def.index('aicore_config_950.Input("key")')
+    assert query_target < target_def.index("ge::DT_FLOAT8_E4M3FN", query_target)
+    assert key_target < target_def.index("ge::DT_FLOAT8_E4M3FN", key_target)
+    assert "query.scalar_type() == at::kFloat8_e4m3fn" in bridge
+    assert "key.scalar_type() == at::kFloat8_e4m3fn" in bridge
     # The public Torch schema keeps the required domain before its optional
     # defaults, while generated ACLNN follows the immutable CANN declaration
     # order. EXEC_NPU_CMD_ORDERED creates a function pointer from its argument

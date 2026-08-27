@@ -94,6 +94,19 @@ The nine outputs are the unchanged official `sparse_indices` and
 the same official `ProcessTopK` valid-source calculation as the exact C8
 indices. It is an `S` bound, not an `O` bound.
 
+### Why `ops.json` describes query/key as `int8`
+
+This is the same two-layer type declaration used by the official A5 C8
+operator. CANN 9.1's `msopgen` accepts `int8` in the generic JSON TypeRange,
+but does not accept the JSON spelling `float8_e4m3fn`. It is **not** a cast,
+conversion, or a change to the bytes that reach the LI kernel. The actual
+Ascend-950 `AICoreConfig` in
+`op_host/a5_streaming_quant_li_get_def.cpp` declares both tensors as
+`DT_FLOAT8_E4M3FN`, and the Torch bridge rejects any input that is not
+`torch.float8_e4m3fn`. Thus the generated bootstrap metadata remains
+compatible with CANN 9.1 while the compiled target ABI, kernel input bits,
+and C8 score/Top-K math remain FP8-identical to the official path.
+
 The required attributes are the official C8 attributes plus
 `kvaf_rows_per_entry` and `kv_object_domain`. A Get descriptor must address
 the KVAF object directory using `O`; it may use

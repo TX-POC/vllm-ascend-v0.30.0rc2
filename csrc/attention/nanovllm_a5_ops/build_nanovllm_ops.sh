@@ -194,9 +194,26 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
     # score tiles and cannot prove score-time prefetch.
     STREAMING_LI_DIR="${ROOT}/a5_streaming_quant_li_get"
     STREAMING_LI_SPEC="${STREAMING_LI_DIR}/ops.json"
+    STREAMING_LI_DEF="${STREAMING_LI_DIR}/op_host/a5_streaming_quant_li_get_def.cpp"
+    STREAMING_LI_BRIDGE="${STREAMING_LI_DIR}/torch_extension/csrc/streaming_quant_li_get.cpp"
     if [[ ! -f "${STREAMING_LI_SPEC}" ]]; then
         echo "[nanovllm_a5_ops] ERROR: A5StreamingQuantLiGet requires ${STREAMING_LI_SPEC}." >&2
         echo "[nanovllm_a5_ops] The descriptor_stage_only/ spec is intentionally incompatible and will not be staged." >&2
+        exit 2
+    fi
+    # CANN 9.1 only accepts int8 in the generic msopgen TypeRange.  This is
+    # also how the official C8 JSON/bootstrap schema is expressed.  It must
+    # never be mistaken for the actual target ABI: the checked-in Ascend950
+    # OpAICoreConfig and typed bridge below remain the two fail-closed FP8
+    # guards.  Check all three layers before spending time in msopgen.
+    if ! grep -Eq '"name": "query".*"type": \["int8"\]' "${STREAMING_LI_SPEC}" || \
+       ! grep -Eq '"name": "key".*"type": \["int8"\]' "${STREAMING_LI_SPEC}" || \
+       ! grep -q 'aicore_config_950.Input("query")' "${STREAMING_LI_DEF}" || \
+       ! grep -q 'aicore_config_950.Input("key")' "${STREAMING_LI_DEF}" || \
+       ! grep -q 'ge::DT_FLOAT8_E4M3FN' "${STREAMING_LI_DEF}" || \
+       ! grep -q 'at::kFloat8_e4m3fn' "${STREAMING_LI_BRIDGE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P3 CANN-bootstrap/FP8 ABI contract is incomplete." >&2
+        echo "[nanovllm_a5_ops] expected: ops.json query/key=int8; Ascend950 OpDef and bridge=FP8 E4M3FN." >&2
         exit 2
     fi
     cp "${STREAMING_LI_SPEC}" "${OP_DEV}/ops.json"
@@ -206,6 +223,7 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         "${OP_DEV}/op_kernel"
     echo "[nanovllm_a5_ops] strict P3 staging: A5StreamingQuantLiGet official C8 closure only"
     echo "[nanovllm_a5_ops] strict P3 staging: repository CMakeLists.txt excluded"
+    echo "[nanovllm_a5_ops] P3 JSON TypeRange=int8 bootstrap; target OpDef/bridge=FP8 E4M3FN"
     echo "[nanovllm_a5_ops] metadata companion: VllmQuantLightningIndexerMetadata must already be registered at runtime; this isolated OPP consumes its [1024] output and does not package a duplicate AICPU producer"
     echo "[nanovllm_a5_ops] layout contract: source-derived tiling preserves official layout_query=TND and BSND behavior; production decode uses TND with layout_key=PA_BSND"
 elif [[ "${STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY}" == "1" ]]; then
