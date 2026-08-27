@@ -165,9 +165,14 @@ def main() -> None:
     require("P4_RESIDENT_SEED_BRIDGE" in audit_adapter and
             "sys.path.insert(0, bridge_root_text)" in audit_adapter,
             "target adapter must resolve the source-matched in-place Seed bridge")
+    require("import nanovllm_a5_c8_resident_seed" in audit_adapter and
+            "import nanovllm_a5_resident_seed" not in audit_adapter,
+            "target adapter must import the exact ResidentSeed bridge package")
     require("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=seed_launch" in target_equivalence and
             "A5_C8_RESIDENT_SEED_TARGET_STAGE stage=official_launch" in target_equivalence,
             "target gate must identify which NPU launch failed")
+    require("sparse_values=bitwise_equal_empty_fp32_return_values_false" in target_equivalence,
+            "target gate must compare the official and Seed empty-value outputs")
 
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 

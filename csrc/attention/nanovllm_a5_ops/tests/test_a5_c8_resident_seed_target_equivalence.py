@@ -80,7 +80,9 @@ def main() -> int:
     torch.npu.synchronize()
     print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=seed_complete", flush=True)
     print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=official_launch", flush=True)
-    official_indices = _call_official_resident_reference(official, inputs, resident)
+    official_indices, official_values = _call_official_resident_reference(
+        official, inputs, resident
+    )
     torch.npu.synchronize()
     print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=official_complete", flush=True)
 
@@ -88,6 +90,11 @@ def main() -> int:
         raise RuntimeError(
             "A5C8ResidentSeed sparse_indices are not bitwise equal to "
             "source-matched official C8 on the same resident FP8 index view"
+        )
+    if not _cpu_equal(seed_values, official_values):
+        raise RuntimeError(
+            "A5C8ResidentSeed return_values=False output is not bitwise equal "
+            "to source-matched official C8"
         )
     if seed_values.dtype != torch.float32 or seed_values.numel() != 0:
         raise RuntimeError(
@@ -119,7 +126,7 @@ def main() -> int:
     print(
         "A5_C8_RESIDENT_SEED_TARGET_RESULT "
         "resident_indices=bitwise_equal "
-        "sparse_values=empty_fp32_return_values_false "
+        "sparse_values=bitwise_equal_empty_fp32_return_values_false "
         "resident_tau_encoding=sortable_uint16_low_bits "
         f"resident_tau={tau_values} tau_valid={valid_values} "
         "official_tau=not_exported "

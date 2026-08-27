@@ -209,7 +209,7 @@ def _bind_resident_seed_opp(opapi: Any) -> None:
     if bridge_root_text in sys.path:
         sys.path.remove(bridge_root_text)
     sys.path.insert(0, bridge_root_text)
-    import nanovllm_a5_resident_seed  # noqa: F401, PLC0415
+    import nanovllm_a5_c8_resident_seed  # noqa: F401, PLC0415
 
     print(
         "P4_RESIDENT_SEED_BRIDGE "
@@ -276,7 +276,7 @@ def _call_official_resident_reference(
     official: Any,
     inputs: dict[str, torch.Tensor],
     resident: dict[str, torch.Tensor],
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate the copied seed's selection domain against official C8."""
     result = official(
         query=inputs["query"],
@@ -301,7 +301,12 @@ def _call_official_resident_reference(
     )
     if not isinstance(result, tuple) or len(result) != 2:
         raise RuntimeError("official resident C8 call returned an unexpected ABI")
-    return result[0]
+    sparse_indices, sparse_values = result
+    if not isinstance(sparse_indices, torch.Tensor) or not isinstance(
+        sparse_values, torch.Tensor
+    ):
+        raise RuntimeError("official resident C8 returned non-tensor outputs")
+    return sparse_indices, sparse_values
 
 
 def _install_resident_snapshot(
@@ -420,16 +425,24 @@ def run_p4_fused_audit() -> dict[str, Any]:
     # selective threshold and a real resident/cold split.
     resident = _build_resident_index_view(inputs, metadata)
     _bind_resident_seed_opp(seed_opapi)
-    seed_indices, _, resident_tau, tau_valid = _launch_resident_seed(inputs, resident)
-    torch.npu.synchronize()
-    official_resident_indices = _call_official_resident_reference(
-        official, inputs, resident
+    seed_indices, seed_values, resident_tau, tau_valid = _launch_resident_seed(
+        inputs, resident
     )
+    torch.npu.synchronize()
+    (
+        official_resident_indices,
+        official_resident_values,
+    ) = _call_official_resident_reference(official, inputs, resident)
     torch.npu.synchronize()
     if not _cpu_equal(seed_indices, official_resident_indices):
         raise RuntimeError(
             "A5C8ResidentSeed selection is not bitwise equal to source-matched "
             "official C8 on the resident index view"
+        )
+    if not _cpu_equal(seed_values, official_resident_values):
+        raise RuntimeError(
+            "A5C8ResidentSeed return_values=False output is not bitwise equal "
+            "to source-matched official C8 on the resident index view"
         )
     if not bool(torch.all(tau_valid == 1)):
         raise RuntimeError(
