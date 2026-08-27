@@ -420,6 +420,43 @@ cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
 rm -f "${GENERATED}/op_host/lightning_indexer_decode_update_a5_def.cpp"
 
+# `msopgen` creates an all-in-one host source named
+# `a5_streaming_quant_li_get.cpp`.  P3 deliberately replaces that generated
+# implementation with the source-derived C8 host closure, whose OpDef lives
+# in `a5_streaming_quant_li_get_def.cpp`.  Unlike the device entry point,
+# those filenames differ, so a normal overlay leaves both OP_ADD registrations
+# in the generated project.  CANN's host-source discovery then emits two
+# sections with the same name in aic-*-ops-info.ini.
+#
+# Keep the generated CMake scaffold and remove only the generated P3 host
+# stub.  The checked-in _def/_infershape/_tiling sources are the one coherent
+# P3 host implementation.  Fail before invoking CANN if staging ever drifts
+# back to zero or multiple registrations; changing the generated INI itself
+# would merely hide an ABI/build-closure error.
+if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
+    P3_GENERATED_HOST_STUB="${GENERATED}/op_host/a5_streaming_quant_li_get.cpp"
+    if [[ ! -f "${P3_GENERATED_HOST_STUB}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: expected msopgen P3 host stub is missing: ${P3_GENERATED_HOST_STUB}" >&2
+        exit 1
+    fi
+    rm -f "${P3_GENERATED_HOST_STUB}"
+
+    P3_OPDEF_SOURCES=()
+    while IFS= read -r -d '' P3_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5StreamingQuantLiGet[[:space:]]*\)' \
+                "${P3_HOST_SOURCE}"; then
+            P3_OPDEF_SOURCES+=("${P3_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f -name '*.cpp' -print0)
+
+    if [[ "${#P3_OPDEF_SOURCES[@]}" -ne 1 ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P3 requires exactly one A5StreamingQuantLiGet OpDef; found ${#P3_OPDEF_SOURCES[@]}." >&2
+        printf '[nanovllm_a5_ops] P3 OpDef source: %s\n' "${P3_OPDEF_SOURCES[@]}" >&2
+        exit 1
+    fi
+    echo "[nanovllm_a5_ops] P3 host registration closure: ${P3_OPDEF_SOURCES[0]}"
+fi
+
 if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \
         "${GENERATED}/op_host" "${GENERATED}/op_kernel"; then
     echo "[nanovllm_a5_ops] ERROR: legacy add_op_to_compiled_list leaked into the CANN 9.1 generated project." >&2

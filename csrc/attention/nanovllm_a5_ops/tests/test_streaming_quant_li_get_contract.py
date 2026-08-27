@@ -285,6 +285,16 @@ def require_source_contract() -> None:
     assert "STREAMING_LI_HOST_COMPAT" in build_script
     assert '"${OP_DEV}/op_host/err/ops_err.h"' in build_script
     assert '"${OP_DEV}/op_host/log/log.h"' in build_script
+    # msopgen emits an all-in-one Host stub containing OP_ADD.  P3 supplies
+    # the source-derived OpDef in a differently named _def.cpp, so the staging
+    # script must delete the generated stub and prove the resulting CANN host
+    # project contains exactly one registration.  Otherwise CANN writes two
+    # [A5StreamingQuantLiGet] sections into aic-*-ops-info.ini before kernel
+    # compilation starts.
+    assert "P3_GENERATED_HOST_STUB" in build_script
+    assert 'rm -f "${P3_GENERATED_HOST_STUB}"' in build_script
+    assert "P3_OPDEF_SOURCES" in build_script
+    assert "P3 host registration closure:" in build_script
     assert "BatchMulWeightAndReduceSum" in vector
     assert "streamingKvafHook_.Emit" in vector
     assert "streamingKvafHook_.Finish" in vector
