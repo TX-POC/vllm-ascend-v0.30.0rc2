@@ -16,8 +16,37 @@ BUILD_JOBS="${A5_OFFICIAL_C8_REFERENCE_BUILD_JOBS:-4}"
 VENDOR_NAME="official_c8_reference"
 OP_LIST="vllm_quant_lightning_indexer,vllm_quant_lightning_indexer_metadata"
 
-printf 'P3_REFERENCE_BUILD source_root=%s install_root=%s ops=%s jobs=%s\n' \
-  "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${OP_LIST}" "${BUILD_JOBS}"
+# `csrc/build.sh` owns one shared CMake build directory.  It defaults to
+# Ninja when Ninja is installed, but a long-lived checkout may already have
+# that directory configured with Unix Makefiles (or vice versa).  CMake
+# refuses to reconfigure a cache with a different generator.  Reuse the
+# cached generator unless a caller has explicitly selected USE_NINJA; this
+# keeps the reference-only package build isolated from unrelated build
+# artifacts without deleting the shared CMake directory.
+UPSTREAM_BUILD_DIR="${SOURCE_ROOT}/csrc/build"
+if [[ -z "${USE_NINJA+x}" && -f "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" ]]; then
+  CACHED_CMAKE_GENERATOR="$({
+    sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' \
+      "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" | head -n 1
+  } || true)"
+  case "${CACHED_CMAKE_GENERATOR}" in
+    Ninja)
+      REFERENCE_USE_NINJA=true
+      ;;
+    "Unix Makefiles")
+      REFERENCE_USE_NINJA=false
+      ;;
+    *)
+      REFERENCE_USE_NINJA=auto
+      ;;
+  esac
+else
+  REFERENCE_USE_NINJA="${USE_NINJA:-auto}"
+fi
+
+printf 'P3_REFERENCE_BUILD source_root=%s install_root=%s ops=%s jobs=%s use_ninja=%s\n' \
+  "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${OP_LIST}" "${BUILD_JOBS}" \
+  "${REFERENCE_USE_NINJA}"
 
 # A linked Git worktree stores .git as a file pointing back to the primary
 # repository, while a normal checkout stores it as a directory.  Both are
@@ -73,7 +102,7 @@ BUILD_MARKER="${INSTALL_PARENT}/.${INSTALL_LEAF}.p3_reference_build_started"
 # the two requested operators via --ops; no vllm_ascend_C target is involved.
 (
   cd "${SOURCE_ROOT}/csrc" || exit 2
-  MAX_JOBS="${BUILD_JOBS}" \
+  MAX_JOBS="${BUILD_JOBS}" USE_NINJA="${REFERENCE_USE_NINJA}" \
     bash ./build.sh --pkg --soc=ascend950 --ops="${OP_LIST}" \
       --vendor_name="${VENDOR_NAME}" -j"${BUILD_JOBS}"
 )
