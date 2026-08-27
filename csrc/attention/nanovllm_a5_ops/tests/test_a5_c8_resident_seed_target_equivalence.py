@@ -61,13 +61,28 @@ def main() -> int:
     inputs["metadata"] = _official_metadata(metadata, inputs)
     resident = _build_resident_index_view(inputs, metadata)
 
+    print(
+        "A5_C8_RESIDENT_SEED_TARGET_STAGE "
+        "stage=resident_view_ready "
+        f"key_shape={tuple(inputs['key'].shape)} "
+        f"full_block_table_shape={tuple(inputs['block_table'].shape)} "
+        "resident_block_table_shape="
+        f"{tuple(resident['resident_index_block_table'].shape)} "
+        "resident_seq_lengths="
+        f"{resident['resident_seq_lengths'].detach().cpu().tolist()}",
+        flush=True,
+    )
     _bind_resident_seed_opp(seed_opapi)
+    print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=seed_launch", flush=True)
     seed_indices, seed_values, resident_tau, tau_valid = _launch_resident_seed(
         inputs, resident
     )
     torch.npu.synchronize()
+    print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=seed_complete", flush=True)
+    print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=official_launch", flush=True)
     official_indices = _call_official_resident_reference(official, inputs, resident)
     torch.npu.synchronize()
+    print("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=official_complete", flush=True)
 
     if not _cpu_equal(seed_indices, official_indices):
         raise RuntimeError(

@@ -162,6 +162,12 @@ def main() -> None:
             "resident fixture must derive source capacity from the concrete input view")
     require("SOURCE_TOKENS // BLOCK_SIZE <= RESIDENT_BLOCKS" not in audit_adapter,
             "resident fixture must not depend on an unimported source-length global")
+    require("P4_RESIDENT_SEED_BRIDGE" in audit_adapter and
+            "sys.path.insert(0, bridge_root_text)" in audit_adapter,
+            "target adapter must resolve the source-matched in-place Seed bridge")
+    require("A5_C8_RESIDENT_SEED_TARGET_STAGE stage=seed_launch" in target_equivalence and
+            "A5_C8_RESIDENT_SEED_TARGET_STAGE stage=official_launch" in target_equivalence,
+            "target gate must identify which NPU launch failed")
 
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 

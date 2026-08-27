@@ -15,6 +15,7 @@ clone's own Top-K stays diagnostic and cannot route QSFA.
 from __future__ import annotations
 
 import os
+import sys
 from time import monotonic
 from pathlib import Path
 from typing import Any
@@ -184,9 +185,38 @@ def _build_resident_index_view(
 
 
 def _bind_resident_seed_opp(opapi: Any) -> None:
-    """Load the independent resident-seed resolver without touching P3."""
+    """Load the current-source ResidentSeed bridge without touching P3.
+
+    This test adapter is run directly from the source tree.  Its bridge is an
+    in-place extension below the sibling ``torch_extension`` directory, rather
+    than a globally installed package.  Put that exact source-matched root
+    first on ``sys.path`` so a shell's inherited ``PYTHONPATH`` cannot select
+    a stale package or omit the bridge after the reference import.
+    """
     os.environ[RESIDENT_SEED_OPAPI_ENV] = str(opapi)
+    bridge_root = (
+        Path(__file__).resolve().parents[1]
+        / "a5_c8_resident_seed"
+        / "torch_extension"
+    )
+    package_dir = bridge_root / "nanovllm_a5_c8_resident_seed"
+    if not (package_dir / "__init__.py").is_file():
+        raise RuntimeError(
+            "ResidentSeed bridge package is missing from the current source tree: "
+            f"{package_dir}"
+        )
+    bridge_root_text = str(bridge_root)
+    if bridge_root_text in sys.path:
+        sys.path.remove(bridge_root_text)
+    sys.path.insert(0, bridge_root_text)
     import nanovllm_a5_resident_seed  # noqa: F401, PLC0415
+
+    print(
+        "P4_RESIDENT_SEED_BRIDGE "
+        f"source_root={bridge_root} path_rank={sys.path.index(bridge_root_text)} "
+        f"opapi={opapi}",
+        flush=True,
+    )
 
 
 def _launch_resident_seed(
