@@ -112,6 +112,10 @@ protected:
 private:
     __aicore__ inline void GetKeyScale(const QLICommon::RunInfo &runInfo, LocalTensor<float> &kScaleUB,
                                        int64_t batchId, int64_t startS2, int64_t getLen);
+    // `score_source_lens` is a P3-only side output.  It is intentionally
+    // published through MTE3 rather than a scalar GM SetValue: paired AIVs
+    // can own adjacent rows, which share a 32-byte GM sector on A5.
+    __aicore__ inline void WriteScoreSourceLen(uint64_t outputRow, int32_t value);
     // ================================Local Buffer区====================================
 
     // tmp buff for vector
@@ -146,6 +150,12 @@ private:
 
     TBuf<TPosition::VECCALC> outInvalidBuf_;
     LocalTensor<int32_t> outInvalidLocal_;
+
+    // One scalar is sufficient per publication; eight int32s reserve a full
+    // 32-byte UB line for the MTE3 DMA source and mirror established A5
+    // side-output publication patterns.
+    TBuf<TPosition::VECCALC> scoreSourceLensBuf_;
+    LocalTensor<int32_t> scoreSourceLensLocal_;
 
     #if A5_STREAMING_LI_GET_ENABLE_HOOK
     // Small caller-owned UB hand-off records for the Direct-HCCP queue lease
@@ -216,6 +226,8 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     //刷-1
     pipe->InitBuffer(outInvalidBuf_, topkCount_ * sizeof(int32_t));
     outInvalidLocal_ = outInvalidBuf_.Get<int32_t>();
+    pipe->InitBuffer(scoreSourceLensBuf_, 8 * sizeof(int32_t));
+    scoreSourceLensLocal_ = scoreSourceLensBuf_.Get<int32_t>();
     #if A5_STREAMING_LI_GET_ENABLE_HOOK
     pipe->InitBuffer(streamingLeaseBuf_, 32U);
     streamingLeaseUb_ = streamingLeaseBuf_.Get<uint8_t>();
@@ -276,6 +288,27 @@ __aicore__ inline void QLIVector<QLIT>::InitScoreSourceLensOutput(
     GlobalTensor<int32_t> scoreSourceLensGm)
 {
     this->scoreSourceLensGm = scoreSourceLensGm;
+}
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::WriteScoreSourceLen(
+    uint64_t outputRow, int32_t value)
+{
+    scoreSourceLensLocal_.SetValue(0, value);
+    PipeBarrier<PIPE_V>();
+
+    // Do not reuse any official C8 TOPK event here.  The scalar receipt has
+    // its own S<->MTE3 dependency and waits before reusing the local buffer.
+    // This avoids A5 scalar-GM false sharing without changing LI/TopK math,
+    // index ownership, or the canonical C8 output-DMA event lifecycle.
+    AscendC::DataCopyParams scalarCopy{
+        1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
+    WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
+    AscendC::DataCopyPad(scoreSourceLensGm[outputRow], scoreSourceLensLocal_,
+                         scalarCopy);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
 }
 
 #if A5_STREAMING_LI_GET_ENABLE_HOOK
@@ -371,7 +404,7 @@ __aicore__ inline void QLIVector<QLIT>::CleanInvalidOutput(int64_t invalidS1Offs
     // division by sparseCount yields exactly the graph-visible output row.
     // A downstream reconcile must treat zero as "no valid score source",
     // never as a host-inferred sequence length.
-    scoreSourceLensGm.SetValue(
+    WriteScoreSourceLen(
         static_cast<uint64_t>(invalidS1Offset) / constInfo_.sparseCount, 0);
     // init -1 and copy to output
     Duplicate(outInvalidLocal_, constInfo_.INVALID_IDX, constInfo_.sparseCount);
@@ -575,8 +608,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         const uint64_t outputRow =
             static_cast<uint64_t>(info.indiceOutOffset) / topkCount_ +
             static_cast<uint64_t>(curS1Idx + rowIdx);
-        scoreSourceLensGm.SetValue(
-            outputRow, validS2Len > 0 ? validS2Len : 0);
+        WriteScoreSourceLen(outputRow, validS2Len > 0 ? validS2Len : 0);
         if (validS2Len <= 0) {
             WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);
