@@ -22,9 +22,6 @@
 #include "lib/matrix/matmul/tiling.h"
 #include "quant_lightning_indexer_common.h"
 #include "../a5_streaming_quant_li_get_hook_mode.h"
-#if A5_STREAMING_LI_GET_ENABLE_HOOK
-#include "a5_streaming_quant_li_get_tile_ready.h"
-#endif
 #include "../arch35/vf/quant_lightning_indexer_vector1.h"
 #include "../arch35/vf/quant_lightning_indexer_topk.h"
 
@@ -54,27 +51,35 @@ public:
     // corresponding sparse-index output row.
     __aicore__ inline void InitScoreSourceLensOutput(
         GlobalTensor<int32_t> scoreSourceLensGm);
+    // The caller-owned score workspace is a byte-identical replacement for
+    // the private C8 scratch score-GM.  In mode 0 the original workspace is
+    // still used; modes 1/2 use this explicit address so a sidecar can later
+    // read the exact uint16 scores without reconstructing Q/K math.
+    // `score_workspace` is declared as int32 only because that is the
+    // graph/ACL tensor carrier.  C8 addresses it as uint16 sortable scores.
+    // Keep the published base in *bytes* so the independent consumer cannot
+    // accidentally interpret it as an int32 element index.
+    __aicore__ inline void InitScoreWorkspaceBase(uint64_t baseBytes);
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+    // A receipt slot is two cache lines: line 0 is immutable descriptor data;
+    // line 1 begins with epoch. Same-MTE3 ordering establishes their producer
+    // issue order. A future concurrent sidecar must additionally use a
+    // documented cross-kernel acquire/release edge before treating epoch as
+    // ready; the current P3 proof reads receipts only after kernel completion.
+    __aicore__ inline void InitScoreTileReceipts(
+        GlobalTensor<int64_t> tileReceiptsGm,
+        GlobalTensor<int64_t> streamingEpochGm);
+    __aicore__ inline void PrepareScoreTileReceipts(
+        const QLICommon::RunInfo &info, uint64_t vec1OutGmOffset,
+        int64_t curAivS1Idx, int64_t curAivS1ProcNum,
+        int64_t curS2Idx, uint32_t pingpong);
+    __aicore__ inline void EmitScoreTileReceipts(
+        const QLICommon::RunInfo &info, int64_t curAivS1Idx,
+        int64_t curAivS1ProcNum, uint32_t pingpong);
+#endif
     __aicore__ inline void InitVecInputTensor(GlobalTensor<float> weightsGm, GlobalTensor<float> qScaleGm,
                                               GlobalTensor<float> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    __aicore__ inline void InitStreamingKvafHook(
-        __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
-        __gm__ uint8_t *kvObjectSlotsSnapshot,
-        __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *kvObjectMap,
-        __gm__ uint8_t *privateSourceToSlot, __gm__ uint8_t *privateReadyTable,
-        __gm__ uint8_t *privateArenaHead, __gm__ uint8_t *privatePackedOutput,
-        __gm__ uint8_t *queueControl,
-        __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
-        __gm__ uint8_t *telemetry,
-        const QLITilingData *__restrict tilingData);
-    // The official C8 `TOPK_MTE3_V_EVENT` is consumed by FreeEventID().
-    // Finish must run only after that canonical event drain, otherwise an
-    // extra wait here steals the final token and leaves FreeEventID waiting
-    // forever.  The wrapper keeps that ownership rule visible at the one
-    // ProcessMain call site.
-    __aicore__ inline void FinishStreamingKvafHook();
-    #endif
     // Used only by the all-invalid forward path. It clears non-alias output
     // #8 in disjoint AIV shards so graph replay cannot expose an old S length.
     __aicore__ inline void ClearScoreSourceLensForInvalidForward(
@@ -91,6 +96,11 @@ protected:
     GlobalTensor<int32_t> indiceOutGm;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> scoreSourceLensGm;
+    uint64_t scoreWorkspaceBaseBytes_ = 0;
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+    GlobalTensor<int64_t> tileReceiptsGm;
+    int64_t streamingEpoch_ = 0;
+#endif
     // =================================常量区=================================
     static constexpr uint32_t VEC1_V_MTE2_EVENT = EVENT_ID0;
     static constexpr uint32_t VEC1_MTE2_V_EVENT = EVENT_ID1;
@@ -139,6 +149,18 @@ private:
     TBuf<TPosition::VECCALC> mrgValueBuf_;
     LocalTensor<SCORE_T> mrgValueLocal_;
 
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+    // Receipt descriptors must not share the Top-K merge buffer. The final
+    // score tile can still be in MTE3 when ProcessTopK starts consuming
+    // mrgValueLocal_, so sharing that storage would allow the Top-K path to
+    // overwrite an in-flight descriptor DMA source. The existing VEC1
+    // MTE3->V ping-pong token already protects this dedicated buffer before
+    // the next same-pingpong score tile reuses it; after the final tile,
+    // FreeEventID drains that token before the kernel returns.
+    TBuf<TPosition::VECCALC> tileReceiptBuf_;
+    LocalTensor<int64_t> tileReceiptLocal_;
+#endif
+
     TBuf<TPosition::VECCALC> indicesOutBuf_;
     LocalTensor<uint32_t> indicesOutLocal_;
 
@@ -156,18 +178,6 @@ private:
     // side-output publication patterns.
     TBuf<TPosition::VECCALC> scoreSourceLensBuf_;
     LocalTensor<int32_t> scoreSourceLensLocal_;
-
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    // Small caller-owned UB hand-off records for the Direct-HCCP queue lease
-    // and bounded private-arena CAS service. The per-queue descriptor arrays
-    // themselves stay graph-static in HBM and are supplied by KVAF control.
-    TBuf<TPosition::VECCALC> streamingLeaseBuf_;
-    LocalTensor<uint8_t> streamingLeaseUb_;
-    TBuf<TPosition::VECCALC> streamingClaimBuf_;
-    LocalTensor<uint8_t> streamingClaimUb_;
-    TBuf<TPosition::VECCALC> streamingSourceOffsetsBuf_;
-    LocalTensor<uint64_t> streamingSourceOffsetsUb_;
-    #endif
 
     int32_t blockId_ = -1;
     // para for vector
@@ -189,9 +199,6 @@ private:
 
     struct QLICommon::ConstInfo constInfo_;
     topk::LITopk<SCORE_T> topkOp_;
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    streaming_li_get::StreamingKvafTileReadyHook streamingKvafHook_;
-    #endif
 };
 
 template <typename QLIT>
@@ -212,6 +219,17 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(mrgValueBuf_, (topkCountAlign256_ + trunkLen_) * sizeof(SCORE_T));     // 大小：(topkCountAlign256_ + 每次排序长度) * sizeof(SCORE_T)
     mrgValueLocal_ = mrgValueBuf_.Get<SCORE_T>();
 
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+    constexpr uint32_t kReceiptWordsPerTile = 16U;
+    // One AIV owns at most ceil(S1_base / 2) rows for each ping-pong score
+    // tile. Keep both ping-pong copies so a later MTE3 store never aliases a
+    // descriptor being prepared on V.
+    const uint32_t rowsPerAiv = CeilDiv(s1BaseSize_, 2);
+    pipe->InitBuffer(tileReceiptBuf_,
+                     2U * rowsPerAiv * kReceiptWordsPerTile * sizeof(int64_t));
+    tileReceiptLocal_ = tileReceiptBuf_.Get<int64_t>();
+#endif
+
     pipe->InitBuffer(indicesOutBuf_, (topkCountAlign256_ + 64) * sizeof(uint32_t));         // 大小：(topkCountAlign256_ + 64) * 4  64:duplicate刷-1需要额外空间
     indicesOutLocal_ = indicesOutBuf_.Get<uint32_t>();
 
@@ -228,15 +246,6 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     outInvalidLocal_ = outInvalidBuf_.Get<int32_t>();
     pipe->InitBuffer(scoreSourceLensBuf_, 8 * sizeof(int32_t));
     scoreSourceLensLocal_ = scoreSourceLensBuf_.Get<int32_t>();
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    pipe->InitBuffer(streamingLeaseBuf_, 32U);
-    streamingLeaseUb_ = streamingLeaseBuf_.Get<uint8_t>();
-    pipe->InitBuffer(streamingClaimBuf_, 32U);
-    streamingClaimUb_ = streamingClaimBuf_.Get<uint8_t>();
-    pipe->InitBuffer(streamingSourceOffsetsBuf_,
-                     streaming_li_get::kMaxWaveRequests * sizeof(uint64_t));
-    streamingSourceOffsetsUb_ = streamingSourceOffsetsBuf_.Get<uint64_t>();
-    #endif
     Duplicate(kScaleUB_, float(0), 2 * s2BaseSize_);
 }
 
@@ -291,6 +300,123 @@ __aicore__ inline void QLIVector<QLIT>::InitScoreSourceLensOutput(
 }
 
 template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::InitScoreWorkspaceBase(
+    uint64_t baseBytes)
+{
+    scoreWorkspaceBaseBytes_ = baseBytes;
+}
+
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::InitScoreTileReceipts(
+    GlobalTensor<int64_t> tileReceiptsGm,
+    GlobalTensor<int64_t> streamingEpochGm)
+{
+    this->tileReceiptsGm = tileReceiptsGm;
+    streamingEpoch_ = streamingEpochGm.GetValue(0);
+}
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::PrepareScoreTileReceipts(
+    const QLICommon::RunInfo &info, uint64_t vec1OutGmOffset,
+    int64_t curAivS1Idx, int64_t curAivS1ProcNum,
+    int64_t curS2Idx, uint32_t pingpong)
+{
+    // Publication is deliberately descriptor-only.  It has no queue claim,
+    // no HCCP call, no threshold comparison, no score observation, and no
+    // extra C8 hard event.  The existing V->MTE3/MTE3->V event pair brackets
+    // both the official score copy and these two fixed-line copies.
+    constexpr uint64_t kWordsPerLine = 8;
+    constexpr uint64_t kWordsPerReceipt = 16;
+    constexpr uint64_t kContractVersion = 1;
+    const uint64_t scoreRowStride = QLICommon::Align(
+        static_cast<uint64_t>(constInfo_.kSeqSize),
+        static_cast<uint64_t>(s2BaseSize_));
+    const int64_t validBase = constInfo_.attenMaskFlag
+        ? info.actS2SizeOrig - info.actS1Size + curAivS1Idx + 1
+        : info.actS2Size;
+
+    // This storage is intentionally disjoint from mrgValueLocal_: Top-K may
+    // start before the final MTE3 descriptor transfer retires. The existing
+    // VEC1 MTE3->V ping-pong handoff serializes reuse of tileReceiptLocal_
+    // without adding an event ID or perturbing the official Top-K lifecycle.
+    auto descriptorLocal = tileReceiptLocal_;
+    for (int64_t localRow = 0; localRow < curAivS1ProcNum; ++localRow) {
+        const uint64_t outputRow =
+            static_cast<uint64_t>(info.indiceOutOffset) / topkCount_ +
+            static_cast<uint64_t>(curAivS1Idx + localRow);
+        const int64_t validS2 = constInfo_.attenMaskFlag
+            ? (validBase + localRow) / static_cast<int64_t>(constInfo_.cmpRatio)
+            : info.actS2Size;
+        const int64_t remain = validS2 - curS2Idx;
+        const uint64_t validInTile = remain <= 0 ? 0 :
+            static_cast<uint64_t>(remain) <
+                    static_cast<uint64_t>(info.actualSingleProcessSInnerSize)
+                ? static_cast<uint64_t>(remain)
+                : static_cast<uint64_t>(info.actualSingleProcessSInnerSize);
+        const uint64_t localBase =
+            static_cast<uint64_t>(pingpong) * 2U * kWordsPerReceipt +
+            static_cast<uint64_t>(localRow) * kWordsPerReceipt;
+
+        // word 0 is an absolute byte offset from score_workspace's base, not
+        // an int32- or uint16-element index.  The sidecar can therefore form
+        // its GM address without a hidden factor-of-two convention.
+        descriptorLocal.SetValue(localBase + 0, static_cast<int64_t>(
+            scoreWorkspaceBaseBytes_ +
+            (vec1OutGmOffset + static_cast<uint64_t>(localRow) *
+                scoreRowStride) * sizeof(SCORE_T)));
+        descriptorLocal.SetValue(localBase + 1, static_cast<int64_t>(outputRow));
+        descriptorLocal.SetValue(localBase + 2, curS2Idx);
+        descriptorLocal.SetValue(localBase + 3, static_cast<int64_t>(validInTile));
+        descriptorLocal.SetValue(localBase + 4, static_cast<int64_t>(scoreRowStride));
+        descriptorLocal.SetValue(localBase + 5, static_cast<int64_t>(blockId_));
+        descriptorLocal.SetValue(localBase + 6, static_cast<int64_t>(info.loop));
+        descriptorLocal.SetValue(localBase + 7, static_cast<int64_t>(kContractVersion));
+
+        // The ready cache line is separate from the immutable descriptor
+        // line. A future consumer combines this epoch with its graph/device
+        // acquire edge; it must not rely on a plain unsynchronized GM poll.
+        for (uint64_t word = 0; word < kWordsPerLine; ++word) {
+            descriptorLocal.SetValue(localBase + kWordsPerLine + word,
+                word == 0 ? streamingEpoch_ : 0);
+        }
+    }
+    PipeBarrier<PIPE_V>();
+}
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::EmitScoreTileReceipts(
+    const QLICommon::RunInfo &info, int64_t curAivS1Idx,
+    int64_t curAivS1ProcNum, uint32_t pingpong)
+{
+    constexpr uint64_t kWordsPerLine = 8;
+    constexpr uint64_t kWordsPerReceipt = 16;
+    const uint64_t tilesPerRow = CeilDiv(
+        static_cast<uint64_t>(constInfo_.kSeqSize),
+        static_cast<uint64_t>(s2BaseSize_));
+    auto descriptorLocal = tileReceiptLocal_;
+    AscendC::DataCopyParams lineCopy{1, 64, 0, 0};
+    for (int64_t localRow = 0; localRow < curAivS1ProcNum; ++localRow) {
+        const uint64_t outputRow =
+            static_cast<uint64_t>(info.indiceOutOffset) / topkCount_ +
+            static_cast<uint64_t>(curAivS1Idx + localRow);
+        const uint64_t receiptBase =
+            (outputRow * tilesPerRow + info.s2Idx) * kWordsPerReceipt;
+        const uint64_t localBase =
+            static_cast<uint64_t>(pingpong) * 2U * kWordsPerReceipt +
+            static_cast<uint64_t>(localRow) * kWordsPerReceipt;
+        // MTE3 is in-order: the score tile copy was enqueued first, this
+        // immutable line second, and its epoch line last.
+        AscendC::DataCopyPad(tileReceiptsGm[receiptBase],
+                             descriptorLocal[localBase], lineCopy);
+        AscendC::DataCopyPad(tileReceiptsGm[receiptBase + kWordsPerLine],
+                             descriptorLocal[localBase + kWordsPerLine],
+                             lineCopy);
+    }
+}
+#endif
+
+template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::WriteScoreSourceLen(
     uint64_t outputRow, int32_t value)
 {
@@ -310,46 +436,6 @@ __aicore__ inline void QLIVector<QLIT>::WriteScoreSourceLen(
     SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
 }
-
-#if A5_STREAMING_LI_GET_ENABLE_HOOK
-template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
-    __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
-    __gm__ uint8_t *kvObjectSlotsSnapshot,
-    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *kvObjectMap,
-    __gm__ uint8_t *privateSourceToSlot, __gm__ uint8_t *privateReadyTable,
-    __gm__ uint8_t *privateArenaHead, __gm__ uint8_t *privatePackedOutput,
-    __gm__ uint8_t *queueControl,
-    __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
-    __gm__ uint8_t *telemetry,
-    const QLITilingData *__restrict tilingData)
-{
-    streamingKvafHook_.Init(
-        residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
-        reqPoolEntries, kvObjectLens, kvObjectMap,
-        privateSourceToSlot, privateReadyTable, privateArenaHead,
-        privatePackedOutput, queueControl,
-        queueLeases, telemetry, constInfo_, tilingData->streamingRowCount,
-        tilingData->streamingSourceCapacity, tilingData->streamingPoolSize,
-        tilingData->streamingKvObjectCapacity,
-        tilingData->streamingPrivatePackedRows,
-        tilingData->streamingPrivateArenaCapacity,
-        tilingData->streamingQueueCount,
-        tilingData->streamingKvafRowsPerEntry,
-        reinterpret_cast<__ubuf__ kvaf_fused_get::KvafStreamingBatchGetLeaseResult *>(
-            streamingLeaseUb_.GetPhyAddr()),
-        reinterpret_cast<__ubuf__ streaming_li_get::PrivateArenaClaimResult *>(
-            streamingClaimUb_.GetPhyAddr()),
-        reinterpret_cast<__ubuf__ uint64_t *>(streamingSourceOffsetsUb_.GetPhyAddr()),
-        static_cast<uint32_t>(blockId_));
-}
-
-template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::FinishStreamingKvafHook()
-{
-    streamingKvafHook_.Finish();
-}
-#endif
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ClearScoreSourceLensForInvalidForward(
@@ -523,46 +609,34 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(QK_T))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(QK_T)) / 2 * constInfo_.mBaseSize;
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    // Take the capacity snapshot before the official score reduction.  If
-    // every speculative-Get queue is already leased and this producer has no
-    // local in-flight wave, the official reduction-to-score-DMA seam has no
-    // P3 barrier or score observation inserted. This is a runtime ordering
-    // guarantee; it does not claim the hook-on kernel has identical compiled
-    // register or UB layout to the standalone official C8 kernel.
-    const bool mayNeedScoreObservation =
-        streamingKvafHook_.MayNeedScoreObservation();
-    #endif
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(QK_T)),
                                         weightBase, UB_BANK_DEPTH_STRIDE / sizeof(float),
                                         kScaleBase, (uint32_t)0,
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(float),
                                         gSize_, curAivS1ProcNum);
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    // Exact seam: official C8 score production is complete, but its normal
-    // score-GM copy has not begun. The hook only observes uint16 scores and
-    // submits a bounded speculative Direct-HCCP wave; it cannot alter TopK.
-    // In the saturated/no-local-wave case, `mayNeedScoreObservation` is
-    // false, so there is no extra operation at this seam.
-    if (mayNeedScoreObservation) {
-        PipeBarrier<PIPE_V>();
-        streamingKvafHook_.Emit(outBase, info, curAivS1Idx, curAivS1ProcNum,
-                                curS2Idx);
-    }
-    #endif
+    int64_t vec1OutGmOffset = blockId_ % 2 == 0 ? curS2Idx :
+                            s1BaseSizePerAIV * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) + curS2Idx;
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+    // Prepare on V before the existing V->MTE3 token. No MTE3 request is
+    // issued yet, therefore the source is complete when the existing score
+    // DMA begins below.
+    PrepareScoreTileReceipts(info, vec1OutGmOffset, curAivS1Idx,
+                             curAivS1ProcNum, curS2Idx, pingpong);
+#endif
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT + pingpong);
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
-    //outUB_ --->  scoreGm
-    int64_t vec1OutGmOffset = blockId_ % 2 == 0 ? curS2Idx :
-                            s1BaseSizePerAIV * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) + curS2Idx;
+    //outUB_ ---> scoreGm
     DataCopyExtParams copyOutParams;
     copyOutParams.blockCount = curAivS1ProcNum;
     copyOutParams.blockLen = s2BaseSize_ * sizeof(SCORE_T);
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - UB_BANK_STRIDE) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+    EmitScoreTileReceipts(info, curAivS1Idx, curAivS1ProcNum, pingpong);
+#endif
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
@@ -570,14 +644,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &info)
 {
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    // Do not drain the final Direct-HCCP wave here.  TopK consumes only
-    // scoreGm and produces only the official sparse-index output; it never
-    // reads the private output arena or the hook's ready table.  Keeping the
-    // wave in flight lets the final H2D overlap this exact C8 TopK phase.
-    // The terminal drain is deliberately below, after every row in this
-    // ProcessTopK invocation has issued its unchanged official output copy.
-    #endif
     SetFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
     WaitFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
 

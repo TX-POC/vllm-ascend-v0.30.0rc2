@@ -23,7 +23,10 @@
       {"name": "private_packed_output", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
       {"name": "queue_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
       {"name": "queue_leases", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "kv_object_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+      {"name": "kv_object_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "score_workspace", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "tile_receipts", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "streaming_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]}
     ],
     "output_desc": [
       {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
@@ -34,7 +37,9 @@
       {"name": "private_packed_output_out", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
       {"name": "queue_leases_out", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "telemetry", "param_type": "required", "format": ["ND"], "type": ["int64"]},
-      {"name": "score_source_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+      {"name": "score_source_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "score_workspace_out", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "tile_receipts_out", "param_type": "required", "format": ["ND"], "type": ["int64"]}
     ],
     "attr": [
       {"name": "query_quant_mode", "type": "int", "default_value": "0"},

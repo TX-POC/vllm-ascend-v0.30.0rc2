@@ -16,7 +16,7 @@
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
 #if (__CCE_AICORE__ != 310)
-    #error "A5StreamingQuantLiGet embeds the Ascend-950 C8 + Direct-HCCP helper and is ASCEND950-only"
+    #error "A5StreamingQuantLiGet is a source-derived Ascend-950 C8 score publisher and is ASCEND950-only"
 #endif
 #include "arch35/quant_lightning_indexer_kernel.h"
 #include "a5_streaming_quant_li_get_template_tiling_key.h"
@@ -33,9 +33,10 @@ using namespace optiling::detail;
                 reqPoolEntries, kvObjectMap,                                                                   \
                 privateSourceToSlot, privateReadyTable, privateArenaHead, privatePackedOutput,                \
                 queueControl, queueLeases, kvObjectLens,                                                      \
+                scoreWorkspace, tileReceipts, streamingEpoch,                                                  \
                 sparseIndices, sparseValues, privateSourceToSlotOut, privateReadyTableOut,                    \
                 privateArenaHeadOut, privatePackedOutputOut, queueLeasesOut, telemetry,                       \
-                scoreSourceLens,                                                                               \
+                scoreSourceLens, scoreWorkspaceOut, tileReceiptsOut,                                          \
                 user, tiling_data, &tPipe);                                                                    \
         op.Process();                                                                                        \
     } while (0)
@@ -57,6 +58,9 @@ __global__ __aicore__ void a5_streaming_quant_li_get(__gm__ uint8_t *query, __gm
                                                    __gm__ uint8_t *queueControl,
                                                    __gm__ uint8_t *queueLeases,
                                                    __gm__ uint8_t *kvObjectLens,
+                                                   __gm__ uint8_t *scoreWorkspace,
+                                                   __gm__ uint8_t *tileReceipts,
+                                                   __gm__ uint8_t *streamingEpoch,
                                                    __gm__ uint8_t *sparseIndices,
                                                    __gm__ uint8_t *sparseValues,
                                                    __gm__ uint8_t *privateSourceToSlotOut,
@@ -66,6 +70,8 @@ __global__ __aicore__ void a5_streaming_quant_li_get(__gm__ uint8_t *query, __gm
                                                    __gm__ uint8_t *queueLeasesOut,
                                                    __gm__ uint8_t *telemetry,
                                                    __gm__ uint8_t *scoreSourceLens,
+                                                   __gm__ uint8_t *scoreWorkspaceOut,
+                                                   __gm__ uint8_t *tileReceiptsOut,
                                                    __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
     TPipe tPipe;

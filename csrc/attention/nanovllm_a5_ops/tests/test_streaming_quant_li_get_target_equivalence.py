@@ -36,6 +36,21 @@ Required adapter result:
         "private_packed_output": (input_tensor, output_tensor),
         "queue_leases": (input_tensor, output_tensor),
       },
+      # The new 24-input / 11-output ABI exposes graph-visible score
+      # publication buffers. Both returned tensors must alias their inputs.
+      "publication_aliases": {
+        "score_workspace": (input_tensor, output_tensor),
+        "tile_receipts": (input_tensor, output_tensor),
+      },
+      # Adapter-validated mode result. Modes are exactly off,
+      # score_workspace, and publisher. Publisher additionally validates the
+      # fixed-slot / epoch receipt layout before returning this dictionary.
+      "publication_summary": {
+        "mode": str,
+        "score_workspace_changed": int,
+        "receipt_ready_count": int,
+        "receipt_expected_active": int,
+      },
       # Optional only when the actual official configuration exposes values:
       "official_values": tensor_or_array_or_none,
       "derived_values": tensor_or_array_or_none,
@@ -176,6 +191,46 @@ def _assert_transaction_aliases(result: dict[str, Any]) -> None:
         )
 
 
+def _assert_publication_contract(result: dict[str, Any]) -> dict[str, Any]:
+    """Require graph aliases and mode-specific publication evidence.
+
+    The detailed receipt descriptor validation belongs to the target adapter:
+    it knows the exact C8 fixture and fixed slot mapping. The generic harness
+    checks the common ABI boundary and prevents a summary-only fake PASS.
+    """
+    aliases = result.get("publication_aliases")
+    if not isinstance(aliases, dict):
+        raise AssertionError("adapter did not return publication_aliases")
+    for name in ("score_workspace", "tile_receipts"):
+        pair = aliases.get(name)
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise AssertionError(f"missing publication input/output alias pair for {name}")
+        input_ptr = _data_pointer(pair[0], f"{name}.input")
+        output_ptr = _data_pointer(pair[1], f"{name}.output")
+        assert input_ptr == output_ptr, (
+            f"{name} is not a graph-visible physical alias: "
+            f"input=0x{input_ptr:x}, output=0x{output_ptr:x}"
+        )
+    summary = result.get("publication_summary")
+    if not isinstance(summary, dict):
+        raise AssertionError("adapter did not return publication_summary")
+    mode = summary.get("mode")
+    changed = summary.get("score_workspace_changed")
+    ready = summary.get("receipt_ready_count")
+    expected = summary.get("receipt_expected_active")
+    if mode not in ("off", "score_workspace", "publisher"):
+        raise AssertionError(f"unknown publication mode {mode!r}")
+    if not isinstance(changed, int) or not isinstance(ready, int) or not isinstance(expected, int):
+        raise AssertionError("publication summary contains non-integer evidence")
+    if mode == "off":
+        assert (changed, ready, expected) == (0, 0, 0), summary
+    elif mode == "score_workspace":
+        assert changed == 1 and ready == 0 and expected == 0, summary
+    else:
+        assert changed == 1 and ready >= expected > 0, summary
+    return summary
+
+
 def _assert_official_input_aliases(result: dict[str, Any]) -> None:
     """Prevent a target adapter from comparing different C8 input cases."""
     aliases = result.get("input_aliases")
@@ -299,6 +354,7 @@ def main() -> int:
         raise TypeError("target adapter must return a dict")
     _assert_official_input_aliases(result)
     _assert_transaction_aliases(result)
+    publication = _assert_publication_contract(result)
     _assert_bitwise_equal(
         result.get("official_indices"), result.get("derived_indices"), "indices"
     )
@@ -316,7 +372,11 @@ def main() -> int:
         "P3_STREAMING_LI_GET_TARGET_EQ_PASS "
         f"values_compared={int(official_values is not None)} "
         "math_gate=bitwise_official_c8 source_domain=verified c8_n2_one=verified input_aliases=verified "
-        "graph_aliases=verified"
+        "graph_aliases=verified "
+        f"publication_mode={publication['mode']} "
+        f"score_workspace_changed={publication['score_workspace_changed']} "
+        f"receipt_ready_count={publication['receipt_ready_count']} "
+        "post_kernel_receipt=adapter_verified"
     )
     return 0
 

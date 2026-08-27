@@ -30,6 +30,9 @@ constexpr uint32_t PRIVATE_PACKED_OUTPUT_INDEX = 17;
 constexpr uint32_t QUEUE_CONTROL_INDEX = 18;
 constexpr uint32_t QUEUE_LEASES_INDEX = 19;
 constexpr uint32_t KV_OBJECT_LENS_INDEX = 20;
+constexpr uint32_t SCORE_WORKSPACE_INDEX = 21;
+constexpr uint32_t TILE_RECEIPTS_INDEX = 22;
+constexpr uint32_t STREAMING_EPOCH_INDEX = 23;
 
 constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 2;
 constexpr uint32_t ATTR_KV_LAYOUT_INDEX = 3;
@@ -47,9 +50,14 @@ constexpr uint32_t PRIVATE_PACKED_OUTPUT_OUTPUT_INDEX = 5;
 constexpr uint32_t QUEUE_LEASES_OUTPUT_INDEX = 6;
 constexpr uint32_t TELEMETRY_OUTPUT_INDEX = 7;
 constexpr uint32_t SCORE_SOURCE_LENS_OUTPUT_INDEX = 8;
+constexpr uint32_t SCORE_WORKSPACE_OUTPUT_INDEX = 9;
+constexpr uint32_t TILE_RECEIPTS_OUTPUT_INDEX = 10;
 constexpr uint32_t STREAMING_TELEMETRY_COLUMNS = 13;
 constexpr uint32_t STREAMING_KVAF_CONTROL_WORDS = 16;
 constexpr uint32_t STREAMING_PACKED_KV_ROW_BYTES = 656;
+constexpr uint32_t STREAMING_TILE_RECEIPT_WORDS = 16;
+constexpr uint32_t STREAMING_SCORE_TILE_WIDTH = 128;
+constexpr int64_t STREAMING_A5_AIC_CORE_COUNT = 36;
 
 static int64_t ProductExceptLast(const gert::Shape &shape)
 {
@@ -88,6 +96,9 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     const gert::Shape *control = context->GetInputShape(QUEUE_CONTROL_INDEX);
     const gert::Shape *leases = context->GetInputShape(QUEUE_LEASES_INDEX);
     const gert::Shape *kvObjectLens = context->GetInputShape(KV_OBJECT_LENS_INDEX);
+    const gert::Shape *scoreWorkspace = context->GetInputShape(SCORE_WORKSPACE_INDEX);
+    const gert::Shape *tileReceipts = context->GetInputShape(TILE_RECEIPTS_INDEX);
+    const gert::Shape *streamingEpoch = context->GetInputShape(STREAMING_EPOCH_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, query);
     OP_CHECK_NULL_WITH_CONTEXT(context, key);
     OP_CHECK_NULL_WITH_CONTEXT(context, resident);
@@ -102,6 +113,9 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     OP_CHECK_NULL_WITH_CONTEXT(context, control);
     OP_CHECK_NULL_WITH_CONTEXT(context, leases);
     OP_CHECK_NULL_WITH_CONTEXT(context, kvObjectLens);
+    OP_CHECK_NULL_WITH_CONTEXT(context, scoreWorkspace);
+    OP_CHECK_NULL_WITH_CONTEXT(context, tileReceipts);
+    OP_CHECK_NULL_WITH_CONTEXT(context, streamingEpoch);
 
     gert::Shape *sparseIndices = context->GetOutputShape(SPARSE_INDICES_OUTPUT_INDEX);
     gert::Shape *sparseValues = context->GetOutputShape(SPARSE_VALUES_OUTPUT_INDEX);
@@ -112,6 +126,8 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     gert::Shape *leasesOut = context->GetOutputShape(QUEUE_LEASES_OUTPUT_INDEX);
     gert::Shape *telemetry = context->GetOutputShape(TELEMETRY_OUTPUT_INDEX);
     gert::Shape *scoreSourceLens = context->GetOutputShape(SCORE_SOURCE_LENS_OUTPUT_INDEX);
+    gert::Shape *scoreWorkspaceOut = context->GetOutputShape(SCORE_WORKSPACE_OUTPUT_INDEX);
+    gert::Shape *tileReceiptsOut = context->GetOutputShape(TILE_RECEIPTS_OUTPUT_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, sparseIndices);
     OP_CHECK_NULL_WITH_CONTEXT(context, sparseValues);
     OP_CHECK_NULL_WITH_CONTEXT(context, sourceToSlotOut);
@@ -121,6 +137,8 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     OP_CHECK_NULL_WITH_CONTEXT(context, leasesOut);
     OP_CHECK_NULL_WITH_CONTEXT(context, telemetry);
     OP_CHECK_NULL_WITH_CONTEXT(context, scoreSourceLens);
+    OP_CHECK_NULL_WITH_CONTEXT(context, scoreWorkspaceOut);
+    OP_CHECK_NULL_WITH_CONTEXT(context, tileReceiptsOut);
 
     auto attrs = context->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
@@ -179,10 +197,23 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
 
     const int64_t rowCount = ProductExceptLast(*sparseIndices);
     const int64_t sourceCapacity = (kvObjectMap->GetDimNum() == 2) ? kvObjectMap->GetDim(1) : -1;
+    const int64_t tileCount = sourceCapacity > 0
+        ? (sourceCapacity + STREAMING_SCORE_TILE_WIDTH - 1) /
+            STREAMING_SCORE_TILE_WIDTH
+        : -1;
+    const int64_t alignedSource = tileCount > 0
+        ? tileCount * static_cast<int64_t>(STREAMING_SCORE_TILE_WIDTH)
+        : -1;
+    const int64_t minScoreWorkspaceWords = alignedSource > 0 &&
+        alignedSource <= INT64_MAX /
+            (STREAMING_A5_AIC_CORE_COUNT * 4)
+        ? (STREAMING_A5_AIC_CORE_COUNT * 4 * alignedSource + 1) / 2
+        : -1;
     const int64_t queueCount = (leases->GetDimNum() == 1) ? leases->GetDim(0) : -1;
     const int64_t privateCapacity = (ready->GetDimNum() == 2) ? ready->GetDim(1) : -1;
     const bool validTransactionInterface =
         rowCount > 0 && sourceCapacity > 0 && queueCount > 0 && privateCapacity > 0 &&
+        tileCount > 0 && rowCount <= INT64_MAX / tileCount &&
         resident->GetDimNum() == 1 && resident->GetDim(0) == rowCount &&
         residentValid->GetDimNum() == 1 && residentValid->GetDim(0) == rowCount &&
         poolEntries->GetDimNum() == 1 && poolEntries->GetDim(0) == rowCount &&
@@ -197,7 +228,13 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
         privatePackedOutput->GetDimNum() == 2 && privatePackedOutput->GetDim(0) > 0 &&
         privatePackedOutput->GetDim(1) == STREAMING_PACKED_KV_ROW_BYTES &&
         control->GetDimNum() == 1 && control->GetDim(0) == STREAMING_KVAF_CONTROL_WORDS &&
-        leases->GetDimNum() == 1 && leases->GetDim(0) == queueCount;
+        leases->GetDimNum() == 1 && leases->GetDim(0) == queueCount &&
+        scoreWorkspace->GetDimNum() == 1 &&
+        scoreWorkspace->GetDim(0) >= minScoreWorkspaceWords &&
+        tileReceipts->GetDimNum() == 2 &&
+        tileReceipts->GetDim(0) == rowCount * tileCount &&
+        tileReceipts->GetDim(1) == STREAMING_TILE_RECEIPT_WORDS &&
+        streamingEpoch->GetDimNum() == 1 && streamingEpoch->GetDim(0) == 1;
     if (!validTransactionInterface) {
         OP_LOGE(context, "streaming transaction tensors do not match the TND/BSND row contract.");
         return ge::GRAPH_FAILED;
@@ -216,6 +253,11 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
     // rows rather than cache-pool or KV-object capacity.
     scoreSourceLens->SetDimNum(1);
     scoreSourceLens->SetDim(0, rowCount);
+    // These are mutation receipts. They alias their graph-static inputs, so
+    // the terminal graph can observe them without making the Get sidecar a
+    // post-C8 dependency; the sidecar polls tile_receipts concurrently.
+    *scoreWorkspaceOut = *scoreWorkspace;
+    *tileReceiptsOut = *tileReceipts;
     OP_LOGD(context->GetNodeName(), "A5StreamingQuantLiGet InferShape end.");
     return ge::GRAPH_SUCCESS;
 }
@@ -236,6 +278,8 @@ static ge::graphStatus InferDataTypeA5StreamingQuantLiGet(
     context->SetOutputDataType(QUEUE_LEASES_OUTPUT_INDEX, ge::DT_INT32);
     context->SetOutputDataType(TELEMETRY_OUTPUT_INDEX, ge::DT_INT64);
     context->SetOutputDataType(SCORE_SOURCE_LENS_OUTPUT_INDEX, ge::DT_INT32);
+    context->SetOutputDataType(SCORE_WORKSPACE_OUTPUT_INDEX, ge::DT_INT32);
+    context->SetOutputDataType(TILE_RECEIPTS_OUTPUT_INDEX, ge::DT_INT64);
     return ge::GRAPH_SUCCESS;
 }
 

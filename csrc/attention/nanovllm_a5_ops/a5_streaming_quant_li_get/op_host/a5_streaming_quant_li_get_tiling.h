@@ -80,6 +80,13 @@ constexpr uint32_t QUEUE_LEASES_INDEX = 19;
 // Per sparse-output row active KV-object prefix.  This is appended rather
 // than inserted so old inputs 0..19 retain their ABI indices.
 constexpr uint32_t KV_OBJECT_LENS_INDEX = 20;
+// Caller-owned score storage and tile receipts.  They are appended after the
+// old 21-input prototype ABI: C8 writes exact uint16 score tiles into the
+// int32-backed storage and, only in publication mode, emits fixed 16-word
+// receipts. The later Get sidecar owns all threshold/queue/HCCP work.
+constexpr uint32_t SCORE_WORKSPACE_INDEX = 21;
+constexpr uint32_t TILE_RECEIPTS_INDEX = 22;
+constexpr uint32_t STREAMING_EPOCH_INDEX = 23;
 
 constexpr uint32_t SPARSE_INDICES_OUTPUT_INDEX = 0;
 constexpr uint32_t SPARSE_VALUES_OUTPUT_INDEX = 1;
@@ -92,6 +99,8 @@ constexpr uint32_t TELEMETRY_OUTPUT_INDEX = 7;
 // Per output row, emitted by the same official C8 ProcessTopK logic that
 // consumes scoreGm.  Its unit is score-source S, not logical KV L.
 constexpr uint32_t SCORE_SOURCE_LENS_OUTPUT_INDEX = 8;
+constexpr uint32_t SCORE_WORKSPACE_OUTPUT_INDEX = 9;
+constexpr uint32_t TILE_RECEIPTS_OUTPUT_INDEX = 10;
 // Attributes Index
 constexpr uint32_t ATTR_QUERY_QUANT_MODE_INDEX = 0;
 constexpr uint32_t ATTR_KEY_QUANT_MODE_INDEX = 1;
@@ -134,6 +143,7 @@ constexpr uint32_t SPARSE_MODE_LOWER = 3;
 constexpr uint32_t METADATA_LIMIT = 1024;
 constexpr uint32_t STREAMING_TELEMETRY_COLUMNS = 13;
 constexpr uint32_t STREAMING_KVAF_CONTROL_WORDS = 16;
+constexpr uint32_t STREAMING_TILE_RECEIPT_WORDS = 16;
 
 // -----------算子TilingData定义---------------
 BEGIN_TILING_DATA_DEF(QLITilingData)
@@ -164,6 +174,9 @@ TILING_DATA_FIELD_DEF(uint32_t, streamingPrivateArenaCapacity)
 TILING_DATA_FIELD_DEF(uint32_t, streamingQueueCount)
 TILING_DATA_FIELD_DEF(uint32_t, streamingTelemetryColumns)
 TILING_DATA_FIELD_DEF(uint32_t, streamingKvafRowsPerEntry)
+TILING_DATA_FIELD_DEF(uint32_t, streamingScoreWorkspaceWords)
+TILING_DATA_FIELD_DEF(uint32_t, streamingTileReceiptCount)
+TILING_DATA_FIELD_DEF(uint32_t, streamingTileReceiptWords)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(A5StreamingQuantLiGet, QLITilingData)
 
@@ -324,6 +337,9 @@ public:
         uint32_t privateArenaCapacity = 0;
         uint32_t queueCount = 0;
         uint32_t kvafRowsPerEntry = 0;
+        uint32_t scoreWorkspaceWords = 0;
+        uint32_t tileReceiptCount = 0;
+        uint32_t tileReceiptWords = 0;
     };
 
     ge::graphStatus DoTiling(

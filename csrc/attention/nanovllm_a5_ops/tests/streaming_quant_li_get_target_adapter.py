@@ -8,21 +8,23 @@ vLLM product route.  It performs one controlled target-NPU comparison:
    real A5 ``VllmQuantLightningIndexer`` reference;
 2. switch the *isolated bridge resolver only* to the separately built
    ``A5StreamingQuantLiGet`` OPP;
-3. run the derived 21-input / 9-output operator with the very same nine C8
+3. run the derived 24-input / 11-output operator with the very same nine C8
    input allocations; and
 4. return the strict dictionary consumed by
    ``test_streaming_quant_li_get_target_equivalence.py``.
 
-The default transaction control deliberately marks its one queue busy.  That
-gives the device hook a structurally valid, graph-shaped transaction ABI while
-preventing it from dereferencing an invented KVAF transport descriptor or
-posting a fabricated H2D request. ``P3_HOOK_CONTROL_MODE=reject_all_busy``
-uses the same safe busy lease table but deliberately invalidates the control
-magic; this proves that hook initialization reached its reject path without
-ever allowing a fabricated H2D post. Therefore this adapter proves target C8
-score/Top-K equivalence, output-alias wiring, exact score-source lengths, and
-the selected safe hook-control path; it does *not* claim Direct-HCCP
-correctness or H2D performance.
+The P3 operator has no inline KVAF/HCCP hook.  Its three build-time publication
+modes are exercised through ``P3_PUBLICATION_MODE``:
+
+* ``off``: original private score workspace, no externally visible change;
+* ``score_workspace``: score DMA targets caller-owned workspace, no receipt;
+* ``publisher``: score workspace plus a fixed 16-word receipt for each score
+  tile, published after that tile's score DMA.
+
+This adapter proves only official C8 Top-K equivalence, output aliases,
+exact score-source lengths, and the selected publication contract.  It does
+not claim that a later sidecar has posted an H2D request or that H2D payloads
+are correct.
 
 Before importing this module, build the two isolated OPPs and set:
 
@@ -67,7 +69,7 @@ PACKED_KV_ROW_BYTES = 656
 QUEUE_COUNT = 1
 PRIVATE_ARENA_CAPACITY = 1
 STREAMING_CONTROL_WORDS = 16
-STREAMING_CONTROL_MAGIC = 0x4B5641465354524D  # "KVAFSTRM"
+STREAMING_CONTROL_MAGIC = 0x4B5641465354524D  # Legacy ABI placeholder only.
 STREAMING_CONTROL_VERSION = 1
 INT64_MAX = (1 << 63) - 1
 REFERENCE_OPP_ENV = "NANOVLLM_A5_REFERENCE_C8_OPP"
@@ -78,14 +80,29 @@ REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
 TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"
 REFERENCE_OPAPI_ENV = "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"
 TARGET_NPU_ENV = "P3_NPU_ID"
+PUBLICATION_MODE_ENV = "P3_PUBLICATION_MODE"
+PUBLICATION_MODES = ("off", "score_workspace", "publisher")
+PUBLICATION_MODE_TO_BUILD_VALUE = {
+    "off": "0",
+    "score_workspace": "1",
+    "publisher": "2",
+}
+SCORE_WORKSPACE_SENTINEL = -0x3A5A5A5A
+TILE_RECEIPT_SENTINEL = -1
+TILE_RECEIPT_WORDS = 16
+TILE_SCORE_WIDTH = 128
+TILE_RECEIPT_CONTRACT_VERSION = 1
+STREAMING_EPOCH = 0x50330001
+# The A5 950 reference target has 36 AICs.  This is the same capacity formula
+# used by the P3 tiler: four score rows per AIC and uint16 scores packed into
+# int32 workspace elements.  Keeping it explicit makes an incompatible target
+# fail before an ACLNN launch instead of under-allocating GM silently.
+A5_AIC_CORE_COUNT = 36
+# Compatibility exports for legacy P4 scripts. They are deliberately no
+# longer consumed by this strict P3 adapter.
 HOOK_CONTROL_MODE_ENV = "P3_HOOK_CONTROL_MODE"
 HOOK_CONTROL_MODE_ALL_BUSY = "valid_all_busy"
 HOOK_CONTROL_MODE_REJECT_BUSY = "reject_all_busy"
-# This is intentionally opt-in and diagnostic-only.  Normal P3 validation
-# must load a hook-on OPP because the product path needs score-time Get
-# observation.  The one hook-off artifact is a binary-isolation tool: it tells
-# us whether merely compiling the hook changes official C8 math, even when no
-# queue is ever leased and no H2D can be posted.
 ALLOW_HOOK_OFF_BASELINE_ENV = "P3_ALLOW_HOOK_OFF_BASELINE"
 NO_POST_TRANSACTION_NAMES = (
     "private_source_to_slot",
@@ -255,10 +272,35 @@ def _expected_target_hook_mode() -> tuple[str, bool]:
     )
 
 
+def _resolve_publication_mode() -> str:
+    """Return the explicit build-time publication mode under test.
+
+    The mode belongs to the separately built OPP binary, not to a runtime
+    branch. The provenance manifest must match this value exactly.
+    """
+    mode = os.getenv(PUBLICATION_MODE_ENV)
+    if mode not in PUBLICATION_MODES:
+        raise RuntimeError(
+            f"set {PUBLICATION_MODE_ENV} to one of {PUBLICATION_MODES}; "
+            f"got {mode!r}"
+        )
+    return mode
+
+
 def _read_target_provenance(
-    vendor: Path, expected_hook_mode: str
+    vendor: Path, expected_publication_mode: str
 ) -> dict[str, str]:
-    """Reject a stale P3 OPP or an unexpected hook compilation mode."""
+    """Reject a stale P3 OPP or mismatched publication binary.
+
+    Passing legacy ``on``/``off`` hook modes fails closed instead of allowing
+    an inline-HCCP artifact to masquerade as this publication ABI.
+    """
+    if expected_publication_mode not in PUBLICATION_MODES:
+        raise RuntimeError(
+            "legacy inline-HCCP provenance is incompatible with the P3 "
+            "publication ABI; use P3_PUBLICATION_MODE=off, "
+            "score_workspace, or publisher"
+        )
     path = vendor / TARGET_PROVENANCE_NAME
     if not path.is_file():
         raise RuntimeError(
@@ -274,14 +316,15 @@ def _read_target_provenance(
         "source_root",
         "source_head",
         "source_clean",
-        "hook_mode",
         "operators",
+        "publication_mode",
     )
     missing = tuple(key for key in required if not values.get(key))
     if missing:
         raise RuntimeError(
             "isolated P3 target provenance is incomplete: "
-            f"path={path} missing={missing}"
+            f"path={path} missing={missing}; rebuild with the publication "
+            "aware P3 OPP build script"
         )
     if values["kind"] != "source_derived_streaming_quant_li_get":
         raise RuntimeError(
@@ -299,12 +342,20 @@ def _read_target_provenance(
             "isolated P3 target OPP was not built from a tracked-clean source "
             f"worktree: source_clean={values['source_clean']!r}"
         )
-    if values["hook_mode"] != expected_hook_mode:
+    if values["publication_mode"] != expected_publication_mode:
         raise RuntimeError(
-            "isolated P3 target OPP has an unexpected hook compilation mode: "
-            f"actual={values['hook_mode']!r} expected={expected_hook_mode!r}; "
-            f"set {ALLOW_HOOK_OFF_BASELINE_ENV}=1 only for the diagnostic "
-            "hook-off mathematical baseline"
+            "isolated P3 target OPP has an unexpected publication mode: "
+            f"actual={values['publication_mode']!r} "
+            f"expected={expected_publication_mode!r}"
+        )
+    build_value = values.get("publication_mode_value")
+    expected_value = PUBLICATION_MODE_TO_BUILD_VALUE[expected_publication_mode]
+    if build_value and build_value != expected_value:
+        raise RuntimeError(
+            "isolated P3 target provenance maps publication mode to the "
+            "wrong compile-time value: "
+            f"mode={expected_publication_mode!r} actual={build_value!r} "
+            f"expected={expected_value!r}"
         )
     return values
 
@@ -710,6 +761,193 @@ def _prove_safe_hook_control(
     )
 
 
+def _make_static_transaction(
+    device: torch.device, row_count: int
+) -> dict[str, torch.Tensor]:
+    """Allocate shape-valid sidecar state without an inline transport contract.
+
+    The P3 score producer does not read or write these resources.  They remain
+    appended graph ABI inputs for the later independent Get sidecar, so this
+    test supplies stable allocations and checks their aliases, but never
+    manufactures a queue descriptor or treats them as a no-post proof.
+    """
+    if row_count != BATCH_SIZE:
+        raise RuntimeError(
+            f"fixed C8 fixture requires row_count={BATCH_SIZE}, got {row_count}"
+        )
+    pool_rows = BATCH_SIZE
+    return {
+        "resident_threshold": torch.zeros(row_count, dtype=torch.int32, device=device),
+        "resident_threshold_valid": torch.zeros(
+            row_count, dtype=torch.int32, device=device
+        ),
+        "kv_object_slots_snapshot": torch.full(
+            (pool_rows, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
+        ),
+        "req_pool_entries": torch.arange(
+            row_count, dtype=torch.int32, device=device
+        ),
+        "kv_object_map": torch.arange(
+            SOURCE_TOKENS, dtype=torch.int32, device=device
+        ).repeat(pool_rows, 1).contiguous(),
+        "private_source_to_slot": torch.full(
+            (row_count, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
+        ),
+        "private_ready_table": torch.zeros(
+            (QUEUE_COUNT, PRIVATE_ARENA_CAPACITY), dtype=torch.int32, device=device
+        ),
+        "private_arena_head": torch.zeros(QUEUE_COUNT, dtype=torch.int32, device=device),
+        "private_packed_output": torch.full(
+            (QUEUE_COUNT * PRIVATE_ARENA_CAPACITY, PACKED_KV_ROW_BYTES),
+            0xA5,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "queue_control": torch.zeros(
+            STREAMING_CONTROL_WORDS, dtype=torch.int64, device=device
+        ),
+        "queue_leases": torch.zeros(QUEUE_COUNT, dtype=torch.int32, device=device),
+        "kv_object_lens": torch.tensor(
+            (SOURCE_TOKENS, SOURCE_TOKENS - BLOCK_SIZE),
+            dtype=torch.int32,
+            device=device,
+        ),
+    }
+
+
+def _score_workspace_words(source_tokens: int) -> int:
+    aligned = ((source_tokens + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH) * TILE_SCORE_WIDTH
+    return (A5_AIC_CORE_COUNT * 4 * aligned + 1) // 2
+
+
+def _make_publication_buffers(device: torch.device) -> dict[str, torch.Tensor]:
+    score_words = _score_workspace_words(SOURCE_TOKENS)
+    receipt_rows = BATCH_SIZE * ((SOURCE_TOKENS + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH)
+    return {
+        "score_workspace": torch.full(
+            (score_words,), SCORE_WORKSPACE_SENTINEL, dtype=torch.int32, device=device
+        ),
+        "tile_receipts": torch.full(
+            (receipt_rows, TILE_RECEIPT_WORDS),
+            TILE_RECEIPT_SENTINEL,
+            dtype=torch.int64,
+            device=device,
+        ),
+        "streaming_epoch": torch.tensor(
+            (STREAMING_EPOCH,), dtype=torch.int64, device=device
+        ),
+    }
+
+
+def _assert_publication_contract(
+    mode: str, publication: dict[str, torch.Tensor]
+) -> dict[str, int | str]:
+    """Validate the score workspace and fixed-slot publication ABI after sync."""
+    score = publication["score_workspace"].detach().cpu().contiguous()
+    receipts = publication["tile_receipts"].detach().cpu().contiguous()
+    epoch = int(publication["streaming_epoch"].detach().cpu().item())
+    if epoch <= 0:
+        raise RuntimeError(
+            "streaming_epoch must be a nonzero forward generation; a zero or "
+            "reused epoch can make a stale receipt appear ready"
+        )
+    score_changed = int(bool(torch.any(score != SCORE_WORKSPACE_SENTINEL).item()))
+    ready = receipts[:, 8] == epoch
+    ready_count = int(torch.count_nonzero(ready).item())
+    untouched = receipts[~ready]
+
+    if mode == "off":
+        if score_changed or ready_count:
+            raise RuntimeError(
+                "publication=off changed graph-visible score/receipt buffers: "
+                f"score_changed={score_changed} ready_count={ready_count}"
+            )
+        if not bool(torch.all(untouched == TILE_RECEIPT_SENTINEL).item()):
+            raise RuntimeError("publication=off changed an unwritten receipt slot")
+        return {
+            "mode": mode,
+            "score_workspace_changed": score_changed,
+            "receipt_ready_count": ready_count,
+            "receipt_expected_active": 0,
+        }
+
+    if not score_changed:
+        raise RuntimeError(f"publication={mode} did not write score_workspace")
+    if mode == "score_workspace":
+        if ready_count:
+            raise RuntimeError(
+                "publication=score_workspace wrote a tile receipt: "
+                f"ready_count={ready_count}"
+            )
+        if not bool(torch.all(untouched == TILE_RECEIPT_SENTINEL).item()):
+            raise RuntimeError("publication=score_workspace changed an unwritten receipt")
+        return {
+            "mode": mode,
+            "score_workspace_changed": score_changed,
+            "receipt_ready_count": ready_count,
+            "receipt_expected_active": 0,
+        }
+
+    if mode != "publisher":
+        raise AssertionError(f"unexpected publication mode {mode!r}")
+    source_lens = (SOURCE_TOKENS, SOURCE_TOKENS - BLOCK_SIZE)
+    tiles_per_row = SOURCE_TOKENS // TILE_SCORE_WIDTH
+    expected_active = sum(
+        (source_len + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH
+        for source_len in source_lens
+    )
+    if ready_count not in (expected_active, BATCH_SIZE * tiles_per_row):
+        raise RuntimeError(
+            "publisher receipt count is neither active-tile nor full-grid: "
+            f"ready_count={ready_count} active={expected_active} "
+            f"grid={BATCH_SIZE * tiles_per_row}"
+        )
+    for row, source_len in enumerate(source_lens):
+        active_tiles = (source_len + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH
+        for tile in range(active_tiles):
+            slot = row * tiles_per_row + tile
+            record = receipts[slot]
+            if int(record[8].item()) != epoch:
+                raise RuntimeError(
+                    "publisher omitted a required fixed receipt slot: "
+                    f"row={row} tile={tile} slot={slot}"
+                )
+            expected_valid = min(TILE_SCORE_WIDTH, source_len - tile * TILE_SCORE_WIDTH)
+            if (
+                int(record[1].item()) != row
+                or int(record[2].item()) != tile * TILE_SCORE_WIDTH
+                or int(record[3].item()) != expected_valid
+                or int(record[4].item()) != SOURCE_TOKENS
+                or int(record[7].item()) != TILE_RECEIPT_CONTRACT_VERSION
+            ):
+                raise RuntimeError(
+                    "publisher receipt descriptor mismatch: "
+                    f"slot={slot} record={record.tolist()}"
+                )
+            byte_offset = int(record[0].item())
+            if byte_offset < 0 or byte_offset % 2 or byte_offset >= score.numel() * 4:
+                raise RuntimeError(
+                    "publisher receipt score byte offset is out of score_workspace: "
+                    f"slot={slot} offset={byte_offset} bytes={score.numel() * 4}"
+                )
+            if not bool(torch.all(record[9:] == 0).item()):
+                raise RuntimeError(
+                    f"publisher receipt has a nonzero ready-line tail at slot={slot}")
+    for slot in range(receipts.shape[0]):
+        if int(receipts[slot, 8].item()) == epoch:
+            continue
+        if not bool(torch.all(receipts[slot] == TILE_RECEIPT_SENTINEL).item()):
+            raise RuntimeError(
+                f"publisher changed a receipt without the expected epoch at slot={slot}"
+            )
+    return {
+        "mode": mode,
+        "score_workspace_changed": score_changed,
+        "receipt_ready_count": ready_count,
+        "receipt_expected_active": expected_active,
+    }
+
+
 def _expected_score_source_lens(device: torch.device) -> torch.Tensor:
     """Independent decode-TND reconstruction of official C8's valid S bound.
 
@@ -735,10 +973,8 @@ def run_target_equivalence() -> dict[str, Any]:
     target_opapi, target_vendor = _resolve_single_opp(
         os.getenv(TARGET_OPP_ENV), "target"
     )
-    expected_hook_mode, hook_off_baseline = _expected_target_hook_mode()
-    target_provenance = _read_target_provenance(
-        target_vendor, expected_hook_mode
-    )
+    publication_mode = _resolve_publication_mode()
+    target_provenance = _read_target_provenance(target_vendor, publication_mode)
     # CANN discovers the binary config for an op on its first ACLNN call.  Both
     # OPP vendors must be visible before either the reference or P3 target
     # executes; switching this path after the reference is too late.
@@ -754,8 +990,8 @@ def run_target_equivalence() -> dict[str, Any]:
         f"source_head={target_provenance['source_head']} "
         f"expected_head={os.getenv(TARGET_EXPECTED_HEAD_ENV, '<unset>')} "
         f"source_clean={target_provenance['source_clean']} "
-        f"hook_mode={target_provenance['hook_mode']} "
-        f"baseline_only={int(hook_off_baseline)} ready=1 "
+        f"publication_mode={target_provenance['publication_mode']} "
+        "inline_hccp=absent ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
         flush=True,
     )
@@ -782,17 +1018,21 @@ def run_target_equivalence() -> dict[str, Any]:
             "torch.ops.a5_streaming_quant_li_get.streaming_quant_li_get"
         )
 
-    row_count = BATCH_SIZE
-    control_mode = _resolve_hook_control_mode()
-    transaction = _make_no_post_transaction(device, row_count, control_mode)
-    transaction_snapshot = _snapshot_no_post_transaction(transaction)
+    transaction = _make_static_transaction(device, BATCH_SIZE)
+    publication = _make_publication_buffers(device)
+    static_sidecar_before = {
+        name: transaction[name].detach().cpu().contiguous().clone()
+        for name in NO_POST_TRANSACTION_NAMES
+    }
     print(
         "P3_STREAMING_LI_GET_TARGET_ADAPTER "
         f"device={device} physical_npu={device.index} "
         f"batch={BATCH_SIZE} source_tokens={SOURCE_TOKENS} "
         f"heads={INDEX_HEADS} metadata_words={inputs['metadata'].numel()} "
         f"reference_opapi={reference_opapi} target_opapi={target_opapi} "
-        f"queue_mode={control_mode} "
+        f"publication_mode={publication_mode} "
+        f"score_workspace_words={publication['score_workspace'].numel()} "
+        f"tile_receipt_rows={publication['tile_receipts'].shape[0]} "
         "product_route=disabled h2d_result=not_exercised",
         flush=True,
     )
@@ -820,6 +1060,9 @@ def run_target_equivalence() -> dict[str, Any]:
         transaction["queue_control"],
         transaction["queue_leases"],
         transaction["kv_object_lens"],
+        publication["score_workspace"],
+        publication["tile_receipts"],
+        publication["streaming_epoch"],
         kv_object_domain=0,
         query_quant_mode=0,
         key_quant_mode=0,
@@ -840,9 +1083,10 @@ def run_target_equivalence() -> dict[str, Any]:
         f"elapsed_ms={(monotonic() - derived_started) * 1000.0:.3f}",
         flush=True,
     )
-    if not isinstance(outputs, tuple) or len(outputs) != 9:
+    if not isinstance(outputs, tuple) or len(outputs) != 11:
         raise RuntimeError(
-            "derived A5StreamingQuantLiGet did not return its 9-output ABI"
+            "derived A5StreamingQuantLiGet did not return its 11-output ABI; "
+            "rebuild the isolated target bridge for 24 inputs / 11 outputs"
         )
     print("P3_DERIVED_STAGE stage=synchronize_begin", flush=True)
     torch.npu.synchronize()
@@ -851,12 +1095,25 @@ def run_target_equivalence() -> dict[str, Any]:
         f"elapsed_ms={(monotonic() - derived_started) * 1000.0:.3f}",
         flush=True,
     )
-    _prove_safe_hook_control(
-        outputs,
-        transaction,
-        transaction_snapshot,
-        control_mode,
-        expected_hook_mode,
+    changed_static = [
+        name
+        for name, before in static_sidecar_before.items()
+        if not torch.equal(transaction[name].detach().cpu().contiguous(), before)
+    ]
+    if changed_static:
+        raise RuntimeError(
+            "C8 score producer changed a static sidecar allocation: "
+            f"changed={','.join(changed_static)}"
+        )
+    publication_summary = _assert_publication_contract(publication_mode, publication)
+    print(
+        "P3_PUBLICATION_PROOF "
+        f"mode={publication_summary['mode']} "
+        f"score_workspace_changed={publication_summary['score_workspace_changed']} "
+        f"receipt_ready_count={publication_summary['receipt_ready_count']} "
+        f"receipt_expected_active={publication_summary['receipt_expected_active']} "
+        "post_kernel_receipt=verified inline_hccp=absent",
+        flush=True,
     )
 
     return {
@@ -891,6 +1148,11 @@ def run_target_equivalence() -> dict[str, Any]:
             ),
             "queue_leases": (transaction["queue_leases"], outputs[6]),
         },
+        "publication_aliases": {
+            "score_workspace": (publication["score_workspace"], outputs[9]),
+            "tile_receipts": (publication["tile_receipts"], outputs[10]),
+        },
+        "publication_summary": publication_summary,
         # A5 C8 rejects return_value=True in the reference tiling, so this
         # first real target proof deliberately compares only sparse indices.
         "official_values": None,

@@ -73,6 +73,9 @@ public:
                                 __gm__ uint8_t *queueControl,
                                 __gm__ uint8_t *queueLeases,
                                 __gm__ uint8_t *kvObjectLens,
+                                __gm__ uint8_t *scoreWorkspace,
+                                __gm__ uint8_t *tileReceipts,
+                                __gm__ uint8_t *streamingEpoch,
                                 __gm__ uint8_t *sparseIndices,
                                 __gm__ uint8_t *sparseValues,
                                 __gm__ uint8_t *privateSourceToSlotOut,
@@ -82,6 +85,8 @@ public:
                                 __gm__ uint8_t *queueLeasesOut,
                                 __gm__ uint8_t *telemetry,
                                 __gm__ uint8_t *scoreSourceLens,
+                                __gm__ uint8_t *scoreWorkspaceOut,
+                                __gm__ uint8_t *tileReceiptsOut,
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
 
@@ -408,6 +413,9 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
                                               __gm__ uint8_t *queueControl,
                                               __gm__ uint8_t *queueLeases,
                                               __gm__ uint8_t *kvObjectLens,
+                                              __gm__ uint8_t *scoreWorkspace,
+                                              __gm__ uint8_t *tileReceipts,
+                                              __gm__ uint8_t *streamingEpoch,
                                               __gm__ uint8_t *sparseIndices,
                                               __gm__ uint8_t *sparseValues,
                                               __gm__ uint8_t *privateSourceToSlotOut,
@@ -417,6 +425,8 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
                                               __gm__ uint8_t *queueLeasesOut,
                                               __gm__ uint8_t *telemetry,
                                               __gm__ uint8_t *scoreSourceLens,
+                                              __gm__ uint8_t *scoreWorkspaceOut,
+                                              __gm__ uint8_t *tileReceiptsOut,
                                               __gm__ uint8_t *workspace,
                                               const QLITilingData *__restrict tiling, TPipe *tPipe)
 {
@@ -437,13 +447,18 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
 
     pipe = tPipe;
 
-    uint64_t offset = 0;
-    //vec 把整个s2的score存储在GM，大小为s1BaseSize * 16K * 4
+    // Vector lanes write the exact uint16 C8 score tile.  Mode 0 retains the
+    // original private C8 workspace. Modes 1/2 switch only this base address
+    // to graph-visible storage; score arithmetic and ProcessTopK are shared.
     GlobalTensor<SCORE_T> scoreGm; //存放vec核写出的score
     if ASCEND_IS_AIV {
         uint64_t singleCoreScoreSize = constInfo.s1BaseSize * QLICommon::Align((uint64_t)constInfo.kSeqSize, (uint64_t)constInfo.s2BaseSize)  * sizeof(SCORE_T);
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 1
+        scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(scoreWorkspace +
+            aiCoreIdx * singleCoreScoreSize));
+#else
         scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + aiCoreIdx * singleCoreScoreSize));
-        offset += GetBlockNum() * singleCoreScoreSize;
+#endif
     }
 
     if ASCEND_IS_AIV {
@@ -457,7 +472,24 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         scoreSourceLensGm.SetGlobalBuffer((__gm__ int32_t *)scoreSourceLens);
         vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, blockTableGm);
         vectorService.InitVecWorkspaceTensor(scoreGm);
+        // This A5 implementation fixes one C8 score tile at 128 source
+        // positions. Host receipt allocation uses the same fail-closed
+        // constant; changing either side requires an ABI revision.
+        static_assert(S2_BASE_SIZE == 128,
+                      "A5 score-tile receipt ABI requires S2_BASE_SIZE=128");
+        vectorService.InitScoreWorkspaceBase(
+            static_cast<uint64_t>(aiCoreIdx) * constInfo.s1BaseSize *
+            QLICommon::Align(static_cast<uint64_t>(constInfo.kSeqSize),
+                             static_cast<uint64_t>(constInfo.s2BaseSize)) *
+            sizeof(SCORE_T));
         vectorService.InitScoreSourceLensOutput(scoreSourceLensGm);
+#if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
+        GlobalTensor<int64_t> tileReceiptsGm;
+        GlobalTensor<int64_t> streamingEpochGm;
+        tileReceiptsGm.SetGlobalBuffer((__gm__ int64_t *)tileReceipts);
+        streamingEpochGm.SetGlobalBuffer((__gm__ int64_t *)streamingEpoch);
+        vectorService.InitScoreTileReceipts(tileReceiptsGm, streamingEpochGm);
+#endif
     } else {
         matmulService.InitParams(constInfo);
         queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
@@ -468,25 +500,30 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm);
     }
     InitBuffers();
-    #if A5_STREAMING_LI_GET_ENABLE_HOOK
-    if ASCEND_IS_AIV {
-        // `sparseValues` and the two receipt outputs are graph aliases in
-        // this isolated prototype. The mutable transaction resources are the
-        // corresponding inputs; no full-map copy is permitted inside LI.
-        (void)sparseValues;
-        (void)privateSourceToSlotOut;
-        (void)privateReadyTableOut;
-        (void)privateArenaHeadOut;
-        (void)privatePackedOutputOut;
-        (void)queueLeasesOut;
-        vectorService.InitStreamingKvafHook(
-            residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
-            reqPoolEntries,
-            kvObjectMap, privateSourceToSlot, privateReadyTable,
-            privateArenaHead, privatePackedOutput, queueControl, queueLeases,
-            kvObjectLens, telemetry, tiling);
-    }
-    #endif
+    // The old inline Direct-HCCP hook was intentionally removed.  These
+    // transaction resources are retained in the appended ABI for the later
+    // independent sidecar, not read by C8's score/TopK producer.
+    (void)residentThreshold;
+    (void)residentThresholdValid;
+    (void)kvObjectSlotsSnapshot;
+    (void)reqPoolEntries;
+    (void)kvObjectMap;
+    (void)privateSourceToSlot;
+    (void)privateReadyTable;
+    (void)privateArenaHead;
+    (void)privatePackedOutput;
+    (void)queueControl;
+    (void)queueLeases;
+    (void)kvObjectLens;
+    (void)sparseValues;
+    (void)privateSourceToSlotOut;
+    (void)privateReadyTableOut;
+    (void)privateArenaHeadOut;
+    (void)privatePackedOutputOut;
+    (void)queueLeasesOut;
+    (void)telemetry;
+    (void)scoreWorkspaceOut;
+    (void)tileReceiptsOut;
 }
 
 template <typename QLIT>
@@ -687,14 +724,6 @@ __aicore__ inline void QLIPreload<QLIT>::ProcessMain()
 
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
-        #if A5_STREAMING_LI_GET_ENABLE_HOOK
-        // FreeEventID owns the final official C8 TOPK_MTE3_V_EVENT.  Only
-        // after it drains that sparse-index DMA may the fused Direct-HCCP
-        // path terminally poll/release its optional wave.  This preserves the
-        // official event token count while still overlapping the final Get
-        // with score-GM TopK work above.
-        vectorService.FinishStreamingKvafHook();
-        #endif
     } else {
         matmulService.FreeEventID();
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 0);

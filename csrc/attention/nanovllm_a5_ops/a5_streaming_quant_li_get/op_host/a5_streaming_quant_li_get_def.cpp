@@ -144,6 +144,28 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
+        // C8 writes exact uint16 scores through this int32-backed
+        // graph-static allocation. It is intentionally separate from CANN's
+        // private workspace so an independent Get sidecar can consume the
+        // same raw-score representation without recomputation.
+        this->Input("score_workspace")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
+        // One fixed [16]int64 slot per (output row, score tile). The producer
+        // writes its epoch in the second cache line only after score and
+        // descriptor lines are enqueued on MTE3.
+        this->Input("tile_receipts")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("streaming_epoch")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         this->Output("sparse_values").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
         // These two outputs are transaction receipts, aliasing the caller's
@@ -159,6 +181,8 @@ public:
         // this per-output-row score-source length.  Reconcile must consume
         // it rather than infer compressed-S2 lengths on the host.
         this->Output("score_source_lens").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
+        this->Output("score_workspace_out").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
+        this->Output("tile_receipts_out").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
         this->Attr("query_quant_mode").AttrType(REQUIRED).Int(0);  // 0: 默认值，per-token-head
         this->Attr("key_quant_mode").AttrType(REQUIRED).Int(0);    // 0: 默认值，per-token-head
         // Product decode calls C8 with TND query plus paged PA_BSND key.
@@ -294,6 +318,21 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
+        aicore_config_950.Input("score_workspace")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
+        aicore_config_950.Input("tile_receipts")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
+        aicore_config_950.Input("streaming_epoch")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
         aicore_config_950.Output("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("sparse_values").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("private_source_to_slot_out").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
@@ -303,6 +342,8 @@ public:
         aicore_config_950.Output("queue_leases_out").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("telemetry").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
         aicore_config_950.Output("score_source_lens").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
+        aicore_config_950.Output("score_workspace_out").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
+        aicore_config_950.Output("tile_receipts_out").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
         aicore_config_950.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)
             .DynamicRankSupportFlag(true)

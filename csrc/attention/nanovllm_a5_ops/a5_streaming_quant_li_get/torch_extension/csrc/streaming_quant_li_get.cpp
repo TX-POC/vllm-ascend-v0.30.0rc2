@@ -23,6 +23,9 @@ constexpr int64_t kControlWords = 16;
 constexpr int64_t kTelemetryColumns = 13;
 constexpr int64_t kPackedKvRowBytes = 656;
 constexpr int64_t kMaxSourceCapacity = 1 << 18;
+constexpr int64_t kAicCoreCount = 36;
+constexpr int64_t kScoreTileWidth = 128;
+constexpr int64_t kTileReceiptWords = 16;
 // Test-only marker.  The normal/product path keeps the output allocation
 // unmodified.  When the environment switch below is enabled, the marker lets
 // a target bring-up distinguish "the AICore never wrote out8" from "AICore
@@ -32,7 +35,7 @@ constexpr int32_t kScoreSourceLensDebugSentinel = -123456789;
 
 using Result = std::tuple<
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-    at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
 
 bool DebugEnabled()
 {
@@ -94,6 +97,18 @@ int64_t ProductExceptLast(const at::Tensor& tensor)
     return rows;
 }
 
+int64_t ScoreWorkspaceWords(int64_t sourceCapacity)
+{
+    TORCH_CHECK(sourceCapacity > 0 && sourceCapacity <= kMaxSourceCapacity,
+                "source capacity is outside the fixed A5 score-workspace range.");
+    const int64_t alignedSource =
+        ((sourceCapacity + kScoreTileWidth - 1) / kScoreTileWidth) *
+        kScoreTileWidth;
+    // The source-derived A5 C8 uses 36 AICs and four score rows per AIC.
+    // Each int32 slot backs two uint16 official sortable scores.
+    return (kAicCoreCount * 4 * alignedSource + 1) / 2;
+}
+
 std::vector<int64_t> SparseOutputShape(
     const at::Tensor& query, const at::Tensor& key,
     const std::string& layoutQuery, const std::string& layoutKey)
@@ -140,6 +155,8 @@ void CheckInputs(
     const at::Tensor& privateReadyTable, const at::Tensor& privateArenaHead,
     const at::Tensor& privatePackedOutput, const at::Tensor& queueControl,
     const at::Tensor& queueLeases, const at::Tensor& kvObjectLens,
+    const at::Tensor& scoreWorkspace, const at::Tensor& tileReceipts,
+    const at::Tensor& streamingEpoch,
     const std::string& layoutQuery, const std::string& layoutKey,
     int64_t sparseCount, int64_t cmpRatio, int64_t kvafRowsPerEntry,
     int64_t kvObjectDomain)
@@ -169,6 +186,9 @@ void CheckInputs(
              {&privatePackedOutput, "private_packed_output"},
              {&queueControl, "queue_control"}, {&queueLeases, "queue_leases"},
              {&kvObjectLens, "kv_object_lens"},
+             {&scoreWorkspace, "score_workspace"},
+             {&tileReceipts, "tile_receipts"},
+             {&streamingEpoch, "streaming_epoch"},
          }) {
         CheckSameNpu(query, *pair.first, pair.second, true);
     }
@@ -198,6 +218,11 @@ void CheckInputs(
     TORCH_CHECK(privatePackedOutput.scalar_type() == at::kByte &&
                     queueControl.scalar_type() == at::kLong,
                 "private_packed_output must be uint8 and queue_control int64.");
+    TORCH_CHECK(scoreWorkspace.scalar_type() == at::kInt,
+                "score_workspace must be int32.");
+    TORCH_CHECK(tileReceipts.scalar_type() == at::kLong &&
+                    streamingEpoch.scalar_type() == at::kLong,
+                "tile_receipts and streaming_epoch must be int64.");
     TORCH_CHECK(sparseCount == kSparseCount,
                 "the source-derived C8 LI is fixed to sparse_count=2048.");
     TORCH_CHECK(cmpRatio == 1 || cmpRatio == 4 || cmpRatio == 128,
@@ -249,6 +274,18 @@ void CheckInputs(
                 "private arena aliases do not meet the queue-by-row ABI.");
     TORCH_CHECK(queueControl.dim() == 1 && queueControl.numel() == kControlWords,
                 "queue_control must be int64[16].");
+    const int64_t sourceCapacity = kvObjectMap.size(1);
+    const int64_t tileCount =
+        (sourceCapacity + kScoreTileWidth - 1) / kScoreTileWidth;
+    TORCH_CHECK(scoreWorkspace.dim() == 1 &&
+                    scoreWorkspace.numel() >= ScoreWorkspaceWords(sourceCapacity),
+                "score_workspace must be int32[>=36*4*aligned_source/2].");
+    TORCH_CHECK(tileReceipts.dim() == 2 &&
+                    tileReceipts.size(0) == rowCount * tileCount &&
+                    tileReceipts.size(1) == kTileReceiptWords,
+                "tile_receipts must be int64[R*ceil(S/128),16].");
+    TORCH_CHECK(streamingEpoch.dim() == 1 && streamingEpoch.numel() == 1,
+                "streaming_epoch must be int64[1].");
 }
 
 Result AllocateAndLaunch(
@@ -264,6 +301,8 @@ Result AllocateAndLaunch(
     at::Tensor privateReadyTable, at::Tensor privateArenaHead,
     at::Tensor privatePackedOutput, const at::Tensor& queueControl,
     at::Tensor queueLeases, const at::Tensor& kvObjectLens,
+    at::Tensor scoreWorkspace, at::Tensor tileReceipts,
+    const at::Tensor& streamingEpoch,
     int64_t queryQuantMode, int64_t keyQuantMode,
     const std::string& layoutQuery, const std::string& layoutKey,
     int64_t sparseCount, int64_t sparseMode, int64_t preTokens,
@@ -276,7 +315,8 @@ Result AllocateAndLaunch(
                 residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,
                 kvObjectMap, privateSourceToSlot, privateReadyTable,
                 privateArenaHead, privatePackedOutput, queueControl, queueLeases,
-                kvObjectLens, layoutQuery, layoutKey, sparseCount, cmpRatio,
+                kvObjectLens, scoreWorkspace, tileReceipts, streamingEpoch,
+                layoutQuery, layoutKey, sparseCount, cmpRatio,
                 kvafRowsPerEntry, kvObjectDomain);
     const std::vector<int64_t> sparseShape =
         SparseOutputShape(query, key, layoutQuery, layoutKey);
@@ -301,9 +341,11 @@ Result AllocateAndLaunch(
     auto privateArenaHeadOut = privateArenaHead;
     auto privatePackedOutputOut = privatePackedOutput;
     auto queueLeasesOut = queueLeases;
+    auto scoreWorkspaceOut = scoreWorkspace;
+    auto tileReceiptsOut = tileReceipts;
     if (DebugEnabled()) {
         std::fprintf(stderr,
-                     "P3_LI_ACLNN_CALL inputs=21 outputs=9 rows=%lld "
+                     "P3_LI_ACLNN_CALL inputs=24 outputs=11 rows=%lld "
                      "sparse_shape=%s cmp_ratio=%lld return_values=%d\n",
                      static_cast<long long>(rowCount),
                      ShapeString(sparseIndices.sizes()).c_str(),
@@ -323,9 +365,14 @@ Result AllocateAndLaunch(
                  {"in14.private_source_to_slot", &privateSourceToSlot},
                  {"in17.private_packed_output", &privatePackedOutput},
                  {"in20.kv_object_lens", &kvObjectLens},
+                 {"in21.score_workspace", &scoreWorkspace},
+                 {"in22.tile_receipts", &tileReceipts},
+                 {"in23.streaming_epoch", &streamingEpoch},
                  {"out0.sparse_indices", &sparseIndices},
                  {"out7.telemetry", &telemetry},
                  {"out8.score_source_lens", &scoreSourceLens},
+                 {"out9.score_workspace_out", &scoreWorkspaceOut},
+                 {"out10.tile_receipts_out", &tileReceiptsOut},
              }) {
             LogTensor(item.first, *item.second);
         }
@@ -341,9 +388,11 @@ Result AllocateAndLaunch(
         residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,
         kvObjectMap, privateSourceToSlot, privateReadyTable,
         privateArenaHead, privatePackedOutput, queueControl, queueLeases,
-        kvObjectLens, sparseIndices, sparseValues, privateSourceToSlotOut,
+        kvObjectLens, scoreWorkspace, tileReceipts, streamingEpoch,
+        sparseIndices, sparseValues, privateSourceToSlotOut,
         privateReadyTableOut, privateArenaHeadOut, privatePackedOutputOut,
-        queueLeasesOut, telemetry, scoreSourceLens);
+        queueLeasesOut, telemetry, scoreSourceLens, scoreWorkspaceOut,
+        tileReceiptsOut);
     // The public Torch schema puts the required kv_object_domain before the
     // optional C8 attributes. The generated CANN ABI is separately fixed:
     // ACLNN ABI keeps kvObjectDomain after kvafRowsPerEntry. Keep this
@@ -356,17 +405,19 @@ Result AllocateAndLaunch(
         residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,
         kvObjectMap, privateSourceToSlot, privateReadyTable,
         privateArenaHead, privatePackedOutput, queueControl, queueLeases,
-        kvObjectLens, queryQuantMode, keyQuantMode, layoutQueryPtr,
+        kvObjectLens, scoreWorkspace, tileReceipts, streamingEpoch,
+        queryQuantMode, keyQuantMode, layoutQueryPtr,
         layoutKeyPtr, sparseCount, sparseMode, preTokens, nextTokens, cmpRatio,
         returnValues, stride, scaleStride, kvafRowsPerEntry, kvObjectDomain,
         sparseIndices,
         sparseValues, privateSourceToSlotOut, privateReadyTableOut,
         privateArenaHeadOut, privatePackedOutputOut, queueLeasesOut, telemetry,
-        scoreSourceLens);
+        scoreSourceLens, scoreWorkspaceOut, tileReceiptsOut);
     return std::make_tuple(
         sparseIndices, sparseValues, privateSourceToSlotOut,
         privateReadyTableOut, privateArenaHeadOut, privatePackedOutputOut,
-        queueLeasesOut, telemetry, scoreSourceLens);
+        queueLeasesOut, telemetry, scoreSourceLens, scoreWorkspaceOut,
+        tileReceiptsOut);
 }
 
 Result StreamingQuantLiGetNpu(
@@ -382,6 +433,8 @@ Result StreamingQuantLiGetNpu(
     at::Tensor privateReadyTable, at::Tensor privateArenaHead,
     at::Tensor privatePackedOutput, const at::Tensor& queueControl,
     at::Tensor queueLeases, const at::Tensor& kvObjectLens,
+    at::Tensor scoreWorkspace, at::Tensor tileReceipts,
+    const at::Tensor& streamingEpoch,
     int64_t kvObjectDomain, int64_t queryQuantMode, int64_t keyQuantMode, std::string layoutQuery,
     std::string layoutKey, int64_t sparseCount, int64_t sparseMode,
     int64_t preTokens, int64_t nextTokens, int64_t cmpRatio,
@@ -394,7 +447,8 @@ Result StreamingQuantLiGetNpu(
         residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,
         kvObjectMap, privateSourceToSlot, privateReadyTable,
         privateArenaHead, privatePackedOutput, queueControl, queueLeases,
-        kvObjectLens, queryQuantMode, keyQuantMode, layoutQuery, layoutKey,
+        kvObjectLens, scoreWorkspace, tileReceipts, streamingEpoch,
+        queryQuantMode, keyQuantMode, layoutQuery, layoutKey,
         sparseCount, sparseMode, preTokens, nextTokens, cmpRatio, returnValues,
         stride, scaleStride, kvafRowsPerEntry, kvObjectDomain);
 }
@@ -412,6 +466,8 @@ Result StreamingQuantLiGetMeta(
     at::Tensor privateReadyTable, at::Tensor privateArenaHead,
     at::Tensor privatePackedOutput, const at::Tensor& queueControl,
     at::Tensor queueLeases, const at::Tensor& kvObjectLens,
+    at::Tensor scoreWorkspace, at::Tensor tileReceipts,
+    const at::Tensor& streamingEpoch,
     int64_t kvObjectDomain, int64_t queryQuantMode, int64_t keyQuantMode, std::string layoutQuery,
     std::string layoutKey, int64_t sparseCount, int64_t sparseMode,
     int64_t preTokens, int64_t nextTokens, int64_t cmpRatio,
@@ -424,7 +480,8 @@ Result StreamingQuantLiGetMeta(
                 residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,
                 kvObjectMap, privateSourceToSlot, privateReadyTable,
                 privateArenaHead, privatePackedOutput, queueControl, queueLeases,
-                kvObjectLens, layoutQuery, layoutKey, sparseCount, cmpRatio,
+                kvObjectLens, scoreWorkspace, tileReceipts, streamingEpoch,
+                layoutQuery, layoutKey, sparseCount, cmpRatio,
                 kvafRowsPerEntry, kvObjectDomain);
     const std::vector<int64_t> sparseShape =
         SparseOutputShape(query, key, layoutQuery, layoutKey);
@@ -439,7 +496,7 @@ Result StreamingQuantLiGetMeta(
         sparseIndices, sparseValues, privateSourceToSlot, privateReadyTable,
         privateArenaHead, privatePackedOutput, queueLeases,
         at::empty({queueLeases.numel(), kTelemetryColumns}, int64Options),
-        at::empty({rowCount}, int32Options));
+        at::empty({rowCount}, int32Options), scoreWorkspace, tileReceipts);
 }
 }  // namespace
 
@@ -455,6 +512,7 @@ TORCH_LIBRARY(a5_streaming_quant_li_get, m)
         "Tensor private_source_to_slot, Tensor private_ready_table, "
         "Tensor private_arena_head, Tensor private_packed_output, "
         "Tensor queue_control, Tensor queue_leases, Tensor kv_object_lens, "
+        "Tensor score_workspace, Tensor tile_receipts, Tensor streaming_epoch, "
         "int kv_object_domain, int query_quant_mode=0, int key_quant_mode=0, "
         "str layout_query='TND', str layout_key='PA_BSND', "
         "int sparse_count=2048, int sparse_mode=3, "
@@ -465,7 +523,8 @@ TORCH_LIBRARY(a5_streaming_quant_li_get, m)
         "Tensor sparse_values, Tensor private_source_to_slot_out, "
         "Tensor private_ready_table_out, Tensor private_arena_head_out, "
         "Tensor private_packed_output_out, Tensor queue_leases_out, "
-        "Tensor telemetry, Tensor score_source_lens)");
+        "Tensor telemetry, Tensor score_source_lens, Tensor score_workspace_out, "
+        "Tensor tile_receipts_out)");
 }
 
 TORCH_LIBRARY_IMPL(a5_streaming_quant_li_get, PrivateUse1, m)

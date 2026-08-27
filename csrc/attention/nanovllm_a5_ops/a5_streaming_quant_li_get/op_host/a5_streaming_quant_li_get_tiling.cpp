@@ -944,6 +944,12 @@ ge::graphStatus A5StreamingQuantLiGetTiling::DoTiling(
     tilingData_.set_streamingQueueCount(streamingInfo.queueCount);
     tilingData_.set_streamingTelemetryColumns(STREAMING_TELEMETRY_COLUMNS);
     tilingData_.set_streamingKvafRowsPerEntry(streamingInfo.kvafRowsPerEntry);
+    tilingData_.set_streamingScoreWorkspaceWords(
+        streamingInfo.scoreWorkspaceWords);
+    tilingData_.set_streamingTileReceiptCount(
+        streamingInfo.tileReceiptCount);
+    tilingData_.set_streamingTileReceiptWords(
+        streamingInfo.tileReceiptWords);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
 
@@ -987,18 +993,19 @@ static ge::graphStatus ParseStreamingInterface(
     A5StreamingQuantLiGetTiling::StreamingInterfaceInfo *streamingInfo)
 {
     if (context == nullptr || streamingInfo == nullptr ||
+        context->GetPlatformInfo() == nullptr ||
         liInfo.socVersion != platform_ascendc::SocVersion::ASCEND950) {
         return ge::GRAPH_FAILED;
     }
     for (uint32_t input = RESIDENT_THRESHOLD_INDEX;
-         input <= KV_OBJECT_LENS_INDEX; ++input) {
+         input <= STREAMING_EPOCH_INDEX; ++input) {
         if (context->GetInputShape(input) == nullptr ||
             context->GetInputDesc(input) == nullptr) {
             return ge::GRAPH_FAILED;
         }
     }
     for (uint32_t output = PRIVATE_SOURCE_TO_SLOT_OUTPUT_INDEX;
-         output <= SCORE_SOURCE_LENS_OUTPUT_INDEX; ++output) {
+         output <= TILE_RECEIPTS_OUTPUT_INDEX; ++output) {
         if (context->GetOutputShape(output) == nullptr ||
             context->GetOutputDesc(output) == nullptr) {
             return ge::GRAPH_FAILED;
@@ -1029,6 +1036,12 @@ static ge::graphStatus ParseStreamingInterface(
         QUEUE_LEASES_INDEX)->GetStorageShape();
     const auto kvObjectLens = context->GetInputShape(
         KV_OBJECT_LENS_INDEX)->GetStorageShape();
+    const auto scoreWorkspace = context->GetInputShape(
+        SCORE_WORKSPACE_INDEX)->GetStorageShape();
+    const auto tileReceipts = context->GetInputShape(
+        TILE_RECEIPTS_INDEX)->GetStorageShape();
+    const auto streamingEpoch = context->GetInputShape(
+        STREAMING_EPOCH_INDEX)->GetStorageShape();
     const auto sourceToSlotOut = context->GetOutputShape(
         PRIVATE_SOURCE_TO_SLOT_OUTPUT_INDEX)->GetStorageShape();
     const auto readyTableOut = context->GetOutputShape(
@@ -1043,6 +1056,10 @@ static ge::graphStatus ParseStreamingInterface(
         TELEMETRY_OUTPUT_INDEX)->GetStorageShape();
     const auto scoreSourceLens = context->GetOutputShape(
         SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetStorageShape();
+    const auto scoreWorkspaceOut = context->GetOutputShape(
+        SCORE_WORKSPACE_OUTPUT_INDEX)->GetStorageShape();
+    const auto tileReceiptsOut = context->GetOutputShape(
+        TILE_RECEIPTS_OUTPUT_INDEX)->GetStorageShape();
     const auto sparseIndices = context->GetOutputShape(
         SPARSE_INDICES_OUTPUT_INDEX)->GetStorageShape();
     auto attrs = context->GetAttrs();
@@ -1054,6 +1071,8 @@ static ge::graphStatus ParseStreamingInterface(
     const int64_t *kvObjectDomain = attrs->GetAttrPointer<int64_t>(
         ATTR_KV_OBJECT_DOMAIN_INDEX);
 
+    constexpr int64_t kA5ReceiptTileWidth = 128;
+    constexpr int64_t kA5StreamingAicCount = 36;
     const int64_t source = liInfo.s2Size;
     int64_t rowCount = 1;
     if (sparseIndices.GetDimNum() < 2) {
@@ -1069,6 +1088,26 @@ static ge::graphStatus ParseStreamingInterface(
     const int64_t poolSize = kvObjectSlots.GetDimNum() == 2 ? kvObjectSlots.GetDim(0) : -1;
     const int64_t queueCount = queueLeases.GetDimNum() == 1 ? queueLeases.GetDim(0) : -1;
     const int64_t privateCapacity = readyTable.GetDimNum() == 2 ? readyTable.GetDim(1) : -1;
+    const int64_t alignedSource = source > 0
+        ? ((source + kA5ReceiptTileWidth - 1) /
+            kA5ReceiptTileWidth) * kA5ReceiptTileWidth
+        : -1;
+    const int64_t scoreTileCount = source > 0
+        ? (source + kA5ReceiptTileWidth - 1) / kA5ReceiptTileWidth
+        : -1;
+    platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const int64_t aicCount = static_cast<int64_t>(platform.GetCoreNumAic());
+    const int64_t scoreWorkspaceWords =
+        (aicCount > 0 && alignedSource > 0 &&
+         aicCount <= std::numeric_limits<int64_t>::max() /
+             (4 * alignedSource))
+            ? (aicCount * 4 * alignedSource + 1) / 2
+            : -1;
+    const int64_t tileReceiptCount =
+        (scoreTileCount > 0 && rowCount > 0 &&
+         rowCount <= std::numeric_limits<int64_t>::max() / scoreTileCount)
+            ? rowCount * scoreTileCount
+            : -1;
     if (rowsPerEntry == nullptr || kvObjectDomain == nullptr ||
         (*kvObjectDomain != static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
          *kvObjectDomain != static_cast<int64_t>(KvObjectDomain::C8_COMPRESSED_OBJECT)) ||
@@ -1078,6 +1117,14 @@ static ge::graphStatus ParseStreamingInterface(
         *rowsPerEntry > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         rowCount <= 0 || source <= 0 || poolSize <= 0 || queueCount <= 0 ||
         privateCapacity <= 0 ||
+        alignedSource <= 0 || scoreTileCount <= 0 ||
+        aicCount != kA5StreamingAicCount ||
+        scoreWorkspaceWords <= 0 || tileReceiptCount <= 0 ||
+        scoreWorkspace.GetDimNum() != 1 ||
+        scoreWorkspace.GetDim(0) >
+            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        tileReceiptCount >
+            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         source > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         context->GetInputDesc(RESIDENT_THRESHOLD_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
@@ -1103,8 +1150,18 @@ static ge::graphStatus ParseStreamingInterface(
             ge::DT_INT32 ||
         context->GetInputDesc(KV_OBJECT_LENS_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
+        context->GetInputDesc(SCORE_WORKSPACE_INDEX)->GetDataType() !=
+            ge::DT_INT32 ||
+        context->GetInputDesc(TILE_RECEIPTS_INDEX)->GetDataType() !=
+            ge::DT_INT64 ||
+        context->GetInputDesc(STREAMING_EPOCH_INDEX)->GetDataType() !=
+            ge::DT_INT64 ||
         context->GetOutputDesc(SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetDataType() !=
             ge::DT_INT32 ||
+        context->GetOutputDesc(SCORE_WORKSPACE_OUTPUT_INDEX)->GetDataType() !=
+            ge::DT_INT32 ||
+        context->GetOutputDesc(TILE_RECEIPTS_OUTPUT_INDEX)->GetDataType() !=
+            ge::DT_INT64 ||
         !ShapeEquals(resident, {rowCount}) ||
         !ShapeEquals(residentValid, {rowCount}) ||
         !ShapeEquals(poolEntries, {rowCount}) ||
@@ -1133,6 +1190,13 @@ static ge::graphStatus ParseStreamingInterface(
         !ShapeEquals(queueLeasesOut, {queueCount}) ||
         !ShapeEquals(telemetry, {queueCount, STREAMING_TELEMETRY_COLUMNS}) ||
         !ShapeEquals(scoreSourceLens, {rowCount}) ||
+        scoreWorkspace.GetDim(0) < scoreWorkspaceWords ||
+        !ShapeEquals(tileReceipts,
+                     {tileReceiptCount, STREAMING_TILE_RECEIPT_WORDS}) ||
+        !ShapeEquals(streamingEpoch, {1}) ||
+        !ShapeEquals(scoreWorkspaceOut, {scoreWorkspace.GetDim(0)}) ||
+        !ShapeEquals(tileReceiptsOut,
+                     {tileReceiptCount, STREAMING_TILE_RECEIPT_WORDS}) ||
         poolSize >
             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         queueCount >
@@ -1150,6 +1214,10 @@ static ge::graphStatus ParseStreamingInterface(
     streamingInfo->privateArenaCapacity = static_cast<uint32_t>(privateCapacity);
     streamingInfo->queueCount = static_cast<uint32_t>(queueCount);
     streamingInfo->kvafRowsPerEntry = static_cast<uint32_t>(*rowsPerEntry);
+    streamingInfo->scoreWorkspaceWords =
+        static_cast<uint32_t>(scoreWorkspace.GetDim(0));
+    streamingInfo->tileReceiptCount = static_cast<uint32_t>(tileReceiptCount);
+    streamingInfo->tileReceiptWords = STREAMING_TILE_RECEIPT_WORDS;
     return ge::GRAPH_SUCCESS;
 }
 

@@ -1,14 +1,20 @@
-// Build-time mode for the isolated P3 streaming-LI probe.
+// Build-time publication mode for the isolated streaming-LI experiment.
 //
-// The normal source tree defaults to the real streaming hook.  The isolated
-// build script may replace this generated staging header with 0 in order to
-// build a *true* no-hook control: the C8 score/TopK closure and the 21-input /
-// 9-output ABI remain, while no KVAF helper, SIMT service, extra hook UB, or
-// hook-only event/barrier is compiled into the target binary.
+// 0: official C8 score workspace only.  This is the bitwise control.
+// 1: score workspace is caller-owned/graph-visible, but no descriptor is
+//    published.  It isolates a changed score-GM address from publication.
+// 2: after the existing score DMA, publish a fixed-slot score-tile receipt.
+//    The receipt contains no KVAF, SIMT, queue, lease, or Get state.  A later
+//    independent sidecar is the only component allowed to consume it and
+//    submit a speculative Get.
 //
-// This is deliberately compile-time rather than a runtime branch.  A runtime
-// branch would still retain the Direct-HCCP/SIMT code and UB reservations, so
-// it could not distinguish a C8-clone issue from a fused-hook issue.
-#ifndef A5_STREAMING_LI_GET_ENABLE_HOOK
-#define A5_STREAMING_LI_GET_ENABLE_HOOK 1
+// Keeping this compile-time is intentional.  A runtime flag would still
+// compile the publication path into the C8 clone and could not diagnose an
+// instruction/register-layout perturbation.
+#ifndef A5_STREAMING_LI_GET_PUBLISH_MODE
+#define A5_STREAMING_LI_GET_PUBLISH_MODE 0
 #endif
+
+static_assert(A5_STREAMING_LI_GET_PUBLISH_MODE >= 0 &&
+              A5_STREAMING_LI_GET_PUBLISH_MODE <= 2,
+              "A5 streaming LI publication mode must be 0, 1, or 2.");

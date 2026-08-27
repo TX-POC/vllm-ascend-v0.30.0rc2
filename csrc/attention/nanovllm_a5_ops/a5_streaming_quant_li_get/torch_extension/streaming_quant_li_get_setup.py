@@ -2,7 +2,7 @@
 
 This extension is intentionally separate from the normal vLLM-Ascend package.
 It is built only after the matching isolated OPP has generated
-``aclnnA5StreamingQuantLiGet``.  That keeps the experiment's 21-input/9-output
+``aclnnA5StreamingQuantLiGet``.  That keeps the experiment's 24-input/11-output
 ABI from accidentally resolving a legacy custom-OP DSO.
 """
 
