@@ -21,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1] / "a5_streaming_quant_li_get"
 VECTOR = ROOT / "op_kernel/arch35/quant_lightning_indexer_service_vector.h"
 HOOK = ROOT / "op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"
+HOOK_MODE = ROOT / "op_kernel/a5_streaming_quant_li_get_hook_mode.h"
 KERNEL = ROOT / "op_kernel/a5_streaming_quant_li_get.cpp"
 KERNEL_PRELOAD = ROOT / "op_kernel/arch35/quant_lightning_indexer_kernel.h"
 OP_DEF = ROOT / "op_host/a5_streaming_quant_li_get_def.cpp"
@@ -199,6 +200,7 @@ def assert_order(label: str, actual: list[str], expected: list[str]) -> None:
 def require_source_contract() -> None:
     vector = VECTOR.read_text()
     hook = HOOK.read_text()
+    hook_mode = HOOK_MODE.read_text()
     kernel = KERNEL.read_text()
     preload = KERNEL_PRELOAD.read_text()
     op_def = OP_DEF.read_text()
@@ -262,6 +264,8 @@ def require_source_contract() -> None:
         "type": ["int32"],
     }
     assert ROOT_CMAKE.is_file()
+    assert HOOK_MODE.is_file()
+    assert "A5_STREAMING_LI_GET_ENABLE_HOOK 1" in hook_mode
     assert "descriptor_stage_only" not in OPS.read_text()
     assert "descriptor_stage_only" not in ROOT_CMAKE.read_text()
     assert METADATA_COMPANION.is_file()
@@ -319,6 +323,16 @@ def require_source_contract() -> None:
     assert "BatchMulWeightAndReduceSum" in vector
     assert "streamingKvafHook_.Emit" in vector
     assert "streamingKvafHook_.Finish" in vector
+    assert "FinishStreamingKvafHook" in vector
+    # The normal source defaults to the fused path, but the isolated OPP
+    # builder can compile a true no-hook control without changing ABI or
+    # relying on CANN CMAKE flag propagation.  The conditional must remove
+    # the helper include, its UB, its score-tile barrier/call, and the TopK
+    # terminal wait/finish as one unit.
+    assert '#include "a5_streaming_quant_li_get_hook_mode.h"' in vector
+    assert "#if A5_STREAMING_LI_GET_ENABLE_HOOK" in vector
+    assert "NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE" in build_script
+    assert "P3 streaming hook mode:" in build_script
     assert "scoreSourceLensGm.SetValue(" in vector
     assert "outputRow, validS2Len > 0 ? validS2Len : 0" in vector
     assert "ProcessTopK" in vector
@@ -327,11 +341,19 @@ def require_source_contract() -> None:
     topk_body = vector[vector.index(
         "__aicore__ inline void QLIVector<QLIT>::ProcessTopK"
     ):]
-    # The final H2D must remain in flight through the official exact TopK
-    # score-GM read / sparse-index write.  Finish only occurs after the last
-    # sparse-index DataCopyPad in that function.
-    assert topk_body.rindex("DataCopyPad(indiceOutGm") < topk_body.rindex(
-        "streamingKvafHook_.Finish()"
+    # The final H2D remains in flight through exact TopK, but ProcessTopK
+    # must not consume the final TOPK_MTE3_V event a second time.  Official
+    # FreeEventID owns that final token; only then may the hook terminally
+    # poll/release its optional wave.  This is a real liveness contract, not
+    # merely a preferred event ordering.
+    assert "streamingKvafHook_.Finish()" not in topk_body
+    process_main = preload[preload.index(
+        "__aicore__ inline void QLIPreload<QLIT>::ProcessMain"
+    ):preload.index(
+        "__aicore__ inline void QLIPreload<QLIT>::ProcessBaseBlock"
+    )]
+    assert process_main.index("vectorService.FreeEventID()") < process_main.index(
+        "vectorService.FinishStreamingKvafHook()"
     )
     # score_source_lens must use the same per-row value before either the
     # short-row / invalid output path or normal official TopK branch. It is a

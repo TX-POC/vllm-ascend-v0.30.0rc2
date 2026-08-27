@@ -21,7 +21,10 @@
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "quant_lightning_indexer_common.h"
+#include "a5_streaming_quant_li_get_hook_mode.h"
+#if A5_STREAMING_LI_GET_ENABLE_HOOK
 #include "a5_streaming_quant_li_get_tile_ready.h"
+#endif
 #include "../arch35/vf/quant_lightning_indexer_vector1.h"
 #include "../arch35/vf/quant_lightning_indexer_topk.h"
 
@@ -54,6 +57,7 @@ public:
     __aicore__ inline void InitVecInputTensor(GlobalTensor<float> weightsGm, GlobalTensor<float> qScaleGm,
                                               GlobalTensor<float> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
     __aicore__ inline void InitStreamingKvafHook(
         __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
         __gm__ uint8_t *kvObjectSlotsSnapshot,
@@ -64,6 +68,13 @@ public:
         __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
         __gm__ uint8_t *telemetry,
         const QLITilingData *__restrict tilingData);
+    // The official C8 `TOPK_MTE3_V_EVENT` is consumed by FreeEventID().
+    // Finish must run only after that canonical event drain, otherwise an
+    // extra wait here steals the final token and leaves FreeEventID waiting
+    // forever.  The wrapper keeps that ownership rule visible at the one
+    // ProcessMain call site.
+    __aicore__ inline void FinishStreamingKvafHook();
+    #endif
     // Used only by the all-invalid forward path. It clears non-alias output
     // #8 in disjoint AIV shards so graph replay cannot expose an old S length.
     __aicore__ inline void ClearScoreSourceLensForInvalidForward(
@@ -136,6 +147,7 @@ private:
     TBuf<TPosition::VECCALC> outInvalidBuf_;
     LocalTensor<int32_t> outInvalidLocal_;
 
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
     // Small caller-owned UB hand-off records for the Direct-HCCP queue lease
     // and bounded private-arena CAS service. The per-queue descriptor arrays
     // themselves stay graph-static in HBM and are supplied by KVAF control.
@@ -145,6 +157,7 @@ private:
     LocalTensor<uint8_t> streamingClaimUb_;
     TBuf<TPosition::VECCALC> streamingSourceOffsetsBuf_;
     LocalTensor<uint64_t> streamingSourceOffsetsUb_;
+    #endif
 
     int32_t blockId_ = -1;
     // para for vector
@@ -166,7 +179,9 @@ private:
 
     struct QLICommon::ConstInfo constInfo_;
     topk::LITopk<SCORE_T> topkOp_;
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
     streaming_li_get::StreamingKvafTileReadyHook streamingKvafHook_;
+    #endif
 };
 
 template <typename QLIT>
@@ -201,6 +216,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     //刷-1
     pipe->InitBuffer(outInvalidBuf_, topkCount_ * sizeof(int32_t));
     outInvalidLocal_ = outInvalidBuf_.Get<int32_t>();
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
     pipe->InitBuffer(streamingLeaseBuf_, 32U);
     streamingLeaseUb_ = streamingLeaseBuf_.Get<uint8_t>();
     pipe->InitBuffer(streamingClaimBuf_, 32U);
@@ -208,6 +224,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(streamingSourceOffsetsBuf_,
                      streaming_li_get::kMaxWaveRequests * sizeof(uint64_t));
     streamingSourceOffsetsUb_ = streamingSourceOffsetsBuf_.Get<uint64_t>();
+    #endif
     Duplicate(kScaleUB_, float(0), 2 * s2BaseSize_);
 }
 
@@ -261,6 +278,7 @@ __aicore__ inline void QLIVector<QLIT>::InitScoreSourceLensOutput(
     this->scoreSourceLensGm = scoreSourceLensGm;
 }
 
+#if A5_STREAMING_LI_GET_ENABLE_HOOK
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
     __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
@@ -292,6 +310,13 @@ __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
         reinterpret_cast<__ubuf__ uint64_t *>(streamingSourceOffsetsUb_.GetPhyAddr()),
         static_cast<uint32_t>(blockId_));
 }
+
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::FinishStreamingKvafHook()
+{
+    streamingKvafHook_.Finish();
+}
+#endif
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ClearScoreSourceLensForInvalidForward(
@@ -471,12 +496,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         kScaleBase, (uint32_t)0,
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(float),
                                         gSize_, curAivS1ProcNum);
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
     // Exact seam: official C8 score production is complete, but its normal
     // score-GM copy has not begun. The hook only observes uint16 scores and
     // submits a bounded speculative Direct-HCCP wave; it cannot alter TopK.
     PipeBarrier<PIPE_V>();
     streamingKvafHook_.Emit(outBase, info, curAivS1Idx, curAivS1ProcNum,
                             curS2Idx);
+    #endif
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT + pingpong);
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
@@ -496,12 +523,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &info)
 {
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
     // Do not drain the final Direct-HCCP wave here.  TopK consumes only
     // scoreGm and produces only the official sparse-index output; it never
     // reads the private output arena or the hook's ready table.  Keeping the
     // wave in flight lets the final H2D overlap this exact C8 TopK phase.
     // The terminal drain is deliberately below, after every row in this
     // ProcessTopK invocation has issued its unchanged official output copy.
+    #endif
     SetFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
     WaitFlag<HardEvent::MTE3_MTE2>(MTE3_MTE2_EVENT);
 
@@ -643,18 +672,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
     }
 
-    // The last row's MTE3 copy is still asynchronous at this point in the
-    // official implementation.  Drain that small, disjoint sparse-index
-    // write before entering the Direct-HCCP terminal polling path: it keeps
-    // the original TOPK_MTE3_V reuse contract intact and avoids relying on an
-    // undocumented MTE3/HCCP coexistence rule.  All score-GM reads and all
-    // exact TopK computation above have already overlapped the final Get.
-    if (curAivS1ProcNum != 0) {
-        WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
-    }
-    // READY/FAILED is published only after terminal CQ, before ProcessMain
-    // moves to the next score region or returns to downstream reconcile.
-    streamingKvafHook_.Finish();
 }
 }  // namespace QLIKernel
 #endif

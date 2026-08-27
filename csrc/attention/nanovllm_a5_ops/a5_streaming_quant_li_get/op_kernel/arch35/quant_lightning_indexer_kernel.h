@@ -468,6 +468,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm);
     }
     InitBuffers();
+    #if A5_STREAMING_LI_GET_ENABLE_HOOK
     if ASCEND_IS_AIV {
         // `sparseValues` and the two receipt outputs are graph aliases in
         // this isolated prototype. The mutable transaction resources are the
@@ -485,6 +486,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
             privateArenaHead, privatePackedOutput, queueControl, queueLeases,
             kvObjectLens, telemetry, tiling);
     }
+    #endif
 }
 
 template <typename QLIT>
@@ -685,6 +687,14 @@ __aicore__ inline void QLIPreload<QLIT>::ProcessMain()
 
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
+        #if A5_STREAMING_LI_GET_ENABLE_HOOK
+        // FreeEventID owns the final official C8 TOPK_MTE3_V_EVENT.  Only
+        // after it drains that sparse-index DMA may the fused Direct-HCCP
+        // path terminally poll/release its optional wave.  This preserves the
+        // official event token count while still overlapping the final Get
+        // with score-GM TopK work above.
+        vectorService.FinishStreamingKvafHook();
+        #endif
     } else {
         matmulService.FreeEventID();
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 0);

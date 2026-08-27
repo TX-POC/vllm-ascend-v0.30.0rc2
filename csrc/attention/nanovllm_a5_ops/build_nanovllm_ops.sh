@@ -229,6 +229,34 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         "${OP_DEV}/op_host"
     copy_tree_without_repository_cmake "${STREAMING_LI_DIR}/op_kernel" \
         "${OP_DEV}/op_kernel"
+    # A full no-hook control must be decided before CANN compiles the kernel.
+    # A runtime if would still retain the Direct-HCCP/SIMT code, hook-only UB
+    # reservations, and its extra pipeline events, which is not a meaningful
+    # control for a C8-clone timeout.  Keep the public 21-input/9-output ABI
+    # unchanged; this header controls only whether the device hook is linked
+    # into the staged binary.
+    STREAMING_LI_HOOK_MODE="${NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE:-on}"
+    case "${STREAMING_LI_HOOK_MODE,,}" in
+        on)
+            STREAMING_LI_HOOK_ENABLED=1
+            ;;
+        off)
+            STREAMING_LI_HOOK_ENABLED=0
+            ;;
+        *)
+            echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE must be on or off; got ${STREAMING_LI_HOOK_MODE}." >&2
+            exit 2
+            ;;
+    esac
+    printf '%s\n' \
+        '// Generated only in the isolated P3 staging tree.' \
+        "#define A5_STREAMING_LI_GET_ENABLE_HOOK ${STREAMING_LI_HOOK_ENABLED}" \
+        > "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
+    if ! grep -Fqx "#define A5_STREAMING_LI_GET_ENABLE_HOOK ${STREAMING_LI_HOOK_ENABLED}" \
+            "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"; then
+        echo "[nanovllm_a5_ops] ERROR: P3 hook-mode staging header is incomplete." >&2
+        exit 2
+    fi
     mkdir -p "${OP_DEV}/op_host/err" "${OP_DEV}/op_host/log"
     cp -f "${STREAMING_LI_HOST_COMPAT}" "${OP_DEV}/op_host/err/ops_err.h"
     cp -f "${STREAMING_LI_HOST_COMPAT}" "${OP_DEV}/op_host/log/log.h"
@@ -241,6 +269,7 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         exit 2
     fi
     echo "[nanovllm_a5_ops] strict P3 staging: A5StreamingQuantLiGet official C8 closure only"
+    echo "[nanovllm_a5_ops] P3 streaming hook mode: ${STREAMING_LI_HOOK_MODE,,} (compiled=${STREAMING_LI_HOOK_ENABLED})"
     echo "[nanovllm_a5_ops] strict P3 staging: repository CMakeLists.txt excluded"
     echo "[nanovllm_a5_ops] P3 JSON TypeRange=int8 bootstrap; target OpDef/bridge=FP8 E4M3FN"
     echo "[nanovllm_a5_ops] P3 host-header closure: staged standalone err/ops_err.h + log/log.h; remaining host SDK includes=CANN"
