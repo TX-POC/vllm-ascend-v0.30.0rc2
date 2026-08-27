@@ -33,6 +33,7 @@ from streaming_quant_li_get_target_adapter import (
     _bind_isolated_target_opp,
     _build_official_inputs,
     _call_official,
+    _expected_target_hook_mode,
     _make_no_post_transaction,
     _official_metadata,
     _expected_score_source_lens,
@@ -769,7 +770,16 @@ def run_p4_fused_audit() -> dict[str, Any]:
     target_opapi, target_vendor = _resolve_single_opp(
         os.getenv(TARGET_OPP_ENV), "target"
     )
-    target_provenance = _read_target_provenance(target_vendor)
+    expected_hook_mode, hook_off_baseline = _expected_target_hook_mode()
+    if hook_off_baseline:
+        raise RuntimeError(
+            "the P4 resident-threshold audit requires a hook-on P3 OPP; "
+            "P3_ALLOW_HOOK_OFF_BASELINE=1 is only valid for the isolated "
+            "P3 mathematical binary-isolation test"
+        )
+    target_provenance = _read_target_provenance(
+        target_vendor, expected_hook_mode
+    )
     seed_opapi, seed_vendor = _resolve_resident_seed_opp(
         os.getenv(RESIDENT_SEED_OPP_ENV)
     )

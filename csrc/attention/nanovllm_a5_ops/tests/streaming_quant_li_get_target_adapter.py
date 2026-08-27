@@ -81,6 +81,12 @@ TARGET_NPU_ENV = "P3_NPU_ID"
 HOOK_CONTROL_MODE_ENV = "P3_HOOK_CONTROL_MODE"
 HOOK_CONTROL_MODE_ALL_BUSY = "valid_all_busy"
 HOOK_CONTROL_MODE_REJECT_BUSY = "reject_all_busy"
+# This is intentionally opt-in and diagnostic-only.  Normal P3 validation
+# must load a hook-on OPP because the product path needs score-time Get
+# observation.  The one hook-off artifact is a binary-isolation tool: it tells
+# us whether merely compiling the hook changes official C8 math, even when no
+# queue is ever leased and no H2D can be posted.
+ALLOW_HOOK_OFF_BASELINE_ENV = "P3_ALLOW_HOOK_OFF_BASELINE"
 NO_POST_TRANSACTION_NAMES = (
     "private_source_to_slot",
     "private_ready_table",
@@ -230,8 +236,29 @@ def _read_reference_provenance(vendor: Path) -> dict[str, str]:
     return values
 
 
-def _read_target_provenance(vendor: Path) -> dict[str, str]:
-    """Reject a stale or hook-off P3 OPP before its static bridge loads it."""
+def _expected_target_hook_mode() -> tuple[str, bool]:
+    """Return the fail-closed hook expectation for this target process.
+
+    ``hook_mode=off`` is never a product option.  It is accepted only for a
+    fresh-process mathematical baseline with an explicit ``=1`` opt-in, so an
+    old diagnostic environment cannot silently turn a normal P3 proof into a
+    hook-free one.
+    """
+    raw_value = os.getenv(ALLOW_HOOK_OFF_BASELINE_ENV)
+    if raw_value in (None, "", "0"):
+        return "on", False
+    if raw_value == "1":
+        return "off", True
+    raise RuntimeError(
+        f"{ALLOW_HOOK_OFF_BASELINE_ENV} must be unset, '0', or '1'; "
+        f"got {raw_value!r}"
+    )
+
+
+def _read_target_provenance(
+    vendor: Path, expected_hook_mode: str
+) -> dict[str, str]:
+    """Reject a stale P3 OPP or an unexpected hook compilation mode."""
     path = vendor / TARGET_PROVENANCE_NAME
     if not path.is_file():
         raise RuntimeError(
@@ -260,10 +287,12 @@ def _read_target_provenance(vendor: Path) -> dict[str, str]:
             "isolated P3 target OPP was built from a different source revision: "
             f"actual={values['source_head']} expected={expected_head}"
         )
-    if values["hook_mode"] != "on":
+    if values["hook_mode"] != expected_hook_mode:
         raise RuntimeError(
-            "isolated P3 target OPP does not contain the score-observation hook: "
-            f"hook_mode={values['hook_mode']!r}"
+            "isolated P3 target OPP has an unexpected hook compilation mode: "
+            f"actual={values['hook_mode']!r} expected={expected_hook_mode!r}; "
+            f"set {ALLOW_HOOK_OFF_BASELINE_ENV}=1 only for the diagnostic "
+            "hook-off mathematical baseline"
         )
     return values
 
@@ -614,6 +643,7 @@ def _prove_safe_hook_control(
     transaction: dict[str, torch.Tensor],
     snapshot: dict[str, torch.Tensor],
     control_mode: str,
+    expected_hook_mode: str,
 ) -> None:
     """Print one compact proof after the target stream has completed."""
     _assert_no_post_transaction_unchanged(transaction, snapshot)
@@ -631,7 +661,20 @@ def _prove_safe_hook_control(
             "safe no-post control unexpectedly posted Direct-HCCP: "
             f"doorbell_posted={doorbell_posted}"
         )
-    if control_mode == HOOK_CONTROL_MODE_REJECT_BUSY:
+    if expected_hook_mode == "off":
+        if control_mode != HOOK_CONTROL_MODE_ALL_BUSY:
+            raise RuntimeError(
+                "the hook-off mathematical baseline requires "
+                f"{HOOK_CONTROL_MODE_ENV}={HOOK_CONTROL_MODE_ALL_BUSY!r}; "
+                f"got {control_mode!r}"
+            )
+        if control_rejected != 0:
+            raise RuntimeError(
+                "hook-off mathematical baseline unexpectedly wrote hook "
+                f"telemetry: control_rejected={control_rejected}"
+            )
+        hook_state = "compiled_off_baseline"
+    elif control_mode == HOOK_CONTROL_MODE_REJECT_BUSY:
         if control_rejected < 1:
             raise RuntimeError(
                 "reject_all_busy did not observe hook control rejection: "
@@ -680,7 +723,10 @@ def run_target_equivalence() -> dict[str, Any]:
     target_opapi, target_vendor = _resolve_single_opp(
         os.getenv(TARGET_OPP_ENV), "target"
     )
-    target_provenance = _read_target_provenance(target_vendor)
+    expected_hook_mode, hook_off_baseline = _expected_target_hook_mode()
+    target_provenance = _read_target_provenance(
+        target_vendor, expected_hook_mode
+    )
     # CANN discovers the binary config for an op on its first ACLNN call.  Both
     # OPP vendors must be visible before either the reference or P3 target
     # executes; switching this path after the reference is too late.
@@ -695,7 +741,8 @@ def run_target_equivalence() -> dict[str, Any]:
         f"source_root={target_provenance['source_root']} "
         f"source_head={target_provenance['source_head']} "
         f"expected_head={os.getenv(TARGET_EXPECTED_HEAD_ENV, '<unset>')} "
-        f"hook_mode={target_provenance['hook_mode']} ready=1 "
+        f"hook_mode={target_provenance['hook_mode']} "
+        f"baseline_only={int(hook_off_baseline)} ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
         flush=True,
     )
@@ -791,7 +838,13 @@ def run_target_equivalence() -> dict[str, Any]:
         f"elapsed_ms={(monotonic() - derived_started) * 1000.0:.3f}",
         flush=True,
     )
-    _prove_safe_hook_control(outputs, transaction, transaction_snapshot, control_mode)
+    _prove_safe_hook_control(
+        outputs,
+        transaction,
+        transaction_snapshot,
+        control_mode,
+        expected_hook_mode,
+    )
 
     return {
         "official_indices": official_indices,
