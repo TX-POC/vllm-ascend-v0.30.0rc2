@@ -795,6 +795,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"source_head={target_provenance['source_head']} "
         "expected_head="
         f"{os.getenv('P3_TARGET_EXPECTED_SOURCE_HEAD', '<unset>')} "
+        f"source_clean={target_provenance['source_clean']} "
         f"hook_mode={target_provenance['hook_mode']} ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
         flush=True,

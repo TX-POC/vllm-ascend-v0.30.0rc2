@@ -639,17 +639,32 @@ if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         echo "[nanovllm_a5_ops] ERROR: cannot record P3 OPP provenance; source HEAD is unavailable." >&2
         exit 1
     fi
+    # A commit ID alone is insufficient evidence when a remote worktree has
+    # locally modified tracked sources: CANN would compile those bytes while
+    # the manifest still claimed the committed HEAD.  Untracked experiment
+    # directories are deliberately ignored, but a tracked diff is a hard
+    # build error for this mathematical-equivalence artifact.
+    P3_PROVENANCE_DIRTY="$(git -C "${ROOT}" status --porcelain --untracked-files=no 2>/dev/null || true)"
+    if [[ -n "${P3_PROVENANCE_DIRTY}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: refuse P3 OPP build from a tracked-dirty source worktree." >&2
+        echo "[nanovllm_a5_ops] source_root=${ROOT} source_head=${P3_PROVENANCE_HEAD}" >&2
+        printf '%s\n' "${P3_PROVENANCE_DIRTY}" >&2
+        exit 1
+    fi
     cat > "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" <<EOF
 format=1
 kind=source_derived_streaming_quant_li_get
 source_root=${ROOT}
 source_head=${P3_PROVENANCE_HEAD}
+source_clean=1
 hook_mode=${STREAMING_LI_HOOK_MODE,,}
 operators=${OP_NAMES[*]}
 EOF
     if ! grep -Fqx 'kind=source_derived_streaming_quant_li_get' \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
        ! grep -Fqx "source_head=${P3_PROVENANCE_HEAD}" \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
+       ! grep -Fqx 'source_clean=1' \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
        ! grep -Fqx "hook_mode=${STREAMING_LI_HOOK_MODE,,}" \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE"; then

@@ -269,7 +269,14 @@ def _read_target_provenance(
         key, separator, value = line.partition("=")
         if separator and key:
             values[key] = value
-    required = ("kind", "source_root", "source_head", "hook_mode", "operators")
+    required = (
+        "kind",
+        "source_root",
+        "source_head",
+        "source_clean",
+        "hook_mode",
+        "operators",
+    )
     missing = tuple(key for key in required if not values.get(key))
     if missing:
         raise RuntimeError(
@@ -286,6 +293,11 @@ def _read_target_provenance(
         raise RuntimeError(
             "isolated P3 target OPP was built from a different source revision: "
             f"actual={values['source_head']} expected={expected_head}"
+        )
+    if values["source_clean"] != "1":
+        raise RuntimeError(
+            "isolated P3 target OPP was not built from a tracked-clean source "
+            f"worktree: source_clean={values['source_clean']!r}"
         )
     if values["hook_mode"] != expected_hook_mode:
         raise RuntimeError(
@@ -741,6 +753,7 @@ def run_target_equivalence() -> dict[str, Any]:
         f"source_root={target_provenance['source_root']} "
         f"source_head={target_provenance['source_head']} "
         f"expected_head={os.getenv(TARGET_EXPECTED_HEAD_ENV, '<unset>')} "
+        f"source_clean={target_provenance['source_clean']} "
         f"hook_mode={target_provenance['hook_mode']} "
         f"baseline_only={int(hook_off_baseline)} ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
