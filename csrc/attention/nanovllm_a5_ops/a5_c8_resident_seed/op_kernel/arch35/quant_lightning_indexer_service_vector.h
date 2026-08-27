@@ -241,12 +241,16 @@ __aicore__ inline void QLIVector<QLIT>::WriteResidentSeed(
     // available.  The wait makes the small receipt buffer reusable for the
     // next row and keeps graph replay's row-to-row ownership deterministic.
     AscendC::DataCopyParams scalarCopy{1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
-    SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
-    WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
+    const event_t scalarToMte3 = static_cast<event_t>(
+        GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+    SetFlag<HardEvent::S_MTE3>(scalarToMte3);
+    WaitFlag<HardEvent::S_MTE3>(scalarToMte3);
     DataCopyPad(residentTauGm[outputRow], residentSeedLocal_, scalarCopy);
     DataCopyPad(tauValidGm[outputRow], residentSeedLocal_[8], scalarCopy);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
+    const event_t mte3ToScalar = static_cast<event_t>(
+        GetTPipePtr()->FetchEventID(HardEvent::MTE3_S));
+    SetFlag<HardEvent::MTE3_S>(mte3ToScalar);
+    WaitFlag<HardEvent::MTE3_S>(mte3ToScalar);
 }
 
 template <typename QLIT>
@@ -576,7 +580,17 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         // sparse_indices. A short resident row has no 2048th item, so it is
         // explicit invalid rather than a padded threshold.
         const int32_t hasExactTau = (validS2Len >= topkCount_) ? 1 : 0;
-        const uint16_t kthTau = hasExactTau ? topkOp_.GetLastKthValue() : 0;
+        uint16_t kthTau = 0;
+        if (hasExactTau) {
+            // LiTopKVF writes nkValueLocal on Vector, whereas GetLastKthValue
+            // reads it on Scalar.  This dependence is required before the
+            // scalar read; it does not alter official C8 score or TopK math.
+            const event_t topkVectorToScalar = static_cast<event_t>(
+                GetTPipePtr()->FetchEventID(HardEvent::V_S));
+            SetFlag<HardEvent::V_S>(topkVectorToScalar);
+            WaitFlag<HardEvent::V_S>(topkVectorToScalar);
+            kthTau = topkOp_.GetLastKthValue();
+        }
         WriteResidentSeed(outputRow, kthTau, hasExactTau);
 
         SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);

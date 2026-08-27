@@ -68,6 +68,11 @@ def main() -> None:
             "DataCopyPad(tauValidGm[outputRow], residentSeedLocal_[8], scalarCopy);" in vector and
             "residentSeedLocal_[1]" not in vector,
             "second scalar MTE3 source must start at the next 32-byte UB line")
+    require("GetTPipePtr()->FetchEventID(HardEvent::S_MTE3)" in vector and
+            "GetTPipePtr()->FetchEventID(HardEvent::MTE3_S)" in vector and
+            "SetFlag<HardEvent::S_MTE3>(scalarToMte3);" in vector and
+            "WaitFlag<HardEvent::MTE3_S>(mte3ToScalar);" in vector,
+            "receipt DMA must use dynamically reserved Scalar/MTE3 events")
     # CANN 9.1's InitGlobalMemory takes a non-const GlobalTensor lvalue.
     # Keep the GM slice's address and row offset unchanged, but materialize
     # the slice as a named view before the fail-closed zero fill.
@@ -85,6 +90,11 @@ def main() -> None:
     require("WriteResidentSeed(outputRow, kthTau, hasExactTau)" in vector, "final TopK must feed tau write")
     require(vector.rindex("topkOp_(mrgValueLocal_") < vector.index("WriteResidentSeed(outputRow, kthTau, hasExactTau)"),
             "tau write must follow the final official TopK reduction")
+    tau_read = vector.index("kthTau = topkOp_.GetLastKthValue();")
+    require(vector.rfind("GetTPipePtr()->FetchEventID(HardEvent::V_S)", 0, tau_read) >= 0 and
+            vector.rfind("SetFlag<HardEvent::V_S>(topkVectorToScalar);", 0, tau_read) >= 0 and
+            vector.rfind("WaitFlag<HardEvent::V_S>(topkVectorToScalar);", 0, tau_read) >= 0,
+            "final TopK boundary must synchronize Vector-to-Scalar before GetValue")
     require("sparse_count=%d so resident_tau is the exact 2048th C8 score" in tiling,
             "tiling must reject non-2048 threshold semantics")
     require("AddConfig(\"ascend950\"" in op_def and "AddConfig(\"ascend910b\"" not in op_def,
