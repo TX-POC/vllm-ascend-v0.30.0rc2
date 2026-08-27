@@ -23,6 +23,12 @@ constexpr int64_t kControlWords = 16;
 constexpr int64_t kTelemetryColumns = 13;
 constexpr int64_t kPackedKvRowBytes = 656;
 constexpr int64_t kMaxSourceCapacity = 1 << 18;
+// Test-only marker.  The normal/product path keeps the output allocation
+// unmodified.  When the environment switch below is enabled, the marker lets
+// a target bring-up distinguish "the AICore never wrote out8" from "AICore
+// wrote an unexpected value" without changing the operator ABI or input
+// dataflow.
+constexpr int32_t kScoreSourceLensDebugSentinel = -123456789;
 
 using Result = std::tuple<
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
@@ -31,6 +37,14 @@ using Result = std::tuple<
 bool DebugEnabled()
 {
     const char* value = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
+    return value != nullptr && value[0] != '\0' &&
+           !(value[0] == '0' && value[1] == '\0');
+}
+
+bool ScoreSourceLensDebugPrefillEnabled()
+{
+    const char* value = std::getenv(
+        "NANOVLLM_A5_SCORE_SOURCE_LENS_DEBUG_PREFILL");
     return value != nullptr && value[0] != '\0' &&
            !(value[0] == '0' && value[1] == '\0');
 }
@@ -274,7 +288,11 @@ Result AllocateAndLaunch(
                                       at::empty({0}, floatOptions);
     const int64_t rowCount = ProductExceptLast(sparseIndices);
     auto telemetry = at::zeros({queueLeases.numel(), kTelemetryColumns}, int64Options);
-    auto scoreSourceLens = at::empty({rowCount}, int32Options);
+    const bool scoreSourceLensDebugPrefill =
+        ScoreSourceLensDebugPrefillEnabled();
+    auto scoreSourceLens = scoreSourceLensDebugPrefill
+        ? at::full({rowCount}, kScoreSourceLensDebugSentinel, int32Options)
+        : at::empty({rowCount}, int32Options);
 
     // Every receipt is intentionally the same physical allocation as its
     // matching mutable input. This is a graph ownership proof, not a copy.
@@ -290,6 +308,10 @@ Result AllocateAndLaunch(
                      static_cast<long long>(rowCount),
                      ShapeString(sparseIndices.sizes()).c_str(),
                      static_cast<long long>(cmpRatio), returnValues ? 1 : 0);
+        std::fprintf(stderr,
+                     "P3_LI_SCORE_SOURCE_LENS_PREFILL enabled=%d sentinel=%d\n",
+                     scoreSourceLensDebugPrefill ? 1 : 0,
+                     static_cast<int>(kScoreSourceLensDebugSentinel));
         for (const auto& item : {
                  std::pair<const char*, const at::Tensor*>{"in0.query", &query},
                  {"in1.key", &key}, {"in2.weights", &weights},
