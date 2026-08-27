@@ -2,34 +2,54 @@
 # Synchronize the P3 streaming-LI/Get prototype through Gitcode only.
 #
 # Run this *inside an A5 Docker container* as:
-#   bash examples/dsa_demo/update_p3_streaming_li_get_sources.sh
+#   P3_VLLM_SHA=<full-sha> P3_KVAF_SHA=<full-sha> \
+#     bash examples/dsa_demo/update_p3_streaming_li_get_sources.sh update
 #
-# It is intentionally a source-update/check utility.  It never builds,
-# deletes, resets, stashes, or changes Git configuration.  A non-empty
-# tracked worktree is left untouched and reported as blocked.
+# The two pinned SHAs are deliberately mandatory: a remote test must consume
+# exactly the source revision published by the local developer, not whichever
+# branch tip happens to exist at execution time.
+#
+# This utility never builds, deletes, resets, stashes, clones, or changes Git
+# configuration. It first fetches and preflights *both* repositories, then
+# fast-forwards both to their exact pinned SHAs. Detached worktrees are valid;
+# a named checkout on an unexpected branch is reported and left untouched.
 
 P3_VLLM_BRANCH="${P3_VLLM_BRANCH:-kip_demo_cs}"
 P3_KVAF_BRANCH="${P3_KVAF_BRANCH:-kip_demo_cs_native_enqueue}"
-# Pin both SHAs in a reproducible validation run.  When they are omitted, the
-# script resolves the currently fetched origin/<branch> tip and prints it.
 P3_VLLM_SHA="${P3_VLLM_SHA:-}"
 P3_KVAF_SHA="${P3_KVAF_SHA:-}"
-
 mode="${1:-update}"
 
 print_usage() {
   printf '%s\n' \
-    'usage: bash update_p3_streaming_li_get_sources.sh [update|check]' \
-    'optional overrides: KIP_ROOT, VLLM_KIP, KVAF_FUSED,' \
-    'P3_VLLM_BRANCH, P3_KVAF_BRANCH, P3_VLLM_SHA, P3_KVAF_SHA'
+    'usage: P3_VLLM_SHA=<full-sha> P3_KVAF_SHA=<full-sha> bash update_p3_streaming_li_get_sources.sh [update|check]' \
+    'optional path overrides: KIP_ROOT, VLLM_KIP, KVAF_FUSED' \
+    'optional branch overrides: P3_VLLM_BRANCH, P3_KVAF_BRANCH'
+}
+
+tracked_count() {
+  git -C "$1" status --porcelain --untracked-files=no 2>/dev/null \
+    | awk 'NF { count += 1 } END { print count + 0 }'
+}
+
+checkout_name() {
+  local name
+  name="$(git -C "$1" branch --show-current 2>/dev/null)"
+  if [ -n "$name" ]; then
+    printf '%s' "$name"
+  else
+    printf '%s' '<detached>'
+  fi
 }
 
 detect_paths() {
+  local candidate
+
   if [ -z "${KIP_ROOT:-}" ]; then
     for candidate in /data/cacheos_kip_demo_cs /home/c00982601; do
       if [ -e "${candidate}/vLLM-DSA-kip_demo_cs/.git" ] && \
          [ -e "${candidate}/KVAF-kip_demo_cs_native_enqueue/.git" ]; then
-        KIP_ROOT="${candidate}"
+        KIP_ROOT="$candidate"
         break
       fi
     done
@@ -48,79 +68,114 @@ detect_paths() {
   return 0
 }
 
-repo_state() {
-  local name="$1"
+print_state() {
+  local repo="$1"
   local path="$2"
-  local branch="$3"
+  local target_branch="$3"
   local expected="$4"
-  local dirty
   local head
+  local branch
+  local dirty
 
-  if [ -z "${expected}" ]; then
-    expected="$(git -C "${path}" rev-parse "origin/${branch}" 2>/dev/null || true)"
-  fi
-  if [ -z "${expected}" ]; then
-    expected="<origin-unfetched>"
-  fi
-
-  dirty="$(git -C "${path}" status --porcelain --untracked-files=no 2>/dev/null)"
-  head="$(git -C "${path}" rev-parse HEAD 2>/dev/null || true)"
-  printf 'P3_UPDATE_STATE repo=%s path=%s branch=%s head=%s expected=%s tracked_dirty=%s\n' \
-    "${name}" "${path}" "${branch}" "${head}" "${expected}" \
-    "$([ -n "${dirty}" ] && echo 1 || echo 0)"
+  head="$(git -C "$path" rev-parse HEAD 2>/dev/null || true)"
+  branch="$(checkout_name "$path")"
+  dirty="$(tracked_count "$path")"
+  printf 'P3_UPDATE_STATE repo=%s path=%s checkout=%s target_branch=%s head=%s expected=%s tracked_dirty=%s\n' \
+    "$repo" "$path" "$branch" "$target_branch" "$head" "$expected" "$dirty"
 }
 
-update_repo() {
-  local name="$1"
+precheck_checkout() {
+  local repo="$1"
+  local path="$2"
+  local target_branch="$3"
+  local branch
+  local dirty
+
+  branch="$(git -C "$path" branch --show-current 2>/dev/null)"
+  dirty="$(tracked_count "$path")"
+  if [ "$dirty" -ne 0 ]; then
+    printf 'P3_UPDATE_BLOCKED repo=%s reason=tracked_changes count=%s\n' "$repo" "$dirty"
+    git -C "$path" status --short --untracked-files=no | sed -n '1,20p'
+    return 1
+  fi
+  if [ -n "$branch" ] && [ "$branch" != "$target_branch" ]; then
+    printf 'P3_UPDATE_BLOCKED repo=%s reason=unexpected_checkout_branch checkout=%s target=%s\n' \
+      "$repo" "$branch" "$target_branch"
+    return 1
+  fi
+  return 0
+}
+
+fetch_branch() {
+  local repo="$1"
+  local path="$2"
+  local branch="$3"
+  local status
+
+  printf 'P3_UPDATE_FETCH repo=%s branch=%s\n' "$repo" "$branch"
+  # Each repo has its own command and therefore its own credential prompt.
+  # Do not paste a username/password into shell text; respond to Git directly.
+  git -C "$path" fetch origin "$branch"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'P3_UPDATE_BLOCKED repo=%s reason=fetch_failed status=%s\n' "$repo" "$status"
+    return 1
+  fi
+  return 0
+}
+
+preflight_pinned_target() {
+  local repo="$1"
   local path="$2"
   local branch="$3"
   local expected="$4"
-  local dirty
-  local fetch_rc
-  local merge_rc
+  local head
 
-  if [ -z "${expected}" ]; then
-    expected="<branch-tip-after-fetch>"
+  if ! git -C "$path" cat-file -e "${expected}^{commit}" 2>/dev/null; then
+    printf 'P3_UPDATE_BLOCKED repo=%s reason=pinned_sha_unavailable sha=%s\n' "$repo" "$expected"
+    return 1
   fi
-
-  dirty="$(git -C "${path}" status --porcelain --untracked-files=no 2>/dev/null)"
-  if [ -n "${dirty}" ]; then
-    printf 'P3_UPDATE_BLOCKED repo=%s reason=tracked_changes\n' "${name}"
-    git -C "${path}" status --short
+  if ! git -C "$path" merge-base --is-ancestor "$expected" "origin/${branch}"; then
+    printf 'P3_UPDATE_BLOCKED repo=%s reason=pinned_sha_not_on_remote_branch sha=%s branch=%s\n' \
+      "$repo" "$expected" "$branch"
     return 1
   fi
 
-  printf 'P3_UPDATE_FETCH repo=%s branch=%s\n' "${name}" "${branch}"
-  # Git owns any interactive Username/Password prompt.  Each repository is
-  # fetched in a separate command so credentials cannot be mixed.
-  git -C "${path}" fetch origin "${branch}"
-  fetch_rc=$?
-  if [ "${fetch_rc}" -ne 0 ]; then
-    printf 'P3_UPDATE_BLOCKED repo=%s reason=fetch_failed status=%s\n' \
-      "${name}" "${fetch_rc}"
+  head="$(git -C "$path" rev-parse HEAD 2>/dev/null || true)"
+  if [ "$head" != "$expected" ] && ! git -C "$path" merge-base --is-ancestor "$head" "$expected"; then
+    printf 'P3_UPDATE_BLOCKED repo=%s reason=non_fast_forward_to_pinned_sha head=%s target=%s\n' \
+      "$repo" "$head" "$expected"
     return 1
   fi
+  printf 'P3_UPDATE_PREFLIGHT repo=%s target=%s remote_branch=origin/%s fast_forward=1\n' \
+    "$repo" "$expected" "$branch"
+  return 0
+}
 
-  git -C "${path}" merge --ff-only "origin/${branch}"
-  merge_rc=$?
-  if [ "${merge_rc}" -ne 0 ]; then
-    printf 'P3_UPDATE_BLOCKED repo=%s reason=ff_only_merge_failed status=%s\n' \
-      "${name}" "${merge_rc}"
+merge_pinned_target() {
+  local repo="$1"
+  local path="$2"
+  local expected="$3"
+  local status
+
+  git -C "$path" merge --ff-only "$expected"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'P3_UPDATE_BLOCKED repo=%s reason=ff_only_merge_failed status=%s target=%s\n' \
+      "$repo" "$status" "$expected"
     return 1
   fi
-
-  repo_state "${name}" "${path}" "${branch}" "${expected}"
+  printf 'P3_UPDATE_MERGED repo=%s target=%s\n' "$repo" "$expected"
   return 0
 }
 
 main() {
   local overall=0
+  local in_container=0
   local vllm_head
   local kvaf_head
-  local vllm_expected
-  local kvaf_expected
 
-  case "${mode}" in
+  case "$mode" in
     update|check) ;;
     *)
       print_usage
@@ -128,31 +183,52 @@ main() {
       ;;
   esac
 
+  if [ -f /.dockerenv ]; then
+    in_container=1
+  fi
+  printf 'P3_UPDATE_HOST hostname=%s in_container=%s mode=%s\n' \
+    "$(hostname)" "$in_container" "$mode"
+
+  if [ -z "$P3_VLLM_SHA" ] || [ -z "$P3_KVAF_SHA" ]; then
+    printf 'P3_UPDATE_BLOCKED reason=missing_pinned_sha vllm=<%s> kvaf=<%s>\n' \
+      "$P3_VLLM_SHA" "$P3_KVAF_SHA"
+    print_usage
+    return 1
+  fi
   if ! detect_paths; then
     return 1
   fi
 
-  printf 'P3_UPDATE_HOST hostname=%s kip_root=%s mode=%s\n' \
-    "$(hostname)" "${KIP_ROOT:-override}" "${mode}"
-  repo_state vllm "${VLLM_KIP}" "${P3_VLLM_BRANCH}" "${P3_VLLM_SHA}"
-  repo_state kvaf "${KVAF_FUSED}" "${P3_KVAF_BRANCH}" "${P3_KVAF_SHA}"
+  print_state vllm "$VLLM_KIP" "$P3_VLLM_BRANCH" "$P3_VLLM_SHA"
+  print_state kvaf "$KVAF_FUSED" "$P3_KVAF_BRANCH" "$P3_KVAF_SHA"
 
-  if [ "${mode}" = "update" ]; then
-    update_repo vllm "${VLLM_KIP}" "${P3_VLLM_BRANCH}" "${P3_VLLM_SHA}" || overall=1
-    update_repo kvaf "${KVAF_FUSED}" "${P3_KVAF_BRANCH}" "${P3_KVAF_SHA}" || overall=1
+  precheck_checkout vllm "$VLLM_KIP" "$P3_VLLM_BRANCH" || overall=1
+  precheck_checkout kvaf "$KVAF_FUSED" "$P3_KVAF_BRANCH" || overall=1
+
+  if [ "$overall" -eq 0 ] && [ "$mode" = update ]; then
+    # Fetch both first. No worktree is advanced until both source targets
+    # have been proven available and fast-forwardable.
+    fetch_branch vllm "$VLLM_KIP" "$P3_VLLM_BRANCH" || overall=1
+    fetch_branch kvaf "$KVAF_FUSED" "$P3_KVAF_BRANCH" || overall=1
   fi
 
-  vllm_head="$(git -C "${VLLM_KIP}" rev-parse HEAD 2>/dev/null || true)"
-  kvaf_head="$(git -C "${KVAF_FUSED}" rev-parse HEAD 2>/dev/null || true)"
-  vllm_expected="${P3_VLLM_SHA:-$(git -C "${VLLM_KIP}" rev-parse "origin/${P3_VLLM_BRANCH}" 2>/dev/null || true)}"
-  kvaf_expected="${P3_KVAF_SHA:-$(git -C "${KVAF_FUSED}" rev-parse "origin/${P3_KVAF_BRANCH}" 2>/dev/null || true)}"
+  if [ "$overall" -eq 0 ] && [ "$mode" = update ]; then
+    preflight_pinned_target vllm "$VLLM_KIP" "$P3_VLLM_BRANCH" "$P3_VLLM_SHA" || overall=1
+    preflight_pinned_target kvaf "$KVAF_FUSED" "$P3_KVAF_BRANCH" "$P3_KVAF_SHA" || overall=1
+  fi
+
+  if [ "$overall" -eq 0 ] && [ "$mode" = update ]; then
+    merge_pinned_target vllm "$VLLM_KIP" "$P3_VLLM_SHA" || overall=1
+    merge_pinned_target kvaf "$KVAF_FUSED" "$P3_KVAF_SHA" || overall=1
+  fi
+
+  vllm_head="$(git -C "$VLLM_KIP" rev-parse HEAD 2>/dev/null || true)"
+  kvaf_head="$(git -C "$KVAF_FUSED" rev-parse HEAD 2>/dev/null || true)"
   printf 'P3_UPDATE_FINAL vllm=%s expected=%s kvaf=%s expected=%s ready=%s\n' \
-    "${vllm_head}" "${vllm_expected}" \
-    "${kvaf_head}" "${kvaf_expected}" \
-    "$([ "${overall}" -eq 0 ] && [ -n "${vllm_expected}" ] && \
-       [ -n "${kvaf_expected}" ] && [ "${vllm_head}" = "${vllm_expected}" ] && \
-       [ "${kvaf_head}" = "${kvaf_expected}" ] && echo 1 || echo 0)"
-  return "${overall}"
+    "$vllm_head" "$P3_VLLM_SHA" "$kvaf_head" "$P3_KVAF_SHA" \
+    "$([ "$overall" -eq 0 ] && [ "$vllm_head" = "$P3_VLLM_SHA" ] && \
+       [ "$kvaf_head" = "$P3_KVAF_SHA" ] && echo 1 || echo 0)"
+  return "$overall"
 }
 
 main "$@"
