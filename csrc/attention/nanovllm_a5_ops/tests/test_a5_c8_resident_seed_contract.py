@@ -144,6 +144,18 @@ def main() -> None:
             "direct indexed GM view" in isolated,
             "isolated builder must reject the known temporary-GM InitGlobalMemory form before msopgen")
 
+    target_equivalence = (
+        ROOT / "tests" / "test_a5_c8_resident_seed_target_equivalence.py"
+    ).read_text()
+    require("A5_C8_RESIDENT_SEED_TARGET_PASS" in target_equivalence,
+            "ResidentSeed needs an isolated target equivalence gate before P4")
+    require("_call_official_resident_reference" in target_equivalence and
+            "_launch_resident_seed" in target_equivalence,
+            "target gate must use one resident FP8 view for official and seed calls")
+    require("official_tau=not_exported" in target_equivalence and
+            "threshold_functional_proof=next_p4_candidate_audit" in target_equivalence,
+            "target gate must not overclaim a public official tau comparator")
+
     print("A5_C8_RESIDENT_SEED_CONTRACT_PASS")
 
 
