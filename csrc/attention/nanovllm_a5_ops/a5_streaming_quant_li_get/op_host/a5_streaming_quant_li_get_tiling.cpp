@@ -17,6 +17,7 @@
 
 #include <initializer_list>
 #include <limits>
+#include <string>
 
 #include "../op_kernel/a5_streaming_quant_li_get_template_tiling_key.h"
 
@@ -987,6 +988,146 @@ static bool ShapeEquals(
     return true;
 }
 
+// Tiling failures are normally collapsed by ACLNN into the generic
+// "Failed to execute tiling function" status.  The P3 ABI extends the
+// official C8 interface by fifteen graph-visible tensors, so a generic
+// failure turns one bad descriptor into an expensive trial-and-error loop.
+// Keep the diagnostics entirely on the host path: they neither change the
+// official C8 tiling math nor add an AIC/AIV instruction to the kernel.
+static std::string ShapeDebugText(const gert::Shape &shape)
+{
+    std::string result("[");
+    for (int64_t index = 0; index < shape.GetDimNum(); ++index) {
+        if (index != 0) {
+            result.append(",");
+        }
+        result.append(std::to_string(shape.GetDim(index)));
+    }
+    result.append("]");
+    return result;
+}
+
+static void LogStreamingInterfaceFailure(
+    gert::TilingContext *context,
+    const char *reason,
+    const QLITilingInfo &liInfo,
+    int64_t rowCount,
+    int64_t source,
+    int64_t poolSize,
+    int64_t queueCount,
+    int64_t privateCapacity,
+    int64_t alignedSource,
+    int64_t scoreTileCount,
+    int64_t aicCount,
+    int64_t aivCount,
+    int64_t scoreWorkspaceWords,
+    int64_t tileReceiptCount,
+    const int64_t *rowsPerEntry,
+    const int64_t *kvObjectDomain)
+{
+    const char *nodeName = context->GetNodeName() == nullptr
+        ? "A5StreamingQuantLiGet"
+        : context->GetNodeName();
+    const int64_t rowsPerEntryValue = rowsPerEntry == nullptr ? -1 : *rowsPerEntry;
+    const int64_t kvObjectDomainValue =
+        kvObjectDomain == nullptr ? -1 : *kvObjectDomain;
+
+    const auto resident = context->GetInputShape(
+        RESIDENT_THRESHOLD_INDEX)->GetStorageShape();
+    const auto residentValid = context->GetInputShape(
+        RESIDENT_THRESHOLD_VALID_INDEX)->GetStorageShape();
+    const auto kvObjectSlots = context->GetInputShape(
+        KV_OBJECT_SLOTS_SNAPSHOT_INDEX)->GetStorageShape();
+    const auto poolEntries = context->GetInputShape(
+        REQ_POOL_ENTRIES_INDEX)->GetStorageShape();
+    const auto kvObjectMap = context->GetInputShape(
+        KV_OBJECT_MAP_INDEX)->GetStorageShape();
+    const auto sourceToSlot = context->GetInputShape(
+        PRIVATE_SOURCE_TO_SLOT_INDEX)->GetStorageShape();
+    const auto readyTable = context->GetInputShape(
+        PRIVATE_READY_TABLE_INDEX)->GetStorageShape();
+    const auto arenaHead = context->GetInputShape(
+        PRIVATE_ARENA_HEAD_INDEX)->GetStorageShape();
+    const auto privatePackedOutput = context->GetInputShape(
+        PRIVATE_PACKED_OUTPUT_INDEX)->GetStorageShape();
+    const auto queueControl = context->GetInputShape(
+        QUEUE_CONTROL_INDEX)->GetStorageShape();
+    const auto queueLeases = context->GetInputShape(
+        QUEUE_LEASES_INDEX)->GetStorageShape();
+    const auto kvObjectLens = context->GetInputShape(
+        KV_OBJECT_LENS_INDEX)->GetStorageShape();
+    const auto scoreWorkspace = context->GetInputShape(
+        SCORE_WORKSPACE_INDEX)->GetStorageShape();
+    const auto tileReceipts = context->GetInputShape(
+        TILE_RECEIPTS_INDEX)->GetStorageShape();
+    const auto streamingEpoch = context->GetInputShape(
+        STREAMING_EPOCH_INDEX)->GetStorageShape();
+    const auto sparseIndices = context->GetOutputShape(
+        SPARSE_INDICES_OUTPUT_INDEX)->GetStorageShape();
+    const auto scoreSourceLens = context->GetOutputShape(
+        SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetStorageShape();
+    const auto scoreWorkspaceOut = context->GetOutputShape(
+        SCORE_WORKSPACE_OUTPUT_INDEX)->GetStorageShape();
+    const auto tileReceiptsOut = context->GetOutputShape(
+        TILE_RECEIPTS_OUTPUT_INDEX)->GetStorageShape();
+
+    OP_LOGE(
+        nodeName,
+        "P3_TILING_DIAG reason=%s soc=%d b=%u n1=%u n2=%u s1=%u s2=%ld "
+        "cmp=%u aic=%ld aiv=%ld rows=%ld source=%ld pool=%ld queue=%ld "
+        "private=%ld aligned=%ld tiles=%ld workspace_required=%ld "
+        "workspace_actual=%ld receipts_required=%ld receipts_actual=%ld "
+        "rows_per_entry=%ld kv_object_domain=%ld",
+        reason, static_cast<int32_t>(liInfo.socVersion), liInfo.bSize,
+        liInfo.n1Size, liInfo.n2Size, liInfo.s1Size, liInfo.s2Size,
+        liInfo.cmpRatio, aicCount, aivCount, rowCount, source, poolSize,
+        queueCount, privateCapacity, alignedSource, scoreTileCount,
+        scoreWorkspaceWords,
+        scoreWorkspace.GetDimNum() == 1 ? scoreWorkspace.GetDim(0) : -1,
+        tileReceiptCount,
+        tileReceipts.GetDimNum() >= 1 ? tileReceipts.GetDim(0) : -1,
+        rowsPerEntryValue, kvObjectDomainValue);
+    OP_LOGE(
+        nodeName,
+        "P3_TILING_DIAG_INPUT_SHAPES in9=%s in10=%s in11=%s in12=%s "
+        "in13=%s in14=%s in15=%s in16=%s in17=%s in18=%s in19=%s "
+        "in20=%s in21=%s in22=%s in23=%s",
+        ShapeDebugText(resident).c_str(), ShapeDebugText(residentValid).c_str(),
+        ShapeDebugText(kvObjectSlots).c_str(), ShapeDebugText(poolEntries).c_str(),
+        ShapeDebugText(kvObjectMap).c_str(), ShapeDebugText(sourceToSlot).c_str(),
+        ShapeDebugText(readyTable).c_str(), ShapeDebugText(arenaHead).c_str(),
+        ShapeDebugText(privatePackedOutput).c_str(), ShapeDebugText(queueControl).c_str(),
+        ShapeDebugText(queueLeases).c_str(), ShapeDebugText(kvObjectLens).c_str(),
+        ShapeDebugText(scoreWorkspace).c_str(), ShapeDebugText(tileReceipts).c_str(),
+        ShapeDebugText(streamingEpoch).c_str());
+    OP_LOGE(
+        nodeName,
+        "P3_TILING_DIAG_OUTPUT_SHAPES out0=%s out8=%s out9=%s out10=%s "
+        "dtypes=in9:%d,in10:%d,in11:%d,in12:%d,in13:%d,in14:%d,in15:%d,"
+        "in16:%d,in17:%d,in18:%d,in19:%d,in20:%d,in21:%d,in22:%d,in23:%d,"
+        "out8:%d,out9:%d,out10:%d",
+        ShapeDebugText(sparseIndices).c_str(), ShapeDebugText(scoreSourceLens).c_str(),
+        ShapeDebugText(scoreWorkspaceOut).c_str(), ShapeDebugText(tileReceiptsOut).c_str(),
+        static_cast<int>(context->GetInputDesc(RESIDENT_THRESHOLD_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(RESIDENT_THRESHOLD_VALID_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(KV_OBJECT_SLOTS_SNAPSHOT_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(REQ_POOL_ENTRIES_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(KV_OBJECT_MAP_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(PRIVATE_SOURCE_TO_SLOT_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(PRIVATE_READY_TABLE_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(PRIVATE_ARENA_HEAD_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(PRIVATE_PACKED_OUTPUT_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(QUEUE_CONTROL_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(QUEUE_LEASES_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(KV_OBJECT_LENS_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(SCORE_WORKSPACE_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(TILE_RECEIPTS_INDEX)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(STREAMING_EPOCH_INDEX)->GetDataType()),
+        static_cast<int>(context->GetOutputDesc(SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetDataType()),
+        static_cast<int>(context->GetOutputDesc(SCORE_WORKSPACE_OUTPUT_INDEX)->GetDataType()),
+        static_cast<int>(context->GetOutputDesc(TILE_RECEIPTS_OUTPUT_INDEX)->GetDataType()));
+}
+
 static ge::graphStatus ParseStreamingInterface(
     gert::TilingContext *context,
     const QLITilingInfo &liInfo,
@@ -995,12 +1136,29 @@ static ge::graphStatus ParseStreamingInterface(
     if (context == nullptr || streamingInfo == nullptr ||
         context->GetPlatformInfo() == nullptr ||
         liInfo.socVersion != platform_ascendc::SocVersion::ASCEND950) {
+        OP_LOGE("A5StreamingQuantLiGet",
+                "P3_TILING_DIAG reason=context_or_platform_invalid context=%p "
+                "streaming_info=%p platform=%p soc=%d",
+                static_cast<const void *>(context),
+                static_cast<const void *>(streamingInfo),
+                context == nullptr ? nullptr :
+                    static_cast<const void *>(context->GetPlatformInfo()),
+                static_cast<int32_t>(liInfo.socVersion));
         return ge::GRAPH_FAILED;
     }
+    const char *opName = context->GetNodeName() == nullptr
+        ? "A5StreamingQuantLiGet"
+        : context->GetNodeName();
     for (uint32_t input = RESIDENT_THRESHOLD_INDEX;
          input <= STREAMING_EPOCH_INDEX; ++input) {
         if (context->GetInputShape(input) == nullptr ||
             context->GetInputDesc(input) == nullptr) {
+            OP_LOGE(opName,
+                    "P3_TILING_DIAG reason=missing_streaming_input index=%u "
+                    "shape=%p desc=%p",
+                    input,
+                    static_cast<const void *>(context->GetInputShape(input)),
+                    static_cast<const void *>(context->GetInputDesc(input)));
             return ge::GRAPH_FAILED;
         }
     }
@@ -1008,6 +1166,12 @@ static ge::graphStatus ParseStreamingInterface(
          output <= TILE_RECEIPTS_OUTPUT_INDEX; ++output) {
         if (context->GetOutputShape(output) == nullptr ||
             context->GetOutputDesc(output) == nullptr) {
+            OP_LOGE(opName,
+                    "P3_TILING_DIAG reason=missing_streaming_output index=%u "
+                    "shape=%p desc=%p",
+                    output,
+                    static_cast<const void *>(context->GetOutputShape(output)),
+                    static_cast<const void *>(context->GetOutputDesc(output)));
             return ge::GRAPH_FAILED;
         }
     }
@@ -1064,6 +1228,8 @@ static ge::graphStatus ParseStreamingInterface(
         SPARSE_INDICES_OUTPUT_INDEX)->GetStorageShape();
     auto attrs = context->GetAttrs();
     if (attrs == nullptr) {
+        OP_LOGE(opName,
+                "P3_TILING_DIAG reason=attrs_missing");
         return ge::GRAPH_FAILED;
     }
     const int64_t *rowsPerEntry = attrs->GetAttrPointer<int64_t>(
@@ -1072,15 +1238,28 @@ static ge::graphStatus ParseStreamingInterface(
         ATTR_KV_OBJECT_DOMAIN_INDEX);
 
     constexpr int64_t kA5ReceiptTileWidth = 128;
-    constexpr int64_t kA5StreamingAicCount = 36;
+    // The copied C8 metadata ABI reserves room for up to 36 AIC and 72 AIV
+    // entries.  Those are capacities, not a requirement that every 950DT
+    // exposes exactly that many active cores.  In particular, the measured
+    // 950DT runtime supplies 32 AIC / 64 AIV; DoTiling below already derives
+    // blockDim and workspace use from that runtime geometry.
+    constexpr int64_t kA5StreamingMaxAicCount = 36;
+    constexpr int64_t kA5StreamingMaxAivCount = 72;
     const int64_t source = liInfo.s2Size;
     int64_t rowCount = 1;
     if (sparseIndices.GetDimNum() < 2) {
+        OP_LOGE(opName,
+                "P3_TILING_DIAG reason=sparse_indices_rank_invalid rank=%ld",
+                sparseIndices.GetDimNum());
         return ge::GRAPH_FAILED;
     }
     for (uint32_t dim = 0; dim + 1 < sparseIndices.GetDimNum(); ++dim) {
         const int64_t value = sparseIndices.GetDim(dim);
         if (value <= 0 || rowCount > std::numeric_limits<int64_t>::max() / value) {
+            OP_LOGE(opName,
+                    "P3_TILING_DIAG reason=sparse_indices_row_product_invalid "
+                    "dim=%u value=%ld accumulated_rows=%ld",
+                    dim, value, rowCount);
             return ge::GRAPH_FAILED;
         }
         rowCount *= value;
@@ -1097,6 +1276,7 @@ static ge::graphStatus ParseStreamingInterface(
         : -1;
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const int64_t aicCount = static_cast<int64_t>(platform.GetCoreNumAic());
+    const int64_t aivCount = static_cast<int64_t>(platform.GetCoreNumAiv());
     const int64_t scoreWorkspaceWords =
         (aicCount > 0 && alignedSource > 0 &&
          aicCount <= std::numeric_limits<int64_t>::max() /
@@ -1108,102 +1288,113 @@ static ge::graphStatus ParseStreamingInterface(
          rowCount <= std::numeric_limits<int64_t>::max() / scoreTileCount)
             ? rowCount * scoreTileCount
             : -1;
-    if (rowsPerEntry == nullptr || kvObjectDomain == nullptr ||
-        (*kvObjectDomain != static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
-         *kvObjectDomain != static_cast<int64_t>(KvObjectDomain::C8_COMPRESSED_OBJECT)) ||
-        (*kvObjectDomain == static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
-         liInfo.cmpRatio != 1U) ||
-        *rowsPerEntry <= 0 ||
-        *rowsPerEntry > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-        rowCount <= 0 || source <= 0 || poolSize <= 0 || queueCount <= 0 ||
-        privateCapacity <= 0 ||
-        alignedSource <= 0 || scoreTileCount <= 0 ||
-        aicCount != kA5StreamingAicCount ||
-        scoreWorkspaceWords <= 0 || tileReceiptCount <= 0 ||
-        scoreWorkspace.GetDimNum() != 1 ||
-        scoreWorkspace.GetDim(0) >
-            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-        tileReceiptCount >
+    const auto fail = [&](const char *reason) {
+        LogStreamingInterfaceFailure(
+            context, reason, liInfo, rowCount, source, poolSize, queueCount,
+            privateCapacity, alignedSource, scoreTileCount, aicCount, aivCount,
+            scoreWorkspaceWords, tileReceiptCount, rowsPerEntry, kvObjectDomain);
+        return ge::GRAPH_FAILED;
+    };
+
+    if (rowsPerEntry == nullptr) return fail("attr.kvaf_rows_per_entry_missing");
+    if (kvObjectDomain == nullptr) return fail("attr.kv_object_domain_missing");
+    if (*kvObjectDomain != static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
+        *kvObjectDomain != static_cast<int64_t>(KvObjectDomain::C8_COMPRESSED_OBJECT)) {
+        return fail("attr.kv_object_domain_invalid");
+    }
+    if (*kvObjectDomain == static_cast<int64_t>(KvObjectDomain::RAW_TOKEN) &&
+        liInfo.cmpRatio != 1U) return fail("attr.raw_token_requires_cmp_ratio_1");
+    if (*rowsPerEntry <= 0 ||
+        *rowsPerEntry > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        return fail("attr.kvaf_rows_per_entry_out_of_range");
+    }
+    if (rowCount <= 0 || source <= 0 || poolSize <= 0 || queueCount <= 0 ||
+        privateCapacity <= 0 || alignedSource <= 0 || scoreTileCount <= 0 ||
+        scoreWorkspaceWords <= 0 || tileReceiptCount <= 0) {
+        return fail("derived.streaming_dimensions_invalid");
+    }
+    if (aicCount <= 0 || aicCount > kA5StreamingMaxAicCount) {
+        return fail("platform.aic_count_out_of_metadata_capacity");
+    }
+    if (aivCount <= 0 || aivCount > kA5StreamingMaxAivCount) {
+        return fail("platform.aiv_count_out_of_metadata_capacity");
+    }
+    if (scoreWorkspace.GetDimNum() != 1) return fail("shape.score_workspace_rank");
+    if (scoreWorkspace.GetDim(0) >
+        static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        return fail("shape.score_workspace_uint32_overflow");
+    }
+    if (tileReceiptCount >
             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         source > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-        context->GetInputDesc(RESIDENT_THRESHOLD_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(RESIDENT_THRESHOLD_VALID_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(KV_OBJECT_SLOTS_SNAPSHOT_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(REQ_POOL_ENTRIES_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(KV_OBJECT_MAP_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(PRIVATE_SOURCE_TO_SLOT_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(PRIVATE_READY_TABLE_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(PRIVATE_ARENA_HEAD_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(PRIVATE_PACKED_OUTPUT_INDEX)->GetDataType() !=
-            ge::DT_UINT8 ||
-        context->GetInputDesc(QUEUE_CONTROL_INDEX)->GetDataType() !=
-            ge::DT_INT64 ||
-        context->GetInputDesc(QUEUE_LEASES_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(KV_OBJECT_LENS_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(SCORE_WORKSPACE_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetInputDesc(TILE_RECEIPTS_INDEX)->GetDataType() !=
-            ge::DT_INT64 ||
-        context->GetInputDesc(STREAMING_EPOCH_INDEX)->GetDataType() !=
-            ge::DT_INT64 ||
-        context->GetOutputDesc(SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetOutputDesc(SCORE_WORKSPACE_OUTPUT_INDEX)->GetDataType() !=
-            ge::DT_INT32 ||
-        context->GetOutputDesc(TILE_RECEIPTS_OUTPUT_INDEX)->GetDataType() !=
-            ge::DT_INT64 ||
-        !ShapeEquals(resident, {rowCount}) ||
-        !ShapeEquals(residentValid, {rowCount}) ||
-        !ShapeEquals(poolEntries, {rowCount}) ||
-        kvObjectSlots.GetDimNum() != 2 || kvObjectSlots.GetDim(1) <= 0 ||
-        kvObjectSlots.GetDim(1) >
-            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-        !ShapeEquals(kvObjectMap, {poolSize, source}) ||
-        !ShapeEquals(sourceToSlot, {rowCount, source}) ||
-        !ShapeEquals(readyTable, {queueCount, privateCapacity}) ||
-        !ShapeEquals(arenaHead, {queueCount}) ||
-        privatePackedOutput.GetDimNum() != 2 ||
-        privatePackedOutput.GetDim(0) <= 0 ||
-        privatePackedOutput.GetDim(0) >
-            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        poolSize > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        queueCount > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        privateCapacity > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        return fail("derived.uint32_overflow");
+    }
+
+    if (context->GetInputDesc(RESIDENT_THRESHOLD_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(RESIDENT_THRESHOLD_VALID_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(KV_OBJECT_SLOTS_SNAPSHOT_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(REQ_POOL_ENTRIES_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(KV_OBJECT_MAP_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(PRIVATE_SOURCE_TO_SLOT_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(PRIVATE_READY_TABLE_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(PRIVATE_ARENA_HEAD_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(PRIVATE_PACKED_OUTPUT_INDEX)->GetDataType() != ge::DT_UINT8 ||
+        context->GetInputDesc(QUEUE_CONTROL_INDEX)->GetDataType() != ge::DT_INT64 ||
+        context->GetInputDesc(QUEUE_LEASES_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(KV_OBJECT_LENS_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(SCORE_WORKSPACE_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetInputDesc(TILE_RECEIPTS_INDEX)->GetDataType() != ge::DT_INT64 ||
+        context->GetInputDesc(STREAMING_EPOCH_INDEX)->GetDataType() != ge::DT_INT64 ||
+        context->GetOutputDesc(SCORE_SOURCE_LENS_OUTPUT_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetOutputDesc(SCORE_WORKSPACE_OUTPUT_INDEX)->GetDataType() != ge::DT_INT32 ||
+        context->GetOutputDesc(TILE_RECEIPTS_OUTPUT_INDEX)->GetDataType() != ge::DT_INT64) {
+        return fail("dtype.streaming_side_channel");
+    }
+
+    if (!ShapeEquals(resident, {rowCount})) return fail("shape.resident_threshold");
+    if (!ShapeEquals(residentValid, {rowCount})) return fail("shape.resident_threshold_valid");
+    if (!ShapeEquals(poolEntries, {rowCount})) return fail("shape.req_pool_entries");
+    if (kvObjectSlots.GetDimNum() != 2 || kvObjectSlots.GetDim(1) <= 0 ||
+        kvObjectSlots.GetDim(1) > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        return fail("shape.kv_object_slots_snapshot");
+    }
+    if (!ShapeEquals(kvObjectMap, {poolSize, source})) return fail("shape.kv_object_map");
+    if (!ShapeEquals(sourceToSlot, {rowCount, source})) return fail("shape.private_source_to_slot");
+    if (!ShapeEquals(readyTable, {queueCount, privateCapacity})) return fail("shape.private_ready_table");
+    if (!ShapeEquals(arenaHead, {queueCount})) return fail("shape.private_arena_head");
+    if (privatePackedOutput.GetDimNum() != 2 || privatePackedOutput.GetDim(0) <= 0 ||
+        privatePackedOutput.GetDim(0) > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         privatePackedOutput.GetDim(1) != 656 ||
         privatePackedOutput.GetDim(0) % queueCount != 0 ||
-        privatePackedOutput.GetDim(0) / queueCount != privateCapacity ||
-        !ShapeEquals(queueControl, {STREAMING_KVAF_CONTROL_WORDS}) ||
-        !ShapeEquals(queueLeases, {queueCount}) ||
-        !ShapeEquals(kvObjectLens, {rowCount}) ||
-        !ShapeEquals(sourceToSlotOut, {rowCount, source}) ||
-        !ShapeEquals(readyTableOut, {queueCount, privateCapacity}) ||
-        !ShapeEquals(arenaHeadOut, {queueCount}) ||
-        !ShapeEquals(privatePackedOutputOut,
-                     {privatePackedOutput.GetDim(0), 656}) ||
-        !ShapeEquals(queueLeasesOut, {queueCount}) ||
-        !ShapeEquals(telemetry, {queueCount, STREAMING_TELEMETRY_COLUMNS}) ||
-        !ShapeEquals(scoreSourceLens, {rowCount}) ||
-        scoreWorkspace.GetDim(0) < scoreWorkspaceWords ||
-        !ShapeEquals(tileReceipts,
-                     {tileReceiptCount, STREAMING_TILE_RECEIPT_WORDS}) ||
-        !ShapeEquals(streamingEpoch, {1}) ||
-        !ShapeEquals(scoreWorkspaceOut, {scoreWorkspace.GetDim(0)}) ||
-        !ShapeEquals(tileReceiptsOut,
-                     {tileReceiptCount, STREAMING_TILE_RECEIPT_WORDS}) ||
-        poolSize >
-            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-        queueCount >
-            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-        privateCapacity >
-            static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
-        return ge::GRAPH_FAILED;
+        privatePackedOutput.GetDim(0) / queueCount != privateCapacity) {
+        return fail("shape.private_packed_output");
+    }
+    if (!ShapeEquals(queueControl, {STREAMING_KVAF_CONTROL_WORDS})) return fail("shape.queue_control");
+    if (!ShapeEquals(queueLeases, {queueCount})) return fail("shape.queue_leases");
+    if (!ShapeEquals(kvObjectLens, {rowCount})) return fail("shape.kv_object_lens");
+    if (!ShapeEquals(sourceToSlotOut, {rowCount, source})) return fail("shape.out_private_source_to_slot");
+    if (!ShapeEquals(readyTableOut, {queueCount, privateCapacity})) return fail("shape.out_private_ready_table");
+    if (!ShapeEquals(arenaHeadOut, {queueCount})) return fail("shape.out_private_arena_head");
+    if (!ShapeEquals(privatePackedOutputOut, {privatePackedOutput.GetDim(0), 656})) {
+        return fail("shape.out_private_packed_output");
+    }
+    if (!ShapeEquals(queueLeasesOut, {queueCount})) return fail("shape.out_queue_leases");
+    if (!ShapeEquals(telemetry, {queueCount, STREAMING_TELEMETRY_COLUMNS})) return fail("shape.out_telemetry");
+    if (!ShapeEquals(scoreSourceLens, {rowCount})) return fail("shape.out_score_source_lens");
+    if (scoreWorkspace.GetDim(0) < scoreWorkspaceWords) return fail("shape.score_workspace_capacity");
+    if (!ShapeEquals(tileReceipts, {tileReceiptCount, STREAMING_TILE_RECEIPT_WORDS})) {
+        return fail("shape.tile_receipts");
+    }
+    if (!ShapeEquals(streamingEpoch, {1})) return fail("shape.streaming_epoch");
+    if (!ShapeEquals(scoreWorkspaceOut, {scoreWorkspace.GetDim(0)})) {
+        return fail("shape.out_score_workspace");
+    }
+    if (!ShapeEquals(tileReceiptsOut,
+                     {tileReceiptCount, STREAMING_TILE_RECEIPT_WORDS})) {
+        return fail("shape.out_tile_receipts");
     }
 
     streamingInfo->rowCount = static_cast<uint32_t>(rowCount);
@@ -1228,6 +1419,8 @@ ge::graphStatus TilingForA5StreamingQuantLiGet(gert::TilingContext *context)
     QLITilingInfo QLIInfo;
     QLIInfoParser QLIInfoParser(context);
     if (QLIInfoParser.ParseAndCheck(QLIInfo) != ge::GRAPH_SUCCESS) {
+        OP_LOGE("A5StreamingQuantLiGet",
+                "P3_TILING_DIAG reason=base_official_c8_parser_failed");
         return ge::GRAPH_FAILED;
     }
     A5StreamingQuantLiGetTiling::StreamingInterfaceInfo streamingInfo;
@@ -1236,7 +1429,11 @@ ge::graphStatus TilingForA5StreamingQuantLiGet(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
     A5StreamingQuantLiGetTiling QLITiling(context);
-    return QLITiling.DoTiling(&QLIInfo, streamingInfo);
+    const ge::graphStatus tilingStatus = QLITiling.DoTiling(&QLIInfo, streamingInfo);
+    if (tilingStatus != ge::GRAPH_SUCCESS) {
+        OP_LOGE("A5StreamingQuantLiGet", "P3_TILING_DIAG reason=do_tiling_failed");
+    }
+    return tilingStatus;
 }
 
 // --------------------------Tiling及函数TilingPrepare函数注册--------

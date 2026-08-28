@@ -164,6 +164,16 @@ def require_source_contract() -> None:
     ):
         assert token in infer or token in tiling, token
 
+    # 36/72 are the fixed source-C8 metadata capacities.  The A5 runtime
+    # reports its active core geometry, so tiling must accept any nonzero
+    # geometry that fits in those arrays rather than requiring an exact 36
+    # AIC count.  The bridge still reserves the 36-AIC maximum workspace.
+    assert "kA5StreamingMaxAicCount = 36" in tiling
+    assert "kA5StreamingMaxAivCount = 72" in tiling
+    assert "aicCount <= 0 || aicCount > kA5StreamingMaxAicCount" in tiling
+    assert "aivCount <= 0 || aivCount > kA5StreamingMaxAivCount" in tiling
+    assert "aicCount != kA5StreamingAicCount" not in tiling
+
     # The bridge must use the same 24/11 public order as CANN.
     for token in (
         "const at::Tensor& scoreWorkspace", "const at::Tensor& tileReceipts",

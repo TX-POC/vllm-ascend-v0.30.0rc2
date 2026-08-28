@@ -104,8 +104,9 @@ int64_t ScoreWorkspaceWords(int64_t sourceCapacity)
     const int64_t alignedSource =
         ((sourceCapacity + kScoreTileWidth - 1) / kScoreTileWidth) *
         kScoreTileWidth;
-    // The source-derived A5 C8 uses 36 AICs and four score rows per AIC.
-    // Each int32 slot backs two uint16 official sortable scores.
+    // The C8-compatible public ABI reserves score storage for at most 36 AICs
+    // and four score rows per AIC.  Runtime tiling may use fewer active cores;
+    // each int32 slot backs two uint16 official sortable scores.
     return (kAicCoreCount * 4 * alignedSource + 1) / 2;
 }
 

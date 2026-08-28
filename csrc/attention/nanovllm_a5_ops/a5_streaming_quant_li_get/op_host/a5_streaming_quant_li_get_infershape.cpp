@@ -57,7 +57,10 @@ constexpr uint32_t STREAMING_KVAF_CONTROL_WORDS = 16;
 constexpr uint32_t STREAMING_PACKED_KV_ROW_BYTES = 656;
 constexpr uint32_t STREAMING_TILE_RECEIPT_WORDS = 16;
 constexpr uint32_t STREAMING_SCORE_TILE_WIDTH = 128;
-constexpr int64_t STREAMING_A5_AIC_CORE_COUNT = 36;
+// This is the fixed metadata/workspace capacity inherited from C8, not an
+// assertion about the number of active AICs on the executing device.  Tiling
+// derives the active geometry from PlatformAscendC at launch time.
+constexpr int64_t STREAMING_A5_MAX_AIC_CORE_COUNT = 36;
 
 static int64_t ProductExceptLast(const gert::Shape &shape)
 {
@@ -206,8 +209,8 @@ static ge::graphStatus InferShapeA5StreamingQuantLiGet(
         : -1;
     const int64_t minScoreWorkspaceWords = alignedSource > 0 &&
         alignedSource <= INT64_MAX /
-            (STREAMING_A5_AIC_CORE_COUNT * 4)
-        ? (STREAMING_A5_AIC_CORE_COUNT * 4 * alignedSource + 1) / 2
+            (STREAMING_A5_MAX_AIC_CORE_COUNT * 4)
+        ? (STREAMING_A5_MAX_AIC_CORE_COUNT * 4 * alignedSource + 1) / 2
         : -1;
     const int64_t queueCount = (leases->GetDimNum() == 1) ? leases->GetDim(0) : -1;
     const int64_t privateCapacity = (ready->GetDimNum() == 2) ? ready->GetDim(1) : -1;

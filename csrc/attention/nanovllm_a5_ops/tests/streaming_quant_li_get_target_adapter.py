@@ -93,11 +93,11 @@ TILE_RECEIPT_WORDS = 16
 TILE_SCORE_WIDTH = 128
 TILE_RECEIPT_CONTRACT_VERSION = 1
 STREAMING_EPOCH = 0x50330001
-# The A5 950 reference target has 36 AICs.  This is the same capacity formula
-# used by the P3 tiler: four score rows per AIC and uint16 scores packed into
-# int32 workspace elements.  Keeping it explicit makes an incompatible target
-# fail before an ACLNN launch instead of under-allocating GM silently.
-A5_AIC_CORE_COUNT = 36
+# C8 reserves score-workspace metadata for up to 36 AICs.  This is a capacity,
+# not the number of active AICs on every 950DT: runtime tiling reads that
+# geometry from PlatformAscendC.  Keeping the maximum here prevents a smaller
+# active geometry from under-allocating the graph-visible workspace.
+A5_MAX_AIC_CORE_COUNT = 36
 # Compatibility exports for legacy P4 scripts. They are deliberately no
 # longer consumed by this strict P3 adapter.
 HOOK_CONTROL_MODE_ENV = "P3_HOOK_CONTROL_MODE"
@@ -817,7 +817,7 @@ def _make_static_transaction(
 
 def _score_workspace_words(source_tokens: int) -> int:
     aligned = ((source_tokens + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH) * TILE_SCORE_WIDTH
-    return (A5_AIC_CORE_COUNT * 4 * aligned + 1) // 2
+    return (A5_MAX_AIC_CORE_COUNT * 4 * aligned + 1) // 2
 
 
 def _make_publication_buffers(device: torch.device) -> dict[str, torch.Tensor]:
