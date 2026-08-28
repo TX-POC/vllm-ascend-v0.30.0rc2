@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -492,6 +493,18 @@ def _ddr_payload(torch: Any) -> Any:
     return (physical_rows * 31 + byte_ids * 11 + 5).remainder(256).to(torch.uint8)
 
 
+def _executor_trace(step: str, **fields: Any) -> None:
+    """Emit a compact, unbuffered executor-lifecycle breadcrumb.
+
+    Direct-HCCP emits its own C++ lifecycle messages.  These Python markers
+    delimit the user-visible control boundaries around them, which makes a
+    single failing run sufficient to tell whether a failure happened during
+    cold bind, ACLNN launch, device synchronization, or teardown.
+    """
+    suffix = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"P5_EXECUTOR_STEP step={step}{(' ' + suffix) if suffix else ''}", flush=True)
+
+
 def _run_executor(
     torch: Any, fixture: P5Fixture, tensors: dict[str, Any], args: argparse.Namespace, device: Any
 ) -> None:
@@ -500,26 +513,48 @@ def _run_executor(
     import nanovllm_exact_scan_get  # noqa: F401
 
     device_id = device.index if device.index is not None else torch.npu.current_device()
+    _executor_trace("runtime_create", device=device_id, transport=args.transport)
     runtime = _create_runtime(kvaf, args, device_id)
+    _executor_trace("runtime_created")
     table = None
     bound = False
+    cleanup_failures: list[BaseException] = []
     try:
         source_cpu = _ddr_payload(torch)
+        _executor_trace("initialize_begin", entry_bytes=ENTRY_BYTES)
         runtime.initialize(ENTRY_BYTES, ENTRY_BYTES)
+        _executor_trace("initialize_done")
+        _executor_trace("batch_put_begin", keys=1, bytes=ENTRY_BYTES)
         runtime.batch_put([1], source_cpu.reshape(-1).to(device), [0], [ENTRY_BYTES])
         torch.npu.synchronize()
+        _executor_trace("batch_put_done")
+        _executor_trace("access_table_prepare_begin", keys=1)
         table = runtime.prepare_access_table([1])
         access = runtime.access_table_view(table, device="npu", capacity=1)
         tensors["address_table"] = access.addresses
         tensors["valid_table"] = access.valid
+        _executor_trace(
+            "access_table_ready",
+            address_ptr=hex(tensors["address_table"].data_ptr()),
+            valid_ptr=hex(tensors["valid_table"].data_ptr()),
+            capacity=tensors["address_table"].numel(),
+        )
+        _executor_trace(
+            "bind_begin",
+            output_ptr=hex(tensors["private_packed_output"].data_ptr()),
+            control_ptr=hex(tensors["fused_get_control"].data_ptr()),
+        )
         runtime.bind_fused_batch_get_control(
             tensors["private_packed_output"],
             tensors["fused_get_control"],
             torch.npu.current_stream(),
         )
         bound = True
+        _executor_trace("bind_done")
         torch.npu.synchronize()
+        _executor_trace("bind_synchronize_done")
 
+        _executor_trace("op_invoke")
         outputs = torch.ops.a5_exact_scan_get.exact_scan_speculative_get(
             tensors["score_workspace"],
             tensors["tile_receipts"],
@@ -542,15 +577,44 @@ def _run_executor(
             tensors["pipeline_state"],
             tensors["execution_mode"],
         )
+        _executor_trace("op_return", outputs=len(outputs))
+        _executor_trace("op_synchronize_begin")
         torch.npu.synchronize()
+        _executor_trace("op_synchronize_done")
         _assert_executor_oracle(torch, fixture, tensors, outputs, source_cpu)
+        _executor_trace("oracle_done")
     finally:
+        primary_exception_active = sys.exc_info()[0] is not None
+        _executor_trace("cleanup_begin", bound=int(bound), table=int(table is not None))
         if bound:
-            torch.npu.synchronize()
-            runtime.release_fused_batch_get_control()
+            try:
+                _executor_trace("cleanup_synchronize_begin")
+                torch.npu.synchronize()
+                _executor_trace("cleanup_synchronize_done")
+            except BaseException as error:  # Preserve the original failure but still release.
+                cleanup_failures.append(error)
+                _executor_trace("cleanup_synchronize_error", error=type(error).__name__)
+            try:
+                runtime.release_fused_batch_get_control()
+                _executor_trace("cleanup_release_control_done")
+            except BaseException as error:
+                cleanup_failures.append(error)
+                _executor_trace("cleanup_release_control_error", error=type(error).__name__)
         if table is not None:
-            runtime.release_access_table(table)
-        runtime.shutdown()
+            try:
+                runtime.release_access_table(table)
+                _executor_trace("cleanup_release_table_done")
+            except BaseException as error:
+                cleanup_failures.append(error)
+                _executor_trace("cleanup_release_table_error", error=type(error).__name__)
+        try:
+            runtime.shutdown()
+            _executor_trace("cleanup_shutdown_done")
+        except BaseException as error:
+            cleanup_failures.append(error)
+            _executor_trace("cleanup_shutdown_error", error=type(error).__name__)
+        if cleanup_failures and not primary_exception_active:
+            raise cleanup_failures[0]
 
 
 def _assert_executor_oracle(
