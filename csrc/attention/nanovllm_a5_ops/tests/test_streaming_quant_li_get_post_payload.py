@@ -61,6 +61,20 @@ DEFAULT_QUEUE_COUNT = 1
 DEFAULT_PRIVATE_ARENA_CAPACITY = 256
 MAX_DENSE_REQUESTS = 256
 MAX_DIAGNOSTIC_SAMPLES = 8
+POST_EXERCISE_MODES = ("all_busy", "threshold_off", "full")
+
+
+# The target ACLNN call is asynchronous.  Keep one compact host-side marker so
+# a device-side failure reported by the following synchronize can still be
+# tied to the last completed lifecycle step without relying on a huge log.
+_LAST_STAGE = "startup"
+
+
+def _stage(name: str, **fields: object) -> None:
+    global _LAST_STAGE
+    _LAST_STAGE = name
+    suffix = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"P3_POST_STAGE name={name}" + (f" {suffix}" if suffix else ""), flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +95,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PRIVATE_ARENA_CAPACITY,
     )
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument(
+        "--post-exercise",
+        choices=POST_EXERCISE_MODES,
+        default="full",
+        help=(
+            "all_busy: prove the P3 C8 base path while skipping every post action; "
+            "threshold_off: exercise score observation plus SIMT lease acquire/release "
+            "without a candidate or H2D post; full: exercise the real Post/CQ payload path"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -368,8 +392,12 @@ def _call_post_op(
             "run in a fresh Python process: the isolated target bridge was "
             "already imported before the source-matched official reference"
         )
+    _stage("target_bridge_bind_begin")
     target._bind_isolated_target_opp(target_opapi)
+    _stage("target_bridge_bind_done")
+    _stage("target_bridge_import_begin")
     importlib.import_module("nanovllm_streaming_quant_li_get")
+    _stage("target_bridge_import_done")
     namespace = getattr(torch.ops, "a5_streaming_quant_li_get", None)
     op = getattr(namespace, "streaming_quant_li_get", None) if namespace else None
     if op is None:
@@ -377,6 +405,7 @@ def _call_post_op(
             "isolated target bridge did not register "
             "torch.ops.a5_streaming_quant_li_get.streaming_quant_li_get"
         )
+    _stage("target_op_submit_begin")
     result = op(
         inputs["query"],
         inputs["key"],
@@ -421,6 +450,7 @@ def _call_post_op(
         raise AssertionError(
             "derived bridge did not return the required 24-input/11-output ABI"
         )
+    _stage("target_op_submitted", outputs=len(result))
     return result
 
 
@@ -466,6 +496,100 @@ def _terminal_summary(
             "P3_POST_PAYLOAD_DIAGNOSTIC terminal="
             f"bad={bad} summary={summary} leases={leases.tolist()} "
             f"telemetry={telemetry.tolist()}"
+        )
+    return summary
+
+
+def _probe_summary(
+    transaction: dict[str, torch.Tensor], outputs: tuple[torch.Tensor, ...]
+) -> dict[str, int]:
+    """Read the same terminal state without asserting that a Get was posted."""
+    telemetry = outputs[7].detach().cpu().contiguous()
+    leases = transaction["queue_leases"].detach().cpu().contiguous()
+    ready = transaction["private_ready_table"].detach().cpu().contiguous()
+    source_to_slot = transaction["private_source_to_slot"].detach().cpu().contiguous()
+    expected_shape = (transaction["queue_leases"].numel(), QUEUE_TELEMETRY_COLUMNS)
+    if tuple(telemetry.shape) != expected_shape:
+        raise AssertionError(
+            "unexpected P3 telemetry shape: "
+            f"got={tuple(telemetry.shape)} expected={expected_shape}"
+        )
+    return {
+        "tile_ready_calls": int(telemetry[:, 0].sum().item()),
+        "doorbell_posted": int(telemetry[:, TELEMETRY_DOORBELL_POSTED].sum().item()),
+        "cq_retired_ready": int(telemetry[:, TELEMETRY_CQ_RETIRED_READY].sum().item()),
+        "cq_retired_failed": int(telemetry[:, TELEMETRY_CQ_RETIRED_FAILED].sum().item()),
+        "lease_released": int(telemetry[:, TELEMETRY_LEASE_RELEASED].sum().item()),
+        "control_rejected": int(telemetry[:, TELEMETRY_CONTROL_REJECTED].sum().item()),
+        "private_claims": int(telemetry[:, 5].sum().item()),
+        "mapped_sources": int(torch.count_nonzero(source_to_slot >= 0).item()),
+        "ready_slots": int(torch.count_nonzero(ready == 2).item()),
+        "failed_slots": int(torch.count_nonzero(ready == 3).item()),
+        "leases_nonzero": int(torch.count_nonzero(leases).item()),
+    }
+
+
+def _apply_post_exercise(
+    transaction: dict[str, torch.Tensor], mode: str
+) -> None:
+    """Select one device-side closure without changing C8 inputs or output ABI.
+
+    ``all_busy`` makes ``MayNeedScoreObservation`` false, so the same target
+    OPP runs its normal C8 path but bypasses the P3 hook altogether.
+    ``threshold_off`` leaves a queue free; it reaches the hook and its SIMT
+    acquire/release path, but rejects every score before private claim/Begin.
+    ``full`` is the real thresholded cold-candidate Post/CQ path.
+    """
+    if mode == "all_busy":
+        transaction["queue_leases"].fill_(1)
+    elif mode == "threshold_off":
+        transaction["resident_threshold_valid"].zero_()
+    elif mode != "full":
+        raise ValueError(f"unsupported post exercise mode: {mode}")
+    torch.npu.synchronize()
+    leases = transaction["queue_leases"].detach().cpu().tolist()
+    threshold_valid = transaction["resident_threshold_valid"].detach().cpu().tolist()
+    _stage(
+        "post_exercise_applied",
+        mode=mode,
+        leases=leases,
+        threshold_valid=threshold_valid,
+    )
+
+
+def _assert_non_payload_mode(
+    mode: str,
+    transaction: dict[str, torch.Tensor],
+    outputs: tuple[torch.Tensor, ...],
+) -> dict[str, int]:
+    """Assert exactly what the two isolation controls are meant to prove."""
+    summary = _probe_summary(transaction, outputs)
+    common = {
+        "control_rejected": summary["control_rejected"] == 0,
+        "doorbell_posted": summary["doorbell_posted"] == 0,
+        "private_claims": summary["private_claims"] == 0,
+        "mapped_sources": summary["mapped_sources"] == 0,
+        "ready_slots": summary["ready_slots"] == 0,
+        "failed_slots": summary["failed_slots"] == 0,
+        "cq_retired_ready": summary["cq_retired_ready"] == 0,
+        "cq_retired_failed": summary["cq_retired_failed"] == 0,
+    }
+    if mode == "all_busy":
+        common["all_busy_kept_leases"] = summary["leases_nonzero"] == transaction[
+            "queue_leases"
+        ].numel()
+        common["all_busy_skipped_hook"] = summary["tile_ready_calls"] == 0
+    elif mode == "threshold_off":
+        common["threshold_off_entered_hook"] = summary["tile_ready_calls"] > 0
+        common["threshold_off_released_lease"] = summary["leases_nonzero"] == 0
+        common["threshold_off_no_cq"] = summary["lease_released"] == 0
+    else:
+        raise ValueError(f"not an isolation mode: {mode}")
+    bad = [name for name, ok in common.items() if not ok]
+    if bad:
+        raise AssertionError(
+            "P3_POST_PAYLOAD_DIAGNOSTIC isolation="
+            f"mode={mode} bad={bad} summary={summary}"
         )
     return summary
 
@@ -629,6 +753,7 @@ def main() -> int:
         f"kvaf_head={target_provenance['kvaf_source_head']} "
         f"inline={target_provenance['inline_mode']} "
         f"publication={target_provenance['publication_mode']} "
+        f"exercise={args.post_exercise} "
         f"kvaf_module={getattr(kvaf, '__file__', '<unknown>')}",
         flush=True,
     )
@@ -636,8 +761,11 @@ def main() -> int:
     # The official C8 call occurs before the target bridge resolver is bound.
     inputs = target._build_official_inputs(device)
     inputs["metadata"] = target._official_metadata(metadata_op, inputs)
+    _stage("official_c8_submit_begin")
     official_indices = target._call_official(official_op, inputs)
+    _stage("official_c8_sync_begin")
     torch.npu.synchronize()
+    _stage("official_c8_sync_done")
 
     runtime = _create_runtime(args)
     _require_streaming_runtime_api(runtime)
@@ -654,10 +782,14 @@ def main() -> int:
             [entry * ENTRY_BYTES for entry in range(args.table_capacity)],
             [ENTRY_BYTES] * args.table_capacity,
         )
+        _stage("kvaf_batch_put_sync_begin")
         torch.npu.synchronize()
+        _stage("kvaf_batch_put_sync_done")
         table = runtime.prepare_access_table(keys)
         access = runtime.access_table_view(table, device="npu", capacity=args.table_capacity)
+        _stage("access_table_sync_begin")
         torch.npu.synchronize()
+        _stage("access_table_sync_done")
 
         transaction = _make_post_transaction(
             device, args.queue_count, args.private_arena_capacity
@@ -671,7 +803,6 @@ def main() -> int:
                 "access.valid": access.valid,
             }
         )
-        persistent_snapshot = transaction["kv_object_slots_snapshot"].detach().cpu().clone()
         descriptor = _make_descriptor_templates(device, args.queue_count)
         _require_logical_npu0_tensors(
             {
@@ -715,11 +846,22 @@ def main() -> int:
             f"templates_configured={snapshot.get('template_configure_count')}",
             flush=True,
         )
+        _stage("streaming_control_bound")
+
+        _apply_post_exercise(transaction, args.post_exercise)
+        persistent_snapshot = transaction["kv_object_slots_snapshot"].detach().cpu().clone()
 
         publication = target._make_publication_buffers(device)
         _require_logical_npu0_tensors(publication)
+        _stage(
+            "publication_allocated",
+            score_workspace=publication["score_workspace"].numel(),
+            tile_receipts=publication["tile_receipts"].numel(),
+        )
         outputs = _call_post_op(inputs, transaction, publication, target_opapi)
+        _stage("target_op_sync_begin")
         torch.npu.synchronize()
+        _stage("target_op_sync_done")
         _require_logical_npu0_tensors(
             {f"output[{index}]": value for index, value in enumerate(outputs)}
         )
@@ -733,26 +875,37 @@ def main() -> int:
         target._assert_publication_contract("off", publication)
         if not torch.equal(transaction["kv_object_slots_snapshot"].detach().cpu(), persistent_snapshot):
             raise AssertionError("post speculation mutated persistent kv_object_slots_snapshot")
-        terminal = _terminal_summary(transaction, outputs)
-        payload = _validate_payload_chain(
-            transaction,
-            ddr_payload,
-            keys,
-            access,
-            args.private_arena_capacity,
-        )
-        print(
-            "P3_POST_PAYLOAD_STRICT_PASS "
-            "topk=bitwise score_source_lens=exact publication=off "
-            "persistent_mapping=unchanged mapping=permuted_pool "
-            f"mapped_sources={payload['mapped_sources']} "
-            f"unique_slots={payload['unique_slots']} ready_slots={payload['ready_slots']} "
-            f"payload_bytes={payload['payload_bytes']} "
-            f"doorbell_posted={terminal['doorbell_posted']} "
-            f"cq_ready={terminal['cq_retired_ready']} "
-            f"physical_npu={args.physical_npu_id} logical_npu=0",
-            flush=True,
-        )
+        if args.post_exercise == "full":
+            terminal = _terminal_summary(transaction, outputs)
+            payload = _validate_payload_chain(
+                transaction,
+                ddr_payload,
+                keys,
+                access,
+                args.private_arena_capacity,
+            )
+            print(
+                "P3_POST_PAYLOAD_STRICT_PASS "
+                "topk=bitwise score_source_lens=exact publication=off "
+                "persistent_mapping=unchanged mapping=permuted_pool "
+                f"mapped_sources={payload['mapped_sources']} "
+                f"unique_slots={payload['unique_slots']} ready_slots={payload['ready_slots']} "
+                f"payload_bytes={payload['payload_bytes']} "
+                f"doorbell_posted={terminal['doorbell_posted']} "
+                f"cq_ready={terminal['cq_retired_ready']} "
+                f"physical_npu={args.physical_npu_id} logical_npu=0",
+                flush=True,
+            )
+        else:
+            summary = _assert_non_payload_mode(args.post_exercise, transaction, outputs)
+            print(
+                "P3_POST_ISOLATION_PASS "
+                f"mode={args.post_exercise} topk=bitwise "
+                "score_source_lens=exact persistent_mapping=unchanged "
+                f"summary={summary} "
+                f"physical_npu={args.physical_npu_id} logical_npu=0",
+                flush=True,
+            )
         return 0
     finally:
         if control_bound:
@@ -768,7 +921,7 @@ if __name__ == "__main__":
     except Exception as error:
         print(
             "P3_POST_PAYLOAD_FAIL "
-            f"type={type(error).__name__} text={error}",
+            f"stage={_LAST_STAGE} type={type(error).__name__} text={error}",
             file=sys.stderr,
             flush=True,
         )
