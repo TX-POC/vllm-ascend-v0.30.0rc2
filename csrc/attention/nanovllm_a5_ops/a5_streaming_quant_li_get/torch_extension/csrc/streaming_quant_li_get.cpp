@@ -33,6 +33,11 @@ constexpr int64_t kTileReceiptWords = 16;
 // dataflow.
 constexpr int32_t kScoreSourceLensDebugSentinel = -123456789;
 
+enum class PostClosureMode {
+    kFull,
+    kEmptyShell,
+};
+
 using Result = std::tuple<
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
@@ -50,6 +55,42 @@ bool ScoreSourceLensDebugPrefillEnabled()
         "NANOVLLM_A5_SCORE_SOURCE_LENS_DEBUG_PREFILL");
     return value != nullptr && value[0] != '\0' &&
            !(value[0] == '0' && value[1] == '\0');
+}
+
+PostClosureMode ResolvePostClosureMode()
+{
+    // The bridge cannot inspect an ACLNN DSO's compile-time macro.  Require
+    // the caller to state the expected post artifact explicitly; the Python
+    // adapter independently validates the matching provenance manifest before
+    // this bridge is imported.
+    const char* value = std::getenv("P3_POST_CLOSURE_MODE");
+    if (value == nullptr || value[0] == '\0' || std::string(value) == "full") {
+        return PostClosureMode::kFull;
+    }
+    if (std::string(value) == "empty_shell") {
+        return PostClosureMode::kEmptyShell;
+    }
+    TORCH_CHECK(false,
+                "P3_POST_CLOSURE_MODE must be unset, 'full', or 'empty_shell'; got ",
+                value);
+    return PostClosureMode::kFull;
+}
+
+void CheckStrictDecodeScoreSourceLensAlias(
+    const at::Tensor& query, const at::Tensor& actualSeqLengthsK,
+    const std::string& layoutQuery, int64_t cmpRatio, int64_t rowCount)
+{
+    TORCH_CHECK(layoutQuery == "TND",
+                "empty-shell score_source_lens alias requires decode layout_query=TND.");
+    TORCH_CHECK(cmpRatio == 1,
+                "empty-shell score_source_lens alias requires cmp_ratio=1.");
+    TORCH_CHECK(query.dim() == 3 && query.size(0) == rowCount,
+                "empty-shell score_source_lens alias requires one TND decode row "
+                "per sparse output row.");
+    TORCH_CHECK(actualSeqLengthsK.dim() == 1 &&
+                    actualSeqLengthsK.numel() == rowCount,
+                "empty-shell score_source_lens alias requires "
+                "actual_seq_lengths_key=int32[R], where R=ProductExceptLast(sparse_indices).");
 }
 
 std::string ShapeString(c10::IntArrayRef values)
@@ -329,11 +370,23 @@ Result AllocateAndLaunch(
                                       at::empty({0}, floatOptions);
     const int64_t rowCount = ProductExceptLast(sparseIndices);
     auto telemetry = at::zeros({queueLeases.numel(), kTelemetryColumns}, int64Options);
+    const PostClosureMode postClosureMode = ResolvePostClosureMode();
+    const bool scoreSourceLensAlias =
+        postClosureMode == PostClosureMode::kEmptyShell;
     const bool scoreSourceLensDebugPrefill =
         ScoreSourceLensDebugPrefillEnabled();
-    auto scoreSourceLens = scoreSourceLensDebugPrefill
-        ? at::full({rowCount}, kScoreSourceLensDebugSentinel, int32Options)
-        : at::empty({rowCount}, int32Options);
+    TORCH_CHECK(!scoreSourceLensAlias || !scoreSourceLensDebugPrefill,
+                "NANOVLLM_A5_SCORE_SOURCE_LENS_DEBUG_PREFILL is incompatible "
+                "with empty-shell input aliasing.");
+    if (scoreSourceLensAlias) {
+        CheckStrictDecodeScoreSourceLensAlias(
+            query, actualSeqLengthsK, layoutQuery, cmpRatio, rowCount);
+    }
+    auto scoreSourceLens = scoreSourceLensAlias
+        ? actualSeqLengthsK
+        : (scoreSourceLensDebugPrefill
+            ? at::full({rowCount}, kScoreSourceLensDebugSentinel, int32Options)
+            : at::empty({rowCount}, int32Options));
 
     // Every receipt is intentionally the same physical allocation as its
     // matching mutable input. This is a graph ownership proof, not a copy.
@@ -355,6 +408,11 @@ Result AllocateAndLaunch(
                      "P3_LI_SCORE_SOURCE_LENS_PREFILL enabled=%d sentinel=%d\n",
                      scoreSourceLensDebugPrefill ? 1 : 0,
                      static_cast<int>(kScoreSourceLensDebugSentinel));
+        std::fprintf(stderr,
+                     "P3_LI_SCORE_SOURCE_LENS_ALIAS actual_seq_lengths_key=%d "
+                     "post_closure_mode=%s\n",
+                     scoreSourceLensAlias ? 1 : 0,
+                     scoreSourceLensAlias ? "empty_shell" : "full");
         for (const auto& item : {
                  std::pair<const char*, const at::Tensor*>{"in0.query", &query},
                  {"in1.key", &key}, {"in2.weights", &weights},
@@ -493,11 +551,18 @@ Result StreamingQuantLiGetMeta(
     auto sparseValues = returnValues ? at::empty(sparseShape, floatOptions) :
                                       at::empty({0}, floatOptions);
     const int64_t rowCount = ProductExceptLast(sparseIndices);
+    const bool scoreSourceLensAlias =
+        ResolvePostClosureMode() == PostClosureMode::kEmptyShell;
+    if (scoreSourceLensAlias) {
+        CheckStrictDecodeScoreSourceLensAlias(
+            query, actualSeqLengthsK, layoutQuery, cmpRatio, rowCount);
+    }
     return std::make_tuple(
         sparseIndices, sparseValues, privateSourceToSlot, privateReadyTable,
         privateArenaHead, privatePackedOutput, queueLeases,
         at::empty({queueLeases.numel(), kTelemetryColumns}, int64Options),
-        at::empty({rowCount}, int32Options), scoreWorkspace, tileReceipts);
+        scoreSourceLensAlias ? actualSeqLengthsK : at::empty({rowCount}, int32Options),
+        scoreWorkspace, tileReceipts);
 }
 }  // namespace
 

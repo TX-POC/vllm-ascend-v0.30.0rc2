@@ -12,7 +12,7 @@
 #include "kernel_operator.h"
 #include "quant_lightning_indexer_common.h"
 #include "../a5_streaming_quant_li_get_hook_mode.h"
-#if A5_STREAMING_LI_GET_INLINE_MODE == 2
+#if A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
 #include "../kvaf_device/kvaf_fused_full_get_device.h"
 
 namespace QLIKernel {
@@ -644,6 +644,6 @@ private:
 }  // namespace streaming_li_get
 }  // namespace QLIKernel
 
-#endif  // A5_STREAMING_LI_GET_INLINE_MODE == 2
+#endif  // A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
 
 #endif  // A5_STREAMING_QUANT_LI_GET_TILE_READY_H

@@ -119,9 +119,12 @@ def require_source_contract() -> None:
     assert "A5_STREAMING_LI_GET_INLINE_MODE" in hook_mode
     assert "A5_STREAMING_LI_GET_INLINE_MODE >= 0" in hook_mode
     assert "A5_STREAMING_LI_GET_INLINE_MODE <= 2" in hook_mode
+    assert "A5_STREAMING_LI_GET_POST_CLOSURE_MODE" in hook_mode
+    assert "A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE" in hook_mode
+    assert "A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS" in hook_mode
     assert "except audit + publisher provenance" in hook_mode
     assert '#if A5_STREAMING_LI_GET_INLINE_MODE == 1' in vector
-    assert '#elif A5_STREAMING_LI_GET_INLINE_MODE == 2' in vector
+    assert '#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE' in vector
     assert 'a5_streaming_quant_li_get_tile_audit.h' in vector
     assert 'a5_streaming_quant_li_get_tile_ready.h' in vector
     assert "StreamingLiTileAuditHook" in vector
@@ -130,7 +133,7 @@ def require_source_contract() -> None:
     assert "InitStreamingKvafHook" in vector
     assert "FinishStreamingKvafHook" in vector
     assert "#if A5_STREAMING_LI_GET_INLINE_MODE == 1" in audit_hook
-    assert "#if A5_STREAMING_LI_GET_INLINE_MODE == 2" in post_hook
+    assert "#if A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE" in post_hook
     # A strict audit build is physically score-only: the generated staging
     # directory deletes the post hook and all KVAF/SIMT sources, while this
     # remaining audit header has no call-site into that closure.
@@ -149,6 +152,14 @@ def require_source_contract() -> None:
     assert "AuditScoreDecision" not in post_hook
     assert "TryAcquireKvafStreamingBatchGetQueueFromAicore" in post_hook
     assert "BeginKvafStreamingBatchGet" in post_hook
+    # Empty-shell post keeps the public 24/11 ABI but must not allocate any
+    # post-hook handoff UB or emit an HCCP wave.  Its output #8 is a bridge
+    # alias of actual_seq_lengths_key, so C8 has no score-lens side write.
+    assert "#if A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE" in vector
+    assert "#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS" in vector
+    assert "#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS" in preload
+    assert "? actualSeqLengthsK" in bridge
+    assert "CheckStrictDecodeScoreSourceLensAlias" in bridge
 
     # Modes 1/2 redirect the official score DMA; mode 2 publishes two fixed
     # 64-byte lines after it, before the existing MTE3/V release.
@@ -190,7 +201,7 @@ def require_source_contract() -> None:
         "#if A5_STREAMING_LI_GET_INLINE_MODE == 1", 0, audit_emit
     )
     audit_branch_end = vector.index(
-        "#elif A5_STREAMING_LI_GET_INLINE_MODE == 2", audit_branch_start
+        "#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE", audit_branch_start
     )
     audit_seam = vector[audit_branch_start:audit_branch_end]
     post_seam = vector[audit_branch_end:vector.index("#endif", post_emit)]
@@ -222,7 +233,7 @@ def require_source_contract() -> None:
     ):
         assert token in preload, token
     assert "#if A5_STREAMING_LI_GET_INLINE_MODE == 1" in preload
-    assert "#elif A5_STREAMING_LI_GET_INLINE_MODE == 2" in preload
+    assert "#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE" in preload
     assert "vectorService.InitStreamingAuditHook(" in preload
     assert "vectorService.InitStreamingKvafHook(" in preload
     free_event = preload.index("vectorService.FreeEventID();")
@@ -231,6 +242,9 @@ def require_source_contract() -> None:
 
     for token in (
         "NEEDS_P3_POST_KVAF=0",
+        "NANOVLLM_A5_STREAMING_LI_GET_POST_CLOSURE_MODE",
+        "P3 post closure mode:",
+        "post_closure_mode=${STREAMING_LI_POST_CLOSURE_MODE_NAME}",
         "P3 inline=audit closure must contain only the audit observer",
         "P3 generated audit closure: score-only verified=1",
         "kvaf_closure=${P3_KVAF_CLOSURE}",
@@ -291,8 +305,26 @@ def require_source_contract() -> None:
         OPS_ROOT / "tests/streaming_quant_li_get_target_adapter.py"
     ).read_text(encoding="utf-8")
     assert '"kvaf_closure"' in target_adapter
-    assert '"staged" if expected_inline_mode == "post" else "absent"' in target_adapter
+    assert "POST_CLOSURE_MODE_ENV" in target_adapter
+    assert '"staged" if expected_post_closure_mode == "full" else "absent"' in target_adapter
+    assert "P3_POST_CLOSURE_MODE=empty_shell" in target_adapter
+    assert "P3_PHYSICAL_NPU_ID" in target_adapter
+    assert "ASCEND_RT_VISIBLE_DEVICES" in target_adapter
+    assert "requested_logical=" in target_adapter
+    assert "physical_npu=" in target_adapter
     assert "no-transport artifact unexpectedly records a KVAF" in target_adapter
+
+    empty_shell_runner = (
+        OPS_ROOT / "tests/test_streaming_quant_li_get_empty_shell_strict.py"
+    ).read_text(encoding="utf-8")
+    for token in (
+        "run_target_equivalence",
+        "P3_EMPTY_SHELL_STRICT_PASS",
+        "P3_EMPTY_SHELL_STRICT_FAIL",
+        "P3_POST_CLOSURE_MODE=empty_shell",
+        "hccp=not_compiled",
+    ):
+        assert token in empty_shell_runner, token
 
     # The strict post test is intentionally separate from the former
     # known-failed payload probe.  It must exercise the full 24/11 ABI and

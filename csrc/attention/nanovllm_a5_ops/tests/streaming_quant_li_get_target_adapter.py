@@ -91,6 +91,7 @@ REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
 TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"
 REFERENCE_OPAPI_ENV = "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"
 TARGET_NPU_ENV = "P3_NPU_ID"
+PHYSICAL_TARGET_NPU_ENV = "P3_PHYSICAL_NPU_ID"
 PUBLICATION_MODE_ENV = "P3_PUBLICATION_MODE"
 PUBLICATION_MODES = ("off", "score_workspace", "publisher")
 PUBLICATION_MODE_TO_BUILD_VALUE = {
@@ -104,6 +105,12 @@ INLINE_MODE_TO_BUILD_VALUE = {
     "off": "0",
     "audit": "1",
     "post": "2",
+}
+POST_CLOSURE_MODE_ENV = "P3_POST_CLOSURE_MODE"
+POST_CLOSURE_MODE_TO_BUILD_VALUE = {
+    "not_applicable": "0",
+    "empty_shell": "0",
+    "full": "1",
 }
 SCORE_WORKSPACE_SENTINEL = -0x3A5A5A5A
 TILE_RECEIPT_SENTINEL = -1
@@ -129,52 +136,102 @@ NO_POST_TRANSACTION_NAMES = (
     "private_packed_output",
     "queue_leases",
 )
+_SELECTED_PHYSICAL_NPU_ID: int | None = None
+
+
+def _parse_nonnegative_npu_id(name: str, value: str | None) -> int:
+    if value is None:
+        raise RuntimeError(f"set {name} to a non-negative integer")
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise RuntimeError(
+            f"{name} must be a non-negative integer, got {value!r}"
+        ) from error
+    if parsed < 0:
+        raise RuntimeError(
+            f"{name} must be a non-negative integer, got {parsed}"
+        )
+    return parsed
+
+
+def _visible_physical_npus() -> tuple[str, tuple[int, ...]] | None:
+    """Return the explicit logical-to-physical mask, if one is present.
+
+    ``ASCEND_RT_VISIBLE_DEVICES=7`` deliberately makes physical NPU 7 appear
+    as logical ``npu:0``.  The strict runner may use that isolation, but its
+    proof must still state the physical card rather than relabelling it as 0.
+    """
+    raw_rt = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
+    raw_legacy = os.getenv("ASCEND_VISIBLE_DEVICES")
+    raw = raw_rt if raw_rt else raw_legacy
+    if not raw:
+        return None
+    source = "ASCEND_RT_VISIBLE_DEVICES" if raw_rt else "ASCEND_VISIBLE_DEVICES"
+    fields = tuple(part.strip() for part in raw.split(","))
+    if not fields or any(not field for field in fields):
+        raise RuntimeError(f"{source} has an invalid empty device entry: {raw!r}")
+    try:
+        physical = tuple(int(field) for field in fields)
+    except ValueError as error:
+        raise RuntimeError(
+            f"{source} must be a comma-separated physical NPU-id list; got {raw!r}"
+        ) from error
+    if any(value < 0 for value in physical) or len(set(physical)) != len(physical):
+        raise RuntimeError(f"{source} has invalid physical NPU ids: {raw!r}")
+    return source, physical
 
 
 def _require_a5_npu() -> torch.device:
+    global _SELECTED_PHYSICAL_NPU_ID
     requested_text = os.getenv(TARGET_NPU_ENV)
     if requested_text is None:
         raise RuntimeError(
-            f"set {TARGET_NPU_ENV} to the explicit physical A5 NPU id; "
-            "this target test must not silently use logical npu:0"
+            f"set {TARGET_NPU_ENV} to the logical A5 NPU id visible to this "
+            "process; this target test must not silently use npu:0"
         )
-    try:
-        requested_id = int(requested_text)
-    except ValueError as error:
-        raise RuntimeError(
-            f"{TARGET_NPU_ENV} must be a non-negative integer, "
-            f"got {requested_text!r}"
-        ) from error
-    if requested_id < 0:
-        raise RuntimeError(
-            f"{TARGET_NPU_ENV} must be a non-negative integer, "
-            f"got {requested_id}"
-        )
-
-    # A single-card ASCEND_VISIBLE_DEVICES mapping makes physical card 7 look
-    # like logical npu:0.  That is useful for product isolation but unsuitable
-    # for this bring-up: it obscures which card actually executed the C8 proof.
-    # Fail closed instead of printing an ambiguous logical id in the evidence.
-    visible_mapping = os.getenv("ASCEND_VISIBLE_DEVICES")
-    if visible_mapping:
-        raise RuntimeError(
-            "P3 target equivalence requires an unmasked physical device; "
-            "unset ASCEND_VISIBLE_DEVICES and use "
-            f"{TARGET_NPU_ENV}={requested_id}, got "
-            f"ASCEND_VISIBLE_DEVICES={visible_mapping!r}"
-        )
+    requested_id = _parse_nonnegative_npu_id(TARGET_NPU_ENV, requested_text)
+    mapping = _visible_physical_npus()
+    explicit_physical_text = os.getenv(PHYSICAL_TARGET_NPU_ENV)
+    explicit_physical = (
+        _parse_nonnegative_npu_id(PHYSICAL_TARGET_NPU_ENV, explicit_physical_text)
+        if explicit_physical_text is not None
+        else None
+    )
+    if mapping is None:
+        physical_id = requested_id
+        if explicit_physical is not None and explicit_physical != physical_id:
+            raise RuntimeError(
+                f"{PHYSICAL_TARGET_NPU_ENV}={explicit_physical} disagrees with "
+                f"unmasked {TARGET_NPU_ENV}={requested_id}"
+            )
+        mapping_text = "<unset>"
+    else:
+        mapping_env, mapped_physical = mapping
+        if requested_id >= len(mapped_physical):
+            raise RuntimeError(
+                f"{TARGET_NPU_ENV}={requested_id} is outside the logical range "
+                f"[0,{len(mapped_physical)}) selected by {mapping_env}"
+            )
+        physical_id = mapped_physical[requested_id]
+        if explicit_physical is not None and explicit_physical != physical_id:
+            raise RuntimeError(
+                f"{PHYSICAL_TARGET_NPU_ENV}={explicit_physical} disagrees with "
+                f"{mapping_env} logical={requested_id} -> physical={physical_id}"
+            )
+        mapping_text = f"{mapping_env}={','.join(str(value) for value in mapped_physical)}"
 
     device_count = int(torch.npu.device_count())
     if requested_id >= device_count:
         raise RuntimeError(
-            f"{TARGET_NPU_ENV}={requested_id} is outside the visible NPU "
-            f"range [0,{device_count})"
+            f"{TARGET_NPU_ENV}={requested_id} is outside the visible logical "
+            f"NPU range [0,{device_count})"
         )
     torch.npu.set_device(requested_id)
     current_id = int(torch.npu.current_device())
     if current_id != requested_id:
         raise RuntimeError(
-            "failed to select requested physical NPU: "
+            "failed to select requested logical NPU: "
             f"requested={requested_id} current={current_id}"
         )
     device = torch.device(f"npu:{requested_id}")
@@ -185,10 +242,12 @@ def _require_a5_npu() -> torch.device:
             "target equivalence requires an Ascend 950 NPU, "
             f"got {name!r}"
         )
+    _SELECTED_PHYSICAL_NPU_ID = physical_id
     print(
         "P3_TARGET_NPU "
-        f"requested_physical={requested_id} current_device={current_id} "
-        f"device={device} visible_mapping=<unset> device_name={name!r}",
+        f"requested_logical={requested_id} requested_physical={physical_id} "
+        f"physical_npu={physical_id} current_device={current_id} "
+        f"device={device} visible_mapping={mapping_text!r} device_name={name!r}",
         flush=True,
     )
     return device
@@ -315,6 +374,25 @@ def _resolve_inline_mode() -> str:
     return mode
 
 
+def _resolve_post_closure_mode(inline_mode: str) -> str:
+    """Return the expected compile-time post closure for this test process."""
+    raw_mode = os.getenv(POST_CLOSURE_MODE_ENV)
+    if inline_mode != "post":
+        if raw_mode not in (None, "", "not_applicable"):
+            raise RuntimeError(
+                f"{POST_CLOSURE_MODE_ENV} is valid only with "
+                f"P3_INLINE_MODE=post; got {raw_mode!r}"
+            )
+        return "not_applicable"
+    mode = raw_mode or "full"
+    if mode not in ("empty_shell", "full"):
+        raise RuntimeError(
+            f"set {POST_CLOSURE_MODE_ENV} to empty_shell or full for "
+            f"P3_INLINE_MODE=post; got {mode!r}"
+        )
+    return mode
+
+
 def _read_target_provenance(
     vendor: Path, expected_publication_mode: str, expected_inline_mode: str
 ) -> dict[str, str]:
@@ -354,6 +432,8 @@ def _read_target_provenance(
         "publication_mode_value",
         "inline_mode",
         "inline_mode_value",
+        "post_closure_mode",
+        "post_closure_mode_value",
         "kvaf_closure",
         "kvaf_source_head",
         "abi",
@@ -419,13 +499,33 @@ def _read_target_provenance(
             f"compile-time value: mode={expected_inline_mode!r} "
             f"actual={inline_value!r} expected={expected_inline_value!r}"
         )
+    expected_post_closure_mode = _resolve_post_closure_mode(expected_inline_mode)
+    if values["post_closure_mode"] != expected_post_closure_mode:
+        raise RuntimeError(
+            "isolated P3 target OPP has an unexpected post closure mode: "
+            f"inline_mode={expected_inline_mode!r} "
+            f"actual={values['post_closure_mode']!r} "
+            f"expected={expected_post_closure_mode!r}"
+        )
+    expected_post_closure_value = POST_CLOSURE_MODE_TO_BUILD_VALUE[
+        expected_post_closure_mode
+    ]
+    if values["post_closure_mode_value"] != expected_post_closure_value:
+        raise RuntimeError(
+            "isolated P3 target provenance maps post closure mode to the "
+            "wrong compile-time value: "
+            f"mode={expected_post_closure_mode!r} "
+            f"actual={values['post_closure_mode_value']!r} "
+            f"expected={expected_post_closure_value!r}"
+        )
     expected_kvaf_closure = (
-        "staged" if expected_inline_mode == "post" else "absent"
+        "staged" if expected_post_closure_mode == "full" else "absent"
     )
     if values["kvaf_closure"] != expected_kvaf_closure:
         raise RuntimeError(
             "isolated P3 target has an unexpected KVAF transport closure: "
             f"inline_mode={expected_inline_mode!r} "
+            f"post_closure_mode={expected_post_closure_mode!r} "
             f"actual={values['kvaf_closure']!r} "
             f"expected={expected_kvaf_closure!r}"
         )
@@ -1080,9 +1180,14 @@ def run_target_equivalence() -> dict[str, Any]:
     )
     publication_mode = _resolve_publication_mode()
     inline_mode = _resolve_inline_mode()
-    if inline_mode != "off":
+    post_closure_mode = _resolve_post_closure_mode(inline_mode)
+    is_empty_post_shell = (
+        inline_mode == "post" and post_closure_mode == "empty_shell"
+    )
+    if inline_mode != "off" and not is_empty_post_shell:
         raise RuntimeError(
-            "this strict P3 publication adapter requires P3_INLINE_MODE=off; "
+            "this strict P3 publication adapter requires P3_INLINE_MODE=off, "
+            "or P3_INLINE_MODE=post with P3_POST_CLOSURE_MODE=empty_shell; "
             "use fused_streaming_quant_li_get_audit_adapter.py for inline=audit"
         )
     target_provenance = _read_target_provenance(
@@ -1105,6 +1210,7 @@ def run_target_equivalence() -> dict[str, Any]:
         f"source_clean={target_provenance['source_clean']} "
         f"publication_mode={target_provenance['publication_mode']} "
         f"inline_mode={target_provenance['inline_mode']} "
+        f"post_closure_mode={target_provenance['post_closure_mode']} "
         f"kvaf_closure={target_provenance['kvaf_closure']} "
         "inline_hccp=absent ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
@@ -1141,12 +1247,13 @@ def run_target_equivalence() -> dict[str, Any]:
     }
     print(
         "P3_STREAMING_LI_GET_TARGET_ADAPTER "
-        f"device={device} physical_npu={device.index} "
+        f"device={device} physical_npu={_SELECTED_PHYSICAL_NPU_ID} "
         f"batch={BATCH_SIZE} source_tokens={SOURCE_TOKENS} "
         f"heads={INDEX_HEADS} metadata_words={inputs['metadata'].numel()} "
         f"reference_opapi={reference_opapi} target_opapi={target_opapi} "
         f"publication_mode={publication_mode} "
         f"inline_mode={inline_mode} "
+        f"post_closure_mode={post_closure_mode} "
         f"score_workspace_words={publication['score_workspace'].numel()} "
         f"tile_receipt_rows={publication['tile_receipts'].shape[0]} "
         "product_route=disabled h2d_result=not_exercised",

@@ -468,8 +468,10 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         qScaleGm.SetGlobalBuffer((__gm__ float *)queryScale);
         kScaleGm.SetGlobalBuffer((__gm__ float *)keyScale);
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
         GlobalTensor<int32_t> scoreSourceLensGm;
         scoreSourceLensGm.SetGlobalBuffer((__gm__ int32_t *)scoreSourceLens);
+#endif
         vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, blockTableGm);
         vectorService.InitVecWorkspaceTensor(scoreGm);
         // This A5 implementation fixes one C8 score tile at 128 source
@@ -482,7 +484,9 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
             QLICommon::Align(static_cast<uint64_t>(constInfo.kSeqSize),
                              static_cast<uint64_t>(constInfo.s2BaseSize)) *
             sizeof(SCORE_T));
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
         vectorService.InitScoreSourceLensOutput(scoreSourceLensGm);
+#endif
 #if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
         GlobalTensor<int64_t> tileReceiptsGm;
         GlobalTensor<int64_t> streamingEpochGm;
@@ -523,7 +527,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
             reqPoolEntries, kvObjectMap, privateSourceToSlot,
             queueLeases, kvObjectLens, tiling);
     }
-#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
+#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     if ASCEND_IS_AIV {
         // Inputs 9..20 are a transaction-local prefetch view.  The hook
         // never publishes persistent mapping and the appended outputs remain
@@ -564,6 +568,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
     (void)privatePackedOutputOut;
     (void)queueLeasesOut;
     (void)telemetry;
+    (void)scoreSourceLens;
     (void)scoreWorkspaceOut;
     (void)tileReceiptsOut;
 #endif
@@ -707,13 +712,14 @@ __aicore__ inline void QLIPreload<QLIT>::ProcessInvalid()
     if ASCEND_IS_AIV {
         uint32_t aivCoreNum = GetBlockNum() * 2;  // 2 means c:v = 1:2
         // In an all-invalid graph replay there is no ProcessTopK or
-        // CleanInvalidOutput call to overwrite output #8. Clear it in the
-        // same no-work branch, using a disjoint AIV partition of the exact
-        // row_count supplied by the streaming ABI. This prevents a previous
-        // forward's nonzero score-source lengths from being consumed by
-        // Reconcile alongside freshly invalid (-1) sparse indices.
+        // CleanInvalidOutput call to overwrite output #8. Non-alias builds
+        // clear it in the same no-work branch. The decode empty shell aliases
+        // output #8 to immutable actual_seq_lengths_key, so it intentionally
+        // issues no side write here.
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
         vectorService.ClearScoreSourceLensForInvalidForward(
             tmpBlockIdx, aivCoreNum);
+#endif
         uint64_t totalOutputSize =
             constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount;
         uint64_t singleCoreSize =
@@ -767,7 +773,7 @@ __aicore__ inline void QLIPreload<QLIT>::ProcessMain()
 
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
-#if A5_STREAMING_LI_GET_INLINE_MODE == 2
+#if A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
         // FreeEventID owns the final official C8 TOPK_MTE3_V_EVENT.  Retire
         // the optional Get only after that drain, so the final Get wave can
         // overlap official Top-K without stealing C8's event token.

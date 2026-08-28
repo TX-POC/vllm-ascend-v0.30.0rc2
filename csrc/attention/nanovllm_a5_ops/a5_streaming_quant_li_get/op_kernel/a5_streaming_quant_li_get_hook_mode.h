@@ -34,6 +34,45 @@ static_assert(A5_STREAMING_LI_GET_INLINE_MODE >= 0 &&
               A5_STREAMING_LI_GET_INLINE_MODE <= 2,
               "A5 streaming LI inline mode must be 0, 1, or 2.");
 
+// ``inline=post`` has one further compile-time split.  ``full`` retains the
+// native-enqueue Direct-HCCP closure; ``empty_shell`` deliberately keeps the
+// *same* 24-input/11-output ABI while compiling that closure out completely.
+// The latter is a mathematical-control binary, not a runtime if-statement:
+// it lets us prove whether merely linking/initialising the post path perturbs
+// source-derived C8 before investigating any transport behaviour.
+//
+// A source tree compiled outside the isolated staging script must default to
+// no post closure.  The build script chooses ``full`` only when it is
+// explicitly building a real ``inline=post`` artifact.
+#ifndef A5_STREAMING_LI_GET_POST_CLOSURE_MODE
+#define A5_STREAMING_LI_GET_POST_CLOSURE_MODE 0
+#endif
+
+static_assert(A5_STREAMING_LI_GET_POST_CLOSURE_MODE >= 0 &&
+              A5_STREAMING_LI_GET_POST_CLOSURE_MODE <= 1,
+              "A5 streaming LI post closure mode must be 0 (empty_shell) or 1 (full).");
+static_assert(A5_STREAMING_LI_GET_INLINE_MODE == 2 ||
+              A5_STREAMING_LI_GET_POST_CLOSURE_MODE == 0,
+              "A5 streaming LI post closure is valid only with inline=post.");
+
+#if A5_STREAMING_LI_GET_INLINE_MODE == 2 && \
+    A5_STREAMING_LI_GET_POST_CLOSURE_MODE == 1
+#define A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE 1
+#else
+#define A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE 0
+#endif
+
+// In the decode-only empty shell, output #8 is a bridge alias of
+// ``actual_seq_lengths_key``.  Do not allocate a side-output UB buffer or
+// issue MTE3 writes from C8 for data that already exists as an immutable C8
+// input.  All other artifacts retain their current independent side output.
+#if A5_STREAMING_LI_GET_INLINE_MODE == 2 && \
+    A5_STREAMING_LI_GET_POST_CLOSURE_MODE == 0
+#define A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS 1
+#else
+#define A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS 0
+#endif
+
 // The publisher owns an externally visible score-workspace/receipt protocol;
 // inline mode owns the transaction-local scan-time observer/transport path.
 // Product post/HCCP therefore remains mutually exclusive with publication.

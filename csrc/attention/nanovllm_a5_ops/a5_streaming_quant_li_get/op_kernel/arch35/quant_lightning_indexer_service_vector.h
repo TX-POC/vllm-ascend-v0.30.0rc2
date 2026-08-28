@@ -24,7 +24,7 @@
 #include "../a5_streaming_quant_li_get_hook_mode.h"
 #if A5_STREAMING_LI_GET_INLINE_MODE == 1
 #include "a5_streaming_quant_li_get_tile_audit.h"
-#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
+#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
 #include "a5_streaming_quant_li_get_tile_ready.h"
 #endif
 #include "../arch35/vf/quant_lightning_indexer_vector1.h"
@@ -51,11 +51,13 @@ public:
     __aicore__ inline void InitParams(const struct QLICommon::ConstInfo &constInfo,
                                       const QLITilingData *__restrict tilingData);
     __aicore__ inline void InitVecWorkspaceTensor(GlobalTensor<SCORE_T> scoreGm);
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
     // Produced by this operator, not inferred by its host bridge.  Each
     // element is the exact score-source S length used by ProcessTopK for the
     // corresponding sparse-index output row.
     __aicore__ inline void InitScoreSourceLensOutput(
         GlobalTensor<int32_t> scoreSourceLensGm);
+#endif
     // The caller-owned score workspace is a byte-identical replacement for
     // the private C8 scratch score-GM.  In mode 0 the original workspace is
     // still used; modes 1/2 use this explicit address so a sidecar can later
@@ -93,7 +95,7 @@ public:
         __gm__ uint8_t *privateSourceToSlot,
         __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
         const QLITilingData *__restrict tilingData);
-#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
+#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     // This hook observes the exact uint16 score tile after the official C8
     // reduction and before its existing score-GM DMA.  It owns only the
     // transaction-local prefetch state; sparse Top-K outputs remain wholly
@@ -116,10 +118,12 @@ public:
     __aicore__ inline void InitVecInputTensor(GlobalTensor<float> weightsGm, GlobalTensor<float> qScaleGm,
                                               GlobalTensor<float> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
     // Used only by the all-invalid forward path. It clears non-alias output
     // #8 in disjoint AIV shards so graph replay cannot expose an old S length.
     __aicore__ inline void ClearScoreSourceLensForInvalidForward(
         uint32_t producerIndex, uint32_t producerCount);
+#endif
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -131,7 +135,9 @@ protected:
     GlobalTensor<float> kScaleGm;
     GlobalTensor<int32_t> indiceOutGm;
     GlobalTensor<int32_t> blockTableGm;
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
     GlobalTensor<int32_t> scoreSourceLensGm;
+#endif
     uint64_t scoreWorkspaceBaseBytes_ = 0;
 #if A5_STREAMING_LI_GET_PUBLISH_MODE >= 2
     GlobalTensor<int64_t> tileReceiptsGm;
@@ -158,10 +164,12 @@ protected:
 private:
     __aicore__ inline void GetKeyScale(const QLICommon::RunInfo &runInfo, LocalTensor<float> &kScaleUB,
                                        int64_t batchId, int64_t startS2, int64_t getLen);
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
     // `score_source_lens` is a P3-only side output.  It is intentionally
     // published through MTE3 rather than a scalar GM SetValue: paired AIVs
     // can own adjacent rows, which share a 32-byte GM sector on A5.
     __aicore__ inline void WriteScoreSourceLen(uint64_t outputRow, int32_t value);
+#endif
     // ================================Local Buffer区====================================
 
     // tmp buff for vector
@@ -197,7 +205,7 @@ private:
     LocalTensor<int64_t> tileReceiptLocal_;
 #endif
 
-#if A5_STREAMING_LI_GET_INLINE_MODE == 2
+#if A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     // Small caller-owned UB hand-off records for KVAF's queue lease and
     // private-arena CAS.  Descriptor arrays remain graph-static in HBM and
     // are supplied by the cold-bound KVAF streaming control.
@@ -221,11 +229,13 @@ private:
     TBuf<TPosition::VECCALC> outInvalidBuf_;
     LocalTensor<int32_t> outInvalidLocal_;
 
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
     // One scalar is sufficient per publication; eight int32s reserve a full
     // 32-byte UB line for the MTE3 DMA source and mirror established A5
     // side-output publication patterns.
     TBuf<TPosition::VECCALC> scoreSourceLensBuf_;
     LocalTensor<int32_t> scoreSourceLensLocal_;
+#endif
 
     int32_t blockId_ = -1;
     // para for vector
@@ -249,7 +259,7 @@ private:
     topk::LITopk<SCORE_T> topkOp_;
 #if A5_STREAMING_LI_GET_INLINE_MODE == 1
     streaming_li_get::StreamingLiTileAuditHook streamingAuditHook_;
-#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
+#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     streaming_li_get::StreamingKvafTileReadyHook streamingKvafHook_;
 #endif
 };
@@ -283,7 +293,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     tileReceiptLocal_ = tileReceiptBuf_.Get<int64_t>();
 #endif
 
-#if A5_STREAMING_LI_GET_INLINE_MODE == 2
+#if A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     pipe->InitBuffer(streamingLeaseBuf_, 32U);
     streamingLeaseUb_ = streamingLeaseBuf_.Get<uint8_t>();
     pipe->InitBuffer(streamingClaimBuf_, 32U);
@@ -307,8 +317,10 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     //刷-1
     pipe->InitBuffer(outInvalidBuf_, topkCount_ * sizeof(int32_t));
     outInvalidLocal_ = outInvalidBuf_.Get<int32_t>();
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
     pipe->InitBuffer(scoreSourceLensBuf_, 8 * sizeof(int32_t));
     scoreSourceLensLocal_ = scoreSourceLensBuf_.Get<int32_t>();
+#endif
     Duplicate(kScaleUB_, float(0), 2 * s2BaseSize_);
 }
 
@@ -355,12 +367,14 @@ __aicore__ inline void QLIVector<QLIT>::InitVecWorkspaceTensor(GlobalTensor<SCOR
     this->scoreGm = scoreGm;//resucesum*k
 }
 
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitScoreSourceLensOutput(
     GlobalTensor<int32_t> scoreSourceLensGm)
 {
     this->scoreSourceLensGm = scoreSourceLensGm;
 }
+#endif
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitScoreWorkspaceBase(
@@ -387,7 +401,7 @@ __aicore__ inline void QLIVector<QLIT>::InitStreamingAuditHook(
         tilingData->streamingKvObjectCapacity,
         tilingData->streamingQueueCount);
 }
-#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
+#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
     __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
@@ -537,6 +551,7 @@ __aicore__ inline void QLIVector<QLIT>::EmitScoreTileReceipts(
 }
 #endif
 
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::WriteScoreSourceLen(
     uint64_t outputRow, int32_t value)
@@ -576,6 +591,7 @@ __aicore__ inline void QLIVector<QLIT>::ClearScoreSourceLensForInvalidForward(
         AscendC::InitGlobalMemory(output, end - begin, 0);
     }
 }
+#endif
 
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::AllocEventID()
@@ -611,8 +627,10 @@ __aicore__ inline void QLIVector<QLIT>::CleanInvalidOutput(int64_t invalidS1Offs
     // division by sparseCount yields exactly the graph-visible output row.
     // A downstream reconcile must treat zero as "no valid score source",
     // never as a host-inferred sequence length.
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
     WriteScoreSourceLen(
         static_cast<uint64_t>(invalidS1Offset) / constInfo_.sparseCount, 0);
+#endif
     // init -1 and copy to output
     Duplicate(outInvalidLocal_, constInfo_.INVALID_IDX, constInfo_.sparseCount);
 
@@ -735,7 +753,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     // reason to observe a score tile is to write the exact fixed receipt.
     const bool mayNeedScoreObservation =
         streamingAuditHook_.MayNeedScoreObservation();
-#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
+#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     // Take the bounded queue-capacity snapshot before reduction.  The exact
     // score seam is left completely untouched when the producer has neither
     // an audit obligation nor a locally pending/available Get queue.
@@ -774,7 +792,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         SetFlag<HardEvent::S_V>(scoreScalarToVector);
         WaitFlag<HardEvent::S_V>(scoreScalarToVector);
     }
-#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
+#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     // Exact inline seam: read only the uint16 values the official reduction
     // just produced, before C8 begins its normal score-GM copy.  The hook
     // never writes this tile or sparse Top-K state. The post closure keeps
@@ -857,10 +875,12 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         // TopK branch.  `sparse_indices` live in score-source domain S; the
         // later exact-reconcile stage must use this S limit before mapping
         // any selected index to logical KV domain L.
+#if !A5_STREAMING_LI_GET_SCORE_SOURCE_LENS_IS_INPUT_ALIAS
         const uint64_t outputRow =
             static_cast<uint64_t>(info.indiceOutOffset) / topkCount_ +
             static_cast<uint64_t>(curS1Idx + rowIdx);
         WriteScoreSourceLen(outputRow, validS2Len > 0 ? validS2Len : 0);
+#endif
         if (validS2Len <= 0) {
             WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), neg, topkCount_);
