@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import sys
 from time import monotonic
 from pathlib import Path
@@ -85,6 +86,7 @@ REFERENCE_OPP_ENV = "NANOVLLM_A5_REFERENCE_C8_OPP"
 TARGET_OPP_ENV = "NANOVLLM_A5_STREAMING_LI_OPP"
 REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"
 TARGET_EXPECTED_HEAD_ENV = "P3_TARGET_EXPECTED_SOURCE_HEAD"
+KVAF_EXPECTED_HEAD_ENV = "P3_KVAF_EXPECTED_SOURCE_HEAD"
 REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
 TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"
 REFERENCE_OPAPI_ENV = "NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB"
@@ -342,13 +344,19 @@ def _read_target_provenance(
         if separator and key:
             values[key] = value
     required = (
+        "format",
         "kind",
         "source_root",
         "source_head",
         "source_clean",
         "operators",
         "publication_mode",
+        "publication_mode_value",
         "inline_mode",
+        "inline_mode_value",
+        "kvaf_closure",
+        "kvaf_source_head",
+        "abi",
     )
     missing = tuple(key for key in required if not values.get(key))
     if missing:
@@ -361,6 +369,16 @@ def _read_target_provenance(
         raise RuntimeError(
             "isolated P3 target provenance has an unexpected kind: "
             f"got={values['kind']!r}"
+        )
+    if values["format"] != "1" or values["abi"] != "24in_11out":
+        raise RuntimeError(
+            "isolated P3 target provenance has an incompatible manifest ABI: "
+            f"format={values['format']!r} abi={values['abi']!r}"
+        )
+    if values["operators"] != "A5StreamingQuantLiGet":
+        raise RuntimeError(
+            "isolated P3 target provenance contains an unexpected operator set: "
+            f"operators={values['operators']!r}"
         )
     expected_head = os.getenv(TARGET_EXPECTED_HEAD_ENV)
     if expected_head and values["source_head"] != expected_head:
@@ -379,9 +397,9 @@ def _read_target_provenance(
             f"actual={values['publication_mode']!r} "
             f"expected={expected_publication_mode!r}"
         )
-    build_value = values.get("publication_mode_value")
+    build_value = values["publication_mode_value"]
     expected_value = PUBLICATION_MODE_TO_BUILD_VALUE[expected_publication_mode]
-    if build_value and build_value != expected_value:
+    if build_value != expected_value:
         raise RuntimeError(
             "isolated P3 target provenance maps publication mode to the "
             "wrong compile-time value: "
@@ -393,14 +411,42 @@ def _read_target_provenance(
             "isolated P3 target OPP has an unexpected inline mode: "
             f"actual={values['inline_mode']!r} expected={expected_inline_mode!r}"
         )
-    inline_value = values.get("inline_mode_value")
+    inline_value = values["inline_mode_value"]
     expected_inline_value = INLINE_MODE_TO_BUILD_VALUE[expected_inline_mode]
-    if inline_value and inline_value != expected_inline_value:
+    if inline_value != expected_inline_value:
         raise RuntimeError(
             "isolated P3 target provenance maps inline mode to the wrong "
             f"compile-time value: mode={expected_inline_mode!r} "
             f"actual={inline_value!r} expected={expected_inline_value!r}"
         )
+    expected_kvaf_closure = (
+        "staged" if expected_inline_mode == "post" else "absent"
+    )
+    if values["kvaf_closure"] != expected_kvaf_closure:
+        raise RuntimeError(
+            "isolated P3 target has an unexpected KVAF transport closure: "
+            f"inline_mode={expected_inline_mode!r} "
+            f"actual={values['kvaf_closure']!r} "
+            f"expected={expected_kvaf_closure!r}"
+        )
+    if expected_kvaf_closure == "absent" and values["kvaf_source_head"] != "not_applicable":
+        raise RuntimeError(
+            "isolated P3 no-transport artifact unexpectedly records a KVAF "
+            f"source: kvaf_source_head={values['kvaf_source_head']!r}"
+        )
+    if expected_kvaf_closure == "staged":
+        kvaf_head = values["kvaf_source_head"]
+        if not re.fullmatch(r"[0-9a-f]{40}", kvaf_head):
+            raise RuntimeError(
+                "isolated P3 post artifact has no exact KVAF source revision: "
+                f"kvaf_source_head={kvaf_head!r}"
+            )
+        expected_kvaf_head = os.getenv(KVAF_EXPECTED_HEAD_ENV)
+        if expected_kvaf_head and kvaf_head != expected_kvaf_head:
+            raise RuntimeError(
+                "isolated P3 post artifact was built from a different KVAF "
+                f"revision: actual={kvaf_head} expected={expected_kvaf_head}"
+            )
     return values
 
 
@@ -1043,7 +1089,9 @@ def run_target_equivalence() -> dict[str, Any]:
         f"expected_head={os.getenv(TARGET_EXPECTED_HEAD_ENV, '<unset>')} "
         f"source_clean={target_provenance['source_clean']} "
         f"publication_mode={target_provenance['publication_mode']} "
-        f"inline_mode={target_provenance['inline_mode']} inline_hccp=absent ready=1 "
+        f"inline_mode={target_provenance['inline_mode']} "
+        f"kvaf_closure={target_provenance['kvaf_closure']} "
+        "inline_hccp=absent ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
         flush=True,
     )

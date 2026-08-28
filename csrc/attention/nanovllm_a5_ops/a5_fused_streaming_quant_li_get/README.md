@@ -28,18 +28,21 @@ candidate audit.
 
 ## Runtime modes
 
-- `audit`: caller initializes every `queue_leases` value to `INT32_MIN`.
-  The device hook records `-3` (`AUDIT_CANDIDATE_MARKER`) in the fixed
-  `private_source_to_slot[R,S]` map for a threshold-qualified, nonresident
-  score source.  It performs no queue claim, descriptor write, doorbell, CQ
-  poll, private-payload write, or cache mapping publication.
-- `post`: caller supplies the normal valid queue lease table.  The preexisting
-  Direct-HCCP path is available only when `P4_FUSED_ALLOW_POST=1`; it remains
+- `audit_score_receipt`: caller initializes every `queue_leases` value to
+  `-2147483647`.  At the C8 score-tile seam, the device writes one tagged
+  `int32` receipt per valid `[row, source]` coordinate into
+  `private_source_to_slot[R,S]`.  The receipt contains the sortable `uint16`
+  score and the threshold, mapping-valid, cold, source-unmapped, and candidate
+  decisions.  This is the only supported audit mode.  It performs no queue
+  claim, descriptor write, doorbell, CQ poll, private-payload write, or cache
+  mapping publication.
+- `post`: caller supplies the normal valid queue lease table. It additionally
+  requires an `inline=post` OPP and `P4_FUSED_ALLOW_POST=1`; it remains
   experimental while payload validation is known failed.
 
-The full `[R,S]` candidate map is intentional for audit: it has no ring
-overflow. Its exact count is `count(marker == -3)` after the target stream
-completes. It is a validation record, not a persistent HBM mapping.
+The full `[R,S]` receipt map is intentional for audit: it has no ring
+overflow and exposes every skipped or malformed coordinate. It is a
+validation record, not a persistent HBM mapping.
 
 ## What the audit proves
 

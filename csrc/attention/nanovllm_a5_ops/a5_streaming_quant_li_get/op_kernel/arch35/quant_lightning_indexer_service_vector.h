@@ -22,7 +22,9 @@
 #include "lib/matrix/matmul/tiling.h"
 #include "quant_lightning_indexer_common.h"
 #include "../a5_streaming_quant_li_get_hook_mode.h"
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+#include "a5_streaming_quant_li_get_tile_audit.h"
+#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
 #include "a5_streaming_quant_li_get_tile_ready.h"
 #endif
 #include "../arch35/vf/quant_lightning_indexer_vector1.h"
@@ -80,7 +82,18 @@ public:
         const QLICommon::RunInfo &info, int64_t curAivS1Idx,
         int64_t curAivS1ProcNum, uint32_t pingpong);
 #endif
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+    // Audit has a deliberately smaller closure: it receives only the tensors
+    // needed to reproduce the score-time predicate and fixed receipt.  It
+    // has no Direct-HCCP/SIMT/descriptor/private-payload arguments.
+    __aicore__ inline void InitStreamingAuditHook(
+        __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
+        __gm__ uint8_t *kvObjectSlotsSnapshot,
+        __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *kvObjectMap,
+        __gm__ uint8_t *privateSourceToSlot,
+        __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
+        const QLITilingData *__restrict tilingData);
+#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
     // This hook observes the exact uint16 score tile after the official C8
     // reduction and before its existing score-GM DMA.  It owns only the
     // transaction-local prefetch state; sparse Top-K outputs remain wholly
@@ -184,7 +197,7 @@ private:
     LocalTensor<int64_t> tileReceiptLocal_;
 #endif
 
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 2
     // Small caller-owned UB hand-off records for KVAF's queue lease and
     // private-arena CAS.  Descriptor arrays remain graph-static in HBM and
     // are supplied by the cold-bound KVAF streaming control.
@@ -234,7 +247,9 @@ private:
 
     struct QLICommon::ConstInfo constInfo_;
     topk::LITopk<SCORE_T> topkOp_;
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+    streaming_li_get::StreamingLiTileAuditHook streamingAuditHook_;
+#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
     streaming_li_get::StreamingKvafTileReadyHook streamingKvafHook_;
 #endif
 };
@@ -268,7 +283,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     tileReceiptLocal_ = tileReceiptBuf_.Get<int64_t>();
 #endif
 
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 2
     pipe->InitBuffer(streamingLeaseBuf_, 32U);
     streamingLeaseUb_ = streamingLeaseBuf_.Get<uint8_t>();
     pipe->InitBuffer(streamingClaimBuf_, 32U);
@@ -354,7 +369,25 @@ __aicore__ inline void QLIVector<QLIT>::InitScoreWorkspaceBase(
     scoreWorkspaceBaseBytes_ = baseBytes;
 }
 
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::InitStreamingAuditHook(
+    __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
+    __gm__ uint8_t *kvObjectSlotsSnapshot,
+    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *kvObjectMap,
+    __gm__ uint8_t *privateSourceToSlot,
+    __gm__ uint8_t *queueLeases, __gm__ uint8_t *kvObjectLens,
+    const QLITilingData *__restrict tilingData)
+{
+    streamingAuditHook_.Init(
+        residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
+        reqPoolEntries, kvObjectLens, kvObjectMap, privateSourceToSlot,
+        queueLeases, constInfo_, tilingData->streamingRowCount,
+        tilingData->streamingSourceCapacity, tilingData->streamingPoolSize,
+        tilingData->streamingKvObjectCapacity,
+        tilingData->streamingQueueCount);
+}
+#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
     __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,
@@ -697,7 +730,12 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(QK_T))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(QK_T)) / 2 * constInfo_.mBaseSize;
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+    // Audit mode has no queue capacity or in-flight HCCP state.  Its only
+    // reason to observe a score tile is to write the exact fixed receipt.
+    const bool mayNeedScoreObservation =
+        streamingAuditHook_.MayNeedScoreObservation();
+#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
     // Take the bounded queue-capacity snapshot before reduction.  The exact
     // score seam is left completely untouched when the producer has neither
     // an audit obligation nor a locally pending/available Get queue.
@@ -710,7 +748,13 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         kScaleBase, (uint32_t)0,
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(float),
                                         gSize_, curAivS1ProcNum);
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+    if (mayNeedScoreObservation) {
+        PipeBarrier<PIPE_V>();
+        streamingAuditHook_.Emit(outBase, info, curAivS1Idx,
+                                 curAivS1ProcNum, curS2Idx);
+    }
+#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
     // Exact inline seam: read only the uint16 values the official reduction
     // just produced, before C8 begins its normal score-GM copy.  The hook
     // never writes this tile or sparse Top-K state.  In audit mode it cannot

@@ -13,7 +13,8 @@ from pathlib import Path
 
 
 OPS = Path(__file__).resolve().parents[1]
-HOOK = OPS / "a5_streaming_quant_li_get/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"
+AUDIT_HOOK = OPS / "a5_streaming_quant_li_get/op_kernel/arch35/a5_streaming_quant_li_get_tile_audit.h"
+POST_HOOK = OPS / "a5_streaming_quant_li_get/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"
 VECTOR = OPS / "a5_streaming_quant_li_get/op_kernel/arch35/quant_lightning_indexer_service_vector.h"
 BRIDGE = (
     OPS
@@ -29,14 +30,9 @@ README = OPS / "a5_fused_streaming_quant_li_get/README.md"
 BUILD = OPS / "build_nanovllm_ops.sh"
 
 
-def _body(source: str, start: str, end: str) -> str:
-    begin = source.index(start)
-    finish = source.index(end, begin)
-    return source[begin:finish]
-
-
 def main() -> int:
-    hook = HOOK.read_text(encoding="utf-8")
+    audit = AUDIT_HOOK.read_text(encoding="utf-8")
+    post = POST_HOOK.read_text(encoding="utf-8")
     vector = VECTOR.read_text(encoding="utf-8")
     bridge = BRIDGE.read_text(encoding="utf-8")
     audit_adapter = AUDIT_ADAPTER.read_text(encoding="utf-8")
@@ -44,36 +40,37 @@ def main() -> int:
     readme = README.read_text(encoding="utf-8")
     build = BUILD.read_text(encoding="utf-8")
 
-    assert "kAuditQueueLeaseSentinel = (-2147483647 - 1)" in hook
-    assert "kAuditScoreReceiptQueueLeaseSentinel = -2147483647" in hook
-    assert "kSourceAuditCandidate = -3" in hook
-    assert "kAuditScoreReceiptTag = 0x80000000U" in hook
-    assert "auditScoreReceiptMode_ = IsAuditScoreReceiptLeaseTable();" in hook
-    assert "auditMode_ = auditScoreReceiptMode_ || IsAuditLeaseTable();" in hook
-    assert "A5_STREAMING_LI_GET_INLINE_MODE == 1" in hook
-    assert "if (!auditScoreReceiptMode_)" in hook
-    assert "if (auditMode_) {\n            return true;" in hook
-    assert "EmitAuditCandidates(out_base" in hook
-    assert "EmitAuditScoreReceipt(out_base" in hook
-    assert "EvaluateAuditScore(" in hook
-    assert "static_cast<int64_t>(receipt) - (1LL << 32)" in hook
-
-    audit = _body(hook, "void EmitAuditCandidates(", "void TryStageCandidate(")
-    assert "TryRecordAuditCandidate(" in audit
-    assert "sourceToSlot_.SetValue(sourceOffset, kSourceAuditCandidate)" in hook
-    # Audit must stop before every transport/arena method.  It may read the
-    # normal control ABI for shape validation, but it cannot claim/post/poll.
-    assert "TryAcquireKvafStreamingBatchGetQueueFromAicore" not in audit
-    assert "BeginKvafStreamingBatchGet" not in audit
-    assert "PublishKvafStreamingBatchGetDescriptorScratch" not in audit
-    assert "TryRetireKvafStreamingBatchGet" not in audit
-    assert "FinishKvafStreamingBatchGet" not in audit
-    assert "privateReady_.SetValue" not in audit
-    assert "privateArenaHead_.SetValue" not in audit
-    assert "AddTelemetry" not in audit
+    assert "kAuditScoreReceiptQueueLeaseSentinel = -2147483647" in audit
+    assert "kAuditScoreReceiptTag = 0x80000000U" in audit
+    assert "A5_STREAMING_LI_GET_INLINE_MODE == 1" in audit
+    assert "StreamingLiTileAuditHook" in audit
+    assert "HasAuditReceiptLeaseTable" in audit
+    assert "MayNeedScoreObservation" in audit
+    assert "AuditScoreDecision Evaluate(" in audit
+    assert "static_cast<int64_t>(receipt) - (1LL << 32)" in audit
+    # Audit is its own compile-time score-only translation-unit closure, not
+    # a runtime branch inside the Direct-HCCP hook.  No descriptor/queue/CQ
+    # helper may be referenced by this header.
+    for forbidden in (
+        "TryAcquireKvafStreamingBatchGet",
+        "BeginKvafStreamingBatchGet",
+        "PublishKvafStreamingBatchGetDescriptorScratch",
+        "TryRetireKvafStreamingBatchGet",
+        "FinishKvafStreamingBatchGet",
+        "kvaf_fused_get::",
+        "privateReady_",
+        "privateArenaHead_",
+        "AddTelemetry",
+    ):
+        assert forbidden not in audit, forbidden
+    assert "kAuditScoreReceipt" not in post
+    assert "AuditScoreDecision" not in post
+    assert "A5_STREAMING_LI_GET_INLINE_MODE == 2" in post
+    assert "TryAcquireKvafStreamingBatchGetQueueFromAicore" in post
+    assert "BeginKvafStreamingBatchGet" in post
 
     reduction = vector.index("BatchMulWeightAndReduceSum")
-    emit = vector.index("streamingKvafHook_.Emit")
+    emit = vector.index("streamingAuditHook_.Emit")
     score_dma = vector.index("DataCopyPad(scoreGm")
     assert reduction < emit < score_dma
     assert "ProcessTopK" in vector
@@ -81,7 +78,9 @@ def main() -> int:
     assert "non_authoritative_sparse_indices" in bridge
     assert "topk_authority\": \"non_authoritative_pending_strict_equivalence" in bridge
     assert "P4_FUSED_ALLOW_POST" in bridge
-    assert "AUDIT_QUEUE_LEASE_SENTINEL" in bridge
+    assert "marker-only audit was retired" in bridge
+    assert "P4.1 mode/build mismatch" in bridge
+    assert "P3_INLINE_MODE" in bridge
     assert "A5StreamingQuantLiGet" in build
     assert "NANOVLLM_A5_OPS_ONLY=A5StreamingQuantLiGet" in bridge
     assert "_AUDIT_SCORE_RECEIPT = \"audit_score_receipt\"" in bridge
@@ -143,7 +142,11 @@ def main() -> int:
     assert "this strict P3 publication adapter requires P3_INLINE_MODE=off" in target_adapter
     assert "P3 target provenance" in build
     assert "NANOVLLM_A5_STREAMING_LI_GET_INLINE_MODE" in build
-    assert "P3 generated KVAF/SIMT closure: present verified=1" in build
+    assert "NEEDS_P3_POST_KVAF=0" in build
+    assert "P3 generated audit closure: score-only verified=1" in build
+    assert "kvaf_closure=${P3_KVAF_CLOSURE}" in build
+    assert "kvaf_source_head=${P3_KVAF_SOURCE_HEAD}" in build
+    assert "P3 inline=audit closure must contain only the audit observer" in build
 
     print(
         "P4_FUSED_SINGLE_SCAN_CONTRACT_PASS "

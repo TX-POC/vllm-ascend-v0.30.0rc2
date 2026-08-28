@@ -500,7 +500,30 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm);
     }
     InitBuffers();
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+    if ASCEND_IS_AIV {
+        // Audit deliberately accepts only the predicate/receipt tensors.
+        // Do not let an audit OPP pull queue-control, descriptor, payload, or
+        // SIMT state into its device closure.
+        (void)privateReadyTable;
+        (void)privateArenaHead;
+        (void)privatePackedOutput;
+        (void)queueControl;
+        (void)sparseValues;
+        (void)privateSourceToSlotOut;
+        (void)privateReadyTableOut;
+        (void)privateArenaHeadOut;
+        (void)privatePackedOutputOut;
+        (void)queueLeasesOut;
+        (void)telemetry;
+        (void)scoreWorkspaceOut;
+        (void)tileReceiptsOut;
+        vectorService.InitStreamingAuditHook(
+            residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
+            reqPoolEntries, kvObjectMap, privateSourceToSlot,
+            queueLeases, kvObjectLens, tiling);
+    }
+#elif A5_STREAMING_LI_GET_INLINE_MODE == 2
     if ASCEND_IS_AIV {
         // Inputs 9..20 are a transaction-local prefetch view.  The hook
         // never publishes persistent mapping and the appended outputs remain
@@ -744,7 +767,7 @@ __aicore__ inline void QLIPreload<QLIT>::ProcessMain()
 
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
-#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+#if A5_STREAMING_LI_GET_INLINE_MODE == 2
         // FreeEventID owns the final official C8 TOPK_MTE3_V_EVENT.  Retire
         // the optional Get only after that drain, so the final Get wave can
         // overlap official Top-K without stealing C8's event token.

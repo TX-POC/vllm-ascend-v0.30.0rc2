@@ -25,7 +25,10 @@ SCORE_RECEIPT_COLD_BIT = 1 << 18
 SCORE_RECEIPT_THRESHOLD_PASS_BIT = 1 << 17
 SCORE_RECEIPT_SOURCE_UNMAPPED_BIT = 1 << 16
 SCORE_RECEIPT_SCORE_MASK = 0xFFFF
-_AUDIT = "audit"
+# The pre-split marker-only audit used this name.  It is deliberately rejected
+# now: the only supported audit has a complete tagged score receipt, which is
+# what lets the strict harness prove every score-time branch in one launch.
+_LEGACY_AUDIT = "audit"
 _AUDIT_SCORE_RECEIPT = "audit_score_receipt"
 _POST = "post"
 _TRANSACTION_KEYS = (
@@ -105,21 +108,34 @@ def launch(
     """Launch exactly one raw-Q/K scan and return non-authoritative receipts.
 
     Audit is selected solely by the caller's graph-static lease input: every
-    lease cell must already equal the sentinel for ``mode``.  The bridge
+    lease cell must already equal the score-receipt sentinel.  The bridge
     intentionally does not perform a host-side fill or synchronization, since
     that would hide a graph dependency and turn the test into two executions.
-    ``audit_score_receipt`` is an isolated diagnostic form of audit: output 2
-    carries a tagged score/decision receipt instead of candidate marker -3.
-    ``post`` uses the normal lease table but remains fail-closed unless the
-    explicit environment gate is enabled.
+    ``audit_score_receipt`` is the only supported audit: output 2 carries a
+    tagged score/decision receipt.  ``post`` uses the normal lease table but
+    remains fail-closed unless both the explicit environment gate and the
+    matching inline=post build selector are present.
     """
-    if mode not in (_AUDIT, _AUDIT_SCORE_RECEIPT, _POST):
+    if mode == _LEGACY_AUDIT:
+        raise ValueError(
+            "P4.1 marker-only audit was retired; use 'audit_score_receipt' "
+            "with a P3 inline=audit artifact"
+        )
+    if mode not in (_AUDIT_SCORE_RECEIPT, _POST):
         raise ValueError(
             "P4.1 mode must be one of "
-            f"{_AUDIT!r}, {_AUDIT_SCORE_RECEIPT!r}, {_POST!r}; got {mode!r}"
-    )
+            f"{_AUDIT_SCORE_RECEIPT!r}, {_POST!r}; got {mode!r}"
+        )
     _require_transaction(transaction)
     _require_publication(publication)
+    expected_inline = "audit" if mode == _AUDIT_SCORE_RECEIPT else "post"
+    if os.getenv("P3_INLINE_MODE") != expected_inline or \
+            os.getenv("P3_PUBLICATION_MODE") != "off":
+        raise RuntimeError(
+            "P4.1 mode/build mismatch: "
+            f"mode={mode!r} requires P3_INLINE_MODE={expected_inline!r} "
+            "and P3_PUBLICATION_MODE='off'"
+        )
     if mode == _POST and not _allow_post():
         raise RuntimeError(
             "P4.1 post is disabled: set P4_FUSED_ALLOW_POST=1 only after "
@@ -177,8 +193,8 @@ def launch(
         # This result intentionally cannot be fed to QSFA by this bridge.
         "non_authoritative_sparse_indices": outputs[0],
         "non_authoritative_sparse_values": outputs[1],
-        # Candidate audit uses -3 records. Score-receipt audit uses a tagged
-        # diagnostic encoding. Post retains the existing private-slot ABI.
+        # Score-receipt audit uses a tagged diagnostic encoding. Post retains
+        # the existing private-slot ABI.
         "candidate_source_to_slot": outputs[2],
         "private_ready_table": outputs[3],
         "private_arena_head": outputs[4],
@@ -192,17 +208,15 @@ def launch(
         "tile_receipts": outputs[10],
         "mode": mode,
         "audit_receipt_kind": (
-            "score" if mode == _AUDIT_SCORE_RECEIPT else "candidate"
+            "score" if mode == _AUDIT_SCORE_RECEIPT else "none"
         ),
         "candidate_marker": AUDIT_CANDIDATE_MARKER,
         "audit_lease_sentinel": (
             AUDIT_SCORE_RECEIPT_QUEUE_LEASE_SENTINEL
-            if mode == _AUDIT_SCORE_RECEIPT
-            else AUDIT_QUEUE_LEASE_SENTINEL
+            if mode == _AUDIT_SCORE_RECEIPT else None
         ),
         "topk_authority": "non_authoritative_pending_strict_equivalence",
         "h2d_claim": (
-            "none" if mode in (_AUDIT, _AUDIT_SCORE_RECEIPT)
-            else "payload_unverified"
+            "none" if mode == _AUDIT_SCORE_RECEIPT else "payload_unverified"
         ),
     }

@@ -14,8 +14,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1] / "a5_streaming_quant_li_get"
+OPS_ROOT = ROOT.parent
 VECTOR = ROOT / "op_kernel/arch35/quant_lightning_indexer_service_vector.h"
 HOOK_MODE = ROOT / "op_kernel/a5_streaming_quant_li_get_hook_mode.h"
+AUDIT_HOOK = ROOT / "op_kernel/arch35/a5_streaming_quant_li_get_tile_audit.h"
+POST_HOOK = ROOT / "op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"
 KERNEL = ROOT / "op_kernel/a5_streaming_quant_li_get.cpp"
 KERNEL_PRELOAD = ROOT / "op_kernel/arch35/quant_lightning_indexer_kernel.h"
 OP_DEF = ROOT / "op_host/a5_streaming_quant_li_get_def.cpp"
@@ -23,7 +26,7 @@ INFER = ROOT / "op_host/a5_streaming_quant_li_get_infershape.cpp"
 TILING = ROOT / "op_host/a5_streaming_quant_li_get_tiling.cpp"
 TILING_HEADER = ROOT / "op_host/a5_streaming_quant_li_get_tiling.h"
 BRIDGE = ROOT / "torch_extension/csrc/streaming_quant_li_get.cpp"
-OPS = ROOT / "ops.json"
+OP_SPEC = ROOT / "ops.json"
 
 CANN_INPUT_NAMES = [
     "query", "key", "weights", "query_dequant_scale", "key_dequant_scale",
@@ -72,6 +75,8 @@ def _assert_in_order(text: str, tokens: list[str], label: str) -> None:
 def require_source_contract() -> None:
     vector = VECTOR.read_text(encoding="utf-8")
     hook_mode = HOOK_MODE.read_text(encoding="utf-8")
+    audit_hook = AUDIT_HOOK.read_text(encoding="utf-8")
+    post_hook = POST_HOOK.read_text(encoding="utf-8")
     kernel = KERNEL.read_text(encoding="utf-8")
     preload = KERNEL_PRELOAD.read_text(encoding="utf-8")
     op_def = OP_DEF.read_text(encoding="utf-8")
@@ -79,7 +84,7 @@ def require_source_contract() -> None:
     tiling = TILING.read_text(encoding="utf-8")
     tiling_header = TILING_HEADER.read_text(encoding="utf-8")
     bridge = BRIDGE.read_text(encoding="utf-8")
-    ops = json.loads(OPS.read_text(encoding="utf-8"))
+    ops = json.loads(OP_SPEC.read_text(encoding="utf-8"))
 
     assert len(ops) == 1 and ops[0]["op"] == "A5StreamingQuantLiGet"
     assert len(ops[0]["input_desc"]) == 24
@@ -104,8 +109,8 @@ def require_source_contract() -> None:
 
     # Both axes are compiled into each isolated OPP artifact. Nonzero
     # publication and inline modes are mutually exclusive: publisher owns a
-    # score-DMA receipt protocol, whereas inline owns transaction-local
-    # score-tile KVAF state.
+    # score-DMA receipt protocol, audit is a score-only observer, and post
+    # alone owns the transaction-local score-tile KVAF state.
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE" in hook_mode
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE >= 0" in hook_mode
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE <= 2" in hook_mode
@@ -113,12 +118,36 @@ def require_source_contract() -> None:
     assert "A5_STREAMING_LI_GET_INLINE_MODE" in hook_mode
     assert "A5_STREAMING_LI_GET_INLINE_MODE >= 0" in hook_mode
     assert "A5_STREAMING_LI_GET_INLINE_MODE <= 2" in hook_mode
-    assert "inline KVAF mode requires publication mode off" in hook_mode
-    assert '#if A5_STREAMING_LI_GET_INLINE_MODE > 0' in vector
+    assert "inline mode requires publication mode off" in hook_mode
+    assert '#if A5_STREAMING_LI_GET_INLINE_MODE == 1' in vector
+    assert '#elif A5_STREAMING_LI_GET_INLINE_MODE == 2' in vector
+    assert 'a5_streaming_quant_li_get_tile_audit.h' in vector
     assert 'a5_streaming_quant_li_get_tile_ready.h' in vector
+    assert "StreamingLiTileAuditHook" in vector
     assert "streamingKvafHook_" in vector
+    assert "InitStreamingAuditHook" in vector
     assert "InitStreamingKvafHook" in vector
     assert "FinishStreamingKvafHook" in vector
+    assert "#if A5_STREAMING_LI_GET_INLINE_MODE == 1" in audit_hook
+    assert "#if A5_STREAMING_LI_GET_INLINE_MODE == 2" in post_hook
+    # A strict audit build is physically score-only: the generated staging
+    # directory deletes the post hook and all KVAF/SIMT sources, while this
+    # remaining audit header has no call-site into that closure.
+    for token in (
+        "TryAcquireKvafStreamingBatchGet",
+        "BeginKvafStreamingBatchGet",
+        "PublishKvafStreamingBatchGetDescriptorScratch",
+        "TryRetireKvafStreamingBatchGet",
+        "FinishKvafStreamingBatchGet",
+        "kvaf_fused_get::",
+        "#include \"../kvaf_device/",
+        "#include \"../simt_api/",
+    ):
+        assert token not in audit_hook, token
+    assert "kAuditScoreReceipt" not in post_hook
+    assert "AuditScoreDecision" not in post_hook
+    assert "TryAcquireKvafStreamingBatchGetQueueFromAicore" in post_hook
+    assert "BeginKvafStreamingBatchGet" in post_hook
 
     # Modes 1/2 redirect the official score DMA; mode 2 publishes two fixed
     # 64-byte lines after it, before the existing MTE3/V release.
@@ -144,28 +173,41 @@ def require_source_contract() -> None:
     assert "mrgValueLocal_.template ReinterpretCast<int64_t>()" not in vector
     score_dma = vector.index("DataCopyPad(scoreGm")
     reduction = vector.index("BatchMulWeightAndReduceSum")
-    inline_emit = vector.index("streamingKvafHook_.Emit")
+    audit_emit = vector.index("streamingAuditHook_.Emit")
+    post_emit = vector.index("streamingKvafHook_.Emit")
     receipt_emit = vector.index("EmitScoreTileReceipts", score_dma)
     mte3_release = vector.index("SetFlag<HardEvent::MTE3_V>", score_dma)
-    assert reduction < inline_emit < score_dma
+    assert reduction < audit_emit < score_dma
+    assert reduction < post_emit < score_dma
     assert score_dma < receipt_emit < mte3_release
     assert "BatchMulWeightAndReduceSum" in vector
     assert "ProcessTopK" in vector
 
     # The inline=off branch retains all transaction resources only as ABI
-    # carriers. Inline mode initializes them after vector UB allocation, and
-    # Finish runs only after the official Top-K event drain.
+    # carriers. Audit initializes only its fixed receipt observer; post alone
+    # initializes and drains the native enqueue state after official Top-K.
     for token in (
         "(void)residentThreshold;", "(void)queueControl;",
         "(void)queueLeases;", "(void)scoreWorkspaceOut;",
         "(void)tileReceiptsOut;",
     ):
         assert token in preload, token
-    assert "#if A5_STREAMING_LI_GET_INLINE_MODE > 0" in preload
+    assert "#if A5_STREAMING_LI_GET_INLINE_MODE == 1" in preload
+    assert "#elif A5_STREAMING_LI_GET_INLINE_MODE == 2" in preload
+    assert "vectorService.InitStreamingAuditHook(" in preload
     assert "vectorService.InitStreamingKvafHook(" in preload
     free_event = preload.index("vectorService.FreeEventID();")
     finish_hook = preload.index("vectorService.FinishStreamingKvafHook();")
     assert free_event < finish_hook
+
+    for token in (
+        "NEEDS_P3_POST_KVAF=0",
+        "P3 inline=audit closure must contain only the audit observer",
+        "P3 generated audit closure: score-only verified=1",
+        "kvaf_closure=${P3_KVAF_CLOSURE}",
+        "kvaf_source_head=${P3_KVAF_SOURCE_HEAD}",
+    ):
+        assert token in (OPS_ROOT / "build_nanovllm_ops.sh").read_text(encoding="utf-8"), token
 
     for token in (
         "SCORE_WORKSPACE_INDEX = 21", "TILE_RECEIPTS_INDEX = 22",
@@ -215,6 +257,13 @@ def require_source_contract() -> None:
         [f'this->Output("{name}")' for name in OUTPUT_NAMES],
         "OpDef ABI",
     )
+
+    target_adapter = (
+        OPS_ROOT / "tests/streaming_quant_li_get_target_adapter.py"
+    ).read_text(encoding="utf-8")
+    assert '"kvaf_closure"' in target_adapter
+    assert '"staged" if expected_inline_mode == "post" else "absent"' in target_adapter
+    assert "no-transport artifact unexpectedly records a KVAF" in target_adapter
 
 
 def probe_publication_layout() -> None:

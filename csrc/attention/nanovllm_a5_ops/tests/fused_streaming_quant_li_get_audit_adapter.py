@@ -818,7 +818,8 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"{os.getenv('P3_TARGET_EXPECTED_SOURCE_HEAD', '<unset>')} "
         f"source_clean={target_provenance['source_clean']} "
         f"publication_mode={target_provenance['publication_mode']} "
-        f"inline_mode={target_provenance['inline_mode']} ready=1 "
+        f"inline_mode={target_provenance['inline_mode']} "
+        f"kvaf_closure={target_provenance['kvaf_closure']} ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
         flush=True,
     )

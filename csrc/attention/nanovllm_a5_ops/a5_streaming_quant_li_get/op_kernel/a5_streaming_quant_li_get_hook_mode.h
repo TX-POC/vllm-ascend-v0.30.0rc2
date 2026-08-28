@@ -42,4 +42,4 @@ static_assert(A5_STREAMING_LI_GET_INLINE_MODE >= 0 &&
 // so the isolated build contract deliberately keeps them mutually exclusive.
 static_assert(A5_STREAMING_LI_GET_INLINE_MODE == 0 ||
               A5_STREAMING_LI_GET_PUBLISH_MODE == 0,
-              "inline KVAF mode requires publication mode off.");
+              "inline mode requires publication mode off.");
