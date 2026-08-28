@@ -22,9 +22,11 @@ mapping cannot accidentally pass merely because the source allocation is
 regular.  The test makes no bandwidth or end-to-end performance claim.
 
 Run in a fresh process with exactly one visible physical card, for example
-``ASCEND_VISIBLE_DEVICES=7 ... --device npu:0 --physical-npu-id 7``.  In that
-process logical ``npu:0`` is physical NPU 7; the explicit mapping check below
-rejects any ambiguous launch.
+``ASCEND_RT_VISIBLE_DEVICES=7 ... --device npu:0 --physical-npu-id 7``.  This
+is the Ascend runtime device-control variable; ``ASCEND_VISIBLE_DEVICES`` does
+not remap ``torch_npu`` devices in the validation container.  In that process
+logical ``npu:0`` is physical NPU 7; the explicit mapping check below rejects
+any ambiguous launch.
 """
 
 from __future__ import annotations
@@ -103,16 +105,19 @@ def _require_test_args(args: argparse.Namespace) -> torch.device:
     if args.device != "npu:0":
         raise ValueError(
             "post payload proof requires logical npu:0; choose the physical card "
-            "only with ASCEND_VISIBLE_DEVICES before the process starts"
+            "only with ASCEND_RT_VISIBLE_DEVICES before the process starts"
         )
     if args.physical_npu_id < 0:
         raise ValueError("--physical-npu-id must be non-negative")
-    visible = os.getenv("ASCEND_VISIBLE_DEVICES")
+    visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
     expected_visible = str(args.physical_npu_id)
     if visible != expected_visible:
         raise RuntimeError(
             "strict physical/logical mapping requires exactly one visible physical "
-            f"card: expected ASCEND_VISIBLE_DEVICES={expected_visible!r}, got {visible!r}"
+            "card selected through Ascend runtime visibility: expected "
+            f"ASCEND_RT_VISIBLE_DEVICES={expected_visible!r}, got {visible!r}; "
+            f"ASCEND_VISIBLE_DEVICES={os.getenv('ASCEND_VISIBLE_DEVICES')!r} is not "
+            "a substitute"
         )
     if args.table_capacity < target.SOURCE_TOKENS // ROWS_PER_ENTRY:
         raise ValueError(
