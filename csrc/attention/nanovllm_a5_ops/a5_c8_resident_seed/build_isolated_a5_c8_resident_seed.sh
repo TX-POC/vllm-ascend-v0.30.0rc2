@@ -67,13 +67,16 @@ if grep -qF 'InitGlobalMemory(residentTauGm[rowOffset]' "${VECTOR_KERNEL}" || \
    ! grep -qF 'GetTPipePtr()->FetchEventID(HardEvent::V_S)' "${VECTOR_KERNEL}" || \
    ! grep -qF 'SetFlag<HardEvent::V_S>(topkVectorToScalar);' "${VECTOR_KERNEL}" || \
    ! grep -qF 'WaitFlag<HardEvent::V_S>(topkVectorToScalar);' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'GetTPipePtr()->FetchEventID(HardEvent::S_V)' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'SetFlag<HardEvent::S_V>(topkScalarToVector);' "${VECTOR_KERNEL}" || \
+   ! grep -qF 'WaitFlag<HardEvent::S_V>(topkScalarToVector);' "${VECTOR_KERNEL}" || \
    ! grep -qF 'GetTPipePtr()->FetchEventID(HardEvent::S_MTE3)' "${VECTOR_KERNEL}" || \
    ! grep -qF 'GetTPipePtr()->FetchEventID(HardEvent::MTE3_S)' "${VECTOR_KERNEL}" || \
    ! grep -qF 'GlobalTensor<int32_t> residentTauOutput = residentTauGm[rowOffset];' "${VECTOR_KERNEL}" || \
    ! grep -qF 'GlobalTensor<int32_t> tauValidOutput = tauValidGm[rowOffset];' "${VECTOR_KERNEL}" || \
    ! grep -qF 'InitGlobalMemory(residentTauOutput, rowCount, 0);' "${VECTOR_KERNEL}" || \
    ! grep -qF 'InitGlobalMemory(tauValidOutput, rowCount, 0);' "${VECTOR_KERNEL}"; then
-  echo "[a5_c8_resident_seed] ERROR: CANN 9.1 InitGlobalMemory lvalue contract or resident receipt device ordering is incomplete (GM lvalue, V-to-S, or Scalar/MTE3)." >&2
+  echo "[a5_c8_resident_seed] ERROR: CANN 9.1 InitGlobalMemory lvalue contract or resident receipt device ordering is incomplete (GM lvalue, V-to-S-to-V, or Scalar/MTE3)." >&2
   exit 2
 fi
 if [[ -e "${BUILD_ROOT}/op_dev" || -e "${BUILD_ROOT}/custom_op" || -e "${BUILD_ROOT}/opp" ]]; then

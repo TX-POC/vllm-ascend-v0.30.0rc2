@@ -590,6 +590,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
             SetFlag<HardEvent::V_S>(topkVectorToScalar);
             WaitFlag<HardEvent::V_S>(topkVectorToScalar);
             kthTau = topkOp_.GetLastKthValue();
+            // `nkValueLocal` is reused by Vector for the next output row.
+            // V->S alone proves only that the current final TopK finished;
+            // it does not keep Vector from overwriting the boundary before
+            // Scalar has executed GetLastKthValue.  Return the ownership
+            // explicitly before this loop advances.  This probe-only fence
+            // changes no C8 score or selection math.
+            const event_t topkScalarToVector = static_cast<event_t>(
+                GetTPipePtr()->FetchEventID(HardEvent::S_V));
+            SetFlag<HardEvent::S_V>(topkScalarToVector);
+            WaitFlag<HardEvent::S_V>(topkScalarToVector);
         }
         WriteResidentSeed(outputRow, kthTau, hasExactTau);
 

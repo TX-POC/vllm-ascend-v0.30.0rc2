@@ -95,6 +95,10 @@ def main() -> None:
             vector.rfind("SetFlag<HardEvent::V_S>(topkVectorToScalar);", 0, tau_read) >= 0 and
             vector.rfind("WaitFlag<HardEvent::V_S>(topkVectorToScalar);", 0, tau_read) >= 0,
             "final TopK boundary must synchronize Vector-to-Scalar before GetValue")
+    tau_return = vector.index("WaitFlag<HardEvent::S_V>(topkScalarToVector);", tau_read)
+    require(vector.find("GetTPipePtr()->FetchEventID(HardEvent::S_V)", tau_read, tau_return) >= 0 and
+            vector.find("SetFlag<HardEvent::S_V>(topkScalarToVector);", tau_read, tau_return) >= 0,
+            "final TopK boundary must return Scalar-to-Vector ownership before reuse")
     require("sparse_count=%d so resident_tau is the exact 2048th C8 score" in tiling,
             "tiling must reject non-2048 threshold semantics")
     require("AddConfig(\"ascend950\"" in op_def and "AddConfig(\"ascend910b\"" not in op_def,
