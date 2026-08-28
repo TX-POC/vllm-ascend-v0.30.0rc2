@@ -328,7 +328,9 @@ def _assert_live_receipt_oracle(fixture: P5Fixture) -> dict[str, int]:
     }
 
 
-def _device_inputs(torch: Any, fixture: P5Fixture, device: Any) -> dict[str, Any]:
+def _device_inputs(
+    torch: Any, fixture: P5Fixture, device: Any, candidate_mode: str = "full"
+) -> dict[str, Any]:
     """Materialize the literal C8 publication boundary on one NPU device."""
     score_workspace = torch.tensor(
         _pack_u16_carrier(fixture.raw_scores), dtype=torch.int32, device=device
@@ -369,6 +371,17 @@ def _device_inputs(torch: Any, fixture: P5Fixture, device: Any) -> dict[str, Any
     # contract.  It is deliberately *not* a ProcessTopK output: P5 needs it
     # before any Top-K terminal result exists so it can classify each fixed
     # receipt position as inactive versus late-but-expected.
+    if candidate_mode not in ("full", "none"):
+        raise ValueError(f"unknown candidate_mode={candidate_mode}")
+    # ``none`` is a diagnostic control, not a performance claim: it keeps
+    # the identical C8-shaped score/receipt/ring geometry but raises the
+    # resident threshold above every fixture score.  Thus the 64-AIV scan and
+    # Get-lane termination protocol run, while BuildFullGetArgs/Post/CQ are
+    # provably not reached.  Comparing it with ``full`` isolates the first
+    # Direct-HCCP device-side dereference in one validation round.
+    if candidate_mode == "none" and max(fixture.raw_scores) >= 0xFFFF:
+        raise AssertionError("none-mode threshold no longer suppresses every fixture score")
+    threshold = fixture.threshold if candidate_mode == "full" else 0xFFFF
     active_score_source_lens = i32(fixture.score_source_lens)
     output_rows = fixture.private_arena_capacity * GET_LANE_COUNT
     return {
@@ -378,7 +391,7 @@ def _device_inputs(torch: Any, fixture: P5Fixture, device: Any) -> dict[str, Any
         # ABI in3: immutable graph-static active_score_source_lens.
         "score_source_lens": active_score_source_lens,
         "resident_threshold": torch.full(
-            (fixture.rows,), fixture.threshold, dtype=torch.int32, device=device
+            (fixture.rows,), threshold, dtype=torch.int32, device=device
         ),
         "resident_threshold_valid": torch.ones(
             (fixture.rows,), dtype=torch.int32, device=device
@@ -513,6 +526,22 @@ def _run_executor(
     import nanovllm_exact_scan_get  # noqa: F401
 
     device_id = device.index if device.index is not None else torch.npu.current_device()
+    _executor_trace(
+        "modules_loaded",
+        kvaf_file=getattr(kvaf, "__file__", "<unknown>"),
+        kvaf_native_file=getattr(getattr(kvaf, "_kvaf", None), "__file__", "<unknown>"),
+        bridge_file=getattr(nanovllm_exact_scan_get, "__file__", "<unknown>"),
+        current_device=torch.npu.current_device(),
+        stream=torch.npu.current_stream(),
+        output_shape=tuple(tensors["private_packed_output"].shape),
+        output_bytes=tensors["private_packed_output"].numel()
+        * tensors["private_packed_output"].element_size(),
+        output_ptr=hex(tensors["private_packed_output"].data_ptr()),
+        control_shape=tuple(tensors["fused_get_control"].shape),
+        control_bytes=tensors["fused_get_control"].numel()
+        * tensors["fused_get_control"].element_size(),
+        control_ptr=hex(tensors["fused_get_control"].data_ptr()),
+    )
     _executor_trace("runtime_create", device=device_id, transport=args.transport)
     runtime = _create_runtime(kvaf, args, device_id)
     _executor_trace("runtime_created")
@@ -543,6 +572,11 @@ def _run_executor(
             "bind_begin",
             output_ptr=hex(tensors["private_packed_output"].data_ptr()),
             control_ptr=hex(tensors["fused_get_control"].data_ptr()),
+            output_bytes=tensors["private_packed_output"].numel()
+            * tensors["private_packed_output"].element_size(),
+            control_bytes=tensors["fused_get_control"].numel()
+            * tensors["fused_get_control"].element_size(),
+            stream=torch.npu.current_stream(),
         )
         runtime.bind_fused_batch_get_control(
             tensors["private_packed_output"],
@@ -553,6 +587,34 @@ def _run_executor(
         _executor_trace("bind_done")
         torch.npu.synchronize()
         _executor_trace("bind_synchronize_done")
+        control_words = [int(value) for value in tensors["fused_get_control"].cpu().tolist()]
+        control_matches_output = int(
+            len(control_words) == 16
+            and control_words[5] == tensors["private_packed_output"].data_ptr()
+        )
+        _executor_trace(
+            "control_ready",
+            words=",".join(str(value) for value in control_words),
+            output_matches=control_matches_output,
+        )
+        if not (
+            len(control_words) == 16
+            and control_words[0] != 0
+            and control_words[1] != 0
+            and control_words[2] != 0
+            and control_words[3] != 0
+            and control_words[4] != 0
+            and control_matches_output == 1
+            and control_words[6] == tensors["private_packed_output"].shape[0]
+            and control_words[7] == GET_LANE_COUNT
+            and control_words[8] == 1
+            and control_words[9] == PACKED_ENTRY_BYTES
+        ):
+            raise AssertionError(
+                "P5 fused Get cold control is invalid before ACLNN dispatch: "
+                f"words={control_words} output_ptr="
+                f"{tensors['private_packed_output'].data_ptr()}"
+            )
 
         _executor_trace("op_invoke")
         outputs = torch.ops.a5_exact_scan_get.exact_scan_speculative_get(
@@ -581,7 +643,9 @@ def _run_executor(
         _executor_trace("op_synchronize_begin")
         torch.npu.synchronize()
         _executor_trace("op_synchronize_done")
-        _assert_executor_oracle(torch, fixture, tensors, outputs, source_cpu)
+        _assert_executor_oracle(
+            torch, fixture, tensors, outputs, source_cpu, args.candidate_mode
+        )
         _executor_trace("oracle_done")
     finally:
         primary_exception_active = sys.exc_info()[0] is not None
@@ -623,6 +687,7 @@ def _assert_executor_oracle(
     inputs: dict[str, Any],
     outputs: tuple[Any, ...],
     source_cpu: Any,
+    candidate_mode: str,
 ) -> None:
     if len(outputs) != 17:
         raise AssertionError(f"P5 ABI returned {len(outputs)} outputs, expected 17")
@@ -663,6 +728,40 @@ def _assert_executor_oracle(
             "producer_stats must expose [62, 10]: lifecycle columns 0..7 plus "
             f"live-receipt polls/timeouts 8..9, got {tuple(stats.shape)}"
         )
+    if candidate_mode == "none":
+        torch.testing.assert_close(
+            candidate_counts.cpu(), torch.zeros(PRODUCER_COUNT, dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            stats[:, :5].cpu(), torch.zeros((PRODUCER_COUNT, 5), dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            get_stats.cpu()[:, :3], torch.zeros((GET_LANE_COUNT, 3), dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            private_head_out.cpu(), torch.zeros(GET_LANE_COUNT, dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            private_ready_out.cpu(),
+            torch.zeros_like(private_ready_out.cpu()),
+        )
+        torch.testing.assert_close(
+            private_source_out.cpu(),
+            torch.full_like(private_source_out.cpu(), -1),
+        )
+        torch.testing.assert_close(
+            private_object_out.cpu(),
+            torch.full_like(private_object_out.cpu(), -1),
+        )
+        expected_trace = torch.cat(
+            (
+                torch.arange(2000, 2000 + GET_LANE_COUNT, dtype=torch.int32),
+                torch.arange(1000, 1000 + PRODUCER_COUNT, dtype=torch.int32),
+            )
+        )
+        torch.testing.assert_close(role_trace.cpu(), expected_trace)
+        return
+
     expected_counts = [len(value) for value in fixture.expected_candidates]
     torch.testing.assert_close(candidate_counts.cpu(), torch.tensor(expected_counts, dtype=torch.int32))
     torch.testing.assert_close(
@@ -774,6 +873,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--frame-epoch", type=int, default=17)
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("full", "none"),
+        default="full",
+        help=(
+            "full exercises Direct-HCCP Post/CQ; none keeps the same 64-AIV "
+            "scan/ring protocol but suppresses every candidate for fault isolation"
+        ),
+    )
     parser.add_argument("--transport", choices=("local", "remote"), default="local")
     parser.add_argument("--cpu-service-addr", default="")
     parser.add_argument("--batch-get-kernel", default="")
@@ -812,13 +920,14 @@ def main() -> None:
 
     device = torch.device(args.device)
     torch.npu.set_device(device)
-    tensors = _device_inputs(torch, fixture, device)
+    tensors = _device_inputs(torch, fixture, device, args.candidate_mode)
     torch.npu.synchronize()
     _assert_receipt_fixture(torch, fixture, tensors)
     print(
         "P5_SEMANTIC_STAGE "
         f"mode={args.stage} source=p2_direct_receipt_fixture "
         f"device={args.device} score_carrier=int32 score_value=uint16 "
+        f"candidate_mode={args.candidate_mode} "
         f"receipts={tensors['tile_receipts'].shape[0]} receipt_words={RECEIPT_WORDS} "
         f"active_score_source_lens={fixture.score_source_lens} "
         "live_c8_publisher=0"
@@ -843,7 +952,16 @@ def main() -> None:
     )
     if args.stage == "executor":
         _run_executor(torch, fixture, tensors, args, device)
-        print("P5_SEMANTIC_EXECUTOR_PASS candidate_exact=1 object_dedup=1 post_cq_ready=1")
+        if args.candidate_mode == "full":
+            print(
+                "P5_SEMANTIC_EXECUTOR_PASS candidate_mode=full "
+                "candidate_exact=1 object_dedup=1 post_cq_ready=1"
+            )
+        else:
+            print(
+                "P5_SEMANTIC_EXECUTOR_PASS candidate_mode=none "
+                "scan_ring_terminal=1 direct_hccp_post_exercised=0"
+            )
     else:
         print("P5_SEMANTIC_RECEIPT_FIXTURE_PASS input_contract=1 oracle=1")
 
