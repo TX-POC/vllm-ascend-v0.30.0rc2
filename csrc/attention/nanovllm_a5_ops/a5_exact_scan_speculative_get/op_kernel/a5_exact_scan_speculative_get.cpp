@@ -851,6 +851,16 @@ private:
                 return false;
             }
         }
+        // `ClosedEpoch` is the producer's terminal release store: every
+        // tail record/state publication precedes it.  A Get lane that sees
+        // all rings closed must acquire that release *before* its final
+        // ConsumeReadyRings pass.  Without this fence, a consumer can read
+        // an earlier SlotState=0, subsequently observe ClosedEpoch=epoch,
+        // and incorrectly exit with the producer's final partial slot still
+        // unclaimed.  The normal streaming path remains nonblocking until
+        // this terminal observation; this barrier applies only to the
+        // closed-tail drain.
+        DataSyncBarrier<MemDsbT::DDR>();
         return true;
     }
 
@@ -1496,6 +1506,12 @@ private:
             // canonical wave.
             const uint32_t target = batches == 0U ? kGetBootstrapRecords
                                                    : kGetWaveRecords;
+            // Observe terminal closure before consuming.  If the final
+            // producer close becomes visible on this iteration,
+            // AllRingsClosed performs the acquire required for the
+            // immediately following tail drain.  If it is not yet closed,
+            // ConsumeReadyRings retains the normal eager streaming behavior.
+            const bool allClosed = AllRingsClosed(lane, epoch);
             const uint32_t before = queued;
             bool deferredReady = false;
             if (queued < target) {
@@ -1503,14 +1519,13 @@ private:
                     lane, fillBuffer, epoch, queued, target, &consumedChunks,
                     &firstConsumedChunkCycle, &descriptorHashSum,
                     &descriptorHashXor, &error, &deferredReady);
-                if (inFlight && queued > before) {
-                    // These stores are ExactScan's selected descriptor work,
-                    // not synthetic delay: they are the next Direct-HCCP
-                    // wave and are flushed before it can be posted.
-                    overlappedDescriptorRecords += queued - before;
-                }
             }
-            const bool allClosed = AllRingsClosed(lane, epoch);
+            // Keep this accounting after the final acquire/drain as well:
+            // descriptors compacted into the alternate buffer while the
+            // preceding Direct-HCCP wave is in flight are genuine overlap.
+            if (inFlight && queued > before) {
+                overlappedDescriptorRecords += queued - before;
+            }
             if (error != 0U) {
                 break;
             }

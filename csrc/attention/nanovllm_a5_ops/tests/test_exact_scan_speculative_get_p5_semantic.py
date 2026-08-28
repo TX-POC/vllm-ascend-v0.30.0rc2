@@ -521,6 +521,47 @@ def _executor_trace(step: str, **fields: Any) -> None:
     print(f"P5_EXECUTOR_STEP step={step}{(' ' + suffix) if suffix else ''}", flush=True)
 
 
+def _executor_terminal_trace(
+    torch: Any, fixture: P5Fixture, outputs: tuple[Any, ...]
+) -> None:
+    """Print the small, decisive device-side lifecycle receipt before oracle checks.
+
+    This executes only after the stream has synchronized.  It makes a failed
+    hardware replay self-diagnosing: candidate word 4 remains ``-1`` only
+    when its owning Get lane never consumed the ring record; a terminal Get
+    error or failed CQ instead appears in the per-lane stats.
+    """
+    candidate_seeds = outputs[5].cpu()
+    candidate_counts = outputs[6].cpu().tolist()
+    get_stats = outputs[8].cpu().tolist()
+    private_head = outputs[3].cpu().tolist()
+
+    seed_slots: list[str] = []
+    for producer, expected in enumerate(fixture.expected_candidates):
+        for local_index, _ in enumerate(expected):
+            if local_index < candidate_counts[producer]:
+                slot = int(candidate_seeds[producer, local_index, 4])
+                seed_slots.append(f"p{producer}:{local_index}={slot}")
+
+    nonzero_counts = [
+        f"p{producer}={count}"
+        for producer, count in enumerate(candidate_counts)
+        if count != 0
+    ]
+    lane_stats = [
+        "l%d:req=%d,batch=%d,err=%d,doorbell=%d,cq=%d,chunks=%d,probe=%d,overlap=%d"
+        % (lane, row[0], row[1], row[2], row[3], row[4], row[6], row[14], row[15])
+        for lane, row in enumerate(get_stats)
+    ]
+    _executor_trace(
+        "op_terminal",
+        candidate_counts=";".join(nonzero_counts) or "none",
+        seed_private_slots=";".join(seed_slots) or "none",
+        private_head=",".join(str(value) for value in private_head),
+        get_stats="|".join(lane_stats),
+    )
+
+
 def _run_executor(
     torch: Any, fixture: P5Fixture, tensors: dict[str, Any], args: argparse.Namespace, device: Any
 ) -> None:
@@ -650,6 +691,7 @@ def _run_executor(
         _executor_trace("op_synchronize_begin")
         torch.npu.synchronize()
         _executor_trace("op_synchronize_done")
+        _executor_terminal_trace(torch, fixture, outputs)
         _assert_executor_oracle(
             torch, fixture, tensors, outputs, source_cpu, args.candidate_mode
         )
