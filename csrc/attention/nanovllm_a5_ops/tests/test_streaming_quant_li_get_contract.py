@@ -301,7 +301,7 @@ def require_source_contract() -> None:
     for token in (
         "P3_POST_PAYLOAD_STRICT_PASS",
         "P3_POST_PAYLOAD_DIAGNOSTIC",
-        "ASCEND_VISIBLE_DEVICES",
+        "ASCEND_RT_VISIBLE_DEVICES",
         "_read_target_provenance(target_vendor, \"off\", \"post\")",
         "bind_streaming_batch_get_control",
         "configure_streaming_batch_get_queue_templates",
