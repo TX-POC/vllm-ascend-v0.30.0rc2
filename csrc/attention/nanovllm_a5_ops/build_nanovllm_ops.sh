@@ -720,6 +720,36 @@ for index in "${!OP_NAMES[@]}"; do
     msopgen "${msopgen_args[@]}"
 done
 
+# In the strict P1 build, msopgen first writes its own host OpDef stub and
+# the checked-in ExactScan host implementation is overlaid immediately after
+# this block.  Depending on the CANN generator revision, that stub may use a
+# different filename from our implementation.  Leaving it in place then
+# emits two OP_ADD(A5ExactScanSpeculativeGet) registrations and produces two
+# same-name sections in aic-*-ops-info.ini.  Remove only the generated
+# registration source while the project contains *only* msopgen output; the
+# checked-in host source is copied in the next block.  This deliberately does
+# not run for a normal/multi-op build, where the generated sources can be
+# shared by legacy operators.
+if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
+    P1_GENERATED_OPDEF_STUBS=()
+    while IFS= read -r -d '' P1_GENERATED_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5ExactScanSpeculativeGet[[:space:]]*\)' \
+                "${P1_GENERATED_HOST_SOURCE}"; then
+            P1_GENERATED_OPDEF_STUBS+=("${P1_GENERATED_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+
+    if [[ "${#P1_GENERATED_OPDEF_STUBS[@]}" -ne 1 ]]; then
+        echo "[nanovllm_a5_ops] ERROR: expected exactly one msopgen A5ExactScanSpeculativeGet host stub; found ${#P1_GENERATED_OPDEF_STUBS[@]}." >&2
+        printf '[nanovllm_a5_ops] P1 generated OpDef stub: %s\n' \
+            "${P1_GENERATED_OPDEF_STUBS[@]}" >&2
+        exit 1
+    fi
+    rm -f "${P1_GENERATED_OPDEF_STUBS[0]}"
+    echo "[nanovllm_a5_ops] P1 removed generated host OpDef stub: ${P1_GENERATED_OPDEF_STUBS[0]}"
+fi
+
 # msopgen owns the CMake scaffold. Checked-in Host/AscendC implementation
 # sources overwrite only generated source stubs; directory structure is kept.
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
@@ -868,6 +898,41 @@ if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         exit 1
     fi
     echo "[nanovllm_a5_ops] P3 host registration closure: ${P3_OPDEF_SOURCES[0]}"
+fi
+
+# P1 has one authoritative host implementation.  This is deliberately a
+# post-overlay check: it proves both that the generated registration stub was
+# removed above and that the checked-in implementation is the sole OP_ADD
+# source seen by CANN.  Do not "fix" the generated INI after the fact: a
+# duplicate there would otherwise hide a source/ABI closure error until a
+# later build or runtime failure.
+if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
+    P1_EXPECTED_OPDEF_SOURCE="${GENERATED}/op_host/a5_exact_scan_speculative_get.cpp"
+    if [[ ! -f "${P1_EXPECTED_OPDEF_SOURCE}" ]] || \
+       ! cmp -s "${ROOT}/a5_exact_scan_speculative_get/op_host/a5_exact_scan_speculative_get.cpp" \
+                 "${P1_EXPECTED_OPDEF_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P1 checked-in ExactScan host implementation did not survive the generated-project overlay." >&2
+        echo "[nanovllm_a5_ops] expected=${P1_EXPECTED_OPDEF_SOURCE}" >&2
+        exit 1
+    fi
+
+    P1_OPDEF_SOURCES=()
+    while IFS= read -r -d '' P1_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5ExactScanSpeculativeGet[[:space:]]*\)' \
+                "${P1_HOST_SOURCE}"; then
+            P1_OPDEF_SOURCES+=("${P1_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+
+    if [[ "${#P1_OPDEF_SOURCES[@]}" -ne 1 || \
+          "${P1_OPDEF_SOURCES[0]:-}" != "${P1_EXPECTED_OPDEF_SOURCE}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P1 requires exactly one A5ExactScanSpeculativeGet OpDef from the checked-in host source; found ${#P1_OPDEF_SOURCES[@]}." >&2
+        printf '[nanovllm_a5_ops] P1 OpDef source: %s\n' \
+            "${P1_OPDEF_SOURCES[@]}" >&2
+        exit 1
+    fi
+    echo "[nanovllm_a5_ops] P1 host registration closure: ${P1_OPDEF_SOURCES[0]} verified=1"
 fi
 
 if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \

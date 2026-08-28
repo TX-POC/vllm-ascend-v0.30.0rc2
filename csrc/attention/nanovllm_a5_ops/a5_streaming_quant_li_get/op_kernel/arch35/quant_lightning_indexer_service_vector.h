@@ -493,9 +493,11 @@ __aicore__ inline void QLIVector<QLIT>::PrepareScoreTileReceipts(
             static_cast<uint64_t>(pingpong) * 2U * kWordsPerReceipt +
             static_cast<uint64_t>(localRow) * kWordsPerReceipt;
 
-        // word 0 is an absolute byte offset from score_workspace's base, not
-        // an int32- or uint16-element index.  The sidecar can therefore form
-        // its GM address without a hidden factor-of-two convention.
+        // Word 0 is a byte offset *relative to the beginning of the passed
+        // score_workspace view*, not a device virtual address and not an
+        // int32-/uint16-element index.  A consumer adds it to its own view
+        // base, so graph replay cannot accidentally retain an old address or
+        // introduce a hidden factor-of-two convention.
         descriptorLocal.SetValue(localBase + 0, static_cast<int64_t>(
             scoreWorkspaceBaseBytes_ +
             (vec1OutGmOffset + static_cast<uint64_t>(localRow) *
@@ -795,14 +797,33 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
     // Exact inline seam: read only the uint16 values the official reduction
     // just produced, before C8 begins its normal score-GM copy.  The hook
-    // never writes this tile or sparse Top-K state. The post closure keeps
-    // its existing scheduling untouched here: its final per-pingpong Scalar
-    // completion fence must be designed with the direct-HCCP overlap protocol,
-    // rather than borrowing the intentionally synchronous audit fence above.
+    // never writes this tile or sparse Top-K state.
+    //
+    // `outBase` is Vector-owned.  A PIPE_V barrier alone cannot make it safe
+    // for the Scalar hook to call GetValue(), nor can it prevent Vector/MTE3
+    // from recycling the ping-pong buffer while Scalar is still scanning it.
+    // The two cross-pipe edges below therefore form the minimum correctness
+    // envelope for *any* inline ExactScoreScan/Post implementation:
+    //
+    //   Vector score complete -> Scalar reads/compacts/posts -> Vector reuse
+    //
+    // This is intentionally the same V->S / S->V lifetime contract used by
+    // the audit path.  It fixes data correctness; it is not yet the final
+    // P5 throughput schedule.  The target ring implementation will move the
+    // scalar completion acknowledgement to the next reuse of this ping-pong
+    // tile, after its bounded CandidateSeed hand-off is proven safe.
     if (mayNeedScoreObservation) {
         PipeBarrier<PIPE_V>();
+        const event_t scoreVectorToScalar = static_cast<event_t>(
+            GetTPipePtr()->FetchEventID(HardEvent::V_S));
+        SetFlag<HardEvent::V_S>(scoreVectorToScalar);
+        WaitFlag<HardEvent::V_S>(scoreVectorToScalar);
         streamingKvafHook_.Emit(outBase, info, curAivS1Idx,
                                 curAivS1ProcNum, curS2Idx);
+        const event_t scoreScalarToVector = static_cast<event_t>(
+            GetTPipePtr()->FetchEventID(HardEvent::S_V));
+        SetFlag<HardEvent::S_V>(scoreScalarToVector);
+        WaitFlag<HardEvent::S_V>(scoreScalarToVector);
     }
 #endif
     int64_t vec1OutGmOffset = blockId_ % 2 == 0 ? curS2Idx :
