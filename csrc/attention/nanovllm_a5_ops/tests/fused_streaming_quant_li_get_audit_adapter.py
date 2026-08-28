@@ -6,10 +6,12 @@ needs: a resident-only C8 scan produces an exact sortable Top-2048 threshold,
 then one full raw-Q/K scan records threshold-qualified cold sources in a fixed
 ``[R,S]`` candidate map.  It never posts H2D in this audit mode.
 
-The full official C8 result remains the only final-Top-K authority.  We use it
-only in this validation program to prove that every *officially selected cold*
-source is covered by the device-side candidate map.  The source-derived P3
-clone's own Top-K stays diagnostic and cannot route QSFA.
+The full official C8 result remains the only final-Top-K authority.  The
+threshold map is only a speculative-transport hint: final ExactTopK plus
+GuaranteedRecall owns losslessness.  This audit additionally builds a
+score-GM publisher variant so every Scalar-read receipt score can be compared
+with the exact score-GM values C8 subsequently consumes for Top-K.  The
+source-derived P3 clone's own Top-K stays diagnostic and cannot route QSFA.
 """
 
 from __future__ import annotations
@@ -30,8 +32,12 @@ from streaming_quant_li_get_target_adapter import (
     INLINE_MODE_ENV,
     PUBLICATION_MODE_ENV,
     REFERENCE_OPP_ENV,
+    SOURCE_TOKENS,
     SPARSE_COUNT,
     TARGET_OPP_ENV,
+    TILE_RECEIPT_CONTRACT_VERSION,
+    TILE_RECEIPT_SENTINEL,
+    TILE_SCORE_WIDTH,
     _bind_isolated_target_opp,
     _build_official_inputs,
     _call_official,
@@ -162,6 +168,168 @@ def _assert_publication_output_aliases(
                 f"name={name} input=0x{int(expected.data_ptr()):x} "
                 f"output=0x{int(actual.data_ptr()):x}"
             )
+
+
+def _decode_published_score_mirror(
+    publication: dict[str, torch.Tensor], score_source_lens: torch.Tensor
+) -> dict[str, Any]:
+    """Decode the exact uint16 score-GM tiles from publisher receipts.
+
+    `A5StreamingQuantLiGet` writes the same score-GM that its later
+    `ProcessTopK` consumes.  Publisher records describe each V->MTE3 tile
+    copy after it has been enqueued, so this is an independent host-side view
+    of the score domain; it never reuses the Scalar audit receipt values.
+    """
+    score_words = publication["score_workspace"].detach().cpu().contiguous()
+    tile_receipts = publication["tile_receipts"].detach().cpu().contiguous()
+    epoch = int(publication["streaming_epoch"].detach().cpu().item())
+    if score_words.dtype != torch.int32:
+        raise RuntimeError(
+            f"P4 score workspace must be int32 carrier, got {score_words.dtype}"
+        )
+    if tile_receipts.ndim != 2 or tile_receipts.shape[1] != 16:
+        raise RuntimeError(
+            "P4 tile receipt ABI must be [slots,16], got "
+            f"shape={tuple(tile_receipts.shape)}"
+        )
+    if score_source_lens.numel() != BATCH_SIZE:
+        raise RuntimeError(
+            "P4 score-source length ABI has unexpected shape: "
+            f"{tuple(score_source_lens.shape)}"
+        )
+
+    # Every int32 carrier stores two exact sortable uint16 score values.  The
+    # publisher's byte offsets are relative to score_workspace's GM base.
+    score_u16 = score_words.view(torch.uint16).reshape(-1)
+    mirror = torch.full(
+        (BATCH_SIZE, int(score_source_lens.max().item())),
+        -1,
+        dtype=torch.int64,
+    )
+    written = torch.zeros_like(mirror, dtype=torch.bool)
+    descriptor_errors: list[str] = []
+    duplicate_count = 0
+    interval_overlap_count = 0
+    active_records = 0
+    ready_records = 0
+    zero_valid_records = 0
+    # A descriptor proves both a logical coordinate and a physical score-GM
+    # interval.  Keep the latter explicit: two distinct source tiles must not
+    # accidentally read the same legal workspace range.
+    intervals: list[tuple[int, int, int]] = []
+    source_lens = score_source_lens.detach().cpu().contiguous()
+    tiles_per_row = (SOURCE_TOKENS + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH
+    expected_active_records = sum(
+        (int(source_lens[row].item()) + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH
+        for row in range(BATCH_SIZE)
+    )
+
+    def record_error(message: str) -> None:
+        if len(descriptor_errors) < 8:
+            descriptor_errors.append(message)
+
+    for slot, record in enumerate(tile_receipts):
+        if int(record[8].item()) != epoch:
+            if not bool(torch.all(record == TILE_RECEIPT_SENTINEL).item()):
+                record_error(f"slot={slot},unready_record_not_sentinel=1")
+            continue
+        ready_records += 1
+        byte_offset = int(record[0].item())
+        row = int(record[1].item())
+        source_base = int(record[2].item())
+        valid = int(record[3].item())
+        source_stride = int(record[4].item())
+        expected_valid = -1
+        expected_slot = -1
+        if 0 <= row < BATCH_SIZE and source_base >= 0 and \
+                source_base % TILE_SCORE_WIDTH == 0 and \
+                source_base < SOURCE_TOKENS:
+            expected_valid = max(
+                0,
+                min(
+                    TILE_SCORE_WIDTH,
+                    int(source_lens[row].item()) - source_base,
+                ),
+            )
+            expected_slot = row * tiles_per_row + source_base // TILE_SCORE_WIDTH
+        descriptor_common_ok = (
+            slot == expected_slot
+            and expected_valid >= 0
+            and valid == expected_valid
+            and source_stride == SOURCE_TOKENS
+            and int(record[7].item()) == TILE_RECEIPT_CONTRACT_VERSION
+            and bool(torch.all(record[9:] == 0).item())
+            and byte_offset >= 0
+            and byte_offset % 2 == 0
+            and (byte_offset // 2) + valid <= score_u16.numel()
+        )
+        # A shorter row can legally produce a *fixed-grid* ready record with
+        # valid=0.  It carries no score data and is accepted only when its
+        # complete descriptor is otherwise exact; it can never fill the
+        # mirror or satisfy a missing score coordinate.
+        if expected_valid == 0 and descriptor_common_ok:
+            zero_valid_records += 1
+            continue
+        if not (expected_valid > 0 and descriptor_common_ok):
+            record_error(
+                "slot=%d,row=%d,source=%d,valid=%d,expected_valid=%d,"
+                "expected_slot=%d,stride=%d,contract=%d,offset=%d" % (
+                    slot,
+                    row,
+                    source_base,
+                    valid,
+                    expected_valid,
+                    expected_slot,
+                    source_stride,
+                    int(record[7].item()),
+                    byte_offset,
+                )
+            )
+            continue
+        active_records += 1
+        target = written[row, source_base:source_base + valid]
+        duplicate_count += int(torch.count_nonzero(target).item())
+        offset_u16 = byte_offset // 2
+        interval_begin = offset_u16
+        interval_end = offset_u16 + valid
+        for existing_begin, existing_end, existing_slot in intervals:
+            if interval_begin < existing_end and existing_begin < interval_end:
+                interval_overlap_count += 1
+                record_error(
+                    "score_interval_overlap slot=%d other_slot=%d range=[%d,%d) "
+                    "other=[%d,%d)" % (
+                        slot,
+                        existing_slot,
+                        interval_begin,
+                        interval_end,
+                        existing_begin,
+                        existing_end,
+                    )
+                )
+        intervals.append((interval_begin, interval_end, slot))
+        mirror[row, source_base:source_base + valid] = score_u16[
+            offset_u16:offset_u16 + valid
+        ].to(torch.int64)
+        written[row, source_base:source_base + valid] = True
+
+    expected = torch.zeros_like(written)
+    for row in range(BATCH_SIZE):
+        expected[row, :int(score_source_lens[row].item())] = True
+    missing_count = int(torch.count_nonzero(expected & ~written).item())
+    outside_count = int(torch.count_nonzero(written & ~expected).item())
+    return {
+        "scores": mirror,
+        "written": written,
+        "active_records": active_records,
+        "ready_records": ready_records,
+        "expected_active_records": expected_active_records,
+        "zero_valid_records": zero_valid_records,
+        "missing_count": missing_count,
+        "outside_count": outside_count,
+        "duplicate_count": duplicate_count,
+        "interval_overlap_count": interval_overlap_count,
+        "descriptor_errors": descriptor_errors,
+    }
 
 
 def _assert_clone_source_domain(
@@ -489,16 +657,17 @@ def _collect_authoritative_cold_coverage(
     resident_threshold: torch.Tensor,
     receipt_kind: str,
     receipt_encoding: dict[str, int] | None,
+    score_mirror: dict[str, Any],
 ) -> dict[str, Any]:
-    """Prove `official TopK ∩ cold ⊆ score-time candidates`.
+    """Collect threshold safety and independent score-provenance evidence.
 
-    This is the actual prefetch safety condition.  It intentionally does not
-    consume the clone's final Top-K output: official C8 remains the unique
-    selection authority, and equal-score ties may make the candidate set a
-    strict superset of the required cold set.  This collector deliberately
-    returns failures as facts instead of raising immediately, so the strict
-    wrapper can report both clone equivalence and candidate coverage from the
-    same single device launch.
+    Official C8 remains the unique selection authority.  The candidate map is
+    a score-time transport decision, so this function reports its coverage
+    separately from final Top-K equivalence.  Crucially, the scalar audit
+    receipt is compared with an independently published score-GM mirror rather
+    than only rechecking its own packed bits.  It returns every failure as a
+    bounded fact so one device launch can distinguish a score-seam error from
+    a threshold-policy miss.
     """
     official = official_indices.detach().cpu().contiguous().reshape(BATCH_SIZE, SPARSE_COUNT)
     candidates = candidate_map.detach().cpu().contiguous()
@@ -509,6 +678,7 @@ def _collect_authoritative_cold_coverage(
     source_lens = score_source_lens.detach().cpu().contiguous()
     thresholds = resident_threshold.detach().cpu().contiguous()
     required_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    official_selected_mask = torch.zeros_like(candidates, dtype=torch.bool)
     eligible_cold_mask = torch.zeros_like(candidates, dtype=torch.bool)
     mapping_valid_mask = torch.zeros_like(candidates, dtype=torch.bool)
     mapping_difference_mask = torch.zeros_like(candidates, dtype=torch.bool)
@@ -553,6 +723,7 @@ def _collect_authoritative_cold_coverage(
                     f"row={row} source={source} valid={valid}"
                 )
             selected += 1
+            official_selected_mask[row, source] = True
             kv_object = int(object_map[pool_row, source].item())
             if kv_object < 0 or kv_object >= object_len:
                 raise RuntimeError(
@@ -582,6 +753,23 @@ def _collect_authoritative_cold_coverage(
     cold_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
     source_unmapped_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
     candidate_bit_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    mirror_scores = score_mirror["scores"].detach().cpu().contiguous()
+    mirror_written = score_mirror["written"].detach().cpu().contiguous()
+    if tuple(mirror_scores.shape) != tuple(candidates.shape) or \
+            tuple(mirror_written.shape) != tuple(candidates.shape):
+        raise RuntimeError(
+            "P4 score-GM mirror shape differs from the score receipt domain: "
+            f"mirror_scores={tuple(mirror_scores.shape)} "
+            f"mirror_written={tuple(mirror_written.shape)} "
+            f"receipt={tuple(candidates.shape)}"
+        )
+    mirror_score_mismatch_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    candidate_from_mirror_mismatch_mask = torch.zeros_like(
+        candidates, dtype=torch.bool
+    )
+    selected_below_tau_mask = torch.zeros_like(candidates, dtype=torch.bool)
+    resident_tau_invariant_by_row: list[dict[str, int]] = []
+    tau_valid_by_row = transaction["resident_threshold_valid"].detach().cpu().contiguous()
     if score_receipt:
         if receipt_encoding is None:
             raise RuntimeError("score receipt has no encoding specification")
@@ -609,19 +797,44 @@ def _collect_authoritative_cold_coverage(
         malformed_mask = valid_domain_mask & ~written_mask & (candidates != -1)
         outside_domain_mask = written_mask & ~valid_domain_mask
         expected_threshold_pass = torch.zeros_like(candidates, dtype=torch.bool)
+        expected_threshold_from_mirror = torch.zeros_like(
+            candidates, dtype=torch.bool
+        )
         for row in range(BATCH_SIZE):
             valid = int(source_lens[row].item())
             tau = int(thresholds[row].item()) & 0xFFFF
-            tau_valid = int(
-                transaction["resident_threshold_valid"].detach().cpu()[row].item()
-            ) == 1
+            tau_valid = int(tau_valid_by_row[row].item()) == 1
             expected_threshold_pass[row, :valid] = (
                 score_values[row, :valid] >= tau
             ) & tau_valid
+            expected_threshold_from_mirror[row, :valid] = (
+                mirror_scores[row, :valid] >= tau
+            ) & tau_valid
+            prefix_len = min(RESIDENT_BLOCKS * BLOCK_SIZE, valid)
+            prefix_scores = mirror_scores[row, :prefix_len]
+            gt_count = int(torch.count_nonzero(prefix_scores > tau).item())
+            ge_count = int(torch.count_nonzero(prefix_scores >= tau).item())
+            resident_tau_invariant_by_row.append(
+                {
+                    "row": row,
+                    "tau": tau,
+                    "prefix_len": prefix_len,
+                    "gt_count": gt_count,
+                    "ge_count": ge_count,
+                    "threshold_valid": int(tau_valid),
+                    "rank_valid": int(
+                        tau_valid and gt_count < SPARSE_COUNT <= ge_count
+                    ),
+                }
+            )
         expected_source_unmapped = valid_domain_mask
         expected_candidate = (
             expected_threshold_pass & mapping_valid_mask & eligible_cold_mask &
             expected_source_unmapped
+        )
+        expected_candidate_from_mirror = (
+            expected_threshold_from_mirror & mapping_valid_mask &
+            eligible_cold_mask & expected_source_unmapped
         )
         threshold_bit_mismatch_mask = (
             valid_domain_mask & written_mask &
@@ -643,6 +856,22 @@ def _collect_authoritative_cold_coverage(
             valid_domain_mask & written_mask &
             (candidate_bit_mask != expected_candidate)
         )
+        mirror_score_mismatch_mask = (
+            valid_domain_mask & written_mask & mirror_written &
+            (score_values != mirror_scores)
+        )
+        candidate_from_mirror_mismatch_mask = (
+            valid_domain_mask & written_mask & mirror_written &
+            (candidate_bit_mask != expected_candidate_from_mirror)
+        )
+        for row in range(BATCH_SIZE):
+            valid = int(source_lens[row].item())
+            tau = int(thresholds[row].item()) & 0xFFFF
+            tau_valid = int(tau_valid_by_row[row].item()) == 1
+            selected_below_tau_mask[row, :valid] = (
+                official_selected_mask[row, :valid] & mirror_written[row, :valid] &
+                (mirror_scores[row, :valid] < tau) & tau_valid
+            )
         candidate_mask = candidate_bit_mask
     else:
         candidate_mask = candidates == marker
@@ -684,6 +913,43 @@ def _collect_authoritative_cold_coverage(
     candidate_bit_mismatch_count = int(
         torch.count_nonzero(candidate_bit_mismatch_mask).item()
     )
+    mirror_score_mismatch_count = int(
+        torch.count_nonzero(mirror_score_mismatch_mask).item()
+    )
+    candidate_from_mirror_mismatch_count = int(
+        torch.count_nonzero(candidate_from_mirror_mismatch_mask).item()
+    )
+    selected_below_tau_count = int(
+        torch.count_nonzero(selected_below_tau_mask).item()
+    )
+    resident_tau_invalid_count = sum(
+        1 for item in resident_tau_invariant_by_row
+        if item["threshold_valid"] == 0
+    )
+    resident_tau_rank_invariant_count = sum(
+        1 for item in resident_tau_invariant_by_row if item["rank_valid"] == 0
+    )
+    provenance_mask = (
+        mirror_score_mismatch_mask |
+        candidate_from_mirror_mismatch_mask |
+        selected_below_tau_mask
+    )
+    provenance_samples: list[str] = []
+    for row, source in torch.nonzero(provenance_mask, as_tuple=False).tolist()[:8]:
+        raw = int(receipt_u32[row, source].item()) & 0xFFFFFFFF if receipt_u32 is not None else 0
+        provenance_samples.append(
+            "row=%d source=%d receipt_score=%d score_gm=%d tau=%d receipt_tp=%d "
+            "receipt_candidate=%d selected=%d" % (
+                row,
+                source,
+                int(score_values[row, source].item()),
+                int(mirror_scores[row, source].item()),
+                int(thresholds[row].item()) & 0xFFFF,
+                int(bool(raw & receipt_encoding["threshold_pass_bit"])) if receipt_encoding else 0,
+                int(bool(raw & receipt_encoding["candidate_bit"])) if receipt_encoding else 0,
+                int(official_selected_mask[row, source].item()),
+            )
+        )
     row_diagnostics: list[dict[str, Any]] = []
     for row in range(BATCH_SIZE):
         valid = int(source_lens[row].item())
@@ -694,6 +960,17 @@ def _collect_authoritative_cold_coverage(
         row_missing = missing_mask[row, :valid]
         row_invalid = invalid_candidate_mask[row, :valid]
         row_outside = outside_domain_mask[row]
+        tau_rank = (
+            resident_tau_invariant_by_row[row]
+            if row < len(resident_tau_invariant_by_row)
+            else {
+                "prefix_len": 0,
+                "gt_count": 0,
+                "ge_count": 0,
+                "threshold_valid": 0,
+                "rank_valid": 0,
+            }
+        )
         row_diagnostics.append(
             {
                 "row": row,
@@ -725,6 +1002,22 @@ def _collect_authoritative_cold_coverage(
                 "candidate_bit_mismatch": int(
                     torch.count_nonzero(candidate_bit_mismatch_mask[row, :valid]).item()
                 ),
+                "score_mirror_mismatch": int(
+                    torch.count_nonzero(mirror_score_mismatch_mask[row, :valid]).item()
+                ),
+                "candidate_from_mirror_mismatch": int(
+                    torch.count_nonzero(
+                        candidate_from_mirror_mismatch_mask[row, :valid]
+                    ).item()
+                ),
+                "selected_below_tau": int(
+                    torch.count_nonzero(selected_below_tau_mask[row, :valid]).item()
+                ),
+                "resident_prefix_len": int(tau_rank["prefix_len"]),
+                "resident_gt_tau": int(tau_rank["gt_count"]),
+                "resident_ge_tau": int(tau_rank["ge_count"]),
+                "resident_tau_threshold_valid": int(tau_rank["threshold_valid"]),
+                "resident_tau_rank_valid": int(tau_rank["rank_valid"]),
                 "candidate_blocks": _block_histogram(row_candidate),
                 "required_blocks": _block_histogram(row_required),
                 "missing_blocks": _block_histogram(row_missing),
@@ -772,6 +1065,26 @@ def _collect_authoritative_cold_coverage(
         "cold_bit_mismatch_count": cold_bit_mismatch_count,
         "source_unmapped_bit_mismatch_count": source_unmapped_bit_mismatch_count,
         "candidate_bit_mismatch_count": candidate_bit_mismatch_count,
+        "score_mirror_active_records": int(score_mirror["active_records"]),
+        "score_mirror_ready_records": int(score_mirror["ready_records"]),
+        "score_mirror_expected_active_records": int(
+            score_mirror["expected_active_records"]
+        ),
+        "score_mirror_zero_valid_records": int(score_mirror["zero_valid_records"]),
+        "score_mirror_missing_count": int(score_mirror["missing_count"]),
+        "score_mirror_outside_count": int(score_mirror["outside_count"]),
+        "score_mirror_duplicate_count": int(score_mirror["duplicate_count"]),
+        "score_mirror_interval_overlap_count": int(
+            score_mirror["interval_overlap_count"]
+        ),
+        "score_mirror_descriptor_errors": list(score_mirror["descriptor_errors"]),
+        "score_mirror_mismatch_count": mirror_score_mismatch_count,
+        "candidate_from_mirror_mismatch_count": candidate_from_mirror_mismatch_count,
+        "selected_below_tau_count": selected_below_tau_count,
+        "resident_tau_invalid_count": resident_tau_invalid_count,
+        "resident_tau_rank_invariant_count": resident_tau_rank_invariant_count,
+        "resident_tau_invariant_by_row": resident_tau_invariant_by_row,
+        "provenance_samples": provenance_samples,
         "row_diagnostics": row_diagnostics,
     }
 
@@ -792,10 +1105,10 @@ def run_p4_fused_audit() -> dict[str, Any]:
     )
     publication_mode = _resolve_publication_mode()
     inline_mode = _resolve_inline_mode()
-    if publication_mode != "off" or inline_mode != "audit":
+    if publication_mode != "publisher" or inline_mode != "audit":
         raise RuntimeError(
-            "P4 resident-threshold audit requires "
-            f"{PUBLICATION_MODE_ENV}=off and {INLINE_MODE_ENV}=audit; got "
+            "P4 resident-threshold provenance audit requires "
+            f"{PUBLICATION_MODE_ENV}=publisher and {INLINE_MODE_ENV}=audit; got "
             f"publication={publication_mode!r} inline={inline_mode!r}"
         )
     target_provenance = _read_target_provenance(
@@ -907,10 +1220,9 @@ def run_p4_fused_audit() -> dict[str, Any]:
     # one cloned LI launch.  There is no second scan or host-side candidate
     # reconstruction.
     transaction["queue_leases"].fill_(AUDIT_SCORE_RECEIPT_QUEUE_LEASE_SENTINEL)
-    # Inline audit compiles PUBLISH_MODE=off, but the fixed 24-input ABI still
-    # carries these graph-static buffers. Their all-sentinel state is checked
-    # after launch, proving score-seam audit did not silently become a second
-    # publication protocol.
+    # Publisher is enabled only for this score-provenance binary. It exports
+    # the score-GM that the target clone's later Top-K consumes; audit remains
+    # score-only and cannot submit H2D because its transport closure is absent.
     publication = _make_publication_buffers(device)
     torch.npu.synchronize()
 
@@ -921,7 +1233,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"target_opapi={target_opapi} "
         "raw_qk_scan_count=1 clone_topk_authority=0 "
         "score_receipt_output=private_source_to_slot[R,S] "
-        "publication=off inline=audit "
+        "publication=publisher inline=audit "
         f"mode=audit_score_receipt resident_blocks={RESIDENT_BLOCKS} "
         "threshold_fixture=resident_seed_exact_sortable_uint16 "
         "h2d_result=not_exercised",
@@ -966,6 +1278,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
             f"expected={expected_score_source_lens.detach().cpu().tolist()} "
             f"derived={score_source_lens.tolist()}"
         )
+    score_mirror = _decode_published_score_mirror(publication, score_source_lens)
     _assert_clone_source_domain(
         result["non_authoritative_sparse_indices"], result["score_source_lens"]
     )
@@ -988,7 +1301,8 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"score_source_lens={score_source_lens.tolist()} "
         "score_source_lens_independent=bitwise_equal "
         "transaction_output_aliases=verified "
-        f"publication_unchanged={int(publication_summary['score_workspace_changed'] == 0 and publication_summary['receipt_ready_count'] == 0)} "
+        f"publisher_score_workspace_changed={int(publication_summary['score_workspace_changed'])} "
+        f"publisher_receipt_ready={int(publication_summary['receipt_ready_count'])} "
         "object_mapping=permuted_pool_reverse_compressed "
         "doorbell_posted=0 private_payload_unchanged=1 telemetry_unchanged=1 "
         f"elapsed_us={elapsed_us:.3f}",
@@ -1003,6 +1317,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
         resident_tau,
         receipt["receipt_kind"],
         score_receipt_encoding,
+        score_mirror,
     )
     for row_diag in coverage["row_diagnostics"]:
         print(
@@ -1018,6 +1333,14 @@ def run_p4_fused_audit() -> dict[str, Any]:
             f"cold_bit_mismatch={row_diag['cold_bit_mismatch']} "
             f"source_unmapped_bit_mismatch={row_diag['source_unmapped_bit_mismatch']} "
             f"candidate_bit_mismatch={row_diag['candidate_bit_mismatch']} "
+            f"score_mirror_mismatch={row_diag['score_mirror_mismatch']} "
+            f"candidate_from_mirror_mismatch={row_diag['candidate_from_mirror_mismatch']} "
+            f"selected_below_tau={row_diag['selected_below_tau']} "
+            f"resident_prefix_len={row_diag['resident_prefix_len']} "
+            f"resident_gt_tau={row_diag['resident_gt_tau']} "
+            f"resident_ge_tau={row_diag['resident_ge_tau']} "
+            f"resident_tau_threshold_valid={row_diag['resident_tau_threshold_valid']} "
+            f"resident_tau_rank_valid={row_diag['resident_tau_rank_valid']} "
             f"candidate_blocks={row_diag['candidate_blocks']} "
             f"required_blocks={row_diag['required_blocks']} "
             f"missing_blocks={row_diag['missing_blocks']} "
@@ -1038,6 +1361,31 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"candidate_bit_mismatch={coverage['candidate_bit_mismatch_count']}",
         flush=True,
     )
+    print(
+        "P4_SCORE_GM_MIRROR "
+        f"active_records={coverage['score_mirror_active_records']} "
+        f"ready_records={coverage['score_mirror_ready_records']} "
+        f"expected_active_records={coverage['score_mirror_expected_active_records']} "
+        f"zero_valid_records={coverage['score_mirror_zero_valid_records']} "
+        f"missing={coverage['score_mirror_missing_count']} "
+        f"outside={coverage['score_mirror_outside_count']} "
+        f"duplicates={coverage['score_mirror_duplicate_count']} "
+        f"interval_overlaps={coverage['score_mirror_interval_overlap_count']} "
+        f"descriptor_errors={len(coverage['score_mirror_descriptor_errors'])}",
+        flush=True,
+    )
+    print(
+        "P4_SCORE_PROVENANCE "
+        f"receipt_score_mismatch={coverage['score_mirror_mismatch_count']} "
+        f"candidate_from_mirror_mismatch={coverage['candidate_from_mirror_mismatch_count']} "
+        f"selected_below_tau={coverage['selected_below_tau_count']} "
+        f"resident_tau_invalid={coverage['resident_tau_invalid_count']} "
+        f"resident_tau_rank_invariant_failures="
+        f"{coverage['resident_tau_rank_invariant_count']}",
+        flush=True,
+    )
+    for sample in coverage["provenance_samples"]:
+        print(f"P4_SCORE_PROVENANCE_DIFF {sample}", flush=True)
     print(
         "P4_FUSED_AUDIT_OFFICIAL_COVERAGE "
         f"official_selected={coverage['official_selected']} "
@@ -1088,6 +1436,32 @@ def run_p4_fused_audit() -> dict[str, Any]:
             "source_unmapped_bit_mismatch_count"
         ],
         "candidate_bit_mismatch_count": coverage["candidate_bit_mismatch_count"],
+        "score_mirror_active_records": coverage["score_mirror_active_records"],
+        "score_mirror_ready_records": coverage["score_mirror_ready_records"],
+        "score_mirror_expected_active_records": coverage[
+            "score_mirror_expected_active_records"
+        ],
+        "score_mirror_zero_valid_records": coverage[
+            "score_mirror_zero_valid_records"
+        ],
+        "score_mirror_missing_count": coverage["score_mirror_missing_count"],
+        "score_mirror_outside_count": coverage["score_mirror_outside_count"],
+        "score_mirror_duplicate_count": coverage["score_mirror_duplicate_count"],
+        "score_mirror_interval_overlap_count": coverage[
+            "score_mirror_interval_overlap_count"
+        ],
+        "score_mirror_descriptor_errors": coverage["score_mirror_descriptor_errors"],
+        "score_mirror_mismatch_count": coverage["score_mirror_mismatch_count"],
+        "candidate_from_mirror_mismatch_count": coverage[
+            "candidate_from_mirror_mismatch_count"
+        ],
+        "selected_below_tau_count": coverage["selected_below_tau_count"],
+        "resident_tau_invalid_count": coverage["resident_tau_invalid_count"],
+        "resident_tau_rank_invariant_count": coverage[
+            "resident_tau_rank_invariant_count"
+        ],
+        "resident_tau_invariant_by_row": coverage["resident_tau_invariant_by_row"],
+        "provenance_samples": coverage["provenance_samples"],
         "expected_score_source_lens": expected_score_source_lens,
         "derived_score_source_lens": result["score_source_lens"],
     }

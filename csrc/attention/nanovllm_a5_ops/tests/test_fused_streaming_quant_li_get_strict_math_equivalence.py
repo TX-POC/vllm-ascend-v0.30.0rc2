@@ -2,10 +2,14 @@
 """One-process, fail-closed math gate for the P4 prefetch predicate.
 
 This wrapper deliberately shares the normal audit adapter, so it launches one
-full raw-Q/K scan on one FP8 fixture.  It turns the audit's diagnostic clone
-route result into a hard pre-H2D admission gate: full C8 Top-K and the exact
-score-source domain must be bytewise equal before the candidate-safety result
-can be called a mathematical pass.
+full raw-Q/K scan on one FP8 fixture.  It keeps two facts separate:
+
+* the final C8 score/Top-K path and the audit receipt must agree exactly; and
+* the resident threshold must be safe enough to cover final cold Top-K items.
+
+The second condition remains a hard pre-H2D gate in this bring-up.  It is not
+silently waived merely because a later GuaranteedRecall stage could recover a
+miss in the product design.
 """
 
 from __future__ import annotations
@@ -95,7 +99,68 @@ def main() -> int:
             f"candidate_bit_mismatch={candidate_bit_mismatch_count}"
         )
     print(
-        "P4_STRICT_MATH_GATE_PROGRESS check=score_receipt status=bitwise_equal",
+        "P4_STRICT_MATH_GATE_PROGRESS check=score_receipt status=internal_consistent",
+        flush=True,
+    )
+    score_mirror_missing_count = int(result["score_mirror_missing_count"])
+    score_mirror_outside_count = int(result["score_mirror_outside_count"])
+    score_mirror_duplicate_count = int(result["score_mirror_duplicate_count"])
+    score_mirror_interval_overlap_count = int(
+        result["score_mirror_interval_overlap_count"]
+    )
+    score_mirror_active_records = int(result["score_mirror_active_records"])
+    score_mirror_expected_active_records = int(
+        result["score_mirror_expected_active_records"]
+    )
+    score_mirror_ready_records = int(result["score_mirror_ready_records"])
+    score_mirror_zero_valid_records = int(result["score_mirror_zero_valid_records"])
+    score_mirror_descriptor_errors = tuple(result["score_mirror_descriptor_errors"])
+    score_mirror_mismatch_count = int(result["score_mirror_mismatch_count"])
+    candidate_from_mirror_mismatch_count = int(
+        result["candidate_from_mirror_mismatch_count"]
+    )
+    score_provenance_ok = (
+        score_mirror_missing_count == 0
+        and score_mirror_outside_count == 0
+        and score_mirror_duplicate_count == 0
+        and score_mirror_interval_overlap_count == 0
+        and score_mirror_active_records == score_mirror_expected_active_records
+        and not score_mirror_descriptor_errors
+        and score_mirror_mismatch_count == 0
+        and candidate_from_mirror_mismatch_count == 0
+    )
+    print(
+        "P4_SCORE_PROVENANCE_GATE "
+        f"status={'pass' if score_provenance_ok else 'fail'} "
+        f"mirror_missing={score_mirror_missing_count} "
+        f"mirror_outside={score_mirror_outside_count} "
+        f"mirror_duplicates={score_mirror_duplicate_count} "
+        f"mirror_interval_overlaps={score_mirror_interval_overlap_count} "
+        f"mirror_active_records={score_mirror_active_records} "
+        f"mirror_expected_active_records={score_mirror_expected_active_records} "
+        f"mirror_ready_records={score_mirror_ready_records} "
+        f"mirror_zero_valid_records={score_mirror_zero_valid_records} "
+        f"mirror_descriptor_errors={len(score_mirror_descriptor_errors)} "
+        f"receipt_score_mismatch={score_mirror_mismatch_count} "
+        f"candidate_from_mirror_mismatch={candidate_from_mirror_mismatch_count}",
+        flush=True,
+    )
+    selected_below_tau_count = int(result["selected_below_tau_count"])
+    resident_tau_invalid_count = int(result["resident_tau_invalid_count"])
+    resident_tau_rank_invariant_count = int(
+        result["resident_tau_rank_invariant_count"]
+    )
+    threshold_domain_ok = (
+        selected_below_tau_count == 0
+        and resident_tau_invalid_count == 0
+        and resident_tau_rank_invariant_count == 0
+    )
+    print(
+        "P4_RESIDENT_THRESHOLD_DOMAIN_GATE "
+        f"status={'pass' if threshold_domain_ok else 'fail'} "
+        f"selected_below_tau={selected_below_tau_count} "
+        f"resident_tau_invalid={resident_tau_invalid_count} "
+        f"resident_tau_rank_invariant_failures={resident_tau_rank_invariant_count}",
         flush=True,
     )
     required_cold = int(result["required_cold"])
@@ -106,30 +171,72 @@ def main() -> int:
     outside_domain_count = int(result["outside_domain_count"])
     mapping_discriminator_selected = int(result["mapping_discriminator_selected"])
     candidate_discriminator_count = int(result["candidate_discriminator_count"])
-    if (
-        required_cold <= 0
-        or covered_cold != required_cold
-        or missing_cold != 0
-        or candidate_count < required_cold
-        or invalid_candidate_count != 0
-        or outside_domain_count != 0
-        or mapping_discriminator_selected <= 0
-        or candidate_discriminator_count <= 0
-    ):
+    threshold_safety_ok = (
+        required_cold > 0
+        and covered_cold == required_cold
+        and missing_cold == 0
+        and candidate_count >= required_cold
+        and invalid_candidate_count == 0
+        and outside_domain_count == 0
+        and mapping_discriminator_selected > 0
+        and candidate_discriminator_count > 0
+    )
+    if not threshold_safety_ok:
+        print(
+            "P4_THRESHOLD_SAFETY_GATE_FAIL "
+            f"required_cold={required_cold} covered_cold={covered_cold} "
+            f"missing_cold={missing_cold} candidate_count={candidate_count} "
+            f"invalid_candidate_count={invalid_candidate_count} "
+            f"outside_domain_count={outside_domain_count} "
+            f"mapping_discriminator_selected={mapping_discriminator_selected} "
+            f"candidate_discriminator_count={candidate_discriminator_count}",
+            flush=True,
+        )
+    else:
+        print(
+            "P4_THRESHOLD_SAFETY_GATE_PASS "
+            "official_topk_cold_subset_of_speculative_candidates=1",
+            flush=True,
+        )
+    if int(result["mapping_discriminator_sources"]) <= 0:
         raise AssertionError(
             "P4_STRICT_MATH_GATE_FAIL "
-            "check=candidate_coverage "
+            "check=mapping_fixture_discriminator"
+        )
+    if not score_provenance_ok:
+        raise AssertionError(
+            "P4_STRICT_MATH_GATE_FAIL "
+            "check=score_provenance "
+            f"mirror_missing={score_mirror_missing_count} "
+            f"mirror_outside={score_mirror_outside_count} "
+            f"mirror_duplicates={score_mirror_duplicate_count} "
+            f"mirror_interval_overlaps={score_mirror_interval_overlap_count} "
+            f"mirror_active_records={score_mirror_active_records} "
+            f"mirror_expected_active_records={score_mirror_expected_active_records} "
+            f"mirror_ready_records={score_mirror_ready_records} "
+            f"mirror_zero_valid_records={score_mirror_zero_valid_records} "
+            f"mirror_descriptor_errors={len(score_mirror_descriptor_errors)} "
+            f"receipt_score_mismatch={score_mirror_mismatch_count} "
+            f"candidate_from_mirror_mismatch={candidate_from_mirror_mismatch_count}"
+        )
+    if not threshold_domain_ok:
+        raise AssertionError(
+            "P4_STRICT_MATH_GATE_FAIL "
+            "check=resident_threshold_domain "
+            f"selected_below_tau={selected_below_tau_count} "
+            f"resident_tau_invalid={resident_tau_invalid_count} "
+            f"resident_tau_rank_invariant_failures={resident_tau_rank_invariant_count}"
+        )
+    if not threshold_safety_ok:
+        raise AssertionError(
+            "P4_STRICT_MATH_GATE_FAIL "
+            "check=threshold_safety "
             f"required_cold={required_cold} covered_cold={covered_cold} "
             f"missing_cold={missing_cold} candidate_count={candidate_count} "
             f"invalid_candidate_count={invalid_candidate_count} "
             f"outside_domain_count={outside_domain_count} "
             f"mapping_discriminator_selected={mapping_discriminator_selected} "
             f"candidate_discriminator_count={candidate_discriminator_count}"
-        )
-    if int(result["mapping_discriminator_sources"]) <= 0:
-        raise AssertionError(
-            "P4_STRICT_MATH_GATE_FAIL "
-            "check=mapping_fixture_discriminator"
         )
     print(
         "P4_STRICT_MATH_GATE_PASS "

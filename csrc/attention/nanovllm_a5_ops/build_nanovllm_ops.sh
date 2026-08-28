@@ -238,9 +238,11 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
     copy_tree_without_repository_cmake "${STREAMING_LI_DIR}/op_kernel" \
         "${OP_DEV}/op_kernel"
     # These decisions are compile-time because they change the exact AIV
-    # closure.  The appended ABI remains 24 inputs / 11 outputs in every
-    # variant, but score publication and true tile-inline KVAF are mutually
-    # exclusive proof/product boundaries.
+    # closure. The appended ABI remains 24 inputs / 11 outputs in every
+    # variant. True tile-inline KVAF is exclusive from score publication. The
+    # single narrow exception, inline=audit + publisher, is a score-provenance
+    # diagnostic binary: it has no KVAF/SIMT/HCCP closure and exposes the
+    # score-GM consumed by C8 Top-K for comparison against audit receipts.
     STREAMING_LI_PUBLISH_MODE_RAW="${NANOVLLM_A5_STREAMING_LI_GET_PUBLISH_MODE:-}"
     STREAMING_LI_HOOK_MODE_LEGACY_RAW="${NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE:-}"
     if [[ -n "${STREAMING_LI_PUBLISH_MODE_RAW}" ]]; then
@@ -309,9 +311,12 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
     esac
     if [[ "${STREAMING_LI_INLINE_MODE}" != "0" && \
           "${STREAMING_LI_PUBLISH_MODE}" != "0" ]]; then
-        echo "[nanovllm_a5_ops] ERROR: inline mode requires NANOVLLM_A5_STREAMING_LI_GET_PUBLISH_MODE=off." >&2
-        echo "[nanovllm_a5_ops] publication and inline Get are separate isolated OPP artifacts." >&2
-        exit 2
+        if [[ "${STREAMING_LI_INLINE_MODE}" != "1" || \
+              "${STREAMING_LI_PUBLISH_MODE}" != "2" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: inline mode requires publication=off, except diagnostic inline=audit + publication=publisher." >&2
+            echo "[nanovllm_a5_ops] post/HCCP and score publication remain separate isolated OPP artifacts." >&2
+            exit 2
+        fi
     fi
 
     # Start from a clean transport closure regardless of mode.  Only post is
@@ -389,6 +394,9 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
             ;;
         1)
             echo "[nanovllm_a5_ops] P3 KVAF/SIMT closure: absent (inline=audit score-only) verified=1"
+            if [[ "${STREAMING_LI_PUBLISH_MODE}" == "2" ]]; then
+                echo "[nanovllm_a5_ops] P3 audit score provenance: publisher score-GM mirror enabled; no H2D/KVAF closure=1"
+            fi
             ;;
         2)
             echo "[nanovllm_a5_ops] P3 KVAF/SIMT closure: post-only required from KVAF_FUSED_GET_SOURCE"

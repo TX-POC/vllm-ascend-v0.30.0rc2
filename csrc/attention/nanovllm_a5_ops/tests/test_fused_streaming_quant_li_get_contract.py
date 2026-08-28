@@ -81,6 +81,8 @@ def main() -> int:
     assert "marker-only audit was retired" in bridge
     assert "P4.1 mode/build mismatch" in bridge
     assert "P3_INLINE_MODE" in bridge
+    assert 'publication_mode in ("off", "publisher")' in bridge
+    assert 'post_publication_ok = publication_mode == "off"' in bridge
     assert "A5StreamingQuantLiGet" in build
     assert "NANOVLLM_A5_OPS_ONLY=A5StreamingQuantLiGet" in bridge
     assert "_AUDIT_SCORE_RECEIPT = \"audit_score_receipt\"" in bridge
@@ -106,7 +108,11 @@ def main() -> int:
     assert "_make_publication_buffers" in audit_adapter
     assert "INLINE_MODE_ENV" in audit_adapter
     assert "PUBLICATION_MODE_ENV" in audit_adapter
-    assert "publication_mode != \"off\" or inline_mode != \"audit\"" in audit_adapter
+    assert 'publication_mode != "publisher" or inline_mode != "audit"' in audit_adapter
+    assert "_decode_published_score_mirror" in audit_adapter
+    assert "P4_SCORE_GM_MIRROR" in audit_adapter
+    assert "P4_SCORE_PROVENANCE" in audit_adapter
+    assert "score_mirror_mismatch_count" in audit_adapter
     assert "_assert_clone_source_domain" in audit_adapter
     assert "kv_object_domain=1" in audit_adapter
     assert "mapping_discriminator_selected" in audit_adapter
@@ -116,7 +122,8 @@ def main() -> int:
     assert "P4_FUSED_AUDIT_SCORE_RECEIPT" in audit_adapter
     assert "mode=\"audit_score_receipt\"" in audit_adapter
     assert "_read_target_provenance" in audit_adapter
-    assert "official TopK ∩ cold" in audit_adapter
+    assert "official_selected_mask" in audit_adapter
+    assert "threshold safety" in audit_adapter
     assert "npu_a5_c8_resident_seed" in resident_seed_bridge
     assert "aclnnA5C8ResidentSeed" in resident_seed_bridge
     assert "NANOVLLM_A5_RESIDENT_SEED_OPAPI_LIB" in resident_seed_bridge
@@ -128,6 +135,9 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert "P4_STRICT_MATH_GATE_PASS" in strict_math_test
     assert "P4_STRICT_MATH_GATE_FAIL" in strict_math_test
+    assert "P4_SCORE_PROVENANCE_GATE" in strict_math_test
+    assert "P4_RESIDENT_THRESHOLD_DOMAIN_GATE" in strict_math_test
+    assert "P4_THRESHOLD_SAFETY_GATE" in strict_math_test
     assert "_assert_bitwise_equal" in strict_math_test
     target_adapter = (OPS / "tests/streaming_quant_li_get_target_adapter.py").read_text(
         encoding="utf-8"

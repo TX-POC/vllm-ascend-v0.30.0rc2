@@ -107,10 +107,10 @@ def require_source_contract() -> None:
     assert outputs[9]["type"] == ["int32"]
     assert outputs[10]["type"] == ["int64"]
 
-    # Both axes are compiled into each isolated OPP artifact. Nonzero
-    # publication and inline modes are mutually exclusive: publisher owns a
-    # score-DMA receipt protocol, audit is a score-only observer, and post
-    # alone owns the transaction-local score-tile KVAF state.
+    # Both axes are compiled into each isolated OPP artifact. Post/HCCP and
+    # publication remain mutually exclusive. Audit + publisher is the one
+    # score-only provenance exception: it compares Scalar audit receipts with
+    # the score-GM consumed by C8 Top-K without adding a transport closure.
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE" in hook_mode
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE >= 0" in hook_mode
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE <= 2" in hook_mode
@@ -118,7 +118,7 @@ def require_source_contract() -> None:
     assert "A5_STREAMING_LI_GET_INLINE_MODE" in hook_mode
     assert "A5_STREAMING_LI_GET_INLINE_MODE >= 0" in hook_mode
     assert "A5_STREAMING_LI_GET_INLINE_MODE <= 2" in hook_mode
-    assert "inline mode requires publication mode off" in hook_mode
+    assert "except audit + publisher provenance" in hook_mode
     assert '#if A5_STREAMING_LI_GET_INLINE_MODE == 1' in vector
     assert '#elif A5_STREAMING_LI_GET_INLINE_MODE == 2' in vector
     assert 'a5_streaming_quant_li_get_tile_audit.h' in vector
@@ -180,6 +180,34 @@ def require_source_contract() -> None:
     assert reduction < audit_emit < score_dma
     assert reduction < post_emit < score_dma
     assert score_dma < receipt_emit < mte3_release
+    # The audit hook reads a Vector-owned ping-pong UB score tile via Scalar
+    # GetValue().  Inspect the *whole* audit branch (rather than ending at
+    # Emit) so this source-only test proves both sides of that lifetime:
+    # V->S makes the score visible before the Scalar read, and S->V prevents
+    # Vector from reusing the ping-pong tile before that read finishes.
+    audit_branch_start = vector.rfind(
+        "#if A5_STREAMING_LI_GET_INLINE_MODE == 1", 0, audit_emit
+    )
+    audit_branch_end = vector.index(
+        "#elif A5_STREAMING_LI_GET_INLINE_MODE == 2", audit_branch_start
+    )
+    audit_seam = vector[audit_branch_start:audit_branch_end]
+    post_seam = vector[audit_branch_end:vector.index("#endif", post_emit)]
+    _assert_in_order(
+        audit_seam,
+        [
+            "PipeBarrier<PIPE_V>();",
+            "FetchEventID(HardEvent::V_S)",
+            "SetFlag<HardEvent::V_S>",
+            "WaitFlag<HardEvent::V_S>",
+            "streamingAuditHook_.Emit",
+            "FetchEventID(HardEvent::S_V)",
+            "SetFlag<HardEvent::S_V>",
+            "WaitFlag<HardEvent::S_V>",
+        ],
+        "audit Vector/Scalar score-tile lifetime",
+    )
+    assert "final per-pingpong Scalar" in post_seam
     assert "BatchMulWeightAndReduceSum" in vector
     assert "ProcessTopK" in vector
 
@@ -284,7 +312,8 @@ def probe_publication_layout() -> None:
     print(
         "P3_STREAMING_LI_GET_CONTRACT_PASS "
         "abi=24in_11out publication_modes=off_score_workspace_publisher "
-        "inline_modes=off_audit_post mutually_exclusive_nonzero=1 "
+        "inline_modes=off_audit_post post_publication_exclusive=1 "
+        "audit_publisher_score_provenance_exception=1 "
         "score_tile_seam=reduction_before_inline_before_score_dma "
         "receipt_words=16 fixed_slot_epoch=required "
         f"score_workspace_words={score_words} active_receipts={active}"

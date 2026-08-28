@@ -751,15 +751,36 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #if A5_STREAMING_LI_GET_INLINE_MODE == 1
     if (mayNeedScoreObservation) {
         PipeBarrier<PIPE_V>();
+        // BatchMulWeightAndReduceSum produces outBase on Vector, while the
+        // audit observer consumes it with Scalar GetValue(). PIPE_V only
+        // orders Vector instructions; it does not make a V-owned UB value
+        // visible to Scalar. Use the same explicit V -> S dependency as the
+        // ResidentSeed path uses before it reads a Vector-produced Top-K
+        // boundary. This leaves the official score-GM and Top-K path intact.
+        const event_t scoreVectorToScalar = static_cast<event_t>(
+            GetTPipePtr()->FetchEventID(HardEvent::V_S));
+        SetFlag<HardEvent::V_S>(scoreVectorToScalar);
+        WaitFlag<HardEvent::V_S>(scoreVectorToScalar);
         streamingAuditHook_.Emit(outBase, info, curAivS1Idx,
                                  curAivS1ProcNum, curS2Idx);
+        // The receipt hook has finished every Scalar GetValue() from this
+        // ping-pong score tile.  Pair the V -> S readiness edge with S -> V
+        // completion before Vector can hand the UB tile to MTE3 or recycle it
+        // on the next ping-pong iteration.  Without this acknowledgement,
+        // V_S alone proves only that Scalar did not start too early; it does
+        // not protect Scalar's read lifetime against a later Vector reuse.
+        const event_t scoreScalarToVector = static_cast<event_t>(
+            GetTPipePtr()->FetchEventID(HardEvent::S_V));
+        SetFlag<HardEvent::S_V>(scoreScalarToVector);
+        WaitFlag<HardEvent::S_V>(scoreScalarToVector);
     }
 #elif A5_STREAMING_LI_GET_INLINE_MODE == 2
     // Exact inline seam: read only the uint16 values the official reduction
     // just produced, before C8 begins its normal score-GM copy.  The hook
-    // never writes this tile or sparse Top-K state.  In audit mode it cannot
-    // post HCCP; in post mode it may launch one bounded Direct-HCCP wave and
-    // immediately returns to the next LI tile.
+    // never writes this tile or sparse Top-K state. The post closure keeps
+    // its existing scheduling untouched here: its final per-pingpong Scalar
+    // completion fence must be designed with the direct-HCCP overlap protocol,
+    // rather than borrowing the intentionally synchronous audit fence above.
     if (mayNeedScoreObservation) {
         PipeBarrier<PIPE_V>();
         streamingKvafHook_.Emit(outBase, info, curAivS1Idx,

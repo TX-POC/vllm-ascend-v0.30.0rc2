@@ -129,12 +129,20 @@ def launch(
     _require_transaction(transaction)
     _require_publication(publication)
     expected_inline = "audit" if mode == _AUDIT_SCORE_RECEIPT else "post"
-    if os.getenv("P3_INLINE_MODE") != expected_inline or \
-            os.getenv("P3_PUBLICATION_MODE") != "off":
+    publication_mode = os.getenv("P3_PUBLICATION_MODE")
+    audit_publication_ok = publication_mode in ("off", "publisher")
+    post_publication_ok = publication_mode == "off"
+    publication_ok = (
+        audit_publication_ok
+        if mode == _AUDIT_SCORE_RECEIPT
+        else post_publication_ok
+    )
+    if os.getenv("P3_INLINE_MODE") != expected_inline or not publication_ok:
         raise RuntimeError(
             "P4.1 mode/build mismatch: "
             f"mode={mode!r} requires P3_INLINE_MODE={expected_inline!r} "
-            "and P3_PUBLICATION_MODE='off'"
+            "and P3_PUBLICATION_MODE='off' (or 'publisher' only for the "
+            "score-only audit provenance diagnostic)"
         )
     if mode == _POST and not _allow_post():
         raise RuntimeError(
@@ -202,8 +210,9 @@ def launch(
         "queue_leases": outputs[6],
         "telemetry": outputs[7],
         "score_source_lens": outputs[8],
-        # PUBLISH_MODE=off is intentional for inline audit.  These aliases
-        # still make the no-publication side-effect boundary observable.
+        # Audit normally uses publication=off.  Its provenance diagnostic may
+        # instead use publisher, which exposes the score-GM consumed by Top-K
+        # but still has no transport closure.
         "score_workspace": outputs[9],
         "tile_receipts": outputs[10],
         "mode": mode,

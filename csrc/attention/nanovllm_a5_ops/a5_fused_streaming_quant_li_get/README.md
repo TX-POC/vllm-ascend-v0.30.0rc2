@@ -35,7 +35,11 @@ candidate audit.
   score and the threshold, mapping-valid, cold, source-unmapped, and candidate
   decisions.  This is the only supported audit mode.  It performs no queue
   claim, descriptor write, doorbell, CQ poll, private-payload write, or cache
-  mapping publication.
+  mapping publication. The strict provenance variant compiles
+  `inline=audit + publication=publisher`: publisher writes the exact score-GM
+  tile that clone `ProcessTopK` reads and a fixed receipt for that tile. It is
+  still score-only—there is no KVAF, SIMT, or HCCP closure—and lets the host
+  compare each Scalar audit score with the actual Top-K score-GM coordinate.
 - `post`: caller supplies the normal valid queue lease table. It additionally
   requires an `inline=post` OPP and `P4_FUSED_ALLOW_POST=1`; it remains
   experimental while payload validation is known failed.
@@ -55,9 +59,13 @@ official C8 final Top-K ∩ cold sources ⊆ score-time candidate map
 ```
 
 `score >= threshold` intentionally permits tie-driven false positives. Missing
-even one official cold source fails the audit. The test also verifies that the
-ResidentSeed selected indices are bitwise equal to official C8 on the same
-resident index view. It does not claim H2D bandwidth or payload correctness.
+even one official cold source fails the threshold-safety gate. Before that gate
+is evaluated, the test verifies that every score-GM tile was published exactly
+once and that its score agrees with the Scalar receipt. This separates a
+score-pipeline error from a true resident-threshold error. The test also
+verifies that ResidentSeed selected indices are bitwise equal to official C8 on
+the same resident index view. It does not claim H2D bandwidth or payload
+correctness.
 
 ## Scoped build / test closure
 

@@ -986,23 +986,45 @@ def _assert_publication_contract(
         (source_len + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH
         for source_len in source_lens
     )
-    if ready_count not in (expected_active, BATCH_SIZE * tiles_per_row):
+    full_grid = BATCH_SIZE * tiles_per_row
+    if ready_count not in (expected_active, full_grid):
         raise RuntimeError(
             "publisher receipt count is neither active-tile nor full-grid: "
             f"ready_count={ready_count} active={expected_active} "
-            f"grid={BATCH_SIZE * tiles_per_row}"
+            f"grid={full_grid}"
         )
+    # Some official C8 schedules iterate the fixed max-length tile grid and
+    # therefore publish a ready descriptor with ``valid=0`` for a shorter
+    # row's terminal tile.  That is acceptable only as a complete, fixed-grid
+    # convention: every score-bearing slot is still present exactly once, and
+    # the zero-valid descriptor itself must carry the same ABI contract.  A
+    # partial mixture would make the publisher impossible to audit safely.
     for row, source_len in enumerate(source_lens):
-        active_tiles = (source_len + TILE_SCORE_WIDTH - 1) // TILE_SCORE_WIDTH
-        for tile in range(active_tiles):
+        for tile in range(tiles_per_row):
             slot = row * tiles_per_row + tile
             record = receipts[slot]
-            if int(record[8].item()) != epoch:
+            expected_valid = max(
+                0, min(TILE_SCORE_WIDTH, source_len - tile * TILE_SCORE_WIDTH)
+            )
+            is_ready = int(record[8].item()) == epoch
+            if expected_valid > 0 and not is_ready:
                 raise RuntimeError(
                     "publisher omitted a required fixed receipt slot: "
                     f"row={row} tile={tile} slot={slot}"
                 )
-            expected_valid = min(TILE_SCORE_WIDTH, source_len - tile * TILE_SCORE_WIDTH)
+            if expected_valid == 0 and not is_ready:
+                if not bool(torch.all(record == TILE_RECEIPT_SENTINEL).item()):
+                    raise RuntimeError(
+                        "publisher changed an inactive receipt without the expected epoch: "
+                        f"row={row} tile={tile} slot={slot} record={record.tolist()}"
+                    )
+                continue
+            # A ready inactive slot is allowed only in the full-grid form.
+            if expected_valid == 0 and ready_count != full_grid:
+                raise RuntimeError(
+                    "publisher mixed active-only and full-grid receipt styles: "
+                    f"row={row} tile={tile} slot={slot} ready_count={ready_count}"
+                )
             if (
                 int(record[1].item()) != row
                 or int(record[2].item()) != tile * TILE_SCORE_WIDTH
@@ -1023,13 +1045,6 @@ def _assert_publication_contract(
             if not bool(torch.all(record[9:] == 0).item()):
                 raise RuntimeError(
                     f"publisher receipt has a nonzero ready-line tail at slot={slot}")
-    for slot in range(receipts.shape[0]):
-        if int(receipts[slot, 8].item()) == epoch:
-            continue
-        if not bool(torch.all(receipts[slot] == TILE_RECEIPT_SENTINEL).item()):
-            raise RuntimeError(
-                f"publisher changed a receipt without the expected epoch at slot={slot}"
-            )
     return {
         "mode": mode,
         "score_workspace_changed": score_changed,

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""P4 resident-threshold candidate gate and separate final-Top-K route gate.
+"""P4 score-provenance, threshold-safety, and final-Top-K route gates.
 
-The candidate gate answers one narrow but essential question: did the scan-time
-resident-threshold predicate cover every cold source that authoritative C8
-ultimately selected?  The clone's own Top-K remains a separate route gate.  A
-clone mismatch must block using it for QSFA, but it must not hide the result of
-the candidate-safety audit, because official C8 remains the active final-Top-K
-producer throughout this bring-up.
+The score-provenance gate first proves that the Scalar audit receipt saw the
+same score-GM values consumed by the target clone's exact C8 Top-K. The
+threshold-safety gate then asks whether that resident-threshold predicate
+covered every cold source authoritative C8 selected. The clone's own Top-K is
+a separate route gate. A clone mismatch must block using it for QSFA, but it
+must not hide score or threshold evidence, because official C8 remains the
+active final-Top-K producer throughout this bring-up.
 """
 
 from __future__ import annotations
@@ -25,6 +26,37 @@ def main() -> int:
     result = run_p4_fused_audit()
     official = _bytes(result["official_indices"])
     clone = _bytes(result["clone_indices"])
+    provenance_ok = (
+        int(result["score_mirror_missing_count"]) == 0
+        and int(result["score_mirror_outside_count"]) == 0
+        and int(result["score_mirror_duplicate_count"]) == 0
+        and int(result["score_mirror_interval_overlap_count"]) == 0
+        and int(result["score_mirror_active_records"])
+        == int(result["score_mirror_expected_active_records"])
+        and not tuple(result["score_mirror_descriptor_errors"])
+        and int(result["score_mirror_mismatch_count"]) == 0
+        and int(result["candidate_from_mirror_mismatch_count"]) == 0
+    )
+    if not provenance_ok:
+        raise RuntimeError(
+            "P4_FUSED_AUDIT_SCORE_PROVENANCE_GATE status=blocked "
+            f"mirror_missing={result['score_mirror_missing_count']} "
+            f"mirror_outside={result['score_mirror_outside_count']} "
+            f"mirror_duplicates={result['score_mirror_duplicate_count']} "
+            f"mirror_interval_overlaps={result['score_mirror_interval_overlap_count']} "
+            f"mirror_active_records={result['score_mirror_active_records']} "
+            f"mirror_expected_active_records={result['score_mirror_expected_active_records']} "
+            f"mirror_ready_records={result['score_mirror_ready_records']} "
+            f"mirror_zero_valid_records={result['score_mirror_zero_valid_records']} "
+            f"mirror_descriptor_errors={len(result['score_mirror_descriptor_errors'])} "
+            f"receipt_score_mismatch={result['score_mirror_mismatch_count']} "
+            f"candidate_from_mirror_mismatch={result['candidate_from_mirror_mismatch_count']}"
+        )
+    print(
+        "P4_FUSED_AUDIT_SCORE_PROVENANCE_GATE status=pass "
+        "receipt_and_score_gm=bitwise_equal",
+        flush=True,
+    )
     coverage_ok = (
         int(result["required_cold"]) > 0
         and int(result["covered_cold"]) == int(result["required_cold"])
@@ -39,6 +71,9 @@ def main() -> int:
         and int(result["cold_bit_mismatch_count"]) == 0
         and int(result["source_unmapped_bit_mismatch_count"]) == 0
         and int(result["candidate_bit_mismatch_count"]) == 0
+        and int(result["selected_below_tau_count"]) == 0
+        and int(result["resident_tau_invalid_count"]) == 0
+        and int(result["resident_tau_rank_invariant_count"]) == 0
         and bool(result["candidate_selective"])
         and bool(result["mapping_fixture_discriminates"])
     )
@@ -58,6 +93,9 @@ def main() -> int:
             f"cold_bit_mismatch_count={result['cold_bit_mismatch_count']} "
             f"source_unmapped_bit_mismatch_count={result['source_unmapped_bit_mismatch_count']} "
             f"candidate_bit_mismatch_count={result['candidate_bit_mismatch_count']} "
+            f"selected_below_tau_count={result['selected_below_tau_count']} "
+            f"resident_tau_invalid_count={result['resident_tau_invalid_count']} "
+            f"resident_tau_rank_invariant_count={result['resident_tau_rank_invariant_count']} "
             f"candidate_selective={int(bool(result['candidate_selective']))} "
             f"mapping_fixture_discriminates={int(bool(result['mapping_fixture_discriminates']))}"
         )

@@ -7,7 +7,7 @@
 //    The receipt contains no KVAF, SIMT, queue, lease, or Get state by
 //    itself.
 //
-// The inline mode is independent of publication mode:
+// These are two compile-time axes. Legal pairs are constrained below:
 // 0: score producer only (the strict mathematical/publisher baseline).
 // 1: at the exact post-reduction, pre-score-DMA seam, run the audit-only
 //    threshold/mapping predicate.  It requires an audit lease sentinel and
@@ -34,12 +34,14 @@ static_assert(A5_STREAMING_LI_GET_INLINE_MODE >= 0 &&
               A5_STREAMING_LI_GET_INLINE_MODE <= 2,
               "A5 streaming LI inline mode must be 0, 1, or 2.");
 
-// The two outputs serve different validation/product boundaries.  The
-// publisher owns an externally visible score-workspace/receipt protocol;
-// inline mode owns the transaction-local scan-time KVAF protocol.  Combining
-// them in one binary would make a failed proof ambiguous (and can make two
-// independent MTE3 publications contend for the same score-tile lifetime),
-// so the isolated build contract deliberately keeps them mutually exclusive.
+// The publisher owns an externally visible score-workspace/receipt protocol;
+// inline mode owns the transaction-local scan-time observer/transport path.
+// Product post/HCCP therefore remains mutually exclusive with publication.
+// The sole exception is audit + publisher: it is a score-provenance diagnostic
+// that still has no KVAF/SIMT/HCCP closure, but exposes the exact score-GM that
+// C8 Top-K consumes so the audit Scalar receipt can be checked independently.
 static_assert(A5_STREAMING_LI_GET_INLINE_MODE == 0 ||
-              A5_STREAMING_LI_GET_PUBLISH_MODE == 0,
-              "inline mode requires publication mode off.");
+              A5_STREAMING_LI_GET_PUBLISH_MODE == 0 ||
+              (A5_STREAMING_LI_GET_INLINE_MODE == 1 &&
+               A5_STREAMING_LI_GET_PUBLISH_MODE == 2),
+              "inline mode requires publication mode off, except audit + publisher provenance.");
