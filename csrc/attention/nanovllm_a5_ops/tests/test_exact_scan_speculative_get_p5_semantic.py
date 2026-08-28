@@ -535,6 +535,11 @@ def _executor_terminal_trace(
     candidate_counts = outputs[6].cpu().tolist()
     get_stats = outputs[8].cpu().tolist()
     private_head = outputs[3].cpu().tolist()
+    private_ready = outputs[2].cpu().reshape(-1).tolist()
+    get_output_indices = outputs[12].cpu()
+    get_mask = outputs[13].cpu()
+    get_candidate_seed_slots = outputs[14].cpu()
+    get_claim_new = outputs[15].cpu()
 
     seed_slots: list[str] = []
     for producer, expected in enumerate(fixture.expected_candidates):
@@ -553,12 +558,39 @@ def _executor_terminal_trace(
         % (lane, row[0], row[1], row[2], row[3], row[4], row[6], row[14], row[15])
         for lane, row in enumerate(get_stats)
     ]
+    # This is the complete, bounded post/CQ ledger for both descriptor
+    # buffers in each queue.  It distinguishes wrong-buffer selection, stale
+    # descriptor visibility, and a private-ready range check rejecting a
+    # descriptor that was actually posted.  The fixture posts at most 256
+    # records per buffer; formatting only each buffer's active prefix keeps
+    # the line compact in both the current two-record case and stress cases.
+    descriptor_ledger: list[str] = []
+    for lane, row in enumerate(get_stats):
+        remaining = max(int(row[0]), 0)
+        for buffer in range(get_output_indices.shape[1]):
+            request_count = min(remaining, GET_WAVE_RECORDS)
+            descriptor_ledger.append(
+                "l%d.b%d:out=%s,seed=%s,claim=%s,mask=%s"
+                % (
+                    lane,
+                    buffer,
+                    get_output_indices[lane, buffer, :request_count].tolist(),
+                    get_candidate_seed_slots[
+                        lane, buffer, :request_count
+                    ].tolist(),
+                    get_claim_new[lane, buffer, :request_count].tolist(),
+                    get_mask[lane, buffer, :request_count].tolist(),
+                )
+            )
+            remaining = max(remaining - GET_WAVE_RECORDS, 0)
     _executor_trace(
         "op_terminal",
         candidate_counts=";".join(nonzero_counts) or "none",
         seed_private_slots=";".join(seed_slots) or "none",
         private_head=",".join(str(value) for value in private_head),
+        private_ready=",".join(str(value) for value in private_ready),
         get_stats="|".join(lane_stats),
+        descriptor_ledger="|".join(descriptor_ledger),
     )
 
 

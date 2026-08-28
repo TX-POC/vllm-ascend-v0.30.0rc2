@@ -120,6 +120,10 @@ constexpr uint64_t kGetResultInvalidPipelineMode = 0x1004U;
 constexpr uint64_t kGetResultSerialGateTimeout = 0x1005U;
 constexpr uint64_t kGetResultReceiptError = 0x1006U;
 constexpr uint64_t kGetResultPrivateStateError = 0x1007U;
+// The descriptor tuple is the exact input to Direct-HCCP PostOnly.  Keep a
+// distinct result so a malformed/stale descriptor can never be mistaken for
+// a CQ failure or for the private-ready bookkeeping error above.
+constexpr uint64_t kGetResultDescriptorStateError = 0x1008U;
 
 // CandidateSeed is intentionally an int32 record so it can be consumed by a
 // later graph-visible reconcile stage without reconstructing a pointer-sized
@@ -734,11 +738,10 @@ private:
                                    kvObject, score, kPrivateSlotUnmapped);
                 ++candidateCount;
                 // CandidateSeed must become visible before its ring ready
-                // word.  The consumer only mutates field 4 after observing
-                // that word.
-                FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(
-                                 CandidateSeedByAbsolute(candidateSlot)),
-                             kCandidateSeedWords * sizeof(int32_t));
+                // word.  CandidateSeed and the ring records are both bypass
+                // GM stores; PublishRingSlot supplies their single release
+                // boundary.  Do not DCCI-clean an unrelated stale cache line
+                // after those bypass stores.
 
                 const uint32_t lane =
                     static_cast<uint32_t>(kvObject) & (kGetLaneCount - 1U);
@@ -988,9 +991,6 @@ private:
                             privateSourceToSlot_ + sourceOffset, objectExisting);
                         WriteGmByPassDCache<int32_t>(
                             seed + kCandidateSeedPrivateSlot, objectExisting);
-                        FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(
-                                         privateSourceToSlot_ + sourceOffset),
-                                     sizeof(int32_t));
                         continue;
                     }
                     if (objectExisting != kPrivateSlotUnmapped ||
@@ -1040,13 +1040,25 @@ private:
                     WriteGmByPassDCache<int32_t>(
                         seed + kCandidateSeedPrivateSlot,
                         static_cast<int32_t>(outputIndex));
-                    laneIndices[queued] = tableIndex;
-                    laneOffsets[queued] = offset;
-                    laneOutputIndices[queued] = static_cast<int32_t>(outputIndex);
-                    laneMask[queued] = 1U;
-                    laneCandidateSeedSlots[queued] =
-                        static_cast<int32_t>(candidateSlot);
-                    laneClaimNew[queued] = 1U;
+                    // These six arrays are the exact Direct-HCCP descriptor
+                    // ledger.  The WQE builder and terminal READY publisher
+                    // consume their GM addresses through bypass loads, so do
+                    // not make an AIV DCache line owner here and then clean
+                    // it later: on Ascend a clean of an old zero-filled line
+                    // can overwrite a newer descriptor value.  Bypass
+                    // stores plus the release barrier below give every
+                    // reader the same HBM-resident tuple.
+                    WriteGmByPassDCache<int32_t>(laneIndices + queued,
+                                                 tableIndex);
+                    WriteGmByPassDCache<int32_t>(laneOffsets + queued, offset);
+                    WriteGmByPassDCache<int32_t>(
+                        laneOutputIndices + queued,
+                        static_cast<int32_t>(outputIndex));
+                    WriteGmByPassDCache<uint8_t>(laneMask + queued, 1U);
+                    WriteGmByPassDCache<int32_t>(
+                        laneCandidateSeedSlots + queued,
+                        static_cast<int32_t>(candidateSlot));
+                    WriteGmByPassDCache<uint8_t>(laneClaimNew + queued, 1U);
                     const uint64_t fingerprint =
                         (static_cast<uint64_t>(static_cast<uint32_t>(tableIndex))
                          << 32U) ^
@@ -1059,28 +1071,10 @@ private:
                         break;
                     }
                 }
-                // The descriptor and private-state stores are complete.  The
-                // slot can be returned only after this release, otherwise a
-                // producer may overwrite the candidate record before its
-                // owner has published PENDING/private slot state.
-                if (queued != 0U) {
-                    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(laneIndices),
-                                 queued * sizeof(int32_t));
-                    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(laneOffsets),
-                                 queued * sizeof(int32_t));
-                    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(laneOutputIndices),
-                                 queued * sizeof(int32_t));
-                    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(laneMask),
-                                 queued * sizeof(uint8_t));
-                    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(
-                                     laneCandidateSeedSlots),
-                                 queued * sizeof(int32_t));
-                    FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(laneClaimNew),
-                                 queued * sizeof(uint8_t));
-                }
-                // The consumer must finish its descriptor stores before it
-                // returns this slot to the producer.  The same barrier also
-                // completes the bypass record reads for this chunk.
+                // The descriptor and private-state stores are complete. The
+                // consumer must release them before returning the ring slot
+                // to the producer; this same barrier also completes the
+                // bypass record reads for the chunk.
                 DataSyncBarrier<MemDsbT::DDR>();
                 StoreRingWord(ring.SlotState(slot), 0U);
                 ++(*consumedChunks);
@@ -1204,6 +1198,45 @@ private:
         return 0U;
     }
 
+    // Validate exactly the HBM descriptor ledger that PostOnly will consume.
+    // This is deliberately just before Post, after the bypass-store release
+    // in ConsumeReadyRings.  It turns a stale/incorrect descriptor into a
+    // precise P5 error before an HCCP write can target a wrong private slot.
+    __aicore__ inline uint64_t ValidateFullGetDescriptorArgs(
+        uint32_t lane, uint32_t requestCount,
+        const KvafExecuteBatchGetKernelArgs& args) const
+    {
+        if (lane >= kGetLaneCount || requestCount == 0U ||
+            requestCount > kGetWaveRecords || args.indices == 0U ||
+            args.offsets == 0U || args.output_indices == 0U) {
+            return kGetResultDescriptorStateError;
+        }
+        const uint32_t laneBase = lane * tiling_->privateArenaCapacity;
+        __gm__ int32_t* const indices =
+            reinterpret_cast<__gm__ int32_t*>(args.indices);
+        __gm__ int32_t* const offsets =
+            reinterpret_cast<__gm__ int32_t*>(args.offsets);
+        __gm__ int32_t* const outputIndices =
+            reinterpret_cast<__gm__ int32_t*>(args.output_indices);
+        DataSyncBarrier<MemDsbT::DDR>();
+        for (uint32_t request = 0U; request < requestCount; ++request) {
+            const int32_t tableIndex =
+                ReadGmByPassDCache<int32_t>(indices + request);
+            const int32_t offset =
+                ReadGmByPassDCache<int32_t>(offsets + request);
+            const int32_t outputIndex =
+                ReadGmByPassDCache<int32_t>(outputIndices + request);
+            if (outputIndex < 0 ||
+                static_cast<uint32_t>(outputIndex) < laneBase ||
+                static_cast<uint32_t>(outputIndex) >=
+                    laneBase + tiling_->privateArenaCapacity ||
+                !IsValidDirectGetDescriptor(tableIndex, offset, outputIndex)) {
+                return kGetResultDescriptorStateError;
+            }
+        }
+        return 0U;
+    }
+
     // A Post failure has no terminal CQ that can make a private payload
     // observable.  Undo every *new* object claim in the failed descriptor
     // wave.  Object-to-slot is the dedup authority, but more than one source
@@ -1285,15 +1318,23 @@ private:
     // `FinishKvafDenseBatchGet` is the terminal CQ boundary.  Direct-HCCP has
     // completed the payload write before this routine is called, so private
     // ready transitions are published only after Finish and its status flush.
+    //
+    // `outputIndicesAddress` is deliberately taken from the immutable args
+    // object that Begin used to materialize the WQEs.  Reconstructing the
+    // active double-buffer from the next fill-buffer is not part of the
+    // Direct-HCCP transaction contract: a stale reconstruction can mark (or
+    // reject) a different descriptor ledger after a perfectly valid CQ.
+    // Tying READY publication to the exact post pointer keeps the H2D
+    // destination and its readiness state inseparable.
     __aicore__ inline uint64_t PublishPrivateReadyForWave(
-        uint32_t lane, uint32_t buffer, uint32_t requestCount,
+        uint32_t lane, uint32_t requestCount, uint64_t outputIndicesAddress,
         bool terminalSuccess)
     {
-        if (buffer >= kGetDescriptorBufferCount) {
+        if (outputIndicesAddress == 0U) {
             return kGetResultPrivateStateError;
         }
         __gm__ int32_t* const outputIndices =
-            GetOutputIndicesBuffer(lane, buffer);
+            reinterpret_cast<__gm__ int32_t*>(outputIndicesAddress);
         const uint32_t laneBase = lane * tiling_->privateArenaCapacity;
         for (uint32_t request = 0U; request < requestCount; ++request) {
             const int32_t outputIndex =
@@ -1327,6 +1368,11 @@ private:
         if (buildError != 0U) {
             return buildError;
         }
+        const uint64_t descriptorError =
+            ValidateFullGetDescriptorArgs(lane, requestCount, args);
+        if (descriptorError != 0U) {
+            return descriptorError;
+        }
 
         kvaf_fused_get::RunKvafDenseBatchGetCore256(
             args, requestCount, 0U);
@@ -1339,7 +1385,7 @@ private:
         }
         *completionCycle = status->profile.completion_done_cycle;
         const uint64_t readyError = PublishPrivateReadyForWave(
-            lane, 0U, requestCount, status->result == 0U);
+            lane, requestCount, args.output_indices, status->result == 0U);
         return status->result != 0U ? status->result : readyError;
     }
 
@@ -1368,6 +1414,18 @@ private:
             transaction->finalized = 1U;
             return buildError;
         }
+        const uint64_t descriptorError =
+            ValidateFullGetDescriptorArgs(lane, requestCount, *args);
+        if (descriptorError != 0U) {
+            // This is still before PostOnly: preserve the same terminal
+            // contract as a Build failure, but keep the malformed descriptor
+            // buffers visible to the bounded P5 test ledger.
+            kvaf_fused_get::ResetDenseBatchGetTransaction(transaction);
+            transaction->result = descriptorError;
+            transaction->state = kvaf_fused_get::kDenseBatchGetFailed;
+            transaction->finalized = 1U;
+            return descriptorError;
+        }
         kvaf_fused_get::BeginKvafDenseBatchGetPostOnly(
             *args, requestCount, 0U, transaction);
         if (*firstDoorbell == 0U && transaction->first_doorbell_cycle != 0U) {
@@ -1377,7 +1435,7 @@ private:
     }
 
     __aicore__ inline uint64_t FinishFullGet(
-        uint32_t lane, uint32_t buffer, uint32_t requestCount,
+        uint32_t lane, uint32_t requestCount,
         const KvafExecuteBatchGetKernelArgs& args,
         kvaf_fused_get::KvafDenseBatchGetTransaction* transaction,
         uint64_t* completionCycle)
@@ -1398,7 +1456,8 @@ private:
             *completionCycle = status->profile.completion_done_cycle;
         }
         const uint64_t readyError = PublishPrivateReadyForWave(
-            lane, buffer, requestCount, transaction->result == 0U);
+            lane, requestCount, args.output_indices,
+            transaction->result == 0U);
         return transaction->result != 0U ? transaction->result : readyError;
     }
 
@@ -1473,6 +1532,10 @@ private:
         uint64_t nonBlockingRetirePolls = 0U;
         uint64_t overlappedDescriptorRecords = 0U;
         uint32_t fillBuffer = 0U;
+        // This is only the owner-side lifetime record for rollback/debugging.
+        // READY publication itself uses activeArgs.output_indices, which is
+        // the same pointer the posted WQEs consumed.
+        uint32_t activeBuffer = 0U;
         uint32_t queued = 0U;
         uint32_t activeRequestCount = 0U;
         bool inFlight = false;
@@ -1489,7 +1552,7 @@ private:
                 ++nonBlockingRetirePolls;
                 if (transaction.state != kvaf_fused_get::kDenseBatchGetInFlight) {
                     const uint64_t result = FinishFullGet(
-                        lane, 1U - fillBuffer, activeRequestCount, activeArgs,
+                        lane, activeRequestCount, activeArgs,
                         &transaction, &completionCycle);
                     inFlight = false;
                     activeRequestCount = 0U;
@@ -1542,12 +1605,12 @@ private:
                 requested += requestCount;
                 ++batches;
                 queued = 0U;
-                const uint32_t activeBuffer = fillBuffer;
+                activeBuffer = fillBuffer;
                 fillBuffer = 1U - fillBuffer;
                 if (result != 0U ||
                     transaction.state != kvaf_fused_get::kDenseBatchGetInFlight) {
                     const uint64_t finalResult = FinishFullGet(
-                        lane, activeBuffer, requestCount, activeArgs,
+                        lane, requestCount, activeArgs,
                         &transaction, &completionCycle);
                     if (result != 0U) {
                         RollBackPrivateClaimsForWave(lane, activeBuffer,
@@ -1591,7 +1654,7 @@ private:
         // publishing the terminal P2 telemetry.
         if (inFlight) {
             const uint64_t result = FinishFullGet(
-                lane, 1U - fillBuffer, activeRequestCount, activeArgs,
+                lane, activeRequestCount, activeArgs,
                 &transaction, &completionCycle);
             if (error == 0U && result != 0U) {
                 error = result;
