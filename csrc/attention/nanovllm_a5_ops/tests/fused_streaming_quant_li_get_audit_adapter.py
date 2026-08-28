@@ -929,15 +929,40 @@ def _collect_authoritative_cold_coverage(
     resident_tau_rank_invariant_count = sum(
         1 for item in resident_tau_invariant_by_row if item["rank_valid"] == 0
     )
-    provenance_mask = (
-        mirror_score_mismatch_mask |
-        candidate_from_mirror_mismatch_mask |
-        selected_below_tau_mask
+    score_provenance_mask = (
+        mirror_score_mismatch_mask | candidate_from_mirror_mismatch_mask
     )
-    provenance_samples: list[str] = []
-    for row, source in torch.nonzero(provenance_mask, as_tuple=False).tolist()[:8]:
+    threshold_domain_samples: list[str] = []
+    for row, source in torch.nonzero(
+        selected_below_tau_mask, as_tuple=False
+    ).tolist()[:8]:
+        raw = (
+            int(receipt_u32[row, source].item()) & 0xFFFFFFFF
+            if receipt_u32 is not None
+            else 0
+        )
+        threshold_domain_samples.append(
+            "row=%d source=%d score_gm=%d tau=%d receipt_tp=%d "
+            "receipt_candidate=%d selected=%d reason=selected_below_tau" % (
+                row,
+                source,
+                int(mirror_scores[row, source].item()),
+                int(thresholds[row].item()) & 0xFFFF,
+                int(bool(raw & receipt_encoding["threshold_pass_bit"]))
+                if receipt_encoding
+                else 0,
+                int(bool(raw & receipt_encoding["candidate_bit"]))
+                if receipt_encoding
+                else 0,
+                int(official_selected_mask[row, source].item()),
+            )
+        )
+    score_provenance_samples: list[str] = []
+    for row, source in torch.nonzero(
+        score_provenance_mask, as_tuple=False
+    ).tolist()[:8]:
         raw = int(receipt_u32[row, source].item()) & 0xFFFFFFFF if receipt_u32 is not None else 0
-        provenance_samples.append(
+        score_provenance_samples.append(
             "row=%d source=%d receipt_score=%d score_gm=%d tau=%d receipt_tp=%d "
             "receipt_candidate=%d selected=%d" % (
                 row,
@@ -1084,7 +1109,8 @@ def _collect_authoritative_cold_coverage(
         "resident_tau_invalid_count": resident_tau_invalid_count,
         "resident_tau_rank_invariant_count": resident_tau_rank_invariant_count,
         "resident_tau_invariant_by_row": resident_tau_invariant_by_row,
-        "provenance_samples": provenance_samples,
+        "score_provenance_samples": score_provenance_samples,
+        "threshold_domain_samples": threshold_domain_samples,
         "row_diagnostics": row_diagnostics,
     }
 
@@ -1384,8 +1410,10 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"{coverage['resident_tau_rank_invariant_count']}",
         flush=True,
     )
-    for sample in coverage["provenance_samples"]:
+    for sample in coverage["score_provenance_samples"]:
         print(f"P4_SCORE_PROVENANCE_DIFF {sample}", flush=True)
+    for sample in coverage["threshold_domain_samples"]:
+        print(f"P4_RESIDENT_THRESHOLD_DOMAIN_DIFF {sample}", flush=True)
     print(
         "P4_FUSED_AUDIT_OFFICIAL_COVERAGE "
         f"official_selected={coverage['official_selected']} "
@@ -1461,7 +1489,8 @@ def run_p4_fused_audit() -> dict[str, Any]:
             "resident_tau_rank_invariant_count"
         ],
         "resident_tau_invariant_by_row": coverage["resident_tau_invariant_by_row"],
-        "provenance_samples": coverage["provenance_samples"],
+        "score_provenance_samples": coverage["score_provenance_samples"],
+        "threshold_domain_samples": coverage["threshold_domain_samples"],
         "expected_score_source_lens": expected_score_source_lens,
         "derived_score_source_lens": result["score_source_lens"],
     }
