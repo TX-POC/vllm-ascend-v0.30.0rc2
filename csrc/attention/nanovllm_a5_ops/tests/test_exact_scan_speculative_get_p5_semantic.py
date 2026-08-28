@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,8 @@ PIPELINE_MODE_PARALLEL = 0
 PRIVATE_READY_FREE = 0
 PRIVATE_READY_PENDING = 1
 PRIVATE_READY_READY = 2
+FUSED_CONTROL_MAGIC = 0x4B56414646555345
+FUSED_CONTROL_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -526,11 +529,14 @@ def _run_executor(
     import nanovllm_exact_scan_get  # noqa: F401
 
     device_id = device.index if device.index is not None else torch.npu.current_device()
+    native_kvaf = getattr(kvaf, "_native", getattr(kvaf, "_kvaf", None))
     _executor_trace(
         "modules_loaded",
         kvaf_file=getattr(kvaf, "__file__", "<unknown>"),
-        kvaf_native_file=getattr(getattr(kvaf, "_kvaf", None), "__file__", "<unknown>"),
+        kvaf_native_file=getattr(native_kvaf, "__file__", "<unknown>"),
         bridge_file=getattr(nanovllm_exact_scan_get, "__file__", "<unknown>"),
+        get_kernel=os.path.realpath(args.batch_get_kernel),
+        put_kernel=os.path.realpath(args.batch_put_kernel),
         current_device=torch.npu.current_device(),
         stream=torch.npu.current_stream(),
         output_shape=tuple(tensors["private_packed_output"].shape),
@@ -599,8 +605,8 @@ def _run_executor(
         )
         if not (
             len(control_words) == 16
-            and control_words[0] != 0
-            and control_words[1] != 0
+            and control_words[0] == FUSED_CONTROL_MAGIC
+            and control_words[1] == FUSED_CONTROL_VERSION
             and control_words[2] != 0
             and control_words[3] != 0
             and control_words[4] != 0
@@ -609,6 +615,7 @@ def _run_executor(
             and control_words[7] == GET_LANE_COUNT
             and control_words[8] == 1
             and control_words[9] == PACKED_ENTRY_BYTES
+            and all(word == 0 for word in control_words[10:])
         ):
             raise AssertionError(
                 "P5 fused Get cold control is invalid before ACLNN dispatch: "
@@ -736,7 +743,7 @@ def _assert_executor_oracle(
             stats[:, :5].cpu(), torch.zeros((PRODUCER_COUNT, 5), dtype=torch.int64)
         )
         torch.testing.assert_close(
-            get_stats.cpu()[:, :3], torch.zeros((GET_LANE_COUNT, 3), dtype=torch.int64)
+            get_stats.cpu()[:, :5], torch.zeros((GET_LANE_COUNT, 5), dtype=torch.int64)
         )
         torch.testing.assert_close(
             private_head_out.cpu(), torch.zeros(GET_LANE_COUNT, dtype=torch.int32)
