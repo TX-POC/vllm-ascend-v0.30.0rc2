@@ -222,6 +222,24 @@ def _require_a5_npu() -> torch.device:
         mapping_text = f"{mapping_env}={','.join(str(value) for value in mapped_physical)}"
 
     device_count = int(torch.npu.device_count())
+    # A caller that asks for an explicit physical proof must use the strict
+    # one-card runtime mapping.  Without this, a multi-card mask can still
+    # print the correct first physical id while leaving the process capable of
+    # submitting work to another card later in the test.
+    if explicit_physical is not None and mapping is not None:
+        if (
+            mapping_env != "ASCEND_RT_VISIBLE_DEVICES"
+            or requested_id != 0
+            or mapped_physical != (explicit_physical,)
+            or device_count != 1
+        ):
+            raise RuntimeError(
+                "explicit physical P3 proof requires exactly one runtime-visible "
+                "card: use ASCEND_RT_VISIBLE_DEVICES=<physical>, P3_NPU_ID=0, "
+                "P3_PHYSICAL_NPU_ID=<same physical>; got "
+                f"mapping={mapping_text!r} logical={requested_id} "
+                f"physical={explicit_physical} device_count={device_count}"
+            )
     if requested_id >= device_count:
         raise RuntimeError(
             f"{TARGET_NPU_ENV}={requested_id} is outside the visible logical "
