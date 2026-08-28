@@ -270,6 +270,15 @@ public:
         }
         auditScoreReceiptMode_ = IsAuditScoreReceiptLeaseTable();
         auditMode_ = auditScoreReceiptMode_ || IsAuditLeaseTable();
+#if A5_STREAMING_LI_GET_INLINE_MODE == 1
+        // Audit is a separate binary, not a runtime promise.  Refuse to
+        // enable this hook unless the caller supplied the full score-receipt
+        // sentinel.  Therefore a mistaken queue table cannot turn a strict
+        // equivalence run into a real Direct-HCCP post.
+        if (!auditScoreReceiptMode_) {
+            return;
+        }
+#endif
         enabled_ = true;
     }
 

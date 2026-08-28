@@ -227,7 +227,7 @@ def _assert_publication_contract(result: dict[str, Any]) -> dict[str, Any]:
     elif mode == "score_workspace":
         assert changed == 1 and ready == 0 and expected == 0, summary
     else:
-        assert changed == 1 and ready >= expected > 0, summary
+        assert changed == 1 and ready == expected > 0, summary
     return summary
 
 

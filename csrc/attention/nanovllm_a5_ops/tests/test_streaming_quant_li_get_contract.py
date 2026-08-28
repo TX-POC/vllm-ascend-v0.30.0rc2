@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Static ABI and publication-contract gate for A5StreamingQuantLiGet.
+"""Static ABI and score-tile-inline contract for A5StreamingQuantLiGet.
 
-P3 no longer embeds a Direct-HCCP/KVAF hook in the C8 score producer.  This
-probe deliberately has no NPU dependency.  It makes a stale 21-input bridge,
-an old inline-HCCP source seam, or an inconsistent score/receipt ABI fail
-before an expensive target-NPU equivalence run.
+This probe has no NPU dependency. It guards the one 24-input / 11-output ABI
+shared by four isolated artifacts: strict C8 control, score publisher,
+inline-audit, and inline native-enqueue post. It rejects an accidental mixed
+publication/HCCP closure before an expensive target-NPU run.
 """
 
 from __future__ import annotations
@@ -102,14 +102,23 @@ def require_source_contract() -> None:
     assert outputs[9]["type"] == ["int32"]
     assert outputs[10]["type"] == ["int64"]
 
-    # Publication mode is compiled into each isolated OPP artifact.
+    # Both axes are compiled into each isolated OPP artifact. Nonzero
+    # publication and inline modes are mutually exclusive: publisher owns a
+    # score-DMA receipt protocol, whereas inline owns transaction-local
+    # score-tile KVAF state.
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE" in hook_mode
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE >= 0" in hook_mode
     assert "A5_STREAMING_LI_GET_PUBLISH_MODE <= 2" in hook_mode
     assert "A5_STREAMING_LI_GET_ENABLE_HOOK" not in hook_mode
-    assert "streamingKvafHook_" not in vector
-    assert "FinishStreamingKvafHook" not in vector
-    assert "a5_streaming_quant_li_get_tile_ready.h" not in vector
+    assert "A5_STREAMING_LI_GET_INLINE_MODE" in hook_mode
+    assert "A5_STREAMING_LI_GET_INLINE_MODE >= 0" in hook_mode
+    assert "A5_STREAMING_LI_GET_INLINE_MODE <= 2" in hook_mode
+    assert "inline KVAF mode requires publication mode off" in hook_mode
+    assert '#if A5_STREAMING_LI_GET_INLINE_MODE > 0' in vector
+    assert 'a5_streaming_quant_li_get_tile_ready.h' in vector
+    assert "streamingKvafHook_" in vector
+    assert "InitStreamingKvafHook" in vector
+    assert "FinishStreamingKvafHook" in vector
 
     # Modes 1/2 redirect the official score DMA; mode 2 publishes two fixed
     # 64-byte lines after it, before the existing MTE3/V release.
@@ -134,20 +143,29 @@ def require_source_contract() -> None:
         assert token in vector, token
     assert "mrgValueLocal_.template ReinterpretCast<int64_t>()" not in vector
     score_dma = vector.index("DataCopyPad(scoreGm")
+    reduction = vector.index("BatchMulWeightAndReduceSum")
+    inline_emit = vector.index("streamingKvafHook_.Emit")
     receipt_emit = vector.index("EmitScoreTileReceipts", score_dma)
     mte3_release = vector.index("SetFlag<HardEvent::MTE3_V>", score_dma)
+    assert reduction < inline_emit < score_dma
     assert score_dma < receipt_emit < mte3_release
     assert "BatchMulWeightAndReduceSum" in vector
     assert "ProcessTopK" in vector
 
-    # Transaction resources are retained as appended graph ABI only.  The C8
-    # producer does not read a queue, publish HCCP, or write private state.
+    # The inline=off branch retains all transaction resources only as ABI
+    # carriers. Inline mode initializes them after vector UB allocation, and
+    # Finish runs only after the official Top-K event drain.
     for token in (
         "(void)residentThreshold;", "(void)queueControl;",
         "(void)queueLeases;", "(void)scoreWorkspaceOut;",
         "(void)tileReceiptsOut;",
     ):
         assert token in preload, token
+    assert "#if A5_STREAMING_LI_GET_INLINE_MODE > 0" in preload
+    assert "vectorService.InitStreamingKvafHook(" in preload
+    free_event = preload.index("vectorService.FreeEventID();")
+    finish_hook = preload.index("vectorService.FinishStreamingKvafHook();")
+    assert free_event < finish_hook
 
     for token in (
         "SCORE_WORKSPACE_INDEX = 21", "TILE_RECEIPTS_INDEX = 22",
@@ -217,7 +235,9 @@ def probe_publication_layout() -> None:
     print(
         "P3_STREAMING_LI_GET_CONTRACT_PASS "
         "abi=24in_11out publication_modes=off_score_workspace_publisher "
-        "inline_hccp=absent receipt_words=16 fixed_slot_epoch=required "
+        "inline_modes=off_audit_post mutually_exclusive_nonzero=1 "
+        "score_tile_seam=reduction_before_inline_before_score_dma "
+        "receipt_words=16 fixed_slot_epoch=required "
         f"score_workspace_words={score_words} active_receipts={active}"
     )
 

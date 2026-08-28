@@ -27,13 +27,16 @@ from streaming_quant_li_get_target_adapter import (
     BATCH_SIZE,
     HOOK_CONTROL_MODE_ALL_BUSY,
     INT64_MAX,
+    INLINE_MODE_ENV,
+    PUBLICATION_MODE_ENV,
     REFERENCE_OPP_ENV,
     SPARSE_COUNT,
     TARGET_OPP_ENV,
     _bind_isolated_target_opp,
     _build_official_inputs,
     _call_official,
-    _expected_target_hook_mode,
+    _assert_publication_contract,
+    _make_publication_buffers,
     _make_no_post_transaction,
     _official_metadata,
     _expected_score_source_lens,
@@ -41,6 +44,8 @@ from streaming_quant_li_get_target_adapter import (
     _require_a5_npu,
     _require_source_matched_official_c8_ops,
     _read_target_provenance,
+    _resolve_inline_mode,
+    _resolve_publication_mode,
     _resolve_single_opp,
 )
 
@@ -140,6 +145,21 @@ def _assert_transaction_output_aliases(
                 "P4 audit returned a copied transaction receipt: "
                 f"name={transaction_name} "
                 f"input=0x{int(expected.data_ptr()):x} "
+                f"output=0x{int(actual.data_ptr()):x}"
+            )
+
+
+def _assert_publication_output_aliases(
+    result: dict[str, Any], publication: dict[str, torch.Tensor]
+) -> None:
+    """Require the dormant publication buffers to preserve physical aliases."""
+    for name in ("score_workspace", "tile_receipts"):
+        expected = publication[name]
+        actual = result[name]
+        if int(expected.data_ptr()) != int(actual.data_ptr()):
+            raise RuntimeError(
+                "P4 audit returned a copied publication buffer: "
+                f"name={name} input=0x{int(expected.data_ptr()):x} "
                 f"output=0x{int(actual.data_ptr()):x}"
             )
 
@@ -770,15 +790,16 @@ def run_p4_fused_audit() -> dict[str, Any]:
     target_opapi, target_vendor = _resolve_single_opp(
         os.getenv(TARGET_OPP_ENV), "target"
     )
-    expected_hook_mode, hook_off_baseline = _expected_target_hook_mode()
-    if hook_off_baseline:
+    publication_mode = _resolve_publication_mode()
+    inline_mode = _resolve_inline_mode()
+    if publication_mode != "off" or inline_mode != "audit":
         raise RuntimeError(
-            "the P4 resident-threshold audit requires a hook-on P3 OPP; "
-            "P3_ALLOW_HOOK_OFF_BASELINE=1 is only valid for the isolated "
-            "P3 mathematical binary-isolation test"
+            "P4 resident-threshold audit requires "
+            f"{PUBLICATION_MODE_ENV}=off and {INLINE_MODE_ENV}=audit; got "
+            f"publication={publication_mode!r} inline={inline_mode!r}"
         )
     target_provenance = _read_target_provenance(
-        target_vendor, expected_hook_mode
+        target_vendor, publication_mode, inline_mode
     )
     seed_opapi, seed_vendor = _resolve_resident_seed_opp(
         os.getenv(RESIDENT_SEED_OPP_ENV)
@@ -796,7 +817,8 @@ def run_p4_fused_audit() -> dict[str, Any]:
         "expected_head="
         f"{os.getenv('P3_TARGET_EXPECTED_SOURCE_HEAD', '<unset>')} "
         f"source_clean={target_provenance['source_clean']} "
-        f"hook_mode={target_provenance['hook_mode']} ready=1 "
+        f"publication_mode={target_provenance['publication_mode']} "
+        f"inline_mode={target_provenance['inline_mode']} ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
         flush=True,
     )
@@ -884,6 +906,11 @@ def run_p4_fused_audit() -> dict[str, Any]:
     # one cloned LI launch.  There is no second scan or host-side candidate
     # reconstruction.
     transaction["queue_leases"].fill_(AUDIT_SCORE_RECEIPT_QUEUE_LEASE_SENTINEL)
+    # Inline audit compiles PUBLISH_MODE=off, but the fixed 24-input ABI still
+    # carries these graph-static buffers. Their all-sentinel state is checked
+    # after launch, proving score-seam audit did not silently become a second
+    # publication protocol.
+    publication = _make_publication_buffers(device)
     torch.npu.synchronize()
 
     print(
@@ -893,6 +920,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"target_opapi={target_opapi} "
         "raw_qk_scan_count=1 clone_topk_authority=0 "
         "score_receipt_output=private_source_to_slot[R,S] "
+        "publication=off inline=audit "
         f"mode=audit_score_receipt resident_blocks={RESIDENT_BLOCKS} "
         "threshold_fixture=resident_seed_exact_sortable_uint16 "
         "h2d_result=not_exercised",
@@ -902,6 +930,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
     result = launch(
         inputs,
         transaction,
+        publication,
         mode="audit_score_receipt",
         # The adversarial fixture deliberately uses a source -> compressed
         # KV-object permutation.  It is therefore C8_COMPRESSED_OBJECT,
@@ -925,6 +954,8 @@ def run_p4_fused_audit() -> dict[str, Any]:
     elapsed_us = (monotonic() - started) * 1_000_000.0
 
     _assert_transaction_output_aliases(result, transaction)
+    _assert_publication_output_aliases(result, publication)
+    publication_summary = _assert_publication_contract(publication_mode, publication)
     receipt = _audit_receipt(result, transaction)
     score_source_lens = result["score_source_lens"].detach().cpu().contiguous()
     expected_score_source_lens = _expected_score_source_lens(device)
@@ -956,6 +987,7 @@ def run_p4_fused_audit() -> dict[str, Any]:
         f"score_source_lens={score_source_lens.tolist()} "
         "score_source_lens_independent=bitwise_equal "
         "transaction_output_aliases=verified "
+        f"publication_unchanged={int(publication_summary['score_workspace_changed'] == 0 and publication_summary['receipt_ready_count'] == 0)} "
         "object_mapping=permuted_pool_reverse_compressed "
         "doorbell_posted=0 private_payload_unchanged=1 telemetry_unchanged=1 "
         f"elapsed_us={elapsed_us:.3f}",

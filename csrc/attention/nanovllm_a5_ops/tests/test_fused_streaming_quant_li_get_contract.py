@@ -50,6 +50,8 @@ def main() -> int:
     assert "kAuditScoreReceiptTag = 0x80000000U" in hook
     assert "auditScoreReceiptMode_ = IsAuditScoreReceiptLeaseTable();" in hook
     assert "auditMode_ = auditScoreReceiptMode_ || IsAuditLeaseTable();" in hook
+    assert "A5_STREAMING_LI_GET_INLINE_MODE == 1" in hook
+    assert "if (!auditScoreReceiptMode_)" in hook
     assert "if (auditMode_) {\n            return true;" in hook
     assert "EmitAuditCandidates(out_base" in hook
     assert "EmitAuditScoreReceipt(out_base" in hook
@@ -84,6 +86,11 @@ def main() -> int:
     assert "NANOVLLM_A5_OPS_ONLY=A5StreamingQuantLiGet" in bridge
     assert "_AUDIT_SCORE_RECEIPT = \"audit_score_receipt\"" in bridge
     assert "SCORE_RECEIPT_CANDIDATE_BIT" in bridge
+    assert "_PUBLICATION_KEYS" in bridge
+    assert "publication: Mapping[str, Any]" in bridge
+    assert "len(outputs) != 11" in bridge
+    assert '"score_workspace": outputs[9]' in bridge
+    assert '"tile_receipts": outputs[10]' in bridge
     assert "official C8" in readme
     assert "non-authoritative" in readme
     assert "no ring\noverflow" in readme
@@ -96,6 +103,11 @@ def main() -> int:
     assert "object_mapping=\"permuted_pool\"" in audit_adapter
     assert "row -> req_pool_entries -> kv_object_map" in audit_adapter
     assert "_assert_transaction_output_aliases" in audit_adapter
+    assert "_assert_publication_output_aliases" in audit_adapter
+    assert "_make_publication_buffers" in audit_adapter
+    assert "INLINE_MODE_ENV" in audit_adapter
+    assert "PUBLICATION_MODE_ENV" in audit_adapter
+    assert "publication_mode != \"off\" or inline_mode != \"audit\"" in audit_adapter
     assert "_assert_clone_source_domain" in audit_adapter
     assert "kv_object_domain=1" in audit_adapter
     assert "mapping_discriminator_selected" in audit_adapter
@@ -123,11 +135,15 @@ def main() -> int:
     )
     assert 'TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"' in target_adapter
     assert 'TARGET_EXPECTED_HEAD_ENV = "P3_TARGET_EXPECTED_SOURCE_HEAD"' in target_adapter
-    assert 'ALLOW_HOOK_OFF_BASELINE_ENV = "P3_ALLOW_HOOK_OFF_BASELINE"' in target_adapter
-    assert "compiled_off_baseline" in target_adapter
     assert '"source_clean"' in target_adapter
     assert "_read_target_provenance" in target_adapter
+    assert 'INLINE_MODE_ENV = "P3_INLINE_MODE"' in target_adapter
+    assert 'INLINE_MODES = ("off", "audit", "post")' in target_adapter
+    assert '"inline_mode"' in target_adapter
+    assert "this strict P3 publication adapter requires P3_INLINE_MODE=off" in target_adapter
     assert "P3 target provenance" in build
+    assert "NANOVLLM_A5_STREAMING_LI_GET_INLINE_MODE" in build
+    assert "P3 generated KVAF/SIMT closure: present verified=1" in build
 
     print(
         "P4_FUSED_SINGLE_SCAN_CONTRACT_PASS "

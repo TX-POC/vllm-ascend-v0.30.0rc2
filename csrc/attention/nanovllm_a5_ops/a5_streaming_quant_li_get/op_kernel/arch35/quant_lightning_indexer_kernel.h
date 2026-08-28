@@ -500,9 +500,28 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm);
     }
     InitBuffers();
-    // The old inline Direct-HCCP hook was intentionally removed.  These
-    // transaction resources are retained in the appended ABI for the later
-    // independent sidecar, not read by C8's score/TopK producer.
+#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+    if ASCEND_IS_AIV {
+        // Inputs 9..20 are a transaction-local prefetch view.  The hook
+        // never publishes persistent mapping and the appended outputs remain
+        // physical aliases of these caller-owned allocations.
+        (void)sparseValues;
+        (void)privateSourceToSlotOut;
+        (void)privateReadyTableOut;
+        (void)privateArenaHeadOut;
+        (void)privatePackedOutputOut;
+        (void)queueLeasesOut;
+        (void)scoreWorkspaceOut;
+        (void)tileReceiptsOut;
+        vectorService.InitStreamingKvafHook(
+            residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
+            reqPoolEntries, kvObjectMap, privateSourceToSlot,
+            privateReadyTable, privateArenaHead, privatePackedOutput,
+            queueControl, queueLeases, kvObjectLens, telemetry, tiling);
+    }
+#else
+    // The strict publisher/control build intentionally retains the full ABI
+    // while compiling no transaction-side KVAF/SIMT closure at all.
     (void)residentThreshold;
     (void)residentThresholdValid;
     (void)kvObjectSlotsSnapshot;
@@ -524,6 +543,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
     (void)telemetry;
     (void)scoreWorkspaceOut;
     (void)tileReceiptsOut;
+#endif
 }
 
 template <typename QLIT>
@@ -724,6 +744,12 @@ __aicore__ inline void QLIPreload<QLIT>::ProcessMain()
 
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
+#if A5_STREAMING_LI_GET_INLINE_MODE > 0
+        // FreeEventID owns the final official C8 TOPK_MTE3_V_EVENT.  Retire
+        // the optional Get only after that drain, so the final Get wave can
+        // overlap official Top-K without stealing C8's event token.
+        vectorService.FinishStreamingKvafHook();
+#endif
     } else {
         matmulService.FreeEventID();
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 0);

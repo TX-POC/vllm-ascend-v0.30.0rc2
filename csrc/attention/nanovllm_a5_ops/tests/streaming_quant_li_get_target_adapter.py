@@ -13,13 +13,22 @@ vLLM product route.  It performs one controlled target-NPU comparison:
 4. return the strict dictionary consumed by
    ``test_streaming_quant_li_get_target_equivalence.py``.
 
-The P3 operator has no inline KVAF/HCCP hook.  Its three build-time publication
-modes are exercised through ``P3_PUBLICATION_MODE``:
+The P3 operator has two independent build-time selectors.  Publication modes
+are exercised through ``P3_PUBLICATION_MODE``:
 
 * ``off``: original private score workspace, no externally visible change;
 * ``score_workspace``: score DMA targets caller-owned workspace, no receipt;
 * ``publisher``: score workspace plus a fixed 16-word receipt for each score
   tile, published after that tile's score DMA.
+
+The real score-tile inline modes are selected through ``P3_INLINE_MODE``:
+
+* ``off``: no KVAF/SIMT closure; this adapter's strict C8 control/publisher
+  proof;
+* ``audit``: tile-local score/threshold/mapping audit, exercised only by the
+  P4 audit adapter; and
+* ``post``: native-enqueue Direct-HCCP, not accepted by this correctness-only
+  adapter until payload correctness is separately established.
 
 This adapter proves only official C8 Top-K equivalence, output aliases,
 exact score-source lengths, and the selected publication contract.  It does
@@ -86,6 +95,13 @@ PUBLICATION_MODE_TO_BUILD_VALUE = {
     "off": "0",
     "score_workspace": "1",
     "publisher": "2",
+}
+INLINE_MODE_ENV = "P3_INLINE_MODE"
+INLINE_MODES = ("off", "audit", "post")
+INLINE_MODE_TO_BUILD_VALUE = {
+    "off": "0",
+    "audit": "1",
+    "post": "2",
 }
 SCORE_WORKSPACE_SENTINEL = -0x3A5A5A5A
 TILE_RECEIPT_SENTINEL = -1
@@ -287,19 +303,33 @@ def _resolve_publication_mode() -> str:
     return mode
 
 
-def _read_target_provenance(
-    vendor: Path, expected_publication_mode: str
-) -> dict[str, str]:
-    """Reject a stale P3 OPP or mismatched publication binary.
+def _resolve_inline_mode() -> str:
+    """Return the explicit score-tile inline mode selected for this process."""
+    mode = os.getenv(INLINE_MODE_ENV)
+    if mode not in INLINE_MODES:
+        raise RuntimeError(
+            f"set {INLINE_MODE_ENV} to one of {INLINE_MODES}; got {mode!r}"
+        )
+    return mode
 
-    Passing legacy ``on``/``off`` hook modes fails closed instead of allowing
-    an inline-HCCP artifact to masquerade as this publication ABI.
+
+def _read_target_provenance(
+    vendor: Path, expected_publication_mode: str, expected_inline_mode: str
+) -> dict[str, str]:
+    """Reject a stale P3 OPP or a build-mode mismatch.
+
+    A P3 artifact's source revision alone is insufficient: publication and
+    inline KVAF closures can produce the same public 24/11 ABI while having
+    intentionally different score-tile execution semantics.
     """
     if expected_publication_mode not in PUBLICATION_MODES:
         raise RuntimeError(
-            "legacy inline-HCCP provenance is incompatible with the P3 "
-            "publication ABI; use P3_PUBLICATION_MODE=off, "
+            "P3 publication provenance is invalid; use P3_PUBLICATION_MODE=off, "
             "score_workspace, or publisher"
+        )
+    if expected_inline_mode not in INLINE_MODES:
+        raise RuntimeError(
+            "P3 inline provenance is invalid; use P3_INLINE_MODE=off, audit, or post"
         )
     path = vendor / TARGET_PROVENANCE_NAME
     if not path.is_file():
@@ -318,6 +348,7 @@ def _read_target_provenance(
         "source_clean",
         "operators",
         "publication_mode",
+        "inline_mode",
     )
     missing = tuple(key for key in required if not values.get(key))
     if missing:
@@ -356,6 +387,19 @@ def _read_target_provenance(
             "wrong compile-time value: "
             f"mode={expected_publication_mode!r} actual={build_value!r} "
             f"expected={expected_value!r}"
+        )
+    if values["inline_mode"] != expected_inline_mode:
+        raise RuntimeError(
+            "isolated P3 target OPP has an unexpected inline mode: "
+            f"actual={values['inline_mode']!r} expected={expected_inline_mode!r}"
+        )
+    inline_value = values.get("inline_mode_value")
+    expected_inline_value = INLINE_MODE_TO_BUILD_VALUE[expected_inline_mode]
+    if inline_value and inline_value != expected_inline_value:
+        raise RuntimeError(
+            "isolated P3 target provenance maps inline mode to the wrong "
+            f"compile-time value: mode={expected_inline_mode!r} "
+            f"actual={inline_value!r} expected={expected_inline_value!r}"
         )
     return values
 
@@ -974,7 +1018,15 @@ def run_target_equivalence() -> dict[str, Any]:
         os.getenv(TARGET_OPP_ENV), "target"
     )
     publication_mode = _resolve_publication_mode()
-    target_provenance = _read_target_provenance(target_vendor, publication_mode)
+    inline_mode = _resolve_inline_mode()
+    if inline_mode != "off":
+        raise RuntimeError(
+            "this strict P3 publication adapter requires P3_INLINE_MODE=off; "
+            "use fused_streaming_quant_li_get_audit_adapter.py for inline=audit"
+        )
+    target_provenance = _read_target_provenance(
+        target_vendor, publication_mode, inline_mode
+    )
     # CANN discovers the binary config for an op on its first ACLNN call.  Both
     # OPP vendors must be visible before either the reference or P3 target
     # executes; switching this path after the reference is too late.
@@ -991,7 +1043,7 @@ def run_target_equivalence() -> dict[str, Any]:
         f"expected_head={os.getenv(TARGET_EXPECTED_HEAD_ENV, '<unset>')} "
         f"source_clean={target_provenance['source_clean']} "
         f"publication_mode={target_provenance['publication_mode']} "
-        "inline_hccp=absent ready=1 "
+        f"inline_mode={target_provenance['inline_mode']} inline_hccp=absent ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",
         flush=True,
     )
@@ -1031,6 +1083,7 @@ def run_target_equivalence() -> dict[str, Any]:
         f"heads={INDEX_HEADS} metadata_words={inputs['metadata'].numel()} "
         f"reference_opapi={reference_opapi} target_opapi={target_opapi} "
         f"publication_mode={publication_mode} "
+        f"inline_mode={inline_mode} "
         f"score_workspace_words={publication['score_workspace'].numel()} "
         f"tile_receipt_rows={publication['tile_receipts'].shape[0]} "
         "product_route=disabled h2d_result=not_exercised",

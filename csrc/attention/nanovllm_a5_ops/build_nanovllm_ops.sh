@@ -120,6 +120,14 @@ echo "[nanovllm_a5_ops] selected operators: ${OP_NAMES[*]}"
 STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=0
 STAGE_STREAMING_QUANT_LI_GET_ONLY=0
 STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY=0
+# P3's source-derived C8 operator has two independent compile-time axes:
+# publication (score workspace/receipts) and inline KVAF.  Default values
+# are declared before staging because this script is nounset-safe and the
+# later KVAF closure gate is shared with P1.
+STREAMING_LI_PUBLISH_MODE=0
+STREAMING_LI_PUBLISH_MODE_NAME=off
+STREAMING_LI_INLINE_MODE=0
+STREAMING_LI_INLINE_MODE_NAME=off
 if [[ "${#OP_NAMES[@]}" == "1" && \
       "${OP_NAMES[0]}" == "A5ExactScanSpeculativeGet" ]]; then
     STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=1
@@ -229,30 +237,10 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         "${OP_DEV}/op_host"
     copy_tree_without_repository_cmake "${STREAMING_LI_DIR}/op_kernel" \
         "${OP_DEV}/op_kernel"
-    # P3 is an LI score-publication producer, not a Get implementation. The
-    # source tree still carries an obsolete inline KVAF/SIMT experiment; do
-    # not let an unused header accidentally become part of this OPP closure.
-    # ExactScanSpeculativeGet stages the authoritative KVAF helper separately.
-    rm -rf "${OP_DEV}/op_kernel/kvaf_device" \
-           "${OP_DEV}/op_kernel/simt_api"
-    rm -f "${OP_DEV}/op_kernel/kvaf_fused_full_get_device.h" \
-          "${OP_DEV}/op_kernel/execute_batch_get_aiv.asc" \
-          "${OP_DEV}/op_kernel/batch_get_abi.h" \
-          "${OP_DEV}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"
-    if [[ -e "${OP_DEV}/op_kernel/kvaf_device" || \
-          -e "${OP_DEV}/op_kernel/simt_api" || \
-          -e "${OP_DEV}/op_kernel/kvaf_fused_full_get_device.h" || \
-          -e "${OP_DEV}/op_kernel/execute_batch_get_aiv.asc" || \
-          -e "${OP_DEV}/op_kernel/batch_get_abi.h" || \
-          -e "${OP_DEV}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h" ]]; then
-        echo "[nanovllm_a5_ops] ERROR: P3 KVAF/SIMT closure leaked into isolated staging." >&2
-        exit 2
-    fi
-
-    # This decision is compile-time because it changes which exact score-GM
-    # publication resources exist in the kernel. It does not add a Direct-HCCP
-    # path: P3 always remains an LI producer and ExactScan remains the KVAF
-    # consumer. The appended ABI is 24 inputs / 11 outputs in every mode.
+    # These decisions are compile-time because they change the exact AIV
+    # closure.  The appended ABI remains 24 inputs / 11 outputs in every
+    # variant, but score publication and true tile-inline KVAF are mutually
+    # exclusive proof/product boundaries.
     STREAMING_LI_PUBLISH_MODE_RAW="${NANOVLLM_A5_STREAMING_LI_GET_PUBLISH_MODE:-}"
     STREAMING_LI_HOOK_MODE_LEGACY_RAW="${NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE:-}"
     if [[ -n "${STREAMING_LI_PUBLISH_MODE_RAW}" ]]; then
@@ -300,13 +288,67 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
             echo "[nanovllm_a5_ops] WARNING: legacy NANOVLLM_A5_STREAMING_LI_GET_HOOK_MODE=${STREAMING_LI_HOOK_MODE_LEGACY_RAW} maps to publication_mode=${STREAMING_LI_PUBLISH_MODE_NAME}." >&2
         fi
     fi
+    STREAMING_LI_INLINE_MODE_RAW="${NANOVLLM_A5_STREAMING_LI_GET_INLINE_MODE:-off}"
+    case "${STREAMING_LI_INLINE_MODE_RAW,,}" in
+        off)
+            STREAMING_LI_INLINE_MODE=0
+            STREAMING_LI_INLINE_MODE_NAME=off
+            ;;
+        audit)
+            STREAMING_LI_INLINE_MODE=1
+            STREAMING_LI_INLINE_MODE_NAME=audit
+            ;;
+        post)
+            STREAMING_LI_INLINE_MODE=2
+            STREAMING_LI_INLINE_MODE_NAME=post
+            ;;
+        *)
+            echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_STREAMING_LI_GET_INLINE_MODE must be off, audit, or post; got ${STREAMING_LI_INLINE_MODE_RAW}." >&2
+            exit 2
+            ;;
+    esac
+    if [[ "${STREAMING_LI_INLINE_MODE}" != "0" && \
+          "${STREAMING_LI_PUBLISH_MODE}" != "0" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: inline KVAF mode requires NANOVLLM_A5_STREAMING_LI_GET_PUBLISH_MODE=off." >&2
+        echo "[nanovllm_a5_ops] publication and inline Get are separate isolated OPP artifacts." >&2
+        exit 2
+    fi
+
+    # Start from a clean closure regardless of mode.  The inline variant is
+    # then populated from KVAF_FUSED_GET_SOURCE below; it must never inherit a
+    # stale helper checked into the vLLM tree.
+    rm -rf "${OP_DEV}/op_kernel/kvaf_device" \
+           "${OP_DEV}/op_kernel/simt_api"
+    rm -f "${OP_DEV}/op_kernel/kvaf_fused_full_get_device.h" \
+          "${OP_DEV}/op_kernel/execute_batch_get_aiv.asc" \
+          "${OP_DEV}/op_kernel/batch_get_abi.h"
+    if [[ "${STREAMING_LI_INLINE_MODE}" == "0" ]]; then
+        rm -f "${OP_DEV}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"
+        if [[ -e "${OP_DEV}/op_kernel/kvaf_device" || \
+              -e "${OP_DEV}/op_kernel/simt_api" || \
+              -e "${OP_DEV}/op_kernel/kvaf_fused_full_get_device.h" || \
+              -e "${OP_DEV}/op_kernel/execute_batch_get_aiv.asc" || \
+              -e "${OP_DEV}/op_kernel/batch_get_abi.h" || \
+              -e "${OP_DEV}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: P3 inline=off contains a KVAF/SIMT closure." >&2
+            exit 2
+        fi
+    else
+        if [[ ! -f "${OP_DEV}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: P3 inline=${STREAMING_LI_INLINE_MODE_NAME} requires the score-tile hook header." >&2
+            exit 2
+        fi
+    fi
     printf '%s\n' \
         '// Generated only in the isolated P3 staging tree.' \
         "#define A5_STREAMING_LI_GET_PUBLISH_MODE ${STREAMING_LI_PUBLISH_MODE}" \
+        "#define A5_STREAMING_LI_GET_INLINE_MODE ${STREAMING_LI_INLINE_MODE}" \
         > "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
     if ! grep -Fqx "#define A5_STREAMING_LI_GET_PUBLISH_MODE ${STREAMING_LI_PUBLISH_MODE}" \
+            "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h" || \
+       ! grep -Fqx "#define A5_STREAMING_LI_GET_INLINE_MODE ${STREAMING_LI_INLINE_MODE}" \
             "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"; then
-        echo "[nanovllm_a5_ops] ERROR: P3 publication-mode staging header is incomplete." >&2
+        echo "[nanovllm_a5_ops] ERROR: P3 mode staging header is incomplete." >&2
         exit 2
     fi
     mkdir -p "${OP_DEV}/op_host/err" "${OP_DEV}/op_host/log"
@@ -320,9 +362,14 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         echo "[nanovllm_a5_ops] ERROR: P3 staged host closure is incomplete (err/ops_err.h + log/log.h)." >&2
         exit 2
     fi
-    echo "[nanovllm_a5_ops] strict P3 staging: A5StreamingQuantLiGet official C8 closure only"
+    echo "[nanovllm_a5_ops] strict P3 staging: A5StreamingQuantLiGet source-derived official C8 closure"
     echo "[nanovllm_a5_ops] P3 publication mode: ${STREAMING_LI_PUBLISH_MODE_NAME} (compiled=${STREAMING_LI_PUBLISH_MODE})"
-    echo "[nanovllm_a5_ops] P3 KVAF/SIMT closure: absent; ExactScanSpeculativeGet is the only KVAF consumer"
+    echo "[nanovllm_a5_ops] P3 inline KVAF mode: ${STREAMING_LI_INLINE_MODE_NAME} (compiled=${STREAMING_LI_INLINE_MODE})"
+    if [[ "${STREAMING_LI_INLINE_MODE}" == "0" ]]; then
+        echo "[nanovllm_a5_ops] P3 KVAF/SIMT closure: absent verified=1"
+    else
+        echo "[nanovllm_a5_ops] P3 KVAF/SIMT closure: required from KVAF_FUSED_GET_SOURCE"
+    fi
     echo "[nanovllm_a5_ops] strict P3 staging: repository CMakeLists.txt excluded"
     echo "[nanovllm_a5_ops] P3 JSON TypeRange=int8 bootstrap; target OpDef/bridge=FP8 E4M3FN"
     echo "[nanovllm_a5_ops] P3 host-header closure: staged standalone err/ops_err.h + log/log.h; remaining host SDK includes=CANN"
@@ -372,13 +419,28 @@ else
     )
 fi
 
-# ExactScanSpeculativeGet is the only custom operator that compiles the KVAF
-# device-side full Get protocol. Keep KVAF as the source of truth: stage the
-# helper and ABI from the exact checkout selected for this build instead of
-# maintaining a divergent WQE/CQ copy under vLLM. P3 LI publication does not
-# consume this closure and therefore neither requires nor stages it.
+# Keep KVAF as the source of truth: stage the helper and ABI from the exact
+# checkout selected for this build instead of maintaining a divergent WQE/CQ
+# copy under vLLM.  P3 publication-only variants need no such closure, while
+# the real score-tile inline audit/post variants do.
+NEEDS_P1_DENSE_KVAF=0
+NEEDS_P3_INLINE_KVAF=0
 if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
-    KVAF_CONSUMER_NAMES=("A5ExactScanSpeculativeGet")
+    NEEDS_P1_DENSE_KVAF=1
+fi
+if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" && \
+      "${STREAMING_LI_INLINE_MODE}" != "0" ]]; then
+    NEEDS_P3_INLINE_KVAF=1
+fi
+if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
+      "${NEEDS_P3_INLINE_KVAF}" == "1" ]]; then
+    KVAF_CONSUMER_NAMES=()
+    if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" ]]; then
+        KVAF_CONSUMER_NAMES+=("A5ExactScanSpeculativeGet")
+    fi
+    if [[ "${NEEDS_P3_INLINE_KVAF}" == "1" ]]; then
+        KVAF_CONSUMER_NAMES+=("A5StreamingQuantLiGet(inline=${STREAMING_LI_INLINE_MODE_NAME})")
+    fi
     if [[ -z "${KVAF_FUSED_GET_SOURCE:-}" ]]; then
         echo "[nanovllm_a5_ops] ERROR: ${KVAF_CONSUMER_NAMES[*]} requires KVAF_FUSED_GET_SOURCE=<exact KVAF checkout>." >&2
         exit 2
@@ -387,19 +449,18 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
     KVAF_FUSED_SOURCE="${KVAF_FUSED_GET_SOURCE}/access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
     KVAF_ABI_HEADER="${KVAF_FUSED_GET_SOURCE}/access_operator/demo/aiv_batch_get/include/batch_get_abi.h"
     if [[ ! -f "${KVAF_FUSED_HEADER}" || ! -f "${KVAF_FUSED_SOURCE}" || ! -f "${KVAF_ABI_HEADER}" ]]; then
-        echo "[nanovllm_a5_ops] ERROR: KVAF_FUSED_GET_SOURCE does not expose the P1 device helper/ABI." >&2
+        echo "[nanovllm_a5_ops] ERROR: KVAF_FUSED_GET_SOURCE does not expose the required device helper/ABI." >&2
         echo "[nanovllm_a5_ops] helper=${KVAF_FUSED_HEADER}" >&2
         echo "[nanovllm_a5_ops] abi=${KVAF_ABI_HEADER}" >&2
         exit 2
     fi
-    # P2's parallel Get lane relies on the split transaction API.  Rejecting
-    # an older KVAF checkout here is much clearer than compiling the custom
-    # operator against a blocking-only helper and silently losing the intended
-    # descriptor/H2D overlap.
-    if ! grep -q 'BeginKvafDenseBatchGetPostOnly' "${KVAF_FUSED_SOURCE}" || \
-       ! grep -q 'TryRetireKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}" || \
-       ! grep -q 'FinishKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}"; then
-        echo "[nanovllm_a5_ops] ERROR: ${KVAF_CONSUMER_NAMES[*]} requires KVAF split PostOnly/TryRetire/Finish helpers." >&2
+    # ExactScan's separate Get lane needs the dense split lifecycle.  Inline
+    # P3 instead uses the streaming lease/CQ lifecycle checked below.
+    if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" ]] && \
+       { ! grep -q 'BeginKvafDenseBatchGetPostOnly' "${KVAF_FUSED_SOURCE}" || \
+         ! grep -q 'TryRetireKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}" || \
+         ! grep -q 'FinishKvafDenseBatchGet' "${KVAF_FUSED_SOURCE}"; }; then
+        echo "[nanovllm_a5_ops] ERROR: A5ExactScanSpeculativeGet requires KVAF split PostOnly/TryRetire/Finish helpers." >&2
         echo "[nanovllm_a5_ops] source=${KVAF_FUSED_SOURCE}" >&2
         exit 2
     fi
@@ -443,6 +504,23 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactScanSpeculativeGet "* ]]; then
             exit 2
         fi
     done
+    if [[ "${NEEDS_P3_INLINE_KVAF}" == "1" ]]; then
+        for required_token in \
+            'TryAcquireKvafStreamingBatchGetQueueFromAicore' \
+            'LoadKvafStreamingBatchGetQueueTemplate' \
+            'PublishKvafStreamingBatchGetDescriptorScratch' \
+            'BeginKvafStreamingBatchGet' \
+            'TryRetireKvafStreamingBatchGet' \
+            'FinishKvafStreamingBatchGet' \
+            'GetKvafStreamingBatchGetReady' \
+            'ReleaseKvafStreamingBatchGetQueueFromAicore'; do
+            if ! grep -Fq "${required_token}" "${KVAF_FUSED_HEADER}"; then
+                echo "[nanovllm_a5_ops] ERROR: P3 inline KVAF closure misses ${required_token}." >&2
+                echo "[nanovllm_a5_ops] kvaf_head=${KVAF_FUSED_HEAD} helper=${KVAF_FUSED_HEADER}" >&2
+                exit 2
+            fi
+        done
+    fi
     # ExactScan includes the helper through its relative kvaf_device path.
     # Keep the flat copies for the P1 closure, but overwrite the relative
     # closure as well. Otherwise a checked-in, older helper could silently
@@ -581,34 +659,49 @@ if [[ -n "${KVAF_STAGE_DIR:-}" ]]; then
     echo "[nanovllm_a5_ops] ${KVAF_CONSUMER_NAMES[*]} generated KVAF relative include closure: ${KVAF_GENERATED_STAGE_DIR} verified=1"
 fi
 
-# The publication-mode header is generated after the P3 score-producer
-# closure has been staged, then overlaid onto msopgen's generated project.
+# The P3 build-mode header is generated after the source-derived closure has
+# been staged, then overlaid onto msopgen's generated project.
 # The source-derived vector header reaches it through `../` from arch35, so
 # validate that exact final path before invoking CANN. This turns a missing
 # staging overlay into an immediate, concise build error rather than an opaque
 # device-compiler include failure several minutes later.
 if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
-    P3_GENERATED_PUBLISH_MODE="${GENERATED}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
-    if [[ ! -f "${P3_GENERATED_PUBLISH_MODE}" ]] || \
+    P3_GENERATED_MODE_HEADER="${GENERATED}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
+    if [[ ! -f "${P3_GENERATED_MODE_HEADER}" ]] || \
        ! grep -Fqx "#define A5_STREAMING_LI_GET_PUBLISH_MODE ${STREAMING_LI_PUBLISH_MODE}" \
-            "${P3_GENERATED_PUBLISH_MODE}" || \
+            "${P3_GENERATED_MODE_HEADER}" || \
+       ! grep -Fqx "#define A5_STREAMING_LI_GET_INLINE_MODE ${STREAMING_LI_INLINE_MODE}" \
+            "${P3_GENERATED_MODE_HEADER}" || \
        grep -q 'A5_STREAMING_LI_GET_ENABLE_HOOK' \
-            "${P3_GENERATED_PUBLISH_MODE}"; then
-        echo "[nanovllm_a5_ops] ERROR: generated P3 publication-mode header is missing or invalid." >&2
-        echo "[nanovllm_a5_ops] expected=${P3_GENERATED_PUBLISH_MODE}" >&2
+            "${P3_GENERATED_MODE_HEADER}"; then
+        echo "[nanovllm_a5_ops] ERROR: generated P3 mode header is missing or invalid." >&2
+        echo "[nanovllm_a5_ops] expected=${P3_GENERATED_MODE_HEADER}" >&2
         exit 2
     fi
-    if [[ -e "${GENERATED}/op_kernel/kvaf_device" || \
-          -e "${GENERATED}/op_kernel/simt_api" || \
-          -e "${GENERATED}/op_kernel/kvaf_fused_full_get_device.h" || \
-          -e "${GENERATED}/op_kernel/execute_batch_get_aiv.asc" || \
-          -e "${GENERATED}/op_kernel/batch_get_abi.h" || \
-          -e "${GENERATED}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h" ]]; then
-        echo "[nanovllm_a5_ops] ERROR: generated P3 project contains a KVAF/SIMT closure." >&2
-        exit 2
+    if [[ "${STREAMING_LI_INLINE_MODE}" == "0" ]]; then
+        if [[ -e "${GENERATED}/op_kernel/kvaf_device" || \
+              -e "${GENERATED}/op_kernel/simt_api" || \
+              -e "${GENERATED}/op_kernel/kvaf_fused_full_get_device.h" || \
+              -e "${GENERATED}/op_kernel/execute_batch_get_aiv.asc" || \
+              -e "${GENERATED}/op_kernel/batch_get_abi.h" || \
+              -e "${GENERATED}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: generated P3 inline=off project contains a KVAF/SIMT closure." >&2
+            exit 2
+        fi
+        echo "[nanovllm_a5_ops] P3 generated KVAF/SIMT closure: absent verified=1"
+    else
+        for required_file in \
+            "${GENERATED}/op_kernel/kvaf_device/kvaf_fused_full_get_device.h" \
+            "${GENERATED}/op_kernel/simt_api/device_atomic_functions.h" \
+            "${GENERATED}/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"; do
+            if [[ ! -s "${required_file}" ]]; then
+                echo "[nanovllm_a5_ops] ERROR: generated P3 inline closure is incomplete: ${required_file}" >&2
+                exit 2
+            fi
+        done
+        echo "[nanovllm_a5_ops] P3 generated KVAF/SIMT closure: present verified=1"
     fi
-    echo "[nanovllm_a5_ops] P3 generated publication-mode header: ${P3_GENERATED_PUBLISH_MODE} mode=${STREAMING_LI_PUBLISH_MODE_NAME} value=${STREAMING_LI_PUBLISH_MODE} verified=1"
-    echo "[nanovllm_a5_ops] P3 generated KVAF/SIMT closure: absent verified=1"
+    echo "[nanovllm_a5_ops] P3 generated mode header: ${P3_GENERATED_MODE_HEADER} publication=${STREAMING_LI_PUBLISH_MODE_NAME}/${STREAMING_LI_PUBLISH_MODE} inline=${STREAMING_LI_INLINE_MODE_NAME}/${STREAMING_LI_INLINE_MODE} verified=1"
 fi
 
 # `msopgen` creates an all-in-one host source named
@@ -688,8 +781,8 @@ done
 # directory for every equivalence/audit run.  Its ACLNN bridge keeps a static
 # resolver handle, so accepting an arbitrary old libcust_opapi.so here would
 # make a later test appear to exercise the current source while actually
-# executing an older publication binary. Stamp the installed vendor with the
-# exact worktree revision, compile-time publication mode, and fixed P3 ABI.
+# executing an older binary. Stamp the installed vendor with the exact
+# worktree revision, both compile-time modes, and fixed P3 ABI.
 # The Python adapters read this before importing the P3 bridge and fail closed
 # on any mismatch.
 if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
@@ -718,6 +811,10 @@ source_head=${P3_PROVENANCE_HEAD}
 source_clean=1
 publication_mode=${STREAMING_LI_PUBLISH_MODE_NAME}
 publication_mode_value=${STREAMING_LI_PUBLISH_MODE}
+inline_mode=${STREAMING_LI_INLINE_MODE_NAME}
+inline_mode_value=${STREAMING_LI_INLINE_MODE}
+kvaf_closure=$([[ "${STREAMING_LI_INLINE_MODE}" == "0" ]] && printf absent || printf staged)
+kvaf_source_head=${KVAF_FUSED_HEAD:-not_applicable}
 abi=24in_11out
 operators=${OP_NAMES[*]}
 EOF
@@ -730,6 +827,10 @@ EOF
        ! grep -Fqx "publication_mode=${STREAMING_LI_PUBLISH_MODE_NAME}" \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
        ! grep -Fqx "publication_mode_value=${STREAMING_LI_PUBLISH_MODE}" \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
+       ! grep -Fqx "inline_mode=${STREAMING_LI_INLINE_MODE_NAME}" \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
+       ! grep -Fqx "inline_mode_value=${STREAMING_LI_INLINE_MODE}" \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
        ! grep -Fqx 'abi=24in_11out' \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE"; then

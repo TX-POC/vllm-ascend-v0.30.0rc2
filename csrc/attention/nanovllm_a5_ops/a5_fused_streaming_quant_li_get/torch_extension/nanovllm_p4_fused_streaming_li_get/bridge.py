@@ -42,6 +42,11 @@ _TRANSACTION_KEYS = (
     "queue_leases",
     "kv_object_lens",
 )
+_PUBLICATION_KEYS = (
+    "score_workspace",
+    "tile_receipts",
+    "streaming_epoch",
+)
 
 
 def _allow_post() -> bool:
@@ -52,6 +57,12 @@ def _require_transaction(transaction: Mapping[str, Any]) -> None:
     missing = tuple(name for name in _TRANSACTION_KEYS if name not in transaction)
     if missing:
         raise ValueError(f"P4.1 transaction is missing keys: {missing}")
+
+
+def _require_publication(publication: Mapping[str, Any]) -> None:
+    missing = tuple(name for name in _PUBLICATION_KEYS if name not in publication)
+    if missing:
+        raise ValueError(f"P4.1 publication is missing keys: {missing}")
 
 
 def _require_backing_bridge() -> Any:
@@ -73,6 +84,7 @@ def _require_backing_bridge() -> Any:
 def launch(
     inputs: Mapping[str, Any],
     transaction: Mapping[str, Any],
+    publication: Mapping[str, Any],
     *,
     mode: str,
     kv_object_domain: int = 0,
@@ -105,8 +117,9 @@ def launch(
         raise ValueError(
             "P4.1 mode must be one of "
             f"{_AUDIT!r}, {_AUDIT_SCORE_RECEIPT!r}, {_POST!r}; got {mode!r}"
-        )
+    )
     _require_transaction(transaction)
+    _require_publication(publication)
     if mode == _POST and not _allow_post():
         raise RuntimeError(
             "P4.1 post is disabled: set P4_FUSED_ALLOW_POST=1 only after "
@@ -136,6 +149,9 @@ def launch(
         transaction["queue_control"],
         transaction["queue_leases"],
         transaction["kv_object_lens"],
+        publication["score_workspace"],
+        publication["tile_receipts"],
+        publication["streaming_epoch"],
         kv_object_domain=kv_object_domain,
         query_quant_mode=query_quant_mode,
         key_quant_mode=key_quant_mode,
@@ -151,8 +167,11 @@ def launch(
         scale_stride=scale_stride,
         kvaf_rows_per_entry=kvaf_rows_per_entry,
     )
-    if not isinstance(outputs, tuple) or len(outputs) != 9:
-        raise RuntimeError("P4.1 backing scan returned an unexpected ABI")
+    if not isinstance(outputs, tuple) or len(outputs) != 11:
+        raise RuntimeError(
+            "P4.1 backing scan returned an unexpected ABI; rebuild the P3 "
+            "bridge for 24 inputs / 11 outputs"
+        )
 
     return {
         # This result intentionally cannot be fed to QSFA by this bridge.
@@ -167,6 +186,10 @@ def launch(
         "queue_leases": outputs[6],
         "telemetry": outputs[7],
         "score_source_lens": outputs[8],
+        # PUBLISH_MODE=off is intentional for inline audit.  These aliases
+        # still make the no-publication side-effect boundary observable.
+        "score_workspace": outputs[9],
+        "tile_receipts": outputs[10],
         "mode": mode,
         "audit_receipt_kind": (
             "score" if mode == _AUDIT_SCORE_RECEIPT else "candidate"
