@@ -125,6 +125,71 @@ def _first_difference(expected: torch.Tensor, actual: torch.Tensor) -> tuple[int
     return index, int(expected[index].item()), int(actual[index].item())
 
 
+def _shape_text(value: torch.Tensor) -> str:
+    return "[" + ",".join(str(int(dim)) for dim in value.shape) + "]"
+
+
+def _flat_coordinate(flat_index: int, shape: tuple[int, ...]) -> str:
+    """Render a compact logical coordinate without relying on a device helper."""
+    if flat_index < 0 or not shape:
+        return "[]"
+    coordinate: list[int] = []
+    remaining = flat_index
+    for dimension in reversed(shape):
+        if dimension <= 0:
+            return "[]"
+        coordinate.append(remaining % dimension)
+        remaining //= dimension
+    return "[" + ",".join(str(value) for value in reversed(coordinate)) + "]"
+
+
+def _strict_tensor_diagnostic(
+    kind: str, expected: torch.Tensor, actual: torch.Tensor
+) -> tuple[bool, str]:
+    """Return a one-line, deterministic strict-equality diagnostic.
+
+    The target and reference execute in separate ACLNN launches.  On a failure,
+    a plain ``torch.equal`` says only that the final gate failed, which leaves
+    shape/dtype drift, a complete corruption, and one unstable Top-K rank
+    indistinguishable.  Move both small result tensors to CPU once and emit the
+    exact compact evidence needed to classify the failure.
+    """
+    expected_cpu = expected.detach().cpu().contiguous()
+    actual_cpu = actual.detach().cpu().contiguous()
+    same_shape = tuple(expected_cpu.shape) == tuple(actual_cpu.shape)
+    same_dtype = expected_cpu.dtype == actual_cpu.dtype
+    mismatch_count = -1
+    first_flat = -1
+    first_coord = "[]"
+    expected_value: object = "<none>"
+    actual_value: object = "<none>"
+    if same_shape and same_dtype:
+        unequal = expected_cpu != actual_cpu
+        mismatch_count = int(torch.count_nonzero(unequal).item())
+        if mismatch_count:
+            first_flat = int(torch.nonzero(unequal.reshape(-1), as_tuple=False)[0, 0].item())
+            first_coord = _flat_coordinate(first_flat, tuple(expected_cpu.shape))
+            expected_value = expected_cpu.reshape(-1)[first_flat].item()
+            actual_value = actual_cpu.reshape(-1)[first_flat].item()
+    equal = same_shape and same_dtype and mismatch_count == 0
+    values = ""
+    if kind == "score_source_lens":
+        values = (
+            f" expected_values={expected_cpu.reshape(-1).tolist()}"
+            f" actual_values={actual_cpu.reshape(-1).tolist()}"
+        )
+    return equal, (
+        f"kind={kind} equal={int(equal)} "
+        f"expected_shape={_shape_text(expected_cpu)} actual_shape={_shape_text(actual_cpu)} "
+        f"expected_dtype={expected_cpu.dtype} actual_dtype={actual_cpu.dtype} "
+        f"expected_numel={expected_cpu.numel()} actual_numel={actual_cpu.numel()} "
+        f"expected_sha16={_sha16(expected_cpu)} actual_sha16={_sha16(actual_cpu)} "
+        f"mismatch_count={mismatch_count} first_flat={first_flat} "
+        f"first_coord={first_coord} expected_value={expected_value} actual_value={actual_value}"
+        f"{values}"
+    )
+
+
 def _require_test_args(args: argparse.Namespace) -> torch.device:
     if args.device != "npu:0":
         raise ValueError(
@@ -866,12 +931,21 @@ def main() -> int:
             {f"output[{index}]": value for index, value in enumerate(outputs)}
         )
         _require_output_aliases(transaction, publication, outputs)
-        if not torch.equal(outputs[0].detach().cpu(), official_indices.detach().cpu()):
-            raise AssertionError("derived inline=post sparse_indices are not bitwise official C8")
-        if not torch.equal(
-            outputs[8].detach().cpu(), target._expected_score_source_lens(device).detach().cpu()
-        ):
-            raise AssertionError("derived inline=post score_source_lens are not exact")
+        expected_score_source_lens = target._expected_score_source_lens(device)
+        topk_equal, topk_diagnostic = _strict_tensor_diagnostic(
+            "sparse_indices", official_indices, outputs[0]
+        )
+        source_lens_equal, source_lens_diagnostic = _strict_tensor_diagnostic(
+            "score_source_lens", expected_score_source_lens, outputs[8]
+        )
+        print("P3_POST_MATH_DIAG " + topk_diagnostic, flush=True)
+        print("P3_POST_MATH_DIAG " + source_lens_diagnostic, flush=True)
+        if not topk_equal or not source_lens_equal:
+            raise AssertionError(
+                "derived inline=post strict math mismatch: "
+                f"sparse_indices_equal={int(topk_equal)} "
+                f"score_source_lens_equal={int(source_lens_equal)}"
+            )
         target._assert_publication_contract("off", publication)
         if not torch.equal(transaction["kv_object_slots_snapshot"].detach().cpu(), persistent_snapshot):
             raise AssertionError("post speculation mutated persistent kv_object_slots_snapshot")
