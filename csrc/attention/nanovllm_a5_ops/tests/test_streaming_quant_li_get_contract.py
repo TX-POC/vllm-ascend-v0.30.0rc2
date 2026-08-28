@@ -27,6 +27,7 @@ TILING = ROOT / "op_host/a5_streaming_quant_li_get_tiling.cpp"
 TILING_HEADER = ROOT / "op_host/a5_streaming_quant_li_get_tiling.h"
 BRIDGE = ROOT / "torch_extension/csrc/streaming_quant_li_get.cpp"
 OP_SPEC = ROOT / "ops.json"
+POST_PAYLOAD_TEST = OPS_ROOT / "tests/test_streaming_quant_li_get_post_payload.py"
 
 CANN_INPUT_NAMES = [
     "query", "key", "weights", "query_dequant_scale", "key_dequant_scale",
@@ -292,6 +293,25 @@ def require_source_contract() -> None:
     assert '"kvaf_closure"' in target_adapter
     assert '"staged" if expected_inline_mode == "post" else "absent"' in target_adapter
     assert "no-transport artifact unexpectedly records a KVAF" in target_adapter
+
+    # The strict post test is intentionally separate from the former
+    # known-failed payload probe.  It must exercise the full 24/11 ABI and
+    # reconstruct every payload row via row -> pool -> object -> table -> key.
+    post_payload = POST_PAYLOAD_TEST.read_text(encoding="utf-8")
+    for token in (
+        "P3_POST_PAYLOAD_STRICT_PASS",
+        "P3_POST_PAYLOAD_DIAGNOSTIC",
+        "ASCEND_VISIBLE_DEVICES",
+        "_read_target_provenance(target_vendor, \"off\", \"post\")",
+        "bind_streaming_batch_get_control",
+        "configure_streaming_batch_get_queue_templates",
+        "req_pool_entries",
+        "kv_object_map",
+        "key = int(keys[table_index])",
+        "mapped_sources != len(unique_slots)",
+        "P3_POST_PAYLOAD_FAIL",
+    ):
+        assert token in post_payload, token
 
 
 def probe_publication_layout() -> None:
