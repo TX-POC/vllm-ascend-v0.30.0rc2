@@ -39,7 +39,7 @@ ENTRY_BYTES = ROWS_PER_ENTRY * PACKED_ENTRY_BYTES
 RING_SLOTS = 2
 RECORDS_PER_RING_SLOT = 32
 CACHE_LINE_WORDS = 8
-RING_SLOT_RECORD_WORD = 2 * CACHE_LINE_WORDS
+RING_SLOT_RECORD_WORD = 3 * CACHE_LINE_WORDS
 RING_WORDS_PER_SLOT = RING_SLOT_RECORD_WORD + RECORDS_PER_RING_SLOT * 3
 PIPELINE_WORDS_PER_RING = RING_SLOTS * RING_WORDS_PER_SLOT + CACHE_LINE_WORDS
 PIPELINE_RING_COUNT = PRODUCER_COUNT * GET_LANE_COUNT
@@ -358,6 +358,65 @@ def _expected_lane_post_counts(fixture: P5Fixture) -> tuple[int, ...]:
     )
 
 
+def _cursor_wave_sizes(fixture: P5Fixture, lane: int) -> tuple[int, ...]:
+    """Model the descriptor-count cursor used by the device Get consumer.
+
+    A ring slot holds CandidateSeeds, not already deduplicated H2D tasks.  A
+    wave boundary must therefore be based on the first source of each cold
+    `(pool, object)` pair, while the duplicate source is retained for the next
+    pass if it falls after that boundary.  This CPU oracle is deliberately
+    independent of device arrival timing: it proves the fixture can fill the
+    advertised descriptor waves only when the ring protocol has a cursor.
+    """
+    chunks = [
+        lane_candidates[start : start + RECORDS_PER_RING_SLOT]
+        for producer_candidates in fixture.expected_candidates
+        for lane_candidates in [
+            [
+                candidate
+                for candidate in producer_candidates
+                if candidate.kv_object & (GET_LANE_COUNT - 1) == lane
+            ]
+        ]
+        for start in range(0, len(lane_candidates), RECORDS_PER_RING_SLOT)
+    ]
+    claimed: set[tuple[int, int]] = set()
+    chunk_index = 0
+    record_index = 0
+    waves: list[int] = []
+
+    while chunk_index < len(chunks):
+        target = GET_WAVE_RECORDS if waves else 64
+        descriptors = 0
+        while chunk_index < len(chunks) and descriptors < target:
+            chunk = chunks[chunk_index]
+            while record_index < len(chunk) and descriptors < target:
+                candidate = chunk[record_index]
+                record_index += 1
+                key = (candidate.pool, candidate.kv_object)
+                if key not in claimed:
+                    claimed.add(key)
+                    descriptors += 1
+            if record_index == len(chunk):
+                chunk_index += 1
+                record_index = 0
+        if descriptors == 0:
+            raise AssertionError("cursor wave made no progress")
+        waves.append(descriptors)
+
+    expected_objects = {
+        key
+        for key in fixture.expected_unique_cold_objects
+        if key[1] & (GET_LANE_COUNT - 1) == lane
+    }
+    if claimed != expected_objects:
+        raise AssertionError(
+            "cursor wave object set mismatch "
+            f"lane={lane} actual={len(claimed)} expected={len(expected_objects)}"
+        )
+    return tuple(waves)
+
+
 def _assert_fixture_oracle(fixture: P5Fixture) -> None:
     assert len(fixture.raw_scores) == fixture.rows * fixture.source_capacity
     assert len(fixture.raw_scores) % 2 == 0
@@ -373,6 +432,9 @@ def _assert_fixture_oracle(fixture: P5Fixture) -> None:
     assert len(fixture.expected_wave_sizes) == GET_LANE_COUNT
     lane_posts = _expected_lane_post_counts(fixture)
     assert tuple(sum(waves) for waves in fixture.expected_wave_sizes) == lane_posts
+    assert tuple(
+        _cursor_wave_sizes(fixture, lane) for lane in range(GET_LANE_COUNT)
+    ) == fixture.expected_wave_sizes
     assert all(post_count <= fixture.private_arena_capacity for post_count in lane_posts)
     assert sum(len(value) for value in fixture.expected_candidates) == sum(
         fixture.expected_misses

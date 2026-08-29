@@ -79,7 +79,7 @@ constexpr uint32_t kCacheLineWords = 8;
 constexpr uint32_t kRingSlots = 2;
 constexpr uint32_t kRecordsPerRingSlot = 32;
 constexpr uint32_t kRecordWords = 3;
-constexpr uint32_t kRingSlotRecordWord = 2 * kCacheLineWords;
+constexpr uint32_t kRingSlotRecordWord = 3 * kCacheLineWords;
 constexpr uint32_t kRingWordsPerSlot =
     kRingSlotRecordWord + kRecordsPerRingSlot * kRecordWords;
 constexpr uint32_t kPipelineWordsPerRing =

@@ -58,7 +58,13 @@ constexpr uint32_t kRecordWords = 3;
 // the compact layout remains safe if surrounding code later needs DCCI.
 constexpr uint32_t kRingSlotStateWord = 0U;
 constexpr uint32_t kRingSlotCountWord = kCacheLineWords;
-constexpr uint32_t kRingSlotRecordWord = 2U * kCacheLineWords;
+// The consumer cursor has its own cache line.  A CandidateSeed chunk can
+// contain aliases of the same compressed KV object, so the number of raw ring
+// records is not the number of HCCP descriptors it produces.  Keeping a
+// cursor lets a Get lane stop exactly at a descriptor-wave boundary without
+// dropping the remaining records in a ready SPSC slot.
+constexpr uint32_t kRingSlotCursorWord = 2U * kCacheLineWords;
+constexpr uint32_t kRingSlotRecordWord = 3U * kCacheLineWords;
 constexpr uint32_t kRingWordsPerSlot =
     kRingSlotRecordWord + kRecordsPerRingSlot * kRecordWords;
 constexpr uint32_t kRingClosedWord = kRingSlots * kRingWordsPerSlot;
@@ -213,6 +219,11 @@ struct RingView {
     __aicore__ inline __gm__ int64_t* SlotCount(uint32_t slot) const
     {
         return words + slot * kRingWordsPerSlot + kRingSlotCountWord;
+    }
+
+    __aicore__ inline __gm__ int64_t* SlotCursor(uint32_t slot) const
+    {
+        return words + slot * kRingWordsPerSlot + kRingSlotCursorWord;
     }
 
     __aicore__ inline __gm__ int64_t* RecordWord(
@@ -393,6 +404,10 @@ private:
         // `state` is the sole ready flag polled by the Get lane; collapsing
         // the two boundaries can therefore produce a successful Direct-HCCP
         // CQ for an old-but-valid descriptor triple.
+        // A slot may have been partly consumed in a prior graph replay.  The
+        // producer resets the private consumer cursor before publishing a new
+        // payload; state remains the sole ready flag.
+        StoreRingWord(ring.SlotCursor(slot), 0U);
         DataSyncBarrier<MemDsbT::DDR>();
         StoreRingWord(ring.SlotCount(slot), count);
         DataSyncBarrier<MemDsbT::DDR>();
@@ -889,8 +904,7 @@ private:
         uint32_t lane, uint32_t descriptorBuffer, uint64_t epoch, uint32_t queued,
         uint32_t consumeLimit, uint64_t* consumedChunks,
         uint64_t* firstConsumedChunkCycle, uint64_t* descriptorHashSum,
-        uint64_t* descriptorHashXor, uint64_t* protocolError,
-        bool* deferredReady)
+        uint64_t* descriptorHashXor, uint64_t* protocolError)
     {
         if (descriptorBuffer >= kGetDescriptorBufferCount) {
             *protocolError = kGetResultRingRecordError;
@@ -922,19 +936,26 @@ private:
                 // ahead of the ready observation.
                 DataSyncBarrier<MemDsbT::DDR>();
                 const uint64_t count64 = LoadRingWord(ring.SlotCount(slot));
+                const uint64_t cursor64 = LoadRingWord(ring.SlotCursor(slot));
                 if (count64 == 0U || count64 > kRecordsPerRingSlot ||
-                    queued + count64 > consumeLimit) {
-                    if (queued + count64 > consumeLimit) {
-                        *deferredReady = true;
-                        return queued;  // issue the fixed-size wave first
-                    }
+                    cursor64 > count64) {
                     *protocolError = kGetResultRingRecordError;
+                    StoreRingWord(ring.SlotCursor(slot), 0U);
                     StoreRingWord(ring.SlotState(slot), 0U);
                     continue;
                 }
                 const uint32_t count = static_cast<uint32_t>(count64);
-                for (uint32_t record = 0U; record < count; ++record) {
-                    __gm__ int64_t* const words = ring.RecordWord(slot, record, 0);
+                // A ring record describes a CandidateSeed, while `queued`
+                // counts only new compressed objects that will receive an
+                // HCCP descriptor.  The two units diverge when two sources
+                // alias one KV object.  Consume only the prefix needed to
+                // fill this descriptor wave and retain the remaining record
+                // range in the slot for the next wave.
+                uint32_t nextRecord = static_cast<uint32_t>(cursor64);
+                for (; nextRecord < count && queued < consumeLimit;
+                     ++nextRecord) {
+                    __gm__ int64_t* const words =
+                        ring.RecordWord(slot, nextRecord, 0);
                     const uint64_t sourceOffset = LoadRingWord(words);
                     const uint64_t objectOffset = LoadRingWord(words + 1U);
                     const uint64_t candidateSlot = LoadRingWord(words + 2U);
@@ -1067,20 +1088,25 @@ private:
                     *descriptorHashSum += fingerprint;
                     *descriptorHashXor ^= fingerprint;
                     ++queued;
-                    if (queued == consumeLimit) {
-                        break;
-                    }
                 }
-                // The descriptor and private-state stores are complete. The
-                // consumer must release them before returning the ring slot
-                // to the producer; this same barrier also completes the
-                // bypass record reads for the chunk.
+                // Publish the next unread record before returning.  If this
+                // slot was only partly consumed, state remains `epoch` and
+                // the next descriptor wave resumes exactly here.  A fully
+                // consumed slot is released to its SPSC producer only after
+                // the cursor and all descriptor/private-state stores are
+                // visible.
                 DataSyncBarrier<MemDsbT::DDR>();
-                StoreRingWord(ring.SlotState(slot), 0U);
-                ++(*consumedChunks);
-                if (*firstConsumedChunkCycle == 0U) {
-                    *firstConsumedChunkCycle =
-                        static_cast<uint64_t>(GetSystemCycle());
+                StoreRingWord(ring.SlotCursor(slot), nextRecord);
+                DataSyncBarrier<MemDsbT::DDR>();
+                if (nextRecord == count) {
+                    StoreRingWord(ring.SlotState(slot), 0U);
+                    ++(*consumedChunks);
+                    if (*firstConsumedChunkCycle == 0U) {
+                        *firstConsumedChunkCycle =
+                            static_cast<uint64_t>(GetSystemCycle());
+                    }
+                } else {
+                    return queued;
                 }
             }
         }
@@ -1576,12 +1602,11 @@ private:
             // ConsumeReadyRings retains the normal eager streaming behavior.
             const bool allClosed = AllRingsClosed(lane, epoch);
             const uint32_t before = queued;
-            bool deferredReady = false;
             if (queued < target) {
                 queued = ConsumeReadyRings(
                     lane, fillBuffer, epoch, queued, target, &consumedChunks,
                     &firstConsumedChunkCycle, &descriptorHashSum,
-                    &descriptorHashXor, &error, &deferredReady);
+                    &descriptorHashXor, &error);
             }
             // Keep this accounting after the final acquire/drain as well:
             // descriptors compacted into the alternate buffer while the
@@ -1595,9 +1620,7 @@ private:
 
             if (!inFlight &&
                 (queued >= target ||
-                 (allClosed && queued != 0U) ||
-                 (deferredReady && queued != 0U) ||
-                 (queued == kGetWaveRecords))) {
+                 (allClosed && queued != 0U))) {
                 const uint32_t requestCount = queued;
                 const uint64_t result = BeginFullGet(
                     lane, fillBuffer, requestCount, &activeArgs, &transaction,
@@ -1721,16 +1744,13 @@ private:
             const uint32_t target = batches == 0U ? kGetBootstrapRecords
                                                    : kGetWaveRecords;
             const uint32_t before = queued;
-            bool deferredReady = false;
             queued = ConsumeReadyRings(
                 lane, 0U, epoch, queued, target, &consumedChunks,
                 &firstConsumedChunkCycle, &descriptorHashSum,
-                &descriptorHashXor, &error, &deferredReady);
+                &descriptorHashXor, &error);
             const bool allClosed = AllRingsClosed(lane, epoch);
             if (queued >= target ||
-                (allClosed && queued != 0U) ||
-                (deferredReady && queued != 0U) ||
-                (queued == kGetWaveRecords)) {
+                (allClosed && queued != 0U)) {
                 const uint64_t result = IssueFullGet(
                     lane, queued, &firstDoorbell, &completionCycle);
                 requested += queued;
