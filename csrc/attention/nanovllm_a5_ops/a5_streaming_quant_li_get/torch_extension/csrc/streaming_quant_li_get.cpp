@@ -20,9 +20,10 @@
 namespace {
 constexpr int64_t kSparseCount = 2048;
 constexpr int64_t kControlWords = 16;
-// Keep this in lockstep with `streaming_li_get::kTelemetryColumns`.  The
-// additional column is a C8-internal overlap witness, not a host timestamp.
-constexpr int64_t kTelemetryColumns = 14;
+// Keep this in lockstep with `streaming_li_get::kTelemetryColumns`.  Columns
+// 14..17 are P6 CandidateSeed scheduling evidence, not host timestamps or
+// a physical-AIV role trace.
+constexpr int64_t kTelemetryColumns = 18;
 constexpr int64_t kPackedKvRowBytes = 656;
 constexpr int64_t kMaxSourceCapacity = 1 << 18;
 constexpr int64_t kAicCoreCount = 36;

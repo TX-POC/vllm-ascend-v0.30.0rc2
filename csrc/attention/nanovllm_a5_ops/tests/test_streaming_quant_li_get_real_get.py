@@ -45,7 +45,11 @@ ENTRY_BYTES = ROWS_PER_ENTRY * PACKED_KV_ROW_BYTES
 STREAMING_CONTROL_WORDS = target.STREAMING_CONTROL_WORDS
 STREAMING_CONTROL_MAGIC = target.STREAMING_CONTROL_MAGIC
 STREAMING_CONTROL_VERSION = target.STREAMING_CONTROL_VERSION
-QUEUE_TELEMETRY_COLUMNS = 13
+# Keep this target-only legacy probe compatible with the graph-visible
+# telemetry ABI of the source-derived operator.  P6 appended four scheduling
+# counters; the existing lifecycle columns below retain their original
+# indices.
+QUEUE_TELEMETRY_COLUMNS = 18
 TELEMETRY_DOORBELL_POSTED = 8
 TELEMETRY_CQ_RETIRED_READY = 9
 TELEMETRY_CQ_RETIRED_FAILED = 10

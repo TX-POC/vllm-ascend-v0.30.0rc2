@@ -130,6 +130,8 @@ STREAMING_LI_INLINE_MODE=0
 STREAMING_LI_INLINE_MODE_NAME=off
 STREAMING_LI_POST_CLOSURE_MODE=0
 STREAMING_LI_POST_CLOSURE_MODE_NAME=not_applicable
+STREAMING_LI_POST_SCHEDULER_MODE=0
+STREAMING_LI_POST_SCHEDULER_MODE_NAME=immediate
 if [[ "${#OP_NAMES[@]}" == "1" && \
       "${OP_NAMES[0]}" == "A5ExactScanSpeculativeGet" ]]; then
     STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=1
@@ -346,6 +348,32 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         exit 2
     fi
 
+    # P6 changes *when* a normal C8 worker posts a candidate, never which
+    # worker is allowed to do it.  Keep the legacy immediate closure as the
+    # default P3 oracle; candidate_seed is an explicit, provenance-recorded
+    # build that first compacts exact scores and posts only at a later seam.
+    if [[ "${STREAMING_LI_INLINE_MODE}" == "2" && \
+          "${STREAMING_LI_POST_CLOSURE_MODE}" == "1" ]]; then
+        STREAMING_LI_POST_SCHEDULER_MODE_RAW="${NANOVLLM_A5_STREAMING_LI_GET_POST_SCHEDULER:-immediate}"
+        case "${STREAMING_LI_POST_SCHEDULER_MODE_RAW,,}" in
+            immediate)
+                STREAMING_LI_POST_SCHEDULER_MODE=0
+                STREAMING_LI_POST_SCHEDULER_MODE_NAME=immediate
+                ;;
+            candidate_seed)
+                STREAMING_LI_POST_SCHEDULER_MODE=1
+                STREAMING_LI_POST_SCHEDULER_MODE_NAME=candidate_seed
+                ;;
+            *)
+                echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_STREAMING_LI_GET_POST_SCHEDULER must be immediate or candidate_seed for inline=post/full; got ${STREAMING_LI_POST_SCHEDULER_MODE_RAW}." >&2
+                exit 2
+                ;;
+        esac
+    elif [[ -n "${NANOVLLM_A5_STREAMING_LI_GET_POST_SCHEDULER:-}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_STREAMING_LI_GET_POST_SCHEDULER is valid only with inline=post and post_closure=full." >&2
+        exit 2
+    fi
+
     # Start from a clean transport closure regardless of mode.  Only post is
     # populated from KVAF_FUSED_GET_SOURCE below; audit must never inherit a
     # stale helper checked into the vLLM tree.
@@ -400,17 +428,48 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
             exit 2
         fi
     fi
-    printf '%s\n' \
-        '// Generated only in the isolated P3 staging tree.' \
-        "#define A5_STREAMING_LI_GET_PUBLISH_MODE ${STREAMING_LI_PUBLISH_MODE}" \
-        "#define A5_STREAMING_LI_GET_INLINE_MODE ${STREAMING_LI_INLINE_MODE}" \
-        "#define A5_STREAMING_LI_GET_POST_CLOSURE_MODE ${STREAMING_LI_POST_CLOSURE_MODE}" \
-        > "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
+    # The mode header is not just four raw values: it derives the closure
+    # macros consumed by the C8 source (`HAS_FULL_POST_CLOSURE`,
+    # `HAS_CANDIDATE_SEED_PIPELINE`, and the score-source-lens alias).
+    # Earlier staging replaced that source header with the raw definitions,
+    # which silently compiled P6 as the no-post branch.  Prepend the selected
+    # raw values, then append the canonical derivation body.  Its `#ifndef`
+    # guards preserve these chosen values.
+    STAGED_FULL_POST_EXPECTED=0
+    if [[ "${STREAMING_LI_INLINE_MODE}" == "2" && \
+          "${STREAMING_LI_POST_CLOSURE_MODE}" == "1" ]]; then
+        STAGED_FULL_POST_EXPECTED=1
+    fi
+    STAGED_CANDIDATE_SEED_EXPECTED=0
+    if [[ "${STREAMING_LI_POST_SCHEDULER_MODE}" == "1" ]]; then
+        STAGED_CANDIDATE_SEED_EXPECTED=1
+    fi
+    {
+        printf '%s\n' \
+            '// Generated only in the isolated P3 staging tree.' \
+            "#define A5_STREAMING_LI_GET_PUBLISH_MODE ${STREAMING_LI_PUBLISH_MODE}" \
+            "#define A5_STREAMING_LI_GET_INLINE_MODE ${STREAMING_LI_INLINE_MODE}" \
+            "#define A5_STREAMING_LI_GET_POST_CLOSURE_MODE ${STREAMING_LI_POST_CLOSURE_MODE}" \
+            "#define A5_STREAMING_LI_GET_POST_SCHEDULER_MODE ${STREAMING_LI_POST_SCHEDULER_MODE}"
+        cat "${STREAMING_LI_DIR}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
+        printf '\n#if A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE != %s\n' \
+            "${STAGED_FULL_POST_EXPECTED}"
+        printf '%s\n' '#error "streaming LI staged full-post closure derivation mismatch"' '#endif'
+        printf '#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE != %s\n' \
+            "${STAGED_CANDIDATE_SEED_EXPECTED}"
+        printf '%s\n' '#error "streaming LI staged CandidateSeed derivation mismatch"' '#endif'
+    } > "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
     if ! grep -Fqx "#define A5_STREAMING_LI_GET_PUBLISH_MODE ${STREAMING_LI_PUBLISH_MODE}" \
             "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h" || \
        ! grep -Fqx "#define A5_STREAMING_LI_GET_INLINE_MODE ${STREAMING_LI_INLINE_MODE}" \
             "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h" || \
        ! grep -Fqx "#define A5_STREAMING_LI_GET_POST_CLOSURE_MODE ${STREAMING_LI_POST_CLOSURE_MODE}" \
+            "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h" || \
+       ! grep -Fqx "#define A5_STREAMING_LI_GET_POST_SCHEDULER_MODE ${STREAMING_LI_POST_SCHEDULER_MODE}" \
+            "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h" || \
+       ! grep -Fq 'streaming LI staged full-post closure derivation mismatch' \
+            "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h" || \
+       ! grep -Fq 'streaming LI staged CandidateSeed derivation mismatch' \
             "${OP_DEV}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"; then
         echo "[nanovllm_a5_ops] ERROR: P3 mode staging header is incomplete." >&2
         exit 2
@@ -430,6 +489,7 @@ elif [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
     echo "[nanovllm_a5_ops] P3 publication mode: ${STREAMING_LI_PUBLISH_MODE_NAME} (compiled=${STREAMING_LI_PUBLISH_MODE})"
     echo "[nanovllm_a5_ops] P3 inline KVAF mode: ${STREAMING_LI_INLINE_MODE_NAME} (compiled=${STREAMING_LI_INLINE_MODE})"
     echo "[nanovllm_a5_ops] P3 post closure mode: ${STREAMING_LI_POST_CLOSURE_MODE_NAME} (compiled=${STREAMING_LI_POST_CLOSURE_MODE})"
+    echo "[nanovllm_a5_ops] P6 post scheduler: ${STREAMING_LI_POST_SCHEDULER_MODE_NAME} (compiled=${STREAMING_LI_POST_SCHEDULER_MODE}); no fixed Get core=1"
     case "${STREAMING_LI_INLINE_MODE}" in
         0)
             echo "[nanovllm_a5_ops] P3 KVAF/SIMT closure: absent (inline=off) verified=1"
@@ -793,6 +853,12 @@ if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
             "${P3_GENERATED_MODE_HEADER}" || \
        ! grep -Fqx "#define A5_STREAMING_LI_GET_POST_CLOSURE_MODE ${STREAMING_LI_POST_CLOSURE_MODE}" \
             "${P3_GENERATED_MODE_HEADER}" || \
+       ! grep -Fqx "#define A5_STREAMING_LI_GET_POST_SCHEDULER_MODE ${STREAMING_LI_POST_SCHEDULER_MODE}" \
+            "${P3_GENERATED_MODE_HEADER}" || \
+       ! grep -Fq 'streaming LI staged full-post closure derivation mismatch' \
+            "${P3_GENERATED_MODE_HEADER}" || \
+       ! grep -Fq 'streaming LI staged CandidateSeed derivation mismatch' \
+            "${P3_GENERATED_MODE_HEADER}" || \
        grep -q 'A5_STREAMING_LI_GET_ENABLE_HOOK' \
             "${P3_GENERATED_MODE_HEADER}"; then
         echo "[nanovllm_a5_ops] ERROR: generated P3 mode header is missing or invalid." >&2
@@ -860,7 +926,7 @@ if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" ]]; then
         echo "[nanovllm_a5_ops] P3 generated KVAF/SIMT closure: post-only verified=1"
         fi
     fi
-    echo "[nanovllm_a5_ops] P3 generated mode header: ${P3_GENERATED_MODE_HEADER} publication=${STREAMING_LI_PUBLISH_MODE_NAME}/${STREAMING_LI_PUBLISH_MODE} inline=${STREAMING_LI_INLINE_MODE_NAME}/${STREAMING_LI_INLINE_MODE} post_closure=${STREAMING_LI_POST_CLOSURE_MODE_NAME}/${STREAMING_LI_POST_CLOSURE_MODE} verified=1"
+    echo "[nanovllm_a5_ops] P3 generated mode header: ${P3_GENERATED_MODE_HEADER} publication=${STREAMING_LI_PUBLISH_MODE_NAME}/${STREAMING_LI_PUBLISH_MODE} inline=${STREAMING_LI_INLINE_MODE_NAME}/${STREAMING_LI_INLINE_MODE} post_closure=${STREAMING_LI_POST_CLOSURE_MODE_NAME}/${STREAMING_LI_POST_CLOSURE_MODE} post_scheduler=${STREAMING_LI_POST_SCHEDULER_MODE_NAME}/${STREAMING_LI_POST_SCHEDULER_MODE} no_fixed_get_core=1 verified=1"
 fi
 
 # `msopgen` creates an all-in-one host source named
@@ -1112,6 +1178,8 @@ inline_mode=${STREAMING_LI_INLINE_MODE_NAME}
 inline_mode_value=${STREAMING_LI_INLINE_MODE}
 post_closure_mode=${STREAMING_LI_POST_CLOSURE_MODE_NAME}
 post_closure_mode_value=${STREAMING_LI_POST_CLOSURE_MODE}
+post_scheduler_mode=${STREAMING_LI_POST_SCHEDULER_MODE_NAME}
+post_scheduler_mode_value=${STREAMING_LI_POST_SCHEDULER_MODE}
 kvaf_closure=${P3_KVAF_CLOSURE}
 kvaf_source_head=${P3_KVAF_SOURCE_HEAD}
 abi=24in_11out
@@ -1134,6 +1202,10 @@ EOF
        ! grep -Fqx "post_closure_mode=${STREAMING_LI_POST_CLOSURE_MODE_NAME}" \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
        ! grep -Fqx "post_closure_mode_value=${STREAMING_LI_POST_CLOSURE_MODE}" \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
+       ! grep -Fqx "post_scheduler_mode=${STREAMING_LI_POST_SCHEDULER_MODE_NAME}" \
+            "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
+       ! grep -Fqx "post_scheduler_mode_value=${STREAMING_LI_POST_SCHEDULER_MODE}" \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \
        ! grep -Fqx "kvaf_closure=${P3_KVAF_CLOSURE}" \
             "${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE" || \

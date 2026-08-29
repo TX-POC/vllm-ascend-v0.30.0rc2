@@ -55,7 +55,7 @@ constexpr uint32_t TILE_RECEIPTS_OUTPUT_INDEX = 10;
 // Keep infer-shape, host tiling, bridge allocation, and the device hook on
 // the same graph-static telemetry ABI.  Column 13 records a later exact C8
 // score tile observed while a prior Direct-HCCP CQ was still pending.
-constexpr uint32_t STREAMING_TELEMETRY_COLUMNS = 14;
+constexpr uint32_t STREAMING_TELEMETRY_COLUMNS = 18;
 constexpr uint32_t STREAMING_KVAF_CONTROL_WORDS = 16;
 constexpr uint32_t STREAMING_PACKED_KV_ROW_BYTES = 656;
 constexpr uint32_t STREAMING_TILE_RECEIPT_WORDS = 16;

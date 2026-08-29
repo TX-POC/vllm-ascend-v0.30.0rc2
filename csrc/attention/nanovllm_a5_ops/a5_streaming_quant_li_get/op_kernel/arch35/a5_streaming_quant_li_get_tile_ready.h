@@ -31,7 +31,7 @@ constexpr int32_t kPrivateReadyReady = 2;
 constexpr int32_t kPrivateReadyFailed = 3;
 
 // Each producer owns one telemetry row only while it holds that queue lease.
-// The row is graph-stable ``int64[Q,14]``.  Column 13 is deliberately a
+// The row is graph-stable ``int64[Q,18]``.  Column 13 is deliberately a
 // causal (rather than timing) overlap witness: `Emit()` is reached only after
 // the current C8 score tile has been reduced, so observing a live previous
 // wave here proves that Direct-HCCP/CQ was still pending while C8 moved on to
@@ -51,9 +51,34 @@ enum TelemetryColumn : uint32_t {
     kLeaseReleased = 11U,
     kControlRejected = 12U,
     kScoreTilesWithCqPending = 13U,
+    // P6 CandidateSeed pipeline evidence.  These counters are flushed only
+    // by a worker that owns a dynamically acquired queue; this avoids an
+    // unowned multi-AIV telemetry row and does not encode any core role.
+    kCandidateSeedsCompacted = 14U,
+    kCandidateSeedsDeferred = 15U,
+    kCandidatePostsFromPriorTile = 16U,
+    kCandidateTailDrains = 17U,
 };
 
-constexpr uint32_t kTelemetryColumns = 14U;
+constexpr uint32_t kTelemetryColumns = 18U;
+
+// A compact seed is deliberately not a Direct-HCCP descriptor.  It records
+// only the exact score-time identity required to revalidate the candidate at
+// a later seam.  It deliberately has no ``private_slot``/DDR descriptor
+// fields: a private HBM slot and the final copy descriptor are created only
+// after an actual queue lease has been acquired and PostOnly will be issued.
+//
+// The two slots below are *worker-local UB storage*, not Get-worker lanes and
+// not physical core partitions.  Every normal C8 worker may own/use them.
+constexpr uint32_t kCandidateSeedWords = 4U;
+constexpr uint32_t kCandidateRingSlots = 2U;
+constexpr uint32_t kCandidateWordRow = 0U;
+constexpr uint32_t kCandidateWordSource = 1U;
+constexpr uint32_t kCandidateWordPool = 2U;
+constexpr uint32_t kCandidateWordObject = 3U;
+constexpr uint32_t kCandidateSlotFree = 0U;
+constexpr uint32_t kCandidateSlotReady = 1U;
+constexpr uint32_t kCandidateInvalidSlot = kCandidateRingSlots;
 
 // A source-map cell is first atomically changed -1 -> -2. Only its winning
 // producer takes a bounded queue-local private slot. The caller publishes the
@@ -166,6 +191,7 @@ public:
         __ubuf__ kvaf_fused_get::KvafStreamingBatchGetLeaseResult *lease_result,
         __ubuf__ PrivateArenaClaimResult *claim_result,
         __ubuf__ uint64_t *source_offsets,
+        __ubuf__ uint32_t *candidate_seeds,
         uint32_t producer_id)
     {
         residentThreshold_.SetGlobalBuffer((__gm__ int32_t *)resident_threshold);
@@ -188,6 +214,7 @@ public:
         leaseResult_ = lease_result;
         claimResult_ = claim_result;
         sourceOffsets_ = source_offsets;
+        candidateSeeds_ = candidate_seeds;
         constInfo_ = const_info;
         rowCount_ = row_count;
         sourceCapacity_ = source_capacity;
@@ -201,6 +228,15 @@ public:
         enabled_ = false;
         hasWave_ = false;
         stagedCount_ = 0U;
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        candidateTileSequence_ = 0U;
+        for (uint32_t slot = 0U; slot < kCandidateRingSlots; ++slot) {
+            candidateSlotState_[slot] = kCandidateSlotFree;
+            candidateSlotCount_[slot] = 0U;
+            candidateSlotTile_[slot] = 0U;
+        }
+        ResetLocalScanStats();
+#endif
         if (resident_threshold == nullptr || resident_threshold_valid == nullptr ||
             kv_object_lens == nullptr ||
             controlGm_ == nullptr || leaseResult_ == nullptr || claimResult_ == nullptr ||
@@ -210,6 +246,11 @@ public:
             queueCount_ == 0U || rowsPerEntry_ == 0U) {
             return;
         }
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        if (candidateSeeds_ == nullptr) {
+            return;
+        }
+#endif
         if (!kvaf_fused_get::LoadKvafStreamingBatchGetControlFromGmForAicore(
                 controlGm_, &control_) ||
             !kvaf_fused_get::IsKvafStreamingBatchGetControlValidForAicore(control_) ||
@@ -250,10 +291,112 @@ public:
         if (!enabled_) {
             return false;
         }
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        // P6 must keep observing exact score tiles even when every Direct-
+        // HCCP queue is occupied.  Queue availability controls only whether
+        // a previously compacted microbatch can be posted; it must never
+        // decide whether the current C8 score tile is examined.
+        return true;
+#else
         // A locally posted wave must reach Emit even while all queues are
         // busy: Emit polls its CQ and may retire/release that lease.
         return hasWave_ || AnyQueueMayBeFree();
+#endif
     }
+
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+    // Called before the next official score reduction.  It never reads the
+    // score UB: it only progresses a wave produced by an earlier score tile.
+    // A worker owns at most one in-flight wave, but no worker is statically a
+    // Get worker: every C8 worker calls this same opportunistic routine.
+    __aicore__ inline void ProgressOwnPostAndCq()
+    {
+        if (!enabled_) {
+            return;
+        }
+        RetireAndReleaseIfTerminal(false);
+        if (hasWave_) {
+            return;
+        }
+        const uint32_t slot = FindReadyCandidateSlot();
+        if (slot == kCandidateInvalidSlot || !AnyQueueMayBeFree()) {
+            return;
+        }
+        // `candidateTileSequence_` is the local monotonically increasing
+        // score-seam sequence.  Do not use raw `cur_s2_idx`: that source
+        // offset restarts for another S1/head group and would make the
+        // causal prior-seam telemetry spuriously report zero.
+        PostReadyCandidateSlot(slot, candidateTileSequence_, false);
+    }
+
+    // Called after the current score tile has been compacted and the score UB
+    // lifetime has been returned to Vector.  It performs only a nonblocking
+    // CQ poll.  Seeing a live old wave here is the causal proof that this
+    // *later exact score tile* completed while its HCCP request was pending.
+    __aicore__ inline void ObserveCqAfterScoreTile()
+    {
+        if (!enabled_ || !hasWave_) {
+            return;
+        }
+        RetireAndReleaseIfTerminal(false);
+        if (hasWave_) {
+            AddTelemetry(wave_.lease.queue_id, kScoreTilesWithCqPending, 1);
+        }
+    }
+
+    // The only P6 method that reads `out_base`.  It runs wholly between the
+    // existing V->S and S->V edges.  It does exact score/threshold/mapping
+    // filtering and writes one bounded local CandidateSeed slot.  It does
+    // *not* acquire a queue, claim a private slot, write a descriptor, or
+    // issue Direct-HCCP; those actions are intentionally deferred to
+    // `ProgressOwnPostAndCq()`.
+    __aicore__ inline void ScanAndCompactTile(
+        const LocalTensor<uint16_t> &out_base,
+        const QLICommon::RunInfo &info,
+        int64_t cur_aiv_s1_idx,
+        int64_t cur_aiv_s1_proc_num,
+        int64_t cur_s2_idx)
+    {
+        if (!enabled_) {
+            return;
+        }
+        ++localScanTiles_;
+        const uint32_t slot = FindFreeCandidateSlot();
+        uint32_t count = 0U;
+        const int64_t curS1ProcNum = cur_aiv_s1_proc_num;
+        for (int64_t localRow = 0; localRow < curS1ProcNum; ++localRow) {
+            const uint64_t row = OutputRow(info, cur_aiv_s1_idx + localRow);
+            if (row >= rowCount_) {
+                continue;
+            }
+            const int32_t validInTile = ValidInTile(info, cur_aiv_s1_idx,
+                                                     localRow, cur_s2_idx);
+            const uint64_t outRowOffset = static_cast<uint64_t>(localRow) *
+                (UB_BANK_DEPTH_STRIDE / sizeof(uint16_t));
+            for (int32_t inTile = 0; inTile < validInTile; ++inTile) {
+                const uint32_t source = static_cast<uint32_t>(cur_s2_idx + inTile);
+                const uint16_t score = out_base.GetValue(outRowOffset + inTile);
+                if (slot == kCandidateInvalidSlot || count >= kMaxWaveRequests) {
+                    // We still evaluate the predicate so overflow is visible
+                    // and, more importantly, never affects exact C8 Top-K.
+                    if (IsCandidateWithoutMutation(score, row, source)) {
+                        ++localCandidateSeedsDeferred_;
+                    }
+                    continue;
+                }
+                if (TryAppendCandidateSeed(slot, count, score, row, source)) {
+                    ++count;
+                }
+            }
+        }
+        if (slot != kCandidateInvalidSlot && count != 0U) {
+            candidateSlotCount_[slot] = count;
+            candidateSlotTile_[slot] = candidateTileSequence_;
+            candidateSlotState_[slot] = kCandidateSlotReady;
+        }
+        ++candidateTileSequence_;
+    }
+#endif  // A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
 
     __aicore__ inline void Emit(const LocalTensor<uint16_t> &out_base,
                                 const QLICommon::RunInfo &info,
@@ -365,7 +508,33 @@ public:
         if (!enabled_) {
             return;
         }
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        // There is no unbounded wait in normal tile progress.  Only this
+        // terminal path is allowed to wait for the one local in-flight wave,
+        // then drains at most the two bounded CandidateSeed microbatches.
         RetireAndReleaseIfTerminal(true);
+        for (uint32_t attempt = 0U; attempt < kCandidateRingSlots; ++attempt) {
+            const uint32_t slot = FindReadyCandidateSlot();
+            if (slot == kCandidateInvalidSlot) {
+                break;
+            }
+            if (hasWave_) {
+                RetireAndReleaseIfTerminal(true);
+            }
+            if (hasWave_ || !AnyQueueMayBeFree() ||
+                !PostReadyCandidateSlot(slot, candidateTileSequence_, true)) {
+                // A terminal queue shortage is only a lost speculative
+                // opportunity.  Do not spin or leak a transaction-local
+                // seed; exact Top-K + Guaranteed Recall remain authoritative.
+                DropCandidateSlot(slot);
+            }
+            if (hasWave_) {
+                RetireAndReleaseIfTerminal(true);
+            }
+        }
+#else
+        RetireAndReleaseIfTerminal(true);
+#endif
     }
 
 private:
@@ -384,6 +553,350 @@ private:
         }
         return false;
     }
+
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+    __aicore__ inline __ubuf__ uint32_t *CandidateSlot(uint32_t slot)
+    {
+        return candidateSeeds_ + static_cast<uint64_t>(slot) *
+            kMaxWaveRequests * kCandidateSeedWords;
+    }
+
+    __aicore__ inline uint32_t FindFreeCandidateSlot() const
+    {
+        for (uint32_t slot = 0U; slot < kCandidateRingSlots; ++slot) {
+            if (candidateSlotState_[slot] == kCandidateSlotFree) {
+                return slot;
+            }
+        }
+        return kCandidateInvalidSlot;
+    }
+
+    __aicore__ inline uint32_t FindReadyCandidateSlot() const
+    {
+        for (uint32_t slot = 0U; slot < kCandidateRingSlots; ++slot) {
+            if (candidateSlotState_[slot] == kCandidateSlotReady &&
+                candidateSlotCount_[slot] != 0U) {
+                return slot;
+            }
+        }
+        return kCandidateInvalidSlot;
+    }
+
+    __aicore__ inline void ResetLocalScanStats()
+    {
+        localScanTiles_ = 0U;
+        localScoresScanned_ = 0U;
+        localThresholdPassed_ = 0U;
+        localResidentHits_ = 0U;
+        localPrivateAlreadyPresent_ = 0U;
+        localInvalidLogicalToken_ = 0U;
+        localCandidateSeedsCompacted_ = 0U;
+        localCandidateSeedsDeferred_ = 0U;
+    }
+
+    // Scan statistics are private to the current normal C8 worker while no
+    // queue is held.  Flush only after a dynamic lease is won so a telemetry
+    // row has exactly one writer; telemetry is never a hidden worker role.
+    __aicore__ inline void FlushLocalScanStats(uint32_t queue_id)
+    {
+        AddTelemetry(queue_id, kTileReadyCalls, localScanTiles_);
+        AddTelemetry(queue_id, kScoresScanned, localScoresScanned_);
+        AddTelemetry(queue_id, kThresholdPassed, localThresholdPassed_);
+        AddTelemetry(queue_id, kResidentHits, localResidentHits_);
+        AddTelemetry(queue_id, kPrivateAlreadyPresent,
+                     localPrivateAlreadyPresent_);
+        AddTelemetry(queue_id, kInvalidLogicalToken, localInvalidLogicalToken_);
+        AddTelemetry(queue_id, kCandidateSeedsCompacted,
+                     localCandidateSeedsCompacted_);
+        AddTelemetry(queue_id, kCandidateSeedsDeferred,
+                     localCandidateSeedsDeferred_);
+        ResetLocalScanStats();
+    }
+
+    // This predicate is the exact score-time filtering part of P6.  It has
+    // no atomic operations and writes no graph-visible transaction state.
+    // `pool_out`/`object_out` become the CandidateSeed identity; Post rechecks
+    // them later before it is allowed to allocate a private slot.
+    __aicore__ inline bool ResolveCandidateIdentity(
+        uint16_t score, uint64_t row, uint32_t source_index,
+        uint32_t *pool_out, int32_t *object_out)
+    {
+        ++localScoresScanned_;
+        if (residentThresholdValid_.GetValue(row) != 1) {
+            return false;
+        }
+        const uint16_t threshold = static_cast<uint16_t>(
+            static_cast<uint32_t>(residentThreshold_.GetValue(row)) & 0xffffU);
+        if (score < threshold) {
+            return false;
+        }
+        ++localThresholdPassed_;
+        const int32_t poolRow = reqPoolEntries_.GetValue(row);
+        if (poolRow < 0 || static_cast<uint32_t>(poolRow) >= poolSize_) {
+            ++localInvalidLogicalToken_;
+            return false;
+        }
+        const int32_t kvObject = kvObjectMap_.GetValue(
+            static_cast<uint64_t>(poolRow) * sourceCapacity_ + source_index);
+        const int32_t kvObjectLen = kvObjectLens_.GetValue(row);
+        if (kvObjectLen <= 0 ||
+            static_cast<uint32_t>(kvObjectLen) > kvObjectCapacity_ ||
+            kvObject < 0 ||
+            static_cast<uint32_t>(kvObject) >=
+                static_cast<uint32_t>(kvObjectLen)) {
+            ++localInvalidLogicalToken_;
+            return false;
+        }
+        if (kvObjectSlots_.GetValue(static_cast<uint64_t>(poolRow) *
+                                    kvObjectCapacity_ +
+                                    static_cast<uint32_t>(kvObject)) >= 0) {
+            ++localResidentHits_;
+            return false;
+        }
+        const uint64_t sourceOffset = row * sourceCapacity_ + source_index;
+        if (sourceToSlot_.GetValue(sourceOffset) != kSourceUnmapped) {
+            ++localPrivateAlreadyPresent_;
+            return false;
+        }
+        *pool_out = static_cast<uint32_t>(poolRow);
+        *object_out = kvObject;
+        return true;
+    }
+
+    __aicore__ inline bool IsCandidateWithoutMutation(
+        uint16_t score, uint64_t row, uint32_t source_index)
+    {
+        uint32_t ignoredPool = 0U;
+        int32_t ignoredObject = kSourceUnmapped;
+        return ResolveCandidateIdentity(score, row, source_index,
+                                        &ignoredPool, &ignoredObject);
+    }
+
+    __aicore__ inline bool TryAppendCandidateSeed(
+        uint32_t slot, uint32_t count, uint16_t score, uint64_t row,
+        uint32_t source_index)
+    {
+        uint32_t pool = 0U;
+        int32_t object = kSourceUnmapped;
+        if (!ResolveCandidateIdentity(score, row, source_index, &pool, &object)) {
+            return false;
+        }
+        __ubuf__ uint32_t *seed = CandidateSlot(slot) +
+            static_cast<uint64_t>(count) * kCandidateSeedWords;
+        seed[kCandidateWordRow] = static_cast<uint32_t>(row);
+        seed[kCandidateWordSource] = source_index;
+        seed[kCandidateWordPool] = pool;
+        seed[kCandidateWordObject] = static_cast<uint32_t>(object);
+        ++localCandidateSeedsCompacted_;
+        return true;
+    }
+
+    // Revalidate a previously compacted seed, claim a private slot only now,
+    // and materialise one descriptor entry.  `seed_slot` is compacted in
+    // place so Finalize/Rollback see only the entries actually posted.
+    __aicore__ inline bool TryStageCandidateSeed(
+        uint32_t seed_slot, uint32_t seed_index, uint32_t queue_id,
+        const kvaf_fused_get::KvafStreamingBatchGetDescriptorScratch &descriptor)
+    {
+        __ubuf__ uint32_t *sourceSeed = CandidateSlot(seed_slot) +
+            static_cast<uint64_t>(seed_index) * kCandidateSeedWords;
+        const uint64_t row = sourceSeed[kCandidateWordRow];
+        const uint32_t source = sourceSeed[kCandidateWordSource];
+        const uint32_t expectedPool = sourceSeed[kCandidateWordPool];
+        const int32_t expectedObject = static_cast<int32_t>(
+            sourceSeed[kCandidateWordObject]);
+        if (row >= rowCount_ || source >= sourceCapacity_) {
+            AddTelemetry(queue_id, kInvalidLogicalToken, 1);
+            return false;
+        }
+        const int32_t poolRow = reqPoolEntries_.GetValue(row);
+        if (poolRow < 0 || static_cast<uint32_t>(poolRow) != expectedPool ||
+            static_cast<uint32_t>(poolRow) >= poolSize_) {
+            AddTelemetry(queue_id, kInvalidLogicalToken, 1);
+            return false;
+        }
+        const int32_t object = kvObjectMap_.GetValue(
+            static_cast<uint64_t>(poolRow) * sourceCapacity_ + source);
+        const int32_t objectLen = kvObjectLens_.GetValue(row);
+        if (object != expectedObject || objectLen <= 0 ||
+            static_cast<uint32_t>(objectLen) > kvObjectCapacity_ ||
+            object < 0 || static_cast<uint32_t>(object) >=
+                static_cast<uint32_t>(objectLen)) {
+            AddTelemetry(queue_id, kInvalidLogicalToken, 1);
+            return false;
+        }
+        if (kvObjectSlots_.GetValue(static_cast<uint64_t>(poolRow) *
+                                    kvObjectCapacity_ +
+                                    static_cast<uint32_t>(object)) >= 0) {
+            AddTelemetry(queue_id, kResidentHits, 1);
+            return false;
+        }
+        const uint64_t sourceOffset = row * sourceCapacity_ + source;
+        if (sourceToSlot_.GetValue(sourceOffset) != kSourceUnmapped) {
+            AddTelemetry(queue_id, kPrivateAlreadyPresent, 1);
+            return false;
+        }
+        if (!ClaimStreamingPrivateArenaFromAiv(sourceToSlotRaw_, privateReadyRaw_,
+                                                privateArenaHeadRaw_, sourceOffset,
+                                                queue_id, privateArenaCapacity_,
+                                                claimResult_, kStreamingSimtEvent)) {
+            AddTelemetry(queue_id, kSuppressedNoQueueOrArena, 1);
+            return false;
+        }
+        const uint32_t tableIndex = static_cast<uint32_t>(object) / rowsPerEntry_;
+        if (tableIndex >= descriptor.table_capacity) {
+            sourceToSlot_.SetValue(sourceOffset, kSourceUnmapped);
+            privateReady_.SetValue(static_cast<uint64_t>(queue_id) *
+                                   privateArenaCapacity_ +
+                                   claimResult_->local_slot, kPrivateReadyFree);
+            AddTelemetry(queue_id, kInvalidLogicalToken, 1);
+            return false;
+        }
+        __gm__ int32_t *indices = reinterpret_cast<__gm__ int32_t *>(descriptor.indices);
+        __gm__ int32_t *offsets = reinterpret_cast<__gm__ int32_t *>(descriptor.offsets);
+        __gm__ int32_t *outputIndices = reinterpret_cast<__gm__ int32_t *>(
+            descriptor.output_indices);
+        __gm__ uint8_t *mask = reinterpret_cast<__gm__ uint8_t *>(descriptor.mask);
+        const uint32_t request = stagedCount_;
+        indices[request] = static_cast<int32_t>(tableIndex);
+        offsets[request] = static_cast<int32_t>((static_cast<uint32_t>(object) %
+                                                  rowsPerEntry_) *
+                                                 kPackedKvRowBytes);
+        outputIndices[request] = static_cast<int32_t>(
+            PrivateOutputRowBase(queue_id) + claimResult_->local_slot);
+        if (mask != nullptr) {
+            mask[request] = 1U;
+        }
+        // Compact postable seeds at the beginning of the slot; the rest of
+        // the slot can be forgotten immediately after Begin succeeds.
+        __ubuf__ uint32_t *postedSeed = CandidateSlot(seed_slot) +
+            static_cast<uint64_t>(request) * kCandidateSeedWords;
+        if (postedSeed != sourceSeed) {
+            for (uint32_t word = 0U; word < kCandidateSeedWords; ++word) {
+                postedSeed[word] = sourceSeed[word];
+            }
+        }
+        ++stagedCount_;
+        AddTelemetry(queue_id, kPrivateClaims, 1);
+        return true;
+    }
+
+    __aicore__ inline bool PostReadyCandidateSlot(
+        uint32_t slot, uint64_t current_tile_sequence, bool terminal_drain)
+    {
+        if (slot == kCandidateInvalidSlot ||
+            candidateSlotState_[slot] != kCandidateSlotReady ||
+            candidateSlotCount_[slot] == 0U) {
+            return false;
+        }
+        kvaf_fused_get::KvafStreamingBatchGetLease lease{};
+        if (!kvaf_fused_get::TryAcquireKvafStreamingBatchGetQueueFromAicore(
+                controlGm_, producerId_, static_cast<uint32_t>(current_tile_sequence),
+                leaseResult_, kStreamingSimtEvent, &lease)) {
+            return false;
+        }
+        const uint32_t queueId = lease.queue_id;
+        FlushLocalScanStats(queueId);
+        kvaf_fused_get::KvafStreamingBatchGetDescriptorScratch descriptor{};
+        if (!kvaf_fused_get::LoadKvafStreamingBatchGetQueueTemplate(
+                control_, lease, &descriptor) ||
+            !ValidateDescriptorTemplate(descriptor, queueId)) {
+            AddTelemetry(queueId, kControlRejected, 1);
+            ReleaseUnpostedLease(lease);
+            return false;
+        }
+        stagedCount_ = 0U;
+        const uint32_t seedCount = candidateSlotCount_[slot];
+        for (uint32_t index = 0U; index < seedCount &&
+             stagedCount_ < descriptor.request_capacity; ++index) {
+            TryStageCandidateSeed(slot, index, queueId, descriptor);
+        }
+        if (stagedCount_ == 0U) {
+            candidateSlotState_[slot] = kCandidateSlotFree;
+            candidateSlotCount_[slot] = 0U;
+            ReleaseUnpostedLease(lease);
+            return false;
+        }
+        descriptor.active_request_count = stagedCount_;
+        if (!kvaf_fused_get::PublishKvafStreamingBatchGetDescriptorScratch(
+                control_, lease, descriptor) ||
+            !kvaf_fused_get::BeginKvafStreamingBatchGet(control_, lease, &wave_)) {
+            RollBackUnpostedClaims(slot, lease, descriptor);
+            if (wave_.lease.state == kvaf_fused_get::kStreamingBatchGetLeaseTerminal) {
+                kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(
+                    controlGm_, leaseResult_, kStreamingSimtEvent, &wave_);
+            } else {
+                ReleaseUnpostedLease(lease);
+            }
+            stagedCount_ = 0U;
+            return false;
+        }
+        FinalizePendingClaims(slot);
+        hasWave_ = true;
+        candidateSlotState_[slot] = kCandidateSlotFree;
+        candidateSlotCount_[slot] = 0U;
+        AddTelemetry(queueId, kDoorbellPosted, 1);
+        if (current_tile_sequence > candidateSlotTile_[slot]) {
+            AddTelemetry(queueId, kCandidatePostsFromPriorTile, 1);
+        }
+        if (terminal_drain) {
+            AddTelemetry(queueId, kCandidateTailDrains, 1);
+        }
+        return true;
+    }
+
+    __aicore__ inline void FinalizePendingClaims(uint32_t seed_slot)
+    {
+        __gm__ int32_t *outputIndices = reinterpret_cast<__gm__ int32_t *>(
+            wave_.queue_args.output_indices);
+        for (uint32_t request = 0U; request < stagedCount_; ++request) {
+            __ubuf__ uint32_t *seed = CandidateSlot(seed_slot) +
+                static_cast<uint64_t>(request) * kCandidateSeedWords;
+            const uint64_t sourceOffset = static_cast<uint64_t>(seed[kCandidateWordRow]) *
+                sourceCapacity_ + seed[kCandidateWordSource];
+            const int32_t localSlot = outputIndices[request] - static_cast<int32_t>(
+                PrivateOutputRowBase(wave_.lease.queue_id));
+            sourceToSlot_.SetValue(sourceOffset, static_cast<int32_t>(
+                wave_.lease.queue_id * privateArenaCapacity_ + localSlot));
+        }
+    }
+
+    __aicore__ inline void RollBackUnpostedClaims(
+        uint32_t seed_slot,
+        const kvaf_fused_get::KvafStreamingBatchGetLease &lease,
+        const kvaf_fused_get::KvafStreamingBatchGetDescriptorScratch &descriptor)
+    {
+        __gm__ int32_t *outputIndices = reinterpret_cast<__gm__ int32_t *>(
+            descriptor.output_indices);
+        for (uint32_t request = 0U; request < stagedCount_; ++request) {
+            __ubuf__ uint32_t *seed = CandidateSlot(seed_slot) +
+                static_cast<uint64_t>(request) * kCandidateSeedWords;
+            const uint64_t sourceOffset = static_cast<uint64_t>(seed[kCandidateWordRow]) *
+                sourceCapacity_ + seed[kCandidateWordSource];
+            const int32_t localSlot = outputIndices[request] - static_cast<int32_t>(
+                PrivateOutputRowBase(lease.queue_id));
+            if (localSlot >= 0 && static_cast<uint32_t>(localSlot) < privateArenaCapacity_) {
+                privateReady_.SetValue(static_cast<uint64_t>(lease.queue_id) *
+                    privateArenaCapacity_ + static_cast<uint32_t>(localSlot),
+                    kPrivateReadyFree);
+            }
+            sourceToSlot_.SetValue(sourceOffset, kSourceUnmapped);
+        }
+        candidateSlotState_[seed_slot] = kCandidateSlotFree;
+        candidateSlotCount_[seed_slot] = 0U;
+    }
+
+    __aicore__ inline void DropCandidateSlot(uint32_t slot)
+    {
+        if (slot >= kCandidateRingSlots ||
+            candidateSlotState_[slot] != kCandidateSlotReady) {
+            return;
+        }
+        localCandidateSeedsDeferred_ += candidateSlotCount_[slot];
+        candidateSlotState_[slot] = kCandidateSlotFree;
+        candidateSlotCount_[slot] = 0U;
+    }
+#endif  // A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
 
     __aicore__ inline uint64_t OutputRow(const QLICommon::RunInfo &info,
                                           int64_t s1_index) const
@@ -640,6 +1153,7 @@ private:
     __ubuf__ kvaf_fused_get::KvafStreamingBatchGetLeaseResult *leaseResult_ = nullptr;
     __ubuf__ PrivateArenaClaimResult *claimResult_ = nullptr;
     __ubuf__ uint64_t *sourceOffsets_ = nullptr;
+    __ubuf__ uint32_t *candidateSeeds_ = nullptr;
     kvaf_fused_get::KvafStreamingBatchGetControl control_{};
     kvaf_fused_get::KvafStreamingBatchGetWave wave_{};
     QLICommon::ConstInfo constInfo_{};
@@ -653,6 +1167,23 @@ private:
     uint32_t rowsPerEntry_ = kRowsPerKvafBlockDefault;
     uint32_t producerId_ = 0U;
     uint32_t stagedCount_ = 0U;
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+    // Per-normal-C8-worker, private to this kernel instance.  These are
+    // scheduling buffers, never lane/core assignments and never persistent
+    // cache mapping state.
+    uint32_t candidateSlotState_[kCandidateRingSlots]{};
+    uint32_t candidateSlotCount_[kCandidateRingSlots]{};
+    uint64_t candidateSlotTile_[kCandidateRingSlots]{};
+    uint64_t candidateTileSequence_ = 0U;
+    uint32_t localScanTiles_ = 0U;
+    uint32_t localScoresScanned_ = 0U;
+    uint32_t localThresholdPassed_ = 0U;
+    uint32_t localResidentHits_ = 0U;
+    uint32_t localPrivateAlreadyPresent_ = 0U;
+    uint32_t localInvalidLogicalToken_ = 0U;
+    uint32_t localCandidateSeedsCompacted_ = 0U;
+    uint32_t localCandidateSeedsDeferred_ = 0U;
+#endif
     bool enabled_ = false;
     bool hasWave_ = false;
 };

@@ -62,6 +62,35 @@ static_assert(A5_STREAMING_LI_GET_INLINE_MODE == 2 ||
 #define A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE 0
 #endif
 
+// Full post has two scheduling implementations.  Mode 0 is the historical
+// bring-up path: score scan, private-slot claim, descriptor materialisation
+// and doorbell all happen in one score-UB hand-off.  Mode 1 is the P6
+// CandidateSeed pipeline: a normal C8 worker first compacts its exact score
+// tile into a bounded *worker-local* seed microbatch, releases the score UB,
+// and only at a later tile seam opportunistically borrows a Direct-HCCP
+// queue to post it.  This is deliberately a scheduler choice, not a core
+// assignment: no AIV is reserved as a Get worker.
+//
+// Keep the default at 0 for the existing P3 mathematical/payload oracle.  A
+// P6 artifact must opt in at build time, which makes its provenance and test
+// evidence unambiguous.
+#ifndef A5_STREAMING_LI_GET_POST_SCHEDULER_MODE
+#define A5_STREAMING_LI_GET_POST_SCHEDULER_MODE 0
+#endif
+
+static_assert(A5_STREAMING_LI_GET_POST_SCHEDULER_MODE >= 0 &&
+              A5_STREAMING_LI_GET_POST_SCHEDULER_MODE <= 1,
+              "A5 streaming LI post scheduler must be 0 (immediate) or 1 (candidate seed).");
+static_assert(A5_STREAMING_LI_GET_POST_SCHEDULER_MODE == 0 ||
+              A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE == 1,
+              "candidate-seed scheduling requires inline=post with the full Direct-HCCP closure.");
+
+#if A5_STREAMING_LI_GET_POST_SCHEDULER_MODE == 1
+#define A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE 1
+#else
+#define A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE 0
+#endif
+
 // In the decode-only empty shell, output #8 is a bridge alias of
 // ``actual_seq_lengths_key``.  Do not allocate a side-output UB buffer or
 // issue MTE3 writes from C8 for data that already exists as an immutable C8

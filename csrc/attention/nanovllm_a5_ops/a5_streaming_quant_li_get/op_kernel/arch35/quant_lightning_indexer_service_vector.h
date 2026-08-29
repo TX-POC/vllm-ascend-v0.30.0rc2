@@ -215,6 +215,14 @@ private:
     LocalTensor<uint8_t> streamingClaimUb_;
     TBuf<TPosition::VECCALC> streamingSourceOffsetsBuf_;
     LocalTensor<uint64_t> streamingSourceOffsetsUb_;
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+    // Two bounded CandidateSeed microbatches.  This belongs to every normal
+    // C8 worker and is not a Get-core allocation.  A seed is four uint32
+    // words: row, score-source S, pool, object.  The private slot and copy
+    // descriptor are intentionally deferred until a queue is actually leased.
+    TBuf<TPosition::VECCALC> streamingCandidateSeedsBuf_;
+    LocalTensor<uint32_t> streamingCandidateSeedsUb_;
+#endif
 #endif
 
     TBuf<TPosition::VECCALC> indicesOutBuf_;
@@ -301,6 +309,13 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(streamingSourceOffsetsBuf_,
                      streaming_li_get::kMaxWaveRequests * sizeof(uint64_t));
     streamingSourceOffsetsUb_ = streamingSourceOffsetsBuf_.Get<uint64_t>();
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+    pipe->InitBuffer(streamingCandidateSeedsBuf_,
+                     streaming_li_get::kCandidateRingSlots *
+                     streaming_li_get::kMaxWaveRequests *
+                     streaming_li_get::kCandidateSeedWords * sizeof(uint32_t));
+    streamingCandidateSeedsUb_ = streamingCandidateSeedsBuf_.Get<uint32_t>();
+#endif
 #endif
 
     pipe->InitBuffer(indicesOutBuf_, (topkCountAlign256_ + 64) * sizeof(uint32_t));         // 大小：(topkCountAlign256_ + 64) * 4  64:duplicate刷-1需要额外空间
@@ -431,6 +446,11 @@ __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
         reinterpret_cast<__ubuf__ streaming_li_get::PrivateArenaClaimResult *>(
             streamingClaimUb_.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint64_t *>(streamingSourceOffsetsUb_.GetPhyAddr()),
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        reinterpret_cast<__ubuf__ uint32_t *>(streamingCandidateSeedsUb_.GetPhyAddr()),
+#else
+        nullptr,
+#endif
         static_cast<uint32_t>(blockId_));
 }
 
@@ -756,9 +776,18 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     const bool mayNeedScoreObservation =
         streamingAuditHook_.MayNeedScoreObservation();
 #elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+    // P6 opportunity seam.  It can only consume seeds from an earlier score
+    // tile because the current tile has not been reduced yet.  It never reads
+    // `outBase`, so a successful PostOnly doorbell can overlap the official
+    // C8 reduction/DMA/Top-K that follows without holding score ping-pong UB.
+    streamingKvafHook_.ProgressOwnPostAndCq();
+#endif
     // Take the bounded queue-capacity snapshot before reduction.  The exact
-    // score seam is left completely untouched when the producer has neither
-    // an audit obligation nor a locally pending/available Get queue.
+    // score seam is left completely untouched in the immediate P3 path when
+    // the producer has neither an audit obligation nor a locally
+    // pending/available Get queue.  P6 deliberately returns true here: queue
+    // scarcity suppresses only speculation, never ExactScoreScan.
     const bool mayNeedScoreObservation =
         streamingKvafHook_.MayNeedScoreObservation();
 #endif
@@ -818,12 +847,31 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
             GetTPipePtr()->FetchEventID(HardEvent::V_S));
         SetFlag<HardEvent::V_S>(scoreVectorToScalar);
         WaitFlag<HardEvent::V_S>(scoreVectorToScalar);
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        // Only the cheap exact predicate and CandidateSeed compact live in
+        // this score-UB lifetime.  Private-slot CAS, descriptor writes and
+        // Direct-HCCP PostOnly run at a later opportunity seam instead.
+        streamingKvafHook_.ScanAndCompactTile(outBase, info, curAivS1Idx,
+                                               curAivS1ProcNum, curS2Idx);
+#else
         streamingKvafHook_.Emit(outBase, info, curAivS1Idx,
                                 curAivS1ProcNum, curS2Idx);
+#endif
         const event_t scoreScalarToVector = static_cast<event_t>(
             GetTPipePtr()->FetchEventID(HardEvent::S_V));
         SetFlag<HardEvent::S_V>(scoreScalarToVector);
         WaitFlag<HardEvent::S_V>(scoreScalarToVector);
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        // The S->V acknowledgement returns score ping-pong UB to C8.  This
+        // is the earliest safe opportunity to PostOnly the just-published
+        // seed, so HCCP DMA can overlap this tile's official score DMA/Top-K
+        // and all later tiles.  The routine never reads `outBase`.
+        streamingKvafHook_.ProgressOwnPostAndCq();
+        // Keep the causal CQ witness after the earliest Post seam.  It is
+        // nonblocking and proves that subsequent exact C8 progress can occur
+        // while an older HCCP CQ is still live.
+        streamingKvafHook_.ObserveCqAfterScoreTile();
+#endif
     }
 #endif
     int64_t vec1OutGmOffset = blockId_ % 2 == 0 ? curS2Idx :

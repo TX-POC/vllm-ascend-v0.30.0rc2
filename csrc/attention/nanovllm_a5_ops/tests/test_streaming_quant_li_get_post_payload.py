@@ -51,13 +51,17 @@ ENTRY_BYTES = ROWS_PER_ENTRY * PACKED_KV_ROW_BYTES
 STREAMING_CONTROL_WORDS = target.STREAMING_CONTROL_WORDS
 STREAMING_CONTROL_MAGIC = target.STREAMING_CONTROL_MAGIC
 STREAMING_CONTROL_VERSION = target.STREAMING_CONTROL_VERSION
-QUEUE_TELEMETRY_COLUMNS = 14
+QUEUE_TELEMETRY_COLUMNS = 18
 TELEMETRY_DOORBELL_POSTED = 8
 TELEMETRY_CQ_RETIRED_READY = 9
 TELEMETRY_CQ_RETIRED_FAILED = 10
 TELEMETRY_LEASE_RELEASED = 11
 TELEMETRY_CONTROL_REJECTED = 12
 TELEMETRY_SCORE_TILES_WITH_CQ_PENDING = 13
+TELEMETRY_CANDIDATE_SEEDS_COMPACTED = 14
+TELEMETRY_CANDIDATE_SEEDS_DEFERRED = 15
+TELEMETRY_CANDIDATE_POSTS_FROM_PRIOR_TILE = 16
+TELEMETRY_CANDIDATE_TAIL_DRAINS = 17
 DEFAULT_QUEUE_COUNT = 1
 DEFAULT_PRIVATE_ARENA_CAPACITY = 256
 MAX_DENSE_REQUESTS = 256
@@ -543,6 +547,18 @@ def _terminal_summary(
             telemetry[:, TELEMETRY_SCORE_TILES_WITH_CQ_PENDING].sum().item()
         ),
         "private_claims": int(telemetry[:, 5].sum().item()),
+        "candidate_seeds_compacted": int(
+            telemetry[:, TELEMETRY_CANDIDATE_SEEDS_COMPACTED].sum().item()
+        ),
+        "candidate_seeds_deferred": int(
+            telemetry[:, TELEMETRY_CANDIDATE_SEEDS_DEFERRED].sum().item()
+        ),
+        "candidate_posts_from_prior_tile": int(
+            telemetry[:, TELEMETRY_CANDIDATE_POSTS_FROM_PRIOR_TILE].sum().item()
+        ),
+        "candidate_tail_drains": int(
+            telemetry[:, TELEMETRY_CANDIDATE_TAIL_DRAINS].sum().item()
+        ),
         "mapped_sources": int(torch.count_nonzero(source_to_slot >= 0).item()),
         "ready_slots": int(torch.count_nonzero(ready == 2).item()),
         "failed_slots": int(torch.count_nonzero(ready == 3).item()),
@@ -565,6 +581,19 @@ def _terminal_summary(
         "score_tiles_with_cq_pending": summary["score_tiles_with_cq_pending"] > 0,
         "queue_leases_zero": bool(torch.equal(leases, torch.zeros_like(leases))),
     }
+    if os.getenv(target.POST_SCHEDULER_MODE_ENV, "immediate") == "candidate_seed":
+        required.update(
+            {
+                "candidate_seeds_compacted": summary["candidate_seeds_compacted"] > 0,
+                # A nonzero value proves a seed published from one score tile
+                # was consumed at a later seam.  A direct score-seam Post
+                # binary cannot satisfy this marker.
+                "candidate_posts_from_prior_tile": summary[
+                    "candidate_posts_from_prior_tile"
+                ]
+                > 0,
+            }
+        )
     bad = [name for name, ok in required.items() if not ok]
     if bad:
         raise AssertionError(
@@ -600,6 +629,12 @@ def _probe_summary(
             telemetry[:, TELEMETRY_SCORE_TILES_WITH_CQ_PENDING].sum().item()
         ),
         "private_claims": int(telemetry[:, 5].sum().item()),
+        "candidate_seeds_compacted": int(
+            telemetry[:, TELEMETRY_CANDIDATE_SEEDS_COMPACTED].sum().item()
+        ),
+        "candidate_posts_from_prior_tile": int(
+            telemetry[:, TELEMETRY_CANDIDATE_POSTS_FROM_PRIOR_TILE].sum().item()
+        ),
         "mapped_sources": int(torch.count_nonzero(source_to_slot >= 0).item()),
         "ready_slots": int(torch.count_nonzero(ready == 2).item()),
         "failed_slots": int(torch.count_nonzero(ready == 3).item()),
@@ -993,6 +1028,18 @@ def main() -> int:
                 f"physical_npu={args.physical_npu_id} logical_npu=0",
                 flush=True,
             )
+            if os.getenv(target.POST_SCHEDULER_MODE_ENV, "immediate") == "candidate_seed":
+                print(
+                    "P6_CANDIDATE_SEED_PIPELINE_STRICT_PASS "
+                    "topk=bitwise score_source_lens=exact payload=byte_exact "
+                    "persistent_mapping=unchanged fixed_get_core=0 "
+                    f"seeds_compacted={terminal['candidate_seeds_compacted']} "
+                    f"posts_from_prior_tile={terminal['candidate_posts_from_prior_tile']} "
+                    f"tail_drains={terminal['candidate_tail_drains']} "
+                    f"score_tiles_with_cq_pending={terminal['score_tiles_with_cq_pending']} "
+                    f"physical_npu={args.physical_npu_id} logical_npu=0",
+                    flush=True,
+                )
         else:
             summary = _assert_non_payload_mode(args.post_exercise, transaction, outputs)
             print(

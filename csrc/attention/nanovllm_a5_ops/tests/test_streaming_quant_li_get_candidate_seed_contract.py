@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Source contract for the P6 C8-worker CandidateSeed scheduler.
+
+This is deliberately a small static gate.  It prevents a future refactor from
+quietly turning the P6 artifact back into either (a) immediate score-seam
+PostOnly, or (b) a fixed Get-core / 31+1 role split.  Runtime strictness lives
+in ``test_streaming_quant_li_get_post_payload.py`` on a real NPU.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+OPS_ROOT = Path(__file__).resolve().parents[1]
+HOOK = OPS_ROOT / "a5_streaming_quant_li_get/op_kernel/arch35/a5_streaming_quant_li_get_tile_ready.h"
+VECTOR = OPS_ROOT / "a5_streaming_quant_li_get/op_kernel/arch35/quant_lightning_indexer_service_vector.h"
+MODE = OPS_ROOT / "a5_streaming_quant_li_get/op_kernel/a5_streaming_quant_li_get_hook_mode.h"
+BUILD = OPS_ROOT / "build_nanovllm_ops.sh"
+
+
+def _between(text: str, start: str, end: str) -> str:
+    begin = text.index(start)
+    finish = text.index(end, begin)
+    return text[begin:finish]
+
+
+def _ordered(text: str, tokens: tuple[str, ...], label: str) -> None:
+    position = -1
+    for token in tokens:
+        next_position = text.find(token, position + 1)
+        assert next_position >= 0, f"{label}: missing {token!r}"
+        assert next_position > position, f"{label}: order violation at {token!r}"
+        position = next_position
+
+
+def main() -> None:
+    hook = HOOK.read_text(encoding="utf-8")
+    vector = VECTOR.read_text(encoding="utf-8")
+    mode = MODE.read_text(encoding="utf-8")
+    build = BUILD.read_text(encoding="utf-8")
+
+    for forbidden in (
+        "kGetLaneCount",
+        "kProducerCount",
+        "roleTrace",
+        "group0",
+        "31+1",
+        "physical AIV",
+    ):
+        assert forbidden not in hook, f"P6 hook must not contain {forbidden!r}"
+
+    for required in (
+        "A5_STREAMING_LI_GET_POST_SCHEDULER_MODE",
+        "A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE",
+        "NANOVLLM_A5_STREAMING_LI_GET_POST_SCHEDULER",
+        "candidate_seed",
+        "no fixed Get core=1",
+    ):
+        assert required in mode or required in build, required
+
+    scan = _between(hook, "void ScanAndCompactTile(", "#endif  // A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE")
+    for forbidden in (
+        "TryAcquireKvafStreamingBatchGetQueueFromAicore",
+        "ClaimStreamingPrivateArenaFromAiv",
+        "PublishKvafStreamingBatchGetDescriptorScratch",
+        "BeginKvafStreamingBatchGet",
+        "privateArenaHead_",
+    ):
+        assert forbidden not in scan, (
+            "CandidateSeed score seam must not perform queue/private-slot/Post work: "
+            + forbidden
+        )
+    for required in (
+        "TryAppendCandidateSeed",
+        "kCandidateSlotReady",
+    ):
+        assert required in scan, required
+    append = _between(hook, "bool TryAppendCandidateSeed(", "// Revalidate a previously")
+    for required in ("ResolveCandidateIdentity", "kCandidateWordObject"):
+        assert required in append, required
+
+    progress = _between(hook, "void ProgressOwnPostAndCq(", "void ObserveCqAfterScoreTile()")
+    _ordered(
+        progress,
+        (
+            "RetireAndReleaseIfTerminal(false)",
+            "FindReadyCandidateSlot",
+            "PostReadyCandidateSlot",
+        ),
+        "P6 opportunity seam",
+    )
+    assert "PostReadyCandidateSlot(slot, candidateTileSequence_, false)" in progress
+    assert "PostReadyCandidateSlot(slot, static_cast<uint32_t>(cur_s2_idx), false)" not in progress
+    post = _between(hook, "bool PostReadyCandidateSlot(", "void FinalizePendingClaims(uint32_t seed_slot)")
+    _ordered(
+        post,
+        (
+            "TryAcquireKvafStreamingBatchGetQueueFromAicore",
+            "TryStageCandidateSeed",
+            "PublishKvafStreamingBatchGetDescriptorScratch",
+            "BeginKvafStreamingBatchGet",
+            "FinalizePendingClaims(slot)",
+        ),
+        "P6 PostOnly lifecycle",
+    )
+    assert "FinishKvafStreamingBatchGet" not in post
+
+    # The score buffer must be released before the later CQ witness.  The
+    # source also retains the immediate `Emit` branch for the P3 control
+    # binary, so inspect only the P6 conditional branch.
+    p6_start = vector.index("streamingKvafHook_.ScanAndCompactTile")
+    p6_branch = vector[p6_start:vector.index("DataCopyExtParams copyOutParams", p6_start)]
+    _ordered(
+        p6_branch,
+        (
+        "streamingKvafHook_.ScanAndCompactTile",
+        "FetchEventID(HardEvent::S_V)",
+        "SetFlag<HardEvent::S_V>",
+        "WaitFlag<HardEvent::S_V>",
+        "streamingKvafHook_.ProgressOwnPostAndCq",
+        "streamingKvafHook_.ObserveCqAfterScoreTile",
+        ),
+        "P6 score-UB release",
+    )
+    assert "BeginKvafStreamingBatchGet" not in p6_branch
+
+    # The isolated build must retain the canonical macro derivation header;
+    # raw mode definitions alone silently preprocess the full P6 closure out.
+    for required in (
+        'cat "${STREAMING_LI_DIR}/op_kernel/a5_streaming_quant_li_get_hook_mode.h"',
+        "streaming LI staged full-post closure derivation mismatch",
+        "streaming LI staged CandidateSeed derivation mismatch",
+    ):
+        assert required in build, required
+
+    print(
+        "P6_CANDIDATE_SEED_CONTRACT_PASS "
+        "scheduler=worker_local_double_microbatch fixed_get_core=0 "
+        "score_seam=scan_compact_only post=opportunity_only cq=nonblocking"
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -120,9 +120,16 @@ POST_CLOSURE_MODE_TO_BUILD_VALUE = {
     "empty_shell": "0",
     "full": "1",
 }
+POST_SCHEDULER_MODE_ENV = "P3_POST_SCHEDULER_MODE"
+POST_SCHEDULER_MODE_TO_BUILD_VALUE = {
+    "not_applicable": "0",
+    "immediate": "0",
+    "candidate_seed": "1",
+}
 SCORE_WORKSPACE_SENTINEL = -0x3A5A5A5A
 TILE_RECEIPT_SENTINEL = -1
 TILE_RECEIPT_WORDS = 16
+STREAMING_TELEMETRY_COLUMNS = 18
 TILE_SCORE_WIDTH = 128
 TILE_RECEIPT_CONTRACT_VERSION = 1
 STREAMING_EPOCH = 0x50330001
@@ -419,6 +426,34 @@ def _resolve_post_closure_mode(inline_mode: str) -> str:
     return mode
 
 
+def _resolve_post_scheduler_mode(
+    inline_mode: str, post_closure_mode: str
+) -> str:
+    """Resolve the provenance-bound scheduling closure.
+
+    This is not a runtime policy switch.  It names the artifact that was
+    compiled: P3's immediate score-seam post or P6's CandidateSeed-at-later-
+    seam schedule.  Keeping it here prevents a stale OPP from silently being
+    used for a timing or correctness claim.
+    """
+    raw_mode = os.getenv(POST_SCHEDULER_MODE_ENV)
+    if inline_mode != "post" or post_closure_mode != "full":
+        if raw_mode not in (None, "", "not_applicable"):
+            raise RuntimeError(
+                f"{POST_SCHEDULER_MODE_ENV} is valid only with "
+                "P3_INLINE_MODE=post and P3_POST_CLOSURE_MODE=full; "
+                f"got {raw_mode!r}"
+            )
+        return "not_applicable"
+    mode = raw_mode or "immediate"
+    if mode not in ("immediate", "candidate_seed"):
+        raise RuntimeError(
+            f"set {POST_SCHEDULER_MODE_ENV} to immediate or candidate_seed "
+            f"for full inline post; got {mode!r}"
+        )
+    return mode
+
+
 def _read_target_provenance(
     vendor: Path, expected_publication_mode: str, expected_inline_mode: str
 ) -> dict[str, str]:
@@ -460,6 +495,8 @@ def _read_target_provenance(
         "inline_mode_value",
         "post_closure_mode",
         "post_closure_mode_value",
+        "post_scheduler_mode",
+        "post_scheduler_mode_value",
         "kvaf_closure",
         "kvaf_source_head",
         "abi",
@@ -543,6 +580,26 @@ def _read_target_provenance(
             f"mode={expected_post_closure_mode!r} "
             f"actual={values['post_closure_mode_value']!r} "
             f"expected={expected_post_closure_value!r}"
+        )
+    expected_post_scheduler_mode = _resolve_post_scheduler_mode(
+        expected_inline_mode, expected_post_closure_mode
+    )
+    if values["post_scheduler_mode"] != expected_post_scheduler_mode:
+        raise RuntimeError(
+            "isolated P3 target OPP has an unexpected post scheduler mode: "
+            f"actual={values['post_scheduler_mode']!r} "
+            f"expected={expected_post_scheduler_mode!r}"
+        )
+    expected_post_scheduler_value = POST_SCHEDULER_MODE_TO_BUILD_VALUE[
+        expected_post_scheduler_mode
+    ]
+    if values["post_scheduler_mode_value"] != expected_post_scheduler_value:
+        raise RuntimeError(
+            "isolated P3 target provenance maps post scheduler mode to the "
+            "wrong compile-time value: "
+            f"mode={expected_post_scheduler_mode!r} "
+            f"actual={values['post_scheduler_mode_value']!r} "
+            f"expected={expected_post_scheduler_value!r}"
         )
     expected_kvaf_closure = (
         "staged" if expected_post_closure_mode == "full" else "absent"
@@ -927,7 +984,7 @@ def _prove_safe_hook_control(
     """Print one compact proof after the target stream has completed."""
     _assert_no_post_transaction_unchanged(transaction, snapshot)
     telemetry = outputs[7].detach().cpu().contiguous()
-    expected_shape = (QUEUE_COUNT, 14)
+    expected_shape = (QUEUE_COUNT, STREAMING_TELEMETRY_COLUMNS)
     if tuple(telemetry.shape) != expected_shape:
         raise RuntimeError(
             "unexpected P3 telemetry shape: "
@@ -1237,6 +1294,7 @@ def run_target_equivalence() -> dict[str, Any]:
         f"publication_mode={target_provenance['publication_mode']} "
         f"inline_mode={target_provenance['inline_mode']} "
         f"post_closure_mode={target_provenance['post_closure_mode']} "
+        f"post_scheduler_mode={target_provenance['post_scheduler_mode']} "
         f"kvaf_closure={target_provenance['kvaf_closure']} "
         "inline_hccp=absent ready=1 "
         f"vendor={target_vendor} opapi={target_opapi}",

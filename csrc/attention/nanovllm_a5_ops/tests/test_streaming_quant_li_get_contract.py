@@ -204,7 +204,6 @@ def require_source_contract() -> None:
         "#elif A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE", audit_branch_start
     )
     audit_seam = vector[audit_branch_start:audit_branch_end]
-    post_seam = vector[audit_branch_end:vector.index("#endif", post_emit)]
     _assert_in_order(
         audit_seam,
         [
@@ -219,13 +218,15 @@ def require_source_contract() -> None:
         ],
         "audit Vector/Scalar score-tile lifetime",
     )
-    # The full Post hook has the same score-tile ownership envelope as audit:
-    # its Scalar ExactScan may not begin before Vector has produced `outBase`,
-    # and Vector may not recycle the ping-pong tile before the scalar reader
-    # is done.  This source check is deliberately structural rather than
-    # matching a stale explanatory comment.
+    # The immediate P3 Post control remains available in the source, while
+    # P6 inserts an additional compile-time CandidateSeed branch before it.
+    # Check the direct branch's lifetime using a tail that starts at its own
+    # callsite rather than stopping at the first nested preprocessor endif.
+    direct_prefix = vector.rfind("PipeBarrier<PIPE_V>();", 0, post_emit)
+    direct_suffix = vector.index("int64_t vec1OutGmOffset", post_emit)
+    direct_post_seam = vector[direct_prefix:direct_suffix]
     _assert_in_order(
-        post_seam,
+        direct_post_seam,
         [
             "PipeBarrier<PIPE_V>();",
             "FetchEventID(HardEvent::V_S)",
@@ -236,7 +237,7 @@ def require_source_contract() -> None:
             "SetFlag<HardEvent::S_V>",
             "WaitFlag<HardEvent::S_V>",
         ],
-        "post Vector/Scalar score-tile lifetime",
+        "immediate-post Vector/Scalar score-tile lifetime",
     )
     assert "BatchMulWeightAndReduceSum" in vector
     assert "ProcessTopK" in vector
@@ -261,8 +262,11 @@ def require_source_contract() -> None:
     for token in (
         "NEEDS_P3_POST_KVAF=0",
         "NANOVLLM_A5_STREAMING_LI_GET_POST_CLOSURE_MODE",
+        "NANOVLLM_A5_STREAMING_LI_GET_POST_SCHEDULER",
         "P3 post closure mode:",
+        "P6 post scheduler:",
         "post_closure_mode=${STREAMING_LI_POST_CLOSURE_MODE_NAME}",
+        "post_scheduler_mode=${STREAMING_LI_POST_SCHEDULER_MODE_NAME}",
         "P3 inline=audit closure must contain only the audit observer",
         "P3 generated audit closure: score-only verified=1",
         "kvaf_closure=${P3_KVAF_CLOSURE}",
@@ -274,7 +278,7 @@ def require_source_contract() -> None:
         "SCORE_WORKSPACE_INDEX = 21", "TILE_RECEIPTS_INDEX = 22",
         "STREAMING_EPOCH_INDEX = 23", "SCORE_WORKSPACE_OUTPUT_INDEX = 9",
         "TILE_RECEIPTS_OUTPUT_INDEX = 10", "STREAMING_TILE_RECEIPT_WORDS = 16",
-        "STREAMING_TELEMETRY_COLUMNS = 14",
+        "STREAMING_TELEMETRY_COLUMNS = 18",
     ):
         assert token in tiling_header, token
     for token in (
@@ -325,6 +329,7 @@ def require_source_contract() -> None:
     ).read_text(encoding="utf-8")
     assert '"kvaf_closure"' in target_adapter
     assert "POST_CLOSURE_MODE_ENV" in target_adapter
+    assert "POST_SCHEDULER_MODE_ENV" in target_adapter
     assert '"staged" if expected_post_closure_mode == "full" else "absent"' in target_adapter
     assert "P3_POST_CLOSURE_MODE=empty_shell" in target_adapter
     assert "P3_PHYSICAL_NPU_ID" in target_adapter

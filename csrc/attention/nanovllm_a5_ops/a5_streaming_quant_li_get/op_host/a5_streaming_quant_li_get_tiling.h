@@ -142,9 +142,10 @@ constexpr uint32_t BLOCK_SIZE_FACTOR = 16;
 constexpr uint32_t SPARSE_MODE_LOWER = 3;
 constexpr uint32_t METADATA_LIMIT = 1024;
 // Keep the graph-visible tensor shape synchronized with the device hook's
-// `streaming_li_get::kTelemetryColumns`: the final column is the causal
-// C8-score-while-CQ-pending overlap witness.
-constexpr uint32_t STREAMING_TELEMETRY_COLUMNS = 14;
+// `streaming_li_get::kTelemetryColumns`: columns 0..13 retain the P3
+// lifecycle contract, while 14..17 prove P6 CandidateSeed compact/defer and
+// later-seam Post timing.  This telemetry is not a worker/core partition.
+constexpr uint32_t STREAMING_TELEMETRY_COLUMNS = 18;
 constexpr uint32_t STREAMING_KVAF_CONTROL_WORDS = 16;
 constexpr uint32_t STREAMING_TILE_RECEIPT_WORDS = 16;
 
