@@ -80,6 +80,21 @@ def main() -> None:
     for required in ("ResolveCandidateIdentity", "kCandidateWordObject"):
         assert required in append, required
 
+    # P6 may not grow the near-full C8 Vector-UB closure. Its two 64-record
+    # CandidateSeed microbatches exactly reuse P3's legacy 2 KiB source-offset
+    # scratch; descriptor capacity remains a separate 256-request transport
+    # limit.
+    for required in (
+        "kCandidateMicrobatchCapacity = 64U",
+        "kCandidateMicrobatchCapacity <= kMaxWaveRequests",
+        "P6 CandidateSeed ring must exactly reuse P5 source-offset UB scratch",
+        "count >= kCandidateMicrobatchCapacity",
+        "kCandidateMicrobatchCapacity * kCandidateSeedWords",
+        "streamingCandidateSeedsUb_ = streamingSourceOffsetsBuf_.Get<uint32_t>()",
+    ):
+        assert required in hook or required in vector, required
+    assert "streamingCandidateSeedsBuf_" not in vector
+
     progress = _between(hook, "void ProgressOwnPostAndCq(", "void ObserveCqAfterScoreTile()")
     _ordered(
         progress,
@@ -136,7 +151,8 @@ def main() -> None:
 
     print(
         "P6_CANDIDATE_SEED_CONTRACT_PASS "
-        "scheduler=worker_local_double_microbatch fixed_get_core=0 "
+        "scheduler=worker_local_double_microbatch candidate_microbatch=64 "
+        "descriptor_capacity=256 fixed_get_core=0 "
         "score_seam=scan_compact_only post=opportunity_only cq=nonblocking"
     )
 

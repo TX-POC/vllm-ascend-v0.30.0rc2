@@ -213,15 +213,15 @@ private:
     LocalTensor<uint8_t> streamingLeaseUb_;
     TBuf<TPosition::VECCALC> streamingClaimBuf_;
     LocalTensor<uint8_t> streamingClaimUb_;
+    // P3 uses this 2 KiB allocation as uint64 source offsets. P6 aliases the
+    // same bytes as two 64x4 uint32 CandidateSeed microbatches. The two paths
+    // are compile-time exclusive: P6 never executes legacy Emit(), so the
+    // aliases cannot overlap in one invocation.
     TBuf<TPosition::VECCALC> streamingSourceOffsetsBuf_;
-    LocalTensor<uint64_t> streamingSourceOffsetsUb_;
 #if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
-    // Two bounded CandidateSeed microbatches.  This belongs to every normal
-    // C8 worker and is not a Get-core allocation.  A seed is four uint32
-    // words: row, score-source S, pool, object.  The private slot and copy
-    // descriptor are intentionally deferred until a queue is actually leased.
-    TBuf<TPosition::VECCALC> streamingCandidateSeedsBuf_;
     LocalTensor<uint32_t> streamingCandidateSeedsUb_;
+#else
+    LocalTensor<uint64_t> streamingSourceOffsetsUb_;
 #endif
 #endif
 
@@ -306,15 +306,19 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     streamingLeaseUb_ = streamingLeaseBuf_.Get<uint8_t>();
     pipe->InitBuffer(streamingClaimBuf_, 32U);
     streamingClaimUb_ = streamingClaimBuf_.Get<uint8_t>();
+#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+    // Keep P6 at P5's exact source-offset scratch footprint. Do not add a
+    // separate CandidateSeed TBuf here: that shifts the official C8 buffers
+    // beyond the Vector UB budget before any HCCP action can run.
+    pipe->InitBuffer(streamingSourceOffsetsBuf_,
+                     streaming_li_get::kCandidateRingSlots *
+                     streaming_li_get::kCandidateMicrobatchCapacity *
+                     streaming_li_get::kCandidateSeedWords * sizeof(uint32_t));
+    streamingCandidateSeedsUb_ = streamingSourceOffsetsBuf_.Get<uint32_t>();
+#else
     pipe->InitBuffer(streamingSourceOffsetsBuf_,
                      streaming_li_get::kMaxWaveRequests * sizeof(uint64_t));
     streamingSourceOffsetsUb_ = streamingSourceOffsetsBuf_.Get<uint64_t>();
-#if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
-    pipe->InitBuffer(streamingCandidateSeedsBuf_,
-                     streaming_li_get::kCandidateRingSlots *
-                     streaming_li_get::kMaxWaveRequests *
-                     streaming_li_get::kCandidateSeedWords * sizeof(uint32_t));
-    streamingCandidateSeedsUb_ = streamingCandidateSeedsBuf_.Get<uint32_t>();
 #endif
 #endif
 
@@ -445,10 +449,14 @@ __aicore__ inline void QLIVector<QLIT>::InitStreamingKvafHook(
             streamingLeaseUb_.GetPhyAddr()),
         reinterpret_cast<__ubuf__ streaming_li_get::PrivateArenaClaimResult *>(
             streamingClaimUb_.GetPhyAddr()),
-        reinterpret_cast<__ubuf__ uint64_t *>(streamingSourceOffsetsUb_.GetPhyAddr()),
 #if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
+        // The P6 CandidateSeed pipeline reuses P3's 2 KiB scratch. The
+        // legacy source-offset path is compile-time exclusive from P6, so
+        // both typed views deliberately name this same allocation.
+        reinterpret_cast<__ubuf__ uint64_t *>(streamingCandidateSeedsUb_.GetPhyAddr()),
         reinterpret_cast<__ubuf__ uint32_t *>(streamingCandidateSeedsUb_.GetPhyAddr()),
 #else
+        reinterpret_cast<__ubuf__ uint64_t *>(streamingSourceOffsetsUb_.GetPhyAddr()),
         nullptr,
 #endif
         static_cast<uint32_t>(blockId_));

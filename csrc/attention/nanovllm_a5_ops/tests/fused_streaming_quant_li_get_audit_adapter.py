@@ -31,10 +31,12 @@ from streaming_quant_li_get_target_adapter import (
     INT64_MAX,
     INLINE_MODE_ENV,
     PUBLICATION_MODE_ENV,
+    RUNNER_EXPECTED_HEAD_ENV,
     REFERENCE_OPP_ENV,
     SOURCE_TOKENS,
     SPARSE_COUNT,
     TARGET_OPP_ENV,
+    TARGET_EXPECTED_OPP_SOURCE_HEAD_ENV,
     TILE_RECEIPT_CONTRACT_VERSION,
     TILE_RECEIPT_SENTINEL,
     TILE_SCORE_WIDTH,
@@ -46,6 +48,7 @@ from streaming_quant_li_get_target_adapter import (
     _make_no_post_transaction,
     _official_metadata,
     _expected_score_source_lens,
+    _expected_opp_source_head,
     _prepend_unique_path,
     _require_a5_npu,
     _require_source_matched_official_c8_ops,
@@ -1153,8 +1156,8 @@ def run_p4_fused_audit() -> dict[str, Any]:
         "P3_TARGET_PROVENANCE "
         f"source_root={target_provenance['source_root']} "
         f"source_head={target_provenance['source_head']} "
-        "expected_head="
-        f"{os.getenv('P3_TARGET_EXPECTED_SOURCE_HEAD', '<unset>')} "
+        f"expected_opp_source_head={_expected_opp_source_head(TARGET_EXPECTED_OPP_SOURCE_HEAD_ENV, 'P3_TARGET_EXPECTED_SOURCE_HEAD', 'target')[0] or '<unset>'} "
+        f"runner_head={os.getenv(RUNNER_EXPECTED_HEAD_ENV, '<unset>')} "
         f"source_clean={target_provenance['source_clean']} "
         f"publication_mode={target_provenance['publication_mode']} "
         f"inline_mode={target_provenance['inline_mode']} "

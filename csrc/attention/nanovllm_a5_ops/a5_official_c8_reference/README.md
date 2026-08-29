@@ -38,9 +38,13 @@ its own DSO.
 The OPP builder writes `P3_REFERENCE_PROVENANCE` in its vendor directory.  It
 contains the exact source checkout and Git revision used for the two official
 operators.  At runtime the target adapter rejects the bundle unless this
-revision matches `P3_REFERENCE_EXPECTED_SOURCE_HEAD` when that variable is
-set.  This prevents a stale editable worktree from silently becoming the
-reference again.
+revision matches `P3_REFERENCE_EXPECTED_OPP_SOURCE_HEAD` when that variable
+is set.  The paired helper
+`tests/resolve_streaming_li_get_artifacts.sh` reads this value directly from
+the selected artifact manifests and sets it with the target artifact's source
+head.  It also records the Python runner revision separately as
+`P3_RUNNER_EXPECTED_HEAD`.  A test-only commit therefore cannot masquerade as
+a stale compiled OPP, while selecting the wrong artifact still fails closed.
 
 This component is only for a bitwise C8 reference test.  It does not report
 H2D bandwidth and it does not make any product execution-path change.

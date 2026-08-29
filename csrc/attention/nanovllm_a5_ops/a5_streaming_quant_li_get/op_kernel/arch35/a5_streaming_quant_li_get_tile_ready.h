@@ -72,6 +72,19 @@ constexpr uint32_t kTelemetryColumns = 18U;
 // not physical core partitions.  Every normal C8 worker may own/use them.
 constexpr uint32_t kCandidateSeedWords = 4U;
 constexpr uint32_t kCandidateRingSlots = 2U;
+// The Direct-HCCP descriptor still supports 256 requests per wave. The
+// score-seam hand-off must be smaller: C8's 2048-TopK closure is already near
+// the 256 KiB Vector UB limit, so every worker keeps two 64-seed microbatches
+// in the *existing* 2 KiB legacy scratch allocation. A full seed ring is not
+// a correctness requirement: excess cold candidates are deliberately
+// deferred to Guaranteed Recall after exact Top-K.
+constexpr uint32_t kCandidateMicrobatchCapacity = 64U;
+static_assert(kCandidateMicrobatchCapacity <= kMaxWaveRequests,
+              "CandidateSeed microbatch must fit a KVAF descriptor wave");
+static_assert(kCandidateRingSlots * kCandidateMicrobatchCapacity *
+                      kCandidateSeedWords * sizeof(uint32_t) ==
+                  kMaxWaveRequests * sizeof(uint64_t),
+              "P6 CandidateSeed ring must exactly reuse P5 source-offset UB scratch");
 constexpr uint32_t kCandidateWordRow = 0U;
 constexpr uint32_t kCandidateWordSource = 1U;
 constexpr uint32_t kCandidateWordPool = 2U;
@@ -376,7 +389,8 @@ public:
             for (int32_t inTile = 0; inTile < validInTile; ++inTile) {
                 const uint32_t source = static_cast<uint32_t>(cur_s2_idx + inTile);
                 const uint16_t score = out_base.GetValue(outRowOffset + inTile);
-                if (slot == kCandidateInvalidSlot || count >= kMaxWaveRequests) {
+                if (slot == kCandidateInvalidSlot ||
+                    count >= kCandidateMicrobatchCapacity) {
                     // We still evaluate the predicate so overflow is visible
                     // and, more importantly, never affects exact C8 Top-K.
                     if (IsCandidateWithoutMutation(score, row, source)) {
@@ -558,7 +572,7 @@ private:
     __aicore__ inline __ubuf__ uint32_t *CandidateSlot(uint32_t slot)
     {
         return candidateSeeds_ + static_cast<uint64_t>(slot) *
-            kMaxWaveRequests * kCandidateSeedWords;
+            kCandidateMicrobatchCapacity * kCandidateSeedWords;
     }
 
     __aicore__ inline uint32_t FindFreeCandidateSlot() const

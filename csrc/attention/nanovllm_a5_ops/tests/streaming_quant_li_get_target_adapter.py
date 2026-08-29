@@ -47,7 +47,13 @@ Before importing this module, build the two isolated OPPs and set:
 
 * ``NANOVLLM_A5_REFERENCE_C8_OPP`` to the source-matched official C8 OPP;
 * ``NANOVLLM_A5_STREAMING_LI_OPP`` to the derived P3 OPP; and
-* ``P3_REFERENCE_EXPECTED_SOURCE_HEAD`` to the current P3 source revision.
+* ``P3_REFERENCE_EXPECTED_OPP_SOURCE_HEAD`` to the source revision recorded
+  in the reference OPP manifest;
+* ``P3_TARGET_EXPECTED_OPP_SOURCE_HEAD`` to the source revision recorded in
+  the target OPP manifest; and
+* optionally ``P3_RUNNER_EXPECTED_HEAD`` to the Python-test revision. This is
+  reported for reproducibility only; a test-only commit must not force an OPP
+  rebuild or be compared with an artifact's source closure.
 
 The reference is then launched through a standalone ACLNN bridge compiled
 from this worktree's ``csrc/torch_binding.cpp`` contract.  In particular, this
@@ -92,8 +98,14 @@ STREAMING_CONTROL_VERSION = 1
 INT64_MAX = (1 << 63) - 1
 REFERENCE_OPP_ENV = "NANOVLLM_A5_REFERENCE_C8_OPP"
 TARGET_OPP_ENV = "NANOVLLM_A5_STREAMING_LI_OPP"
-REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"
-TARGET_EXPECTED_HEAD_ENV = "P3_TARGET_EXPECTED_SOURCE_HEAD"
+REFERENCE_EXPECTED_OPP_SOURCE_HEAD_ENV = "P3_REFERENCE_EXPECTED_OPP_SOURCE_HEAD"
+TARGET_EXPECTED_OPP_SOURCE_HEAD_ENV = "P3_TARGET_EXPECTED_OPP_SOURCE_HEAD"
+# New launch scripts use explicit OPP-source variables. The legacy fallback
+# remains strict for existing scripts, but is deliberately not used by new
+# commands because it was too easy to put the Python-runner head there.
+LEGACY_REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"
+LEGACY_TARGET_EXPECTED_HEAD_ENV = "P3_TARGET_EXPECTED_SOURCE_HEAD"
+RUNNER_EXPECTED_HEAD_ENV = "P3_RUNNER_EXPECTED_HEAD"
 KVAF_EXPECTED_HEAD_ENV = "P3_KVAF_EXPECTED_SOURCE_HEAD"
 REFERENCE_PROVENANCE_NAME = "P3_REFERENCE_PROVENANCE"
 TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"
@@ -354,11 +366,17 @@ def _read_reference_provenance(vendor: Path) -> dict[str, str]:
             "reference OPP provenance kind is not source-matched official C8: "
             f"got={values['kind']!r}"
         )
-    expected_head = os.getenv(REFERENCE_EXPECTED_HEAD_ENV)
+    expected_head, expected_env = _expected_opp_source_head(
+        REFERENCE_EXPECTED_OPP_SOURCE_HEAD_ENV,
+        LEGACY_REFERENCE_EXPECTED_HEAD_ENV,
+        "reference",
+    )
     if expected_head and values["source_head"] != expected_head:
         raise RuntimeError(
-            "reference OPP was built from a different source revision: "
-            f"actual={values['source_head']} expected={expected_head}"
+            "reference OPP source closure differs from the requested artifact: "
+            f"actual={values['source_head']} expected={expected_head} "
+            f"expected_env={expected_env}; use {RUNNER_EXPECTED_HEAD_ENV} "
+            "for a test-only worktree revision"
         )
     return values
 
@@ -380,6 +398,32 @@ def _expected_target_hook_mode() -> tuple[str, bool]:
         f"{ALLOW_HOOK_OFF_BASELINE_ENV} must be unset, '0', or '1'; "
         f"got {raw_value!r}"
     )
+
+
+def _expected_opp_source_head(
+    explicit_env: str, legacy_env: str, role: str
+) -> tuple[str, str]:
+    """Return an OPP source closure, never a Python-runner worktree head.
+
+    The OPP may legitimately outlive a diagnostic-only test commit. Keeping
+    the identities separate prevents a test-only update from falsely looking
+    like a stale compiled kernel, while conflicting explicit/legacy values
+    still fail before the first ACLNN call.
+    """
+    explicit = os.getenv(explicit_env, "")
+    legacy = os.getenv(legacy_env, "")
+    if explicit and legacy and explicit != legacy:
+        raise RuntimeError(
+            f"conflicting {role} OPP source expectations: "
+            f"{explicit_env}={explicit} {legacy_env}={legacy}; "
+            f"set only {explicit_env}, and use {RUNNER_EXPECTED_HEAD_ENV} "
+            "for the Python-test revision"
+        )
+    if explicit:
+        return explicit, explicit_env
+    if legacy:
+        return legacy, legacy_env
+    return "", "<unset>"
 
 
 def _resolve_publication_mode() -> str:
@@ -523,11 +567,17 @@ def _read_target_provenance(
             "isolated P3 target provenance contains an unexpected operator set: "
             f"operators={values['operators']!r}"
         )
-    expected_head = os.getenv(TARGET_EXPECTED_HEAD_ENV)
+    expected_head, expected_env = _expected_opp_source_head(
+        TARGET_EXPECTED_OPP_SOURCE_HEAD_ENV,
+        LEGACY_TARGET_EXPECTED_HEAD_ENV,
+        "target",
+    )
     if expected_head and values["source_head"] != expected_head:
         raise RuntimeError(
-            "isolated P3 target OPP was built from a different source revision: "
-            f"actual={values['source_head']} expected={expected_head}"
+            "isolated P3 target OPP source closure differs from the requested artifact: "
+            f"actual={values['source_head']} expected={expected_head} "
+            f"expected_env={expected_env}; use {RUNNER_EXPECTED_HEAD_ENV} "
+            "for a test-only worktree revision"
         )
     if values["source_clean"] != "1":
         raise RuntimeError(
@@ -666,7 +716,8 @@ def _require_source_matched_official_c8_ops(
         "implementation=standalone_source_opp "
         f"source_root={provenance['source_root']} "
         f"source_head={provenance['source_head']} "
-        f"expected_head={os.getenv(REFERENCE_EXPECTED_HEAD_ENV, '<unset>')} "
+        f"expected_opp_source_head={_expected_opp_source_head(REFERENCE_EXPECTED_OPP_SOURCE_HEAD_ENV, LEGACY_REFERENCE_EXPECTED_HEAD_ENV, 'reference')[0] or '<unset>'} "
+        f"runner_head={os.getenv(RUNNER_EXPECTED_HEAD_ENV, '<unset>')} "
         "ready=1 "
         f"vendor={reference_vendor} opapi={reference_opapi}",
         flush=True,
@@ -1289,7 +1340,8 @@ def run_target_equivalence() -> dict[str, Any]:
         "P3_TARGET_PROVENANCE "
         f"source_root={target_provenance['source_root']} "
         f"source_head={target_provenance['source_head']} "
-        f"expected_head={os.getenv(TARGET_EXPECTED_HEAD_ENV, '<unset>')} "
+        f"expected_opp_source_head={_expected_opp_source_head(TARGET_EXPECTED_OPP_SOURCE_HEAD_ENV, LEGACY_TARGET_EXPECTED_HEAD_ENV, 'target')[0] or '<unset>'} "
+        f"runner_head={os.getenv(RUNNER_EXPECTED_HEAD_ENV, '<unset>')} "
         f"source_clean={target_provenance['source_clean']} "
         f"publication_mode={target_provenance['publication_mode']} "
         f"inline_mode={target_provenance['inline_mode']} "

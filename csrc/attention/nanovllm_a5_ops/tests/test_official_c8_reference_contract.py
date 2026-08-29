@@ -63,16 +63,22 @@ def require_source_matched_reference_contract() -> None:
     assert "import vllm_ascend" not in adapter
     assert "a5_dsa_registration" not in adapter
     assert 'REFERENCE_OPP_ENV = "NANOVLLM_A5_REFERENCE_C8_OPP"' in adapter
-    assert 'REFERENCE_EXPECTED_HEAD_ENV = "P3_REFERENCE_EXPECTED_SOURCE_HEAD"' in adapter
+    assert 'REFERENCE_EXPECTED_OPP_SOURCE_HEAD_ENV = "P3_REFERENCE_EXPECTED_OPP_SOURCE_HEAD"' in adapter
+    assert 'RUNNER_EXPECTED_HEAD_ENV = "P3_RUNNER_EXPECTED_HEAD"' in adapter
+    artifact_env = (OPS_ROOT / "tests" / "resolve_streaming_li_get_artifacts.sh").read_text()
+    assert "P3_REFERENCE_EXPECTED_OPP_SOURCE_HEAD" in artifact_env
+    assert "P3_TARGET_EXPECTED_OPP_SOURCE_HEAD" in artifact_env
+    assert "P3_RUNNER_EXPECTED_HEAD" in artifact_env
+    assert "unset P3_REFERENCE_EXPECTED_SOURCE_HEAD P3_TARGET_EXPECTED_SOURCE_HEAD" in artifact_env
     assert "P3_REFERENCE_PROVENANCE" in adapter
     assert "ASCEND_CUSTOM_OPP_PATH" in adapter
     assert "nanovllm_official_c8_reference" in adapter
     # Target hardware selection must be explicit.  A single-card
-    # ASCEND_VISIBLE_DEVICES mapping would turn physical card 7 into npu:0
-    # and make the validation log ambiguous.
+    # ASCEND_RT_VISIBLE_DEVICES deliberately maps physical card 7 to logical
+    # npu:0, and the adapter must print both identities in the validation log.
     assert 'TARGET_NPU_ENV = "P3_NPU_ID"' in adapter
     assert 'torch.device(f"npu:{requested_id}")' in adapter
-    assert "unset ASCEND_VISIBLE_DEVICES" in adapter
+    assert "ASCEND_RT_VISIBLE_DEVICES" in adapter
     assert "P3_TARGET_NPU" in adapter
     # Keep target-call boundaries visible in remote timeout logs.  A derived
     # OPP launch may be asynchronous, so call-return and synchronize markers

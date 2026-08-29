@@ -658,8 +658,9 @@ def _apply_post_exercise(
     ``all_busy`` retains a valid streaming control with every queue held.
     Candidate-seed P6 still observes score tiles in this mode, so it is not a
     hook-off control.
-    ``threshold_off`` leaves a queue free; it reaches the hook and its SIMT
-    acquire/release path, but rejects every score before private claim/Begin.
+    ``threshold_off`` leaves a queue free. P6 may still scan exact scores,
+    but it creates no CandidateSeed and therefore performs no lease, private
+    claim, descriptor write, Post or CQ action.
     ``full`` is the real thresholded cold-candidate Post/CQ path.
     """
     if mode == "hook_off":
@@ -712,9 +713,7 @@ def _assert_non_payload_mode(
         common["all_busy_kept_leases"] = summary["leases_nonzero"] == transaction[
             "queue_leases"
         ].numel()
-        common["all_busy_skipped_hook"] = summary["tile_ready_calls"] == 0
     elif mode == "threshold_off":
-        common["threshold_off_entered_hook"] = summary["tile_ready_calls"] > 0
         common["threshold_off_released_lease"] = summary["leases_nonzero"] == 0
         common["threshold_off_no_cq"] = summary["lease_released"] == 0
     else:
@@ -884,6 +883,9 @@ def main() -> int:
         "P3_POST_PAYLOAD_CONFIG "
         f"reference_head={reference_provenance['source_head']} "
         f"target_head={target_provenance['source_head']} "
+        f"reference_opp_expected={os.getenv(target.REFERENCE_EXPECTED_OPP_SOURCE_HEAD_ENV, '<unset>')} "
+        f"target_opp_expected={os.getenv(target.TARGET_EXPECTED_OPP_SOURCE_HEAD_ENV, '<unset>')} "
+        f"runner_head={os.getenv(target.RUNNER_EXPECTED_HEAD_ENV, '<unset>')} "
         f"kvaf_head={target_provenance['kvaf_source_head']} "
         f"inline={target_provenance['inline_mode']} "
         f"publication={target_provenance['publication_mode']} "
@@ -1052,7 +1054,8 @@ def main() -> int:
                 print(
                     "P6_CANDIDATE_SEED_PIPELINE_STRICT_PASS "
                     "topk=bitwise score_source_lens=exact payload=byte_exact "
-                    "persistent_mapping=unchanged fixed_get_core=0 "
+                    "persistent_mapping=unchanged candidate_microbatch=64 "
+                    "descriptor_capacity=256 fixed_get_core=0 "
                     f"seeds_compacted={terminal['candidate_seeds_compacted']} "
                     f"posts_from_prior_tile={terminal['candidate_posts_from_prior_tile']} "
                     f"tail_drains={terminal['candidate_tail_drains']} "

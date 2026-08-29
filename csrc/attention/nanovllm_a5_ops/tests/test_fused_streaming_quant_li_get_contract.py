@@ -65,7 +65,10 @@ def main() -> int:
         assert forbidden not in audit, forbidden
     assert "kAuditScoreReceipt" not in post
     assert "AuditScoreDecision" not in post
-    assert "A5_STREAMING_LI_GET_INLINE_MODE == 2" in post
+    # The post header is included through the generated mode header. It must
+    # depend on the derived full-closure guard, not repeat the raw inline-mode
+    # expression (which is intentionally absent from this translation unit).
+    assert "A5_STREAMING_LI_GET_HAS_FULL_POST_CLOSURE" in post
     assert "TryAcquireKvafStreamingBatchGetQueueFromAicore" in post
     assert "BeginKvafStreamingBatchGet" in post
 
@@ -143,7 +146,12 @@ def main() -> int:
         encoding="utf-8"
     )
     assert 'TARGET_PROVENANCE_NAME = "P3_STREAMING_LI_PROVENANCE"' in target_adapter
-    assert 'TARGET_EXPECTED_HEAD_ENV = "P3_TARGET_EXPECTED_SOURCE_HEAD"' in target_adapter
+    assert 'TARGET_EXPECTED_OPP_SOURCE_HEAD_ENV = "P3_TARGET_EXPECTED_OPP_SOURCE_HEAD"' in target_adapter
+    assert 'RUNNER_EXPECTED_HEAD_ENV = "P3_RUNNER_EXPECTED_HEAD"' in target_adapter
+    artifact_env = (OPS / "tests/resolve_streaming_li_get_artifacts.sh").read_text(encoding="utf-8")
+    assert "P3_ARTIFACT_ENV" in artifact_env
+    assert "P3_TARGET_EXPECTED_OPP_SOURCE_HEAD" in artifact_env
+    assert "P3_RUNNER_EXPECTED_HEAD" in artifact_env
     assert '"source_clean"' in target_adapter
     assert "_read_target_provenance" in target_adapter
     assert 'INLINE_MODE_ENV = "P3_INLINE_MODE"' in target_adapter
