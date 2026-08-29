@@ -66,7 +66,7 @@ DEFAULT_QUEUE_COUNT = 1
 DEFAULT_PRIVATE_ARENA_CAPACITY = 256
 MAX_DENSE_REQUESTS = 256
 MAX_DIAGNOSTIC_SAMPLES = 8
-POST_EXERCISE_MODES = ("all_busy", "threshold_off", "full")
+POST_EXERCISE_MODES = ("hook_off", "all_busy", "threshold_off", "full")
 
 
 # The target ACLNN call is asynchronous.  Keep one compact host-side marker so
@@ -105,7 +105,9 @@ def parse_args() -> argparse.Namespace:
         choices=POST_EXERCISE_MODES,
         default="full",
         help=(
-            "all_busy: prove the P3 C8 base path while skipping every post action; "
+            "hook_off: retain the compiled P6 UB layout but reject the runtime "
+            "streaming control before the score seam; "
+            "all_busy: retain a valid control with every queue held; "
             "threshold_off: exercise score observation plus SIMT lease acquire/release "
             "without a candidate or H2D post; full: exercise the real Post/CQ payload path"
         ),
@@ -647,13 +649,27 @@ def _apply_post_exercise(
 ) -> None:
     """Select one device-side closure without changing C8 inputs or output ABI.
 
-    ``all_busy`` makes ``MayNeedScoreObservation`` false, so the same target
-    OPP runs its normal C8 path but bypasses the P3 hook altogether.
+    ``hook_off`` corrupts only the streaming-control magic after KVAF has
+    cold-bound it.  The P6 OPP therefore keeps exactly the same TPipe/UB
+    allocation, but ``Init()`` leaves the hook disabled and C8 must take its
+    normal score/Top-K path.  This distinguishes a static UB-layout failure
+    from an executed score seam without rebuilding the OPP.
+
+    ``all_busy`` retains a valid streaming control with every queue held.
+    Candidate-seed P6 still observes score tiles in this mode, so it is not a
+    hook-off control.
     ``threshold_off`` leaves a queue free; it reaches the hook and its SIMT
     acquire/release path, but rejects every score before private claim/Begin.
     ``full`` is the real thresholded cold-candidate Post/CQ path.
     """
-    if mode == "all_busy":
+    if mode == "hook_off":
+        # `bind_streaming_batch_get_control()` has already filled the control
+        # tensor and linked its graph-static pointers.  Changing only magic
+        # makes the device-side validator reject the hook before any score
+        # seam, lease, private-slot, descriptor, Post or CQ action.  All P6
+        # TPipe allocations remain compiled into the same target binary.
+        transaction["queue_control"][0] = 0
+    elif mode == "all_busy":
         transaction["queue_leases"].fill_(1)
     elif mode == "threshold_off":
         transaction["resident_threshold_valid"].zero_()
@@ -678,7 +694,6 @@ def _assert_non_payload_mode(
     """Assert exactly what the two isolation controls are meant to prove."""
     summary = _probe_summary(transaction, outputs)
     common = {
-        "control_rejected": summary["control_rejected"] == 0,
         "doorbell_posted": summary["doorbell_posted"] == 0,
         "private_claims": summary["private_claims"] == 0,
         "mapped_sources": summary["mapped_sources"] == 0,
@@ -688,6 +703,11 @@ def _assert_non_payload_mode(
         "cq_retired_failed": summary["cq_retired_failed"] == 0,
         "no_pending_cq_score_tiles": summary["score_tiles_with_cq_pending"] == 0,
     }
+    if mode == "hook_off":
+        common["hook_off_control_rejected"] = summary["control_rejected"] > 0
+        common["hook_off_kept_leases"] = summary["leases_nonzero"] == 0
+    else:
+        common["control_rejected"] = summary["control_rejected"] == 0
     if mode == "all_busy":
         common["all_busy_kept_leases"] = summary["leases_nonzero"] == transaction[
             "queue_leases"
