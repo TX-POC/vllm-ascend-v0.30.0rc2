@@ -501,6 +501,27 @@ def _assert_live_oracle(
     producer_stats = outputs[7].cpu()
     get_stats = outputs[8].cpu()
 
+    deferred_ids = torch.nonzero(
+        producer_stats[:, 4] != 0, as_tuple=False
+    ).flatten().tolist()
+    print(
+        "P5_LIVE_C8_TELEMETRY "
+        f"selected={int(producer_stats[:, 0].sum())} "
+        f"hit={int(producer_stats[:, 1].sum())} "
+        f"miss={int(producer_stats[:, 2].sum())} "
+        f"enqueued={int(producer_stats[:, 3].sum())} "
+        f"deferred={int(producer_stats[:, 4].sum())} "
+        f"receipt_polls={int(producer_stats[:, 8].sum())} "
+        f"receipt_timeouts={int(producer_stats[:, 9].sum())} "
+        f"deferred_producers={deferred_ids[:8]} "
+        f"get_requested={get_stats[:, 0].tolist()} "
+        f"get_batches={get_stats[:, 1].tolist()} "
+        f"get_errors={get_stats[:, 2].tolist()} "
+        f"cq_cycles={get_stats[:, 4].tolist()} "
+        f"private_ready={int((private_ready == PRIVATE_READY_READY).sum())}",
+        flush=True,
+    )
+
     source_lens = [int(value) for value in inputs["score_source_lens"].cpu().tolist()]
     expected_total = sum(source_lens)
     expected_per_lane = expected_total // GET_LANE_COUNT

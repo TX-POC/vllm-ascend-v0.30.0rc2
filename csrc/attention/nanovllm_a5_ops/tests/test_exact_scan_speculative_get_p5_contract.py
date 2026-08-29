@@ -471,6 +471,10 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
         self.assertIn(
             "tiling_->pipelineWordsPerRing == kRingWords", kernel
         )
+        self.assertIn("WaitForRingWriteSlot", kernel)
+        self.assertIn("allowConsumerProgress", kernel)
+        self.assertIn("kProducerRingFreePollLimit", kernel)
+        self.assertIn("kPipelineModeParallel", kernel)
 
         # The legacy overlap benchmark imports its allocation shape from the
         # old test module.  It must include cursor storage as well, otherwise

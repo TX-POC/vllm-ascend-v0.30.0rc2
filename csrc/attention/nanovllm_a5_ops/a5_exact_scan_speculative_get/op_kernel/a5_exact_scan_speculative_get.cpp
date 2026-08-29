@@ -107,9 +107,19 @@ constexpr uint32_t kSerialGatePollLimit = 16U * 1024U * 1024U;
 // suppresses a speculative request; Guaranteed Recall retains exactness.
 constexpr uint32_t kReceiptReadyPollLimit = 16U * 1024U * 1024U;
 constexpr uint32_t kReceiptPollBarrierStride = 256U;
+// ExactScoreScan can produce one 128-source C8 tile before Direct-HCCP has
+// retired the preceding 64-record SPSC burst.  In the normal parallel path a
+// full producer slot is therefore backpressure, not a candidate-loss event.
+// The wait remains bounded: a genuinely stalled Get lane must fail closed so
+// GuaranteedRecall, rather than an unbounded AIV spin, preserves correctness.
+constexpr uint32_t kProducerRingFreePollLimit = 16U * 1024U * 1024U;
+constexpr uint32_t kProducerRingFreePollBarrierStride = 256U;
 static_assert((kReceiptPollBarrierStride &
                (kReceiptPollBarrierStride - 1U)) == 0U,
               "receipt polling barrier stride must be a power of two");
+static_assert((kProducerRingFreePollBarrierStride &
+               (kProducerRingFreePollBarrierStride - 1U)) == 0U,
+              "ring polling barrier stride must be a power of two");
 
 constexpr uint64_t kPipelineModeParallel = 0U;
 constexpr uint64_t kPipelineModeSerialWaitAllClosed = 1U;
@@ -454,13 +464,45 @@ private:
         StoreRingWord(ring.SlotState(slot), epoch);
     }
 
+    // The Get lane clears SlotState only after it has acquired the producer
+    // payload and advanced its private cursor.  A producer may reuse that
+    // slot only after seeing the clear and taking the corresponding DDR
+    // acquire edge.  This wait must be disabled in serial_wait_all_closed:
+    // that reference intentionally does not start its consumers until every
+    // producer has closed, so waiting there would create a circular wait.
+    __aicore__ inline bool WaitForRingWriteSlot(
+        const RingView& ring, uint32_t slot, uint64_t epoch,
+        bool allowConsumerProgress) const
+    {
+        if (LoadRingWord(ring.SlotState(slot)) != epoch) {
+            DataSyncBarrier<MemDsbT::DDR>();
+            return true;
+        }
+        if (!allowConsumerProgress) {
+            return false;
+        }
+        for (uint32_t poll = 0U; poll < kProducerRingFreePollLimit; ++poll) {
+            if (LoadRingWord(ring.SlotState(slot)) != epoch) {
+                DataSyncBarrier<MemDsbT::DDR>();
+                return true;
+            }
+            if ((poll & (kProducerRingFreePollBarrierStride - 1U)) ==
+                (kProducerRingFreePollBarrierStride - 1U)) {
+                DataSyncBarrier<MemDsbT::DDR>();
+            }
+        }
+        return false;
+    }
+
     __aicore__ inline bool TryAppendCandidate(
         const RingView& ring, uint32_t* writeSlot, uint32_t* writeCount,
         uint64_t epoch, uint64_t sourceOffset, uint64_t objectOffset,
-        uint64_t candidateSlot, uint64_t* firstPublishCycle)
+        uint64_t candidateSlot, uint64_t* firstPublishCycle,
+        bool allowConsumerProgress)
     {
         if (*writeCount == 0U &&
-            LoadRingWord(ring.SlotState(*writeSlot)) == epoch) {
+            !WaitForRingWriteSlot(ring, *writeSlot, epoch,
+                                  allowConsumerProgress)) {
             return false;
         }
         // The executor deliberately does not let a producer allocate a
@@ -491,10 +533,11 @@ private:
     __aicore__ inline void FlushProducerTail(
         const RingView& ring, uint32_t writeSlot, uint32_t writeCount,
         uint64_t epoch, uint64_t* firstPublishCycle, uint64_t* overflow,
-        uint64_t* deferred)
+        uint64_t* deferred, bool allowConsumerProgress)
     {
         if (writeCount != 0U) {
-            if (LoadRingWord(ring.SlotState(writeSlot)) == epoch) {
+            if (!WaitForRingWriteSlot(ring, writeSlot, epoch,
+                                      allowConsumerProgress)) {
                 *overflow = 1U;
                 for (uint32_t record = 0U; record < writeCount; ++record) {
                     const uint64_t candidateSlot = static_cast<uint64_t>(
@@ -629,6 +672,8 @@ private:
     __aicore__ inline void ProcessExactScanProducer(uint32_t producer)
     {
         const uint64_t epoch = LoadColdEpoch(streamingEpoch_);
+        const bool allowConsumerProgress =
+            LoadColdEpoch(executionMode_) == kPipelineModeParallel;
         WriteRoleTrace(kProducerAivBegin + producer,
                        kRoleTraceExactScanBase + static_cast<int32_t>(producer));
         if (epoch == 0U || tiling_->candidateSeedWords != kCandidateSeedWords ||
@@ -806,7 +851,8 @@ private:
                                         static_cast<uint64_t>(row) *
                                             tiling_->sourceCapacity + source,
                                         compressedObjectOffset, candidateSlot,
-                                        &firstPublishCycle[lane])) {
+                                        &firstPublishCycle[lane],
+                                        allowConsumerProgress)) {
                     laneOverflow[lane] = 1U;
                     WriteGmByPassDCache<int32_t>(
                         CandidateSeedByAbsolute(candidateSlot) +
@@ -824,7 +870,7 @@ private:
             FlushProducerTail(Ring(producer, lane), writeSlot[lane],
                               writeCount[lane], epoch,
                               &firstPublishCycle[lane], &laneOverflow[lane],
-                              &deferred);
+                              &deferred, allowConsumerProgress);
         }
         WriteGmByPassDCache<int32_t>(candidateCounts_ + producer,
                                      static_cast<int32_t>(candidateCount));
