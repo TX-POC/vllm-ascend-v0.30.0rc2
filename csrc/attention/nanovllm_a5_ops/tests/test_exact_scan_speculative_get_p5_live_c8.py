@@ -341,6 +341,81 @@ def _call_p5(inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _require_p5_bridge_abi() -> None:
+    """Reject a stale bridge before it can invoke the P5 host tiler.
+
+    The custom OPP and its Torch bridge are built separately.  A stale bridge
+    previously allocated the legacy ``[124, 232]`` ring state while the P5
+    OPP expected ``[124, 248]`` after the exact descriptor-wave cursor was
+    added.  The host only saw a malformed tensor and returned generic EZ1008.
+    This direct extension query turns that into one explicit, early error.
+    """
+    try:
+        from nanovllm_exact_scan_get import _C as bridge
+        contract = dict(bridge.p5_abi_contract())
+    except (AttributeError, ImportError) as error:
+        raise RuntimeError(
+            "P5 bridge lacks p5_abi_contract; rebuild only the scoped "
+            "a5_exact_scan_speculative_get Torch bridge from this revision"
+        ) from error
+
+    expected = {
+        "abi_version": 3,
+        "producer_count": PRODUCER_COUNT,
+        "get_lane_count": GET_LANE_COUNT,
+        "ring_slots": RING_SLOTS,
+        "ring_slot_record_word": RING_SLOT_RECORD_WORD,
+        "records_per_ring_slot": RECORDS_PER_RING_SLOT,
+        "record_words": 3,
+        "pipeline_words_per_ring": PIPELINE_WORDS_PER_RING,
+        "pipeline_ring_count": PIPELINE_RING_COUNT,
+        "candidate_seed_words": 5,
+        "producer_stat_columns": 10,
+        "get_stat_columns": 16,
+        "packed_entry_bytes": PACKED_ENTRY_BYTES,
+        "get_wave_records": 256,
+    }
+    observed = {name: int(contract.get(name, -1)) for name in expected}
+    if observed != expected:
+        raise RuntimeError(
+            "P5 bridge ABI mismatch before ACLNN: "
+            f"expected={expected} observed={observed}; rebuild only the "
+            "scoped P5 Torch bridge and do not reuse its old _C.so"
+        )
+    print(
+        "P5_BRIDGE_ABI "
+        f"version={observed['abi_version']} "
+        f"rings={observed['pipeline_ring_count']}x"
+        f"{observed['pipeline_words_per_ring']} "
+        f"cursor_word={observed['ring_slot_record_word']} "
+        f"candidate_seed_words={observed['candidate_seed_words']} "
+        f"producer_stats={observed['producer_stat_columns']} "
+        f"get_stats={observed['get_stat_columns']}",
+        flush=True,
+    )
+
+
+def _log_p5_input_abi(inputs: dict[str, torch.Tensor]) -> None:
+    """Print the compact host-tiling contract once, before any HCCP work."""
+    def shape(name: str) -> str:
+        return "x".join(str(value) for value in inputs[name].shape)
+
+    print(
+        "P5_LIVE_C8_INPUT_ABI "
+        f"score={shape('score_workspace')} receipts={shape('tile_receipts')} "
+        f"epoch={shape('streaming_epoch')} source_lens={shape('score_source_lens')} "
+        f"resident={shape('resident_threshold')} "
+        f"object_slots={shape('kv_object_slots_snapshot')} "
+        f"object_map={shape('kv_object_map')} "
+        f"private_ready={shape('private_ready_table')} "
+        f"private_output={shape('private_packed_output')} "
+        f"control={shape('fused_get_control')} "
+        f"pipeline={shape('pipeline_state')} "
+        f"mode={shape('execution_mode')}",
+        flush=True,
+    )
+
+
 def _assert_live_oracle(
     result: dict[str, Any],
     inputs: dict[str, torch.Tensor],
@@ -476,8 +551,10 @@ def _run(args: argparse.Namespace) -> None:
 
     import kvaf
     import nanovllm_exact_scan_get  # noqa: F401  # Registers the P5 bridge.
+    _require_p5_bridge_abi()
 
     inputs, table_capacity, private_arena_capacity = _make_p5_inputs(publication, device)
+    _log_p5_input_abi(inputs)
     runtime = kvaf.NpuRuntime(
         args.batch_get_kernel,
         0,

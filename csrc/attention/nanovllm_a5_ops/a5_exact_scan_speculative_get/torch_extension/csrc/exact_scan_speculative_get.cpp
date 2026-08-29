@@ -40,6 +40,13 @@ constexpr int64_t kPackedEntryBytes = 656;
 constexpr int64_t kReceiptTileWidth = 128;
 constexpr int64_t kReceiptWords = 16;
 constexpr int64_t kCandidateSeedWords = 5;
+// The bridge owns all dynamically allocated transaction buffers.  Keep this
+// explicit ABI marker in the loaded extension so a newly built OPP cannot be
+// accidentally paired with an older bridge that allocated a differently
+// sized pipeline_state tensor.  In particular, ABI 3 carries the three
+// cache-line ring cursors introduced with the exact descriptor-wave fix:
+// [62 * 2, 248], not the legacy [124, 232].
+constexpr int64_t kP5BridgeAbiVersion = 3;
 
 struct P2Geometry {
     int64_t rowCount;
@@ -509,4 +516,28 @@ TORCH_LIBRARY_IMPL(a5_exact_scan_get, Meta, m)
     m.impl("exact_scan_speculative_get", &ExactScanSpeculativeGetMeta);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
+    // Expose a tiny, allocation-free contract probe.  The live integration
+    // test calls it *before* it initializes Direct-HCCP, so a stale .so is
+    // reported as a clear bridge/OPP ABI mismatch rather than an opaque host
+    // tiling failure followed by runtime cleanup noise.
+    m.def("p5_abi_contract", [] {
+        pybind11::dict contract;
+        contract["abi_version"] = kP5BridgeAbiVersion;
+        contract["producer_count"] = kProducerCount;
+        contract["get_lane_count"] = kGetLaneCount;
+        contract["ring_slots"] = kRingSlots;
+        contract["ring_slot_record_word"] = kRingSlotRecordWord;
+        contract["records_per_ring_slot"] = kRecordsPerRingSlot;
+        contract["record_words"] = kRecordWords;
+        contract["pipeline_words_per_ring"] = kPipelineWordsPerRing;
+        contract["pipeline_ring_count"] = kPipelineRingCount;
+        contract["candidate_seed_words"] = kCandidateSeedWords;
+        contract["producer_stat_columns"] = kProducerStatColumns;
+        contract["get_stat_columns"] = kGetStatColumns;
+        contract["packed_entry_bytes"] = kPackedEntryBytes;
+        contract["get_wave_records"] = kGetWaveRecords;
+        return contract;
+    });
+}
