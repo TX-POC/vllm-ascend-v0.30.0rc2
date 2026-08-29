@@ -932,7 +932,18 @@ if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
             "${P1_OPDEF_SOURCES[@]}" >&2
         exit 1
     fi
+    P1_TILING_SCHEMA_SOURCE="${GENERATED}/op_host/a5_exact_scan_speculative_get_tiling_data.h"
+    if [[ ! -s "${P1_TILING_SCHEMA_SOURCE}" ]] || \
+       ! grep -q 'BEGIN_TILING_DATA_DEF(A5ExactScanSpeculativeGetHostTilingData)' \
+               "${P1_TILING_SCHEMA_SOURCE}" || \
+       ! grep -q 'REGISTER_TILING_DATA_CLASS(A5ExactScanSpeculativeGet,' \
+               "${P1_TILING_SCHEMA_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P1 macro-backed host tiling schema did not survive the generated-project overlay." >&2
+        echo "[nanovllm_a5_ops] expected=${P1_TILING_SCHEMA_SOURCE}" >&2
+        exit 1
+    fi
     echo "[nanovllm_a5_ops] P1 host registration closure: ${P1_OPDEF_SOURCES[0]} verified=1"
+    echo "[nanovllm_a5_ops] P1 host tiling schema closure: ${P1_TILING_SCHEMA_SOURCE} verified=1"
 fi
 
 if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \

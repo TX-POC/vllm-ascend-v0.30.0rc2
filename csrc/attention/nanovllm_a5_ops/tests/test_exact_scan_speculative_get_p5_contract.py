@@ -31,6 +31,9 @@ OPS_JSON = OP_ROOT / "ops.json"
 HOST_CPP = OP_ROOT / "op_host" / "a5_exact_scan_speculative_get.cpp"
 KERNEL_CPP = OP_ROOT / "op_kernel" / "a5_exact_scan_speculative_get.cpp"
 TILING_H = OP_ROOT / "op_kernel" / "a5_exact_scan_speculative_get_tiling.h"
+HOST_TILING_H = (
+    OP_ROOT / "op_host" / "a5_exact_scan_speculative_get_tiling_data.h"
+)
 BRIDGE_CPP = (
     OP_ROOT / "torch_extension" / "csrc" / "exact_scan_speculative_get.cpp"
 )
@@ -200,32 +203,77 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
             "if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS)", host
         )
 
-    def test_host_registers_and_writes_the_pod_tiling_abi_explicitly(self) -> None:
-        """ACLNN direct calls need the P5 raw tiling capacity registered.
+    def test_host_registers_a_packaging_visible_tiling_schema(self) -> None:
+        """ACLNN direct calls need a package-visible raw tiling capacity.
 
-        The device kernel intentionally reads a compact 21-word POD through
-        ``GET_TILING_DATA``.  The host registration must therefore allocate
-        that exact raw buffer and write it explicitly; a typed helper with no
-        registered TilingDef turns a valid direct call into opaque EZ1008.
+        A hand-written TilingDef registers too late for CANN's OPP packager;
+        it can leave a direct ACLNN invocation with a zero-capacity raw
+        buffer.  The host schema must use BEGIN_TILING_DATA_DEF, while the
+        runtime code gates the serialized byte count against the device POD.
         """
         host = _text(HOST_CPP)
+        host_tiling = _text(HOST_TILING_H)
         for required in (
-            '#include "register/tilingdata_base.h"',
-            "class A5ExactScanSpeculativeGetTilingRegistration final",
+            "BEGIN_TILING_DATA_DEF(A5ExactScanSpeculativeGetHostTilingData)",
             "REGISTER_TILING_DATA_CLASS(A5ExactScanSpeculativeGet,",
-            "A5ExactScanSpeculativeGetTilingRegistration",
-            "21U * sizeof(uint32_t)",
+            "A5ExactScanSpeculativeGetHostTilingData",
+            "TILING_DATA_FIELD_DEF(uint32_t, rowCount)",
+            "TILING_DATA_FIELD_DEF(uint32_t, reserved)",
+            "TILING_DATA_FIELD_DEF(uint32_t, schemaAlignmentPadding)",
+        ):
+            self.assertIn(required, host_tiling)
+        for required in (
+            '#include "a5_exact_scan_speculative_get_tiling_data.h"',
+            "A5ExactScanSpeculativeGetHostTilingData tiling{};",
+            "22U * sizeof(uint32_t)",
+            "schemaAlignmentPadding) ==",
+            "const size_t serializedTilingBytes = tiling.GetDataSize();",
+            "tiling.set_schemaAlignmentPadding(0U);",
+            "serializedTilingBytes != kDeviceTilingBytes",
+            "schema_device_abi_mismatch",
             "context->GetRawTilingData()",
             'LogP5RawTilingFailure("raw_tiling_null"',
             'LogP5RawTilingFailure("raw_tiling_capacity"',
-            "std::memcpy(rawTiling->GetData(), &tiling, sizeof(tiling));",
-            "rawTiling->SetDataSize(sizeof(tiling));",
-            '"P5_TILING_RAW_READY capacity=%zu bytes=%zu\\n"',
+            "tiling.SaveToBuffer(rawTiling->GetData(), rawTiling->GetCapacity());",
+            "rawTiling->SetDataSize(serializedTilingBytes);",
+            '"P5_TILING_RAW_READY capacity=%zu schema_bytes=%zu "',
         ):
             self.assertIn(required, host)
-        self.assertNotIn(
-            "context->GetTilingData<A5ExactScanSpeculativeGetTilingData>()",
-            host,
+        self.assertNotIn("TilingRegistration final", host)
+
+        # The device uses 21 semantic words plus one explicit zero padding
+        # word.  This matches CANN's 8-byte schema alignment exactly; all
+        # semantic fields must preserve the device order exactly.
+        host_fields = re.findall(
+            r"TILING_DATA_FIELD_DEF\(uint32_t,\s*([A-Za-z0-9_]+)\)",
+            host_tiling,
+        )
+        self.assertEqual(
+            host_fields,
+            [
+                "rowCount",
+                "sourceCapacity",
+                "poolSize",
+                "kvObjectCapacity",
+                "privateArenaCapacity",
+                "tileReceiptCount",
+                "scoreWorkspaceWords",
+                "rowsPerEntry",
+                "candidateCapacityPerProducer",
+                "candidateSeedWords",
+                "tableCapacity",
+                "outputRows",
+                "controlWords",
+                "producerCount",
+                "getLaneCount",
+                "ringSlots",
+                "recordsPerRingSlot",
+                "getBootstrapRecords",
+                "getWaveRecords",
+                "pipelineWordsPerRing",
+                "reserved",
+                "schemaAlignmentPadding",
+            ],
         )
 
     def test_tiling_and_kernel_use_c8_score_receipts_not_float_scores(self) -> None:
