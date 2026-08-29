@@ -25,7 +25,8 @@ _p6_required_path() {
 }
 
 VLLM_KIP="${VLLM_KIP:-}"
-if ! _p6_required_path vllm_worktree "$VLLM_KIP" || [ ! -d "$VLLM_KIP/.git" ]; then
+if ! _p6_required_path vllm_worktree "$VLLM_KIP" || \
+   ! git -C "$VLLM_KIP" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     _p6_note "P6_HOOK_OFF_BLOCKED reason=invalid_vllm_worktree path=${VLLM_KIP:-<unset>}"
     exit 2
 fi
