@@ -987,7 +987,7 @@ fi
 VENDOR_DIR="$(cd "$(dirname "${OPAPI_LIBS[0]}")/../.." && pwd)"
 
 # ``opParaSize`` is the preallocated payload size observed by a direct ACLNN
-# tiling callback.  The P5 kernel's shared POD is 88 bytes and CANN reserves
+# tiling callback.  The P5 kernel's shared POD is 84 bytes and CANN reserves
 # an additional eight-byte runtime header, so a P5 package with opParaSize=8
 # would deterministically recreate the zero-capacity failure before any HCCP
 # or score-publisher code runs.  Inspect the installed artifact, not merely
@@ -1050,8 +1050,8 @@ PY
         exit 1
     fi
     if ! printf '%s\n' "${P1_OP_PARA_SIZE}" | \
-            awk -F= '$NF + 0 >= 96 { found = 1 } END { exit found ? 0 : 1 }'; then
-        echo "[nanovllm_a5_ops] ERROR: P1 installed OPP has insufficient tiling payload; expected opParaSize>=96." >&2
+            awk -F= '$NF + 0 >= 92 { found = 1 } END { exit found ? 0 : 1 }'; then
+        echo "[nanovllm_a5_ops] ERROR: P1 installed OPP has insufficient tiling payload; expected opParaSize>=92." >&2
         printf '%s\n' "${P1_OP_PARA_SIZE}" >&2
         exit 1
     fi

@@ -199,6 +199,14 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
         self.assertNotIn(
             "if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS)", host
         )
+        self.assertLess(
+            host.index("const ge::graphStatus scheduleStatus = context->SetScheduleMode(1U);"),
+            host.index("context->GetTilingData<"),
+        )
+        self.assertLess(
+            host.index("context->SetBlockDim(aivOnlyBlockDim);"),
+            host.index("context->GetTilingData<"),
+        )
 
     def test_host_and_kernel_share_the_standard_pod_tiling_contract(self) -> None:
         """Direct ACLNN must use one standard C++ POD on both sides.
@@ -216,10 +224,10 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
             '#include "../op_kernel/a5_exact_scan_speculative_get_tiling.h"',
             "context->GetTilingData<",
             "A5ExactScanSpeculativeGetTilingData>();",
-            "22U * sizeof(uint32_t)",
-            "schemaAlignmentPadding) ==",
-            "tiling->schemaAlignmentPadding = 0U;",
+            "21U * sizeof(uint32_t)",
+            "reserved) ==",
             '"P5_TILING_TYPED_READY bytes=%zu alignment=%zu "',
+            '"P5_TILING_PREALLOC aic=%u aiv=%u requested_aiv=%u block_dim=%u "',
         ):
             self.assertIn(required, host)
         for forbidden in (
@@ -231,9 +239,9 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, host)
 
-        # The device uses 21 semantic words plus one explicit zero padding
-        # word.  Host writes this exact shared POD rather than serializing a
-        # second schema, so the field order is the single source of truth.
+        # The device and host share one 21-word POD.  CANN's runtime header
+        # is outside this payload; adding a synthetic tail word changes the
+        # registered direct-ACLNN typed allocation contract.
         fields = re.findall(
             r"uint32_t\s+([A-Za-z0-9_]+);",
             tiling,
@@ -262,7 +270,6 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
                 "getWaveRecords",
                 "pipelineWordsPerRing",
                 "reserved",
-                "schemaAlignmentPadding",
             ],
         )
         self.assertIn(

@@ -110,12 +110,12 @@ constexpr uint32_t kProducerStatColumns = 10;
 constexpr uint32_t kGetStatColumns = 16;
 
 static_assert(sizeof(A5ExactScanSpeculativeGetTilingData) ==
-                  22U * sizeof(uint32_t),
-              "P5 raw tiling ABI must remain 22 contiguous uint32 words");
-static_assert(offsetof(A5ExactScanSpeculativeGetTilingData,
-                       schemaAlignmentPadding) ==
                   21U * sizeof(uint32_t),
-              "P5 semantic tiling field offsets must precede only one tail word");
+              "P5 tiling ABI must remain 21 contiguous uint32 words");
+static_assert(offsetof(A5ExactScanSpeculativeGetTilingData,
+                       reserved) ==
+                  20U * sizeof(uint32_t),
+              "P5 tiling ABI must keep reserved as its final word");
 
 bool IsVectorWithPositiveLength(const gert::Shape& shape)
 {
@@ -266,17 +266,19 @@ void LogP5TilingContractFailure(
 }
 
 void LogP5TypedTilingFailure(
-    const char* stage, const gert::TilingContext* context)
+    const char* stage, const gert::TilingContext* context, uint32_t aicCount,
+    uint32_t aivCount, uint32_t blockDim, ge::graphStatus scheduleStatus)
 {
     const char* node = context->GetNodeName() == nullptr
         ? "A5ExactScanSpeculativeGet"
         : context->GetNodeName();
     std::fprintf(
         stderr,
-        "P5_TILING_TYPED stage=%s node=%s required_bytes=%zu "
-        "alignment=%zu\n",
+        "P5_TILING_TYPED stage=%s node=%s required_bytes=%zu alignment=%zu "
+        "aic=%u aiv=%u block_dim=%u schedule_status=%d\n",
         stage, node, sizeof(A5ExactScanSpeculativeGetTilingData),
-        alignof(A5ExactScanSpeculativeGetTilingData));
+        alignof(A5ExactScanSpeculativeGetTilingData), aicCount, aivCount,
+        blockDim, static_cast<int>(scheduleStatus));
     std::fflush(stderr);
 }
 
@@ -517,6 +519,26 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
         return ge::GRAPH_FAILED;
     }
 
+    // The direct ACLNN executor allocates this registered POD while it
+    // constructs the launch schedule.  In the known-good P5 path the
+    // schedule mode and block count are therefore supplied *before*
+    // GetTilingData<T>().  Moving them after the typed lookup leaves this
+    // callback with a null typed payload on CANN 9.1, even when the packaged
+    // metadata advertises a sufficiently large opParaSize.  Keep the direct
+    // ACLNN fallback: an unsupported batch request is recorded but does not
+    // alter the fixed 64-AIV ABI.
+    const ge::graphStatus scheduleStatus = context->SetScheduleMode(1U);
+    const char* scheduleEffective =
+        scheduleStatus == ge::GRAPH_SUCCESS ? "batch" : "default_aiv_only";
+    context->SetBlockDim(aivOnlyBlockDim);
+    std::fprintf(
+        stderr,
+        "P5_TILING_PREALLOC aic=%u aiv=%u requested_aiv=%u block_dim=%u "
+        "schedule_request=batch schedule_status=%d schedule_effective=%s\n",
+        aicCount, aivCount, kAivCount, aivOnlyBlockDim,
+        static_cast<int>(scheduleStatus), scheduleEffective);
+    std::fflush(stderr);
+
     // This is the standard CANN C++ tiling path.  The device entry point
     // registers this exact POD with REGISTER_TILING_DEFAULT, so CANN owns
     // both allocation and serialization.  Do not mix it with the legacy
@@ -525,7 +547,8 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     auto* tiling = context->GetTilingData<
         A5ExactScanSpeculativeGetTilingData>();
     if (tiling == nullptr) {
-        LogP5TypedTilingFailure("typed_tiling_null", context);
+        LogP5TypedTilingFailure("typed_tiling_null", context, aicCount,
+                                aivCount, aivOnlyBlockDim, scheduleStatus);
         return ge::GRAPH_FAILED;
     }
     tiling->rowCount = geometry.rowCount;
@@ -550,7 +573,6 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     tiling->getWaveRecords = kGetWaveRecords;
     tiling->pipelineWordsPerRing = kPipelineWordsPerRing;
     tiling->reserved = 0U;
-    tiling->schemaAlignmentPadding = 0U;
     std::fprintf(stderr,
                  "P5_TILING_TYPED_READY bytes=%zu alignment=%zu "
                  "row_count=%u source_capacity=%u\n",
@@ -558,16 +580,6 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
                  geometry.rowCount, geometry.sourceCapacity);
     std::fflush(stderr);
 
-    // The block dimension must be fixed before requesting an optional batch
-    // schedule.  A GE/model launch accepts batch mode and provides the
-    // cooperative start required by the target graph path.  CANN may reject
-    // that request for an ACLNN direct single-op launch.  Treat that as a
-    // launch-mode fallback, not as an ABI or arithmetic failure: the same
-    // 64 AIV-only blocks still execute, and the test reports it explicitly.
-    context->SetBlockDim(aivOnlyBlockDim);
-    const ge::graphStatus scheduleStatus = context->SetScheduleMode(1U);
-    const char* scheduleEffective =
-        scheduleStatus == ge::GRAPH_SUCCESS ? "batch" : "default_aiv_only";
     std::fprintf(
         stderr,
         "P5_TILING_READY aic=%u aiv=%u requested_aiv=%u block_dim=%u "

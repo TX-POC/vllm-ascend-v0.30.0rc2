@@ -46,12 +46,6 @@ struct A5ExactScanSpeculativeGetTilingData {
     uint32_t getWaveRecords;
     uint32_t pipelineWordsPerRing;
     uint32_t reserved;
-
-    // CANN host TilingData is rounded to an eight-byte boundary.  Keep that
-    // boundary explicit in the device ABI as well: it leaves every semantic
-    // field above at the same offset while making the host schema and the
-    // GET_TILING_DATA type exactly the same 88-byte object.
-    uint32_t schemaAlignmentPadding;
 };
 
 #endif  // A5_EXACT_SCAN_SPECULATIVE_GET_TILING_H
