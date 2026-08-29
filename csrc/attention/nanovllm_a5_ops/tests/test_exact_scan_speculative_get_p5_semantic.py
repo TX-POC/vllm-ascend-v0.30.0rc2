@@ -76,6 +76,7 @@ class ReceiptWindow:
 
 @dataclass(frozen=True)
 class P5Fixture:
+    name: str
     rows: int
     source_capacity: int
     pool_size: int
@@ -93,6 +94,14 @@ class P5Fixture:
     expected_misses: list[int]
     expected_deferred: list[int]
     expected_unique_cold_objects: set[tuple[int, int]]
+    # Every lane follows the same fixed P2 WQE segmentation.  The baseline
+    # has a short terminal tail only; the multiwave fixture deliberately
+    # forces the A -> B -> A descriptor-buffer reuse sequence.
+    expected_wave_sizes: tuple[tuple[int, ...], ...]
+    # A real, expected C8 receipt used only by the Python live-window oracle.
+    # The executor itself receives all receipts, so this never weakens the
+    # actual Post/CQ correctness check.
+    late_receipt_slot: int
 
 
 def _pack_u16_carrier(raw_scores: list[int]) -> list[int]:
@@ -146,7 +155,7 @@ def _receipt_slot_for_source(fixture: P5Fixture, candidate: Candidate) -> int:
     return candidate.row * tiles_per_row + candidate.source // TILE_SCORE_WIDTH
 
 
-def _build_fixture(epoch: int) -> P5Fixture:
+def _build_baseline_fixture(epoch: int) -> P5Fixture:
     rows = 2
     # The graph reserves three 128-score windows per row, while this forward
     # activates only the first two.  The third receipt is intentionally zero
@@ -217,6 +226,7 @@ def _build_fixture(epoch: int) -> P5Fixture:
                 unique_cold.add((pool, kv_object))
 
     return P5Fixture(
+        name="baseline",
         rows=rows,
         source_capacity=source_capacity,
         pool_size=pool_size,
@@ -234,6 +244,117 @@ def _build_fixture(epoch: int) -> P5Fixture:
         expected_misses=expected_misses,
         expected_deferred=expected_deferred,
         expected_unique_cold_objects=unique_cold,
+        expected_wave_sizes=((2,), (2,)),
+        late_receipt_slot=1,
+    )
+
+
+def _build_multiwave_fixture(epoch: int) -> P5Fixture:
+    """Build the smallest real HCCP fixture for A -> B -> A reuse.
+
+    There are twelve C8 score windows (one 128-source window per row).  Each
+    producer owns exactly one window.  Mapping pairs of source indices to the
+    same compressed KV object gives each producer 64 CandidateSeeds per Get
+    lane but only 32 distinct Get requests per lane.  Each producer therefore
+    publishes two full 32-record ring chunks per lane.  The Get consumer can
+    receive chunks in any producer-arrival order, but all chunk sizes divide
+    the fixed 64/256 boundaries; both lanes must consequently see exactly::
+
+        64 requests  (descriptor buffer A)
+        256 requests (descriptor buffer B)
+        64 requests  (descriptor buffer A reused)
+
+    This construction fills but never overflows a producer's two-slot SPSC
+    ring.  Keeping Ocap=64
+    means all Direct-HCCP descriptors remain inside one KVAF 128-row table
+    entry; the test stresses the device executor rather than a larger host
+    table-setup path.
+    """
+    rows = 12
+    source_capacity = 128
+    pool_size = rows
+    object_capacity = 64
+    private_arena_capacity = 384
+    threshold = 0x7000
+    raw_scores = [
+        0x7800 + ((row * source_capacity + source) & 0x7F)
+        for row in range(rows)
+        for source in range(source_capacity)
+    ]
+    score_source_lens = [source_capacity] * rows
+    object_map = [
+        source // 2
+        for _pool in range(pool_size)
+        for source in range(source_capacity)
+    ]
+    object_slots_snapshot = [-1] * (pool_size * object_capacity)
+    expected_candidates: list[list[Candidate]] = [[] for _ in range(PRODUCER_COUNT)]
+    expected_selected = [0] * PRODUCER_COUNT
+    expected_hits = [0] * PRODUCER_COUNT
+    expected_misses = [0] * PRODUCER_COUNT
+    expected_deferred = [0] * PRODUCER_COUNT
+    unique_cold: set[tuple[int, int]] = set()
+
+    # With one tile per row, receipt slot == row and hence producer == row.
+    # Each populated producer contributes exactly two 32-record chunks to
+    # each lane.  The wave *membership* is intentionally not asserted: it is
+    # an asynchronous arrival detail, while the 64/256/64 segmentation is
+    # the actual descriptor-buffer contract.
+    for row in range(rows):
+        producer = row
+        pool = row
+        for source in range(source_capacity):
+            kv_object = source // 2
+            score = raw_scores[row * source_capacity + source]
+            if score < threshold:
+                raise AssertionError("multiwave score construction regressed")
+            expected_selected[producer] += 1
+            expected_misses[producer] += 1
+            expected_candidates[producer].append(
+                Candidate(row, source, pool, kv_object, score)
+            )
+            unique_cold.add((pool, kv_object))
+
+    return P5Fixture(
+        name="multiwave",
+        rows=rows,
+        source_capacity=source_capacity,
+        pool_size=pool_size,
+        object_capacity=object_capacity,
+        private_arena_capacity=private_arena_capacity,
+        threshold=threshold,
+        epoch=epoch,
+        raw_scores=raw_scores,
+        score_source_lens=score_source_lens,
+        object_map=object_map,
+        object_slots_snapshot=object_slots_snapshot,
+        expected_candidates=expected_candidates,
+        expected_selected=expected_selected,
+        expected_hits=expected_hits,
+        expected_misses=expected_misses,
+        expected_deferred=expected_deferred,
+        expected_unique_cold_objects=unique_cold,
+        expected_wave_sizes=((64, 256, 64), (64, 256, 64)),
+        late_receipt_slot=11,
+    )
+
+
+def _build_fixture(epoch: int, fixture_name: str) -> P5Fixture:
+    if fixture_name == "baseline":
+        return _build_baseline_fixture(epoch)
+    if fixture_name == "multiwave":
+        return _build_multiwave_fixture(epoch)
+    raise ValueError(f"unknown P5 fixture: {fixture_name}")
+
+
+def _expected_lane_post_counts(fixture: P5Fixture) -> tuple[int, ...]:
+    return tuple(
+        sum(
+            1
+            for _pool, kv_object in fixture.expected_unique_cold_objects
+            if kv_object & (GET_LANE_COUNT - 1) == lane
+        )
+        for lane in range(GET_LANE_COUNT)
     )
 
 
@@ -242,16 +363,23 @@ def _assert_fixture_oracle(fixture: P5Fixture) -> None:
     assert len(fixture.raw_scores) % 2 == 0
     assert len(_pack_u16_carrier(fixture.raw_scores)) * 2 == len(fixture.raw_scores)
     windows = _receipt_windows(fixture)
-    assert len(windows) == 6
-    assert [window.valid_count for window in windows] == [128, 128, 0, 128, 128, 0]
-    assert [window.slot for window in windows if not window.active] == [2, 5]
-    assert sum(fixture.expected_selected) == 12
-    assert sum(fixture.expected_hits) == 2
-    assert sum(fixture.expected_misses) == 8
-    assert sum(fixture.expected_deferred) == 2
-    assert sum(len(value) for value in fixture.expected_candidates) == 8
-    assert fixture.expected_unique_cold_objects == {(0, 1), (0, 4), (1, 1), (1, 4)}
-    # O=1/O=4 each appear twice within a pool: the test's dedup proof.
+    expected_receipt_count = fixture.rows * math.ceil(
+        fixture.source_capacity / TILE_SCORE_WIDTH
+    )
+    assert len(windows) == expected_receipt_count
+    assert sum(window.valid_count for window in windows) == sum(
+        fixture.score_source_lens
+    )
+    assert len(fixture.expected_wave_sizes) == GET_LANE_COUNT
+    lane_posts = _expected_lane_post_counts(fixture)
+    assert tuple(sum(waves) for waves in fixture.expected_wave_sizes) == lane_posts
+    assert all(post_count <= fixture.private_arena_capacity for post_count in lane_posts)
+    assert sum(len(value) for value in fixture.expected_candidates) == sum(
+        fixture.expected_misses
+    )
+    # Every cold object appears twice in CandidateSeed space.  This gives the
+    # fixture its object-dedup proof while retaining a larger seed stream than
+    # the eventual HCCP request stream.
     for pool, kv_object in fixture.expected_unique_cold_objects:
         multiplicity = sum(
             candidate.pool == pool and candidate.kv_object == kv_object
@@ -259,6 +387,32 @@ def _assert_fixture_oracle(fixture: P5Fixture) -> None:
             for candidate in candidates
         )
         assert multiplicity == 2, (pool, kv_object, multiplicity)
+
+    if fixture.name == "baseline":
+        assert [window.valid_count for window in windows] == [128, 128, 0, 128, 128, 0]
+        assert [window.slot for window in windows if not window.active] == [2, 5]
+        assert sum(fixture.expected_selected) == 12
+        assert sum(fixture.expected_hits) == 2
+        assert sum(fixture.expected_misses) == 8
+        assert sum(fixture.expected_deferred) == 2
+        assert sum(len(value) for value in fixture.expected_candidates) == 8
+        assert fixture.expected_unique_cold_objects == {(0, 1), (0, 4), (1, 1), (1, 4)}
+        assert lane_posts == (2, 2)
+    elif fixture.name == "multiwave":
+        assert len(windows) == 12
+        assert all(window.active and window.valid_count == 128 for window in windows)
+        assert sum(fixture.expected_selected) == 1536
+        assert sum(fixture.expected_hits) == 0
+        assert sum(fixture.expected_misses) == 1536
+        assert sum(fixture.expected_deferred) == 0
+        assert sum(len(value) for value in fixture.expected_candidates) == 1536
+        assert len(fixture.expected_unique_cold_objects) == 768
+        assert lane_posts == (384, 384)
+        assert fixture.expected_wave_sizes == ((64, 256, 64), (64, 256, 64))
+        assert [len(fixture.expected_candidates[index]) for index in range(12)] == [128] * 12
+        assert all(len(fixture.expected_candidates[index]) == 0 for index in range(12, PRODUCER_COUNT))
+    else:
+        raise AssertionError(f"fixture lacks an oracle branch: {fixture.name}")
 
 
 def _assert_live_receipt_oracle(fixture: P5Fixture) -> dict[str, int]:
@@ -273,13 +427,10 @@ def _assert_live_receipt_oracle(fixture: P5Fixture) -> dict[str, int]:
     windows = _receipt_windows(fixture)
     active_windows = [window for window in windows if window.active]
     inactive_windows = [window for window in windows if not window.active]
-    # Row 0's second window carries the two O=4 cold candidates plus an
-    # invalid high-score source.  It is a genuine expected receipt, not one
-    # of the fixed inert slots at 2/5.
     late_window = next(
         window
         for window in active_windows
-        if window.row == 0 and window.source_begin == TILE_SCORE_WIDTH
+        if window.slot == fixture.late_receipt_slot
     )
     exact_candidates = [
         candidate
@@ -298,12 +449,24 @@ def _assert_live_receipt_oracle(fixture: P5Fixture) -> dict[str, int]:
     ]
 
     assert late_window.active
-    assert late_window.valid_count == TILE_SCORE_WIDTH
+    assert late_window.valid_count > 0
     assert late_window.slot not in {window.slot for window in inactive_windows}
-    assert [(candidate.row, candidate.source) for candidate in withheld_candidates] == [
-        (0, 133),
-        (0, 137),
-    ]
+    if fixture.name == "baseline":
+        # Row 0's second window carries the two O=4 cold candidates plus an
+        # invalid high-score source.  It is a genuine expected receipt, not
+        # one of the fixed inert slots at 2/5.
+        assert [(candidate.row, candidate.source) for candidate in withheld_candidates] == [
+            (0, 133),
+            (0, 137),
+        ]
+    elif fixture.name == "multiwave":
+        # The last row owns exactly one full receipt window: withholding it
+        # suppresses 128 speculative seeds, but must not change the exact
+        # set that GuaranteedRecall will later own.
+        assert late_window.row == 11 and late_window.source_begin == 0
+        assert len(withheld_candidates) == 128
+    else:
+        raise AssertionError(f"fixture lacks a live-receipt oracle: {fixture.name}")
     assert len(speculative_candidates) == len(exact_candidates) - len(withheld_candidates)
     # This is the mathematical-equivalence statement at the live seam: the
     # speculative subset can shrink, but the exact authority remains the
@@ -521,6 +684,52 @@ def _executor_trace(step: str, **fields: Any) -> None:
     print(f"P5_EXECUTOR_STEP step={step}{(' ' + suffix) if suffix else ''}", flush=True)
 
 
+def _compact_ints(values: Any, *, limit: int = 4) -> str:
+    """Return a bounded, deterministic diagnostic for a descriptor vector.
+
+    P5's multiwave case has 256 live records in one descriptor buffer.  A
+    full dump is both hard to copy from a terminal and misleading once buffer
+    A is reused.  The strict oracle below still checks every value; this
+    summary is only the useful failure breadcrumb.
+    """
+    normalized = [int(value) for value in values]
+    count = len(normalized)
+    if count == 0:
+        return "n=0"
+    mask = (1 << 64) - 1
+    digest = 0xCBF29CE484222325
+    xor_value = 0
+    for value in normalized:
+        word = value & mask
+        digest = ((digest ^ word) * 0x100000001B3) & mask
+        xor_value ^= word
+    first = normalized[:limit]
+    last = normalized[-limit:] if count > limit else []
+    return (
+        f"n={count},first={first},last={last},sum={sum(normalized)},"
+        f"xor=0x{xor_value:016x},fnv=0x{digest:016x}"
+    )
+
+
+def _terminal_buffer_record_counts(
+    fixture: P5Fixture, lane: int, requested: int, batches: int
+) -> tuple[int, ...]:
+    """Return the valid terminal prefix left in each double buffer.
+
+    Descriptor buffer A is reused by wave three.  It therefore contains the
+    tail wave, not wave one.  Only expose a prefix when the observed Get
+    statistics prove the expected fixed wave plan completed; otherwise an
+    uninitialized output buffer must never be printed as evidence.
+    """
+    waves = fixture.expected_wave_sizes[lane]
+    if requested != sum(waves) or batches != len(waves):
+        return (0,) * GET_DESCRIPTOR_BUFFER_COUNT
+    terminal = [0] * GET_DESCRIPTOR_BUFFER_COUNT
+    for wave_index, records in enumerate(waves):
+        terminal[wave_index % GET_DESCRIPTOR_BUFFER_COUNT] = records
+    return tuple(terminal)
+
+
 def _executor_terminal_trace(
     torch: Any, fixture: P5Fixture, outputs: tuple[Any, ...]
 ) -> None:
@@ -541,12 +750,12 @@ def _executor_terminal_trace(
     get_candidate_seed_slots = outputs[14].cpu()
     get_claim_new = outputs[15].cpu()
 
-    seed_slots: list[str] = []
+    seed_slots: list[int] = []
     for producer, expected in enumerate(fixture.expected_candidates):
         for local_index, _ in enumerate(expected):
             if local_index < candidate_counts[producer]:
                 slot = int(candidate_seeds[producer, local_index, 4])
-                seed_slots.append(f"p{producer}:{local_index}={slot}")
+                seed_slots.append(slot)
 
     nonzero_counts = [
         f"p{producer}={count}"
@@ -558,37 +767,44 @@ def _executor_terminal_trace(
         % (lane, row[0], row[1], row[2], row[3], row[4], row[6], row[14], row[15])
         for lane, row in enumerate(get_stats)
     ]
-    # This is the complete, bounded post/CQ ledger for both descriptor
-    # buffers in each queue.  It distinguishes wrong-buffer selection, stale
-    # descriptor visibility, and a private-ready range check rejecting a
-    # descriptor that was actually posted.  The fixture posts at most 256
-    # records per buffer; formatting only each buffer's active prefix keeps
-    # the line compact in both the current two-record case and stress cases.
+    # This is the bounded terminal post/CQ ledger for both descriptor buffers
+    # in each queue.  In the multiwave case A is intentionally overwritten by
+    # wave three, so it must report the final 64 entries rather than pretend
+    # it still contains the first 64 or dump an invalid 256-entry prefix.
     descriptor_ledger: list[str] = []
     for lane, row in enumerate(get_stats):
-        remaining = max(int(row[0]), 0)
-        for buffer in range(get_output_indices.shape[1]):
-            request_count = min(remaining, GET_WAVE_RECORDS)
+        terminal_counts = _terminal_buffer_record_counts(
+            fixture, lane, int(row[0]), int(row[1])
+        )
+        for buffer, request_count in enumerate(terminal_counts):
+            output_values = get_output_indices[lane, buffer, :request_count].tolist()
+            seed_values = get_candidate_seed_slots[
+                lane, buffer, :request_count
+            ].tolist()
+            mask_values = get_mask[lane, buffer, :request_count].tolist()
+            claim_values = get_claim_new[lane, buffer, :request_count].tolist()
             descriptor_ledger.append(
-                "l%d.b%d:out=%s,seed=%s,claim=%s,mask=%s"
+                "l%d.b%d:active=%d,out={%s},seed={%s},mask_sum=%d,claim_sum=%d"
                 % (
                     lane,
                     buffer,
-                    get_output_indices[lane, buffer, :request_count].tolist(),
-                    get_candidate_seed_slots[
-                        lane, buffer, :request_count
-                    ].tolist(),
-                    get_claim_new[lane, buffer, :request_count].tolist(),
-                    get_mask[lane, buffer, :request_count].tolist(),
+                    request_count,
+                    _compact_ints(output_values),
+                    _compact_ints(seed_values),
+                    sum(mask_values),
+                    sum(claim_values),
                 )
             )
-            remaining = max(remaining - GET_WAVE_RECORDS, 0)
     _executor_trace(
         "op_terminal",
         candidate_counts=";".join(nonzero_counts) or "none",
-        seed_private_slots=";".join(seed_slots) or "none",
+        seed_private_slots="{" + _compact_ints(seed_slots) + "}",
         private_head=",".join(str(value) for value in private_head),
-        private_ready=",".join(str(value) for value in private_ready),
+        private_ready="{" + _compact_ints(private_ready) + "}",
+        expected_waves="/".join(
+            ",".join(str(records) for records in waves)
+            for waves in fixture.expected_wave_sizes
+        ),
         get_stats="|".join(lane_stats),
         descriptor_ledger="|".join(descriptor_ledger),
     )
@@ -855,6 +1071,9 @@ def _assert_executor_oracle(
         stats[:, 2].cpu(), torch.tensor(fixture.expected_misses, dtype=torch.int64)
     )
     torch.testing.assert_close(
+        stats[:, 3].cpu(), torch.tensor(fixture.expected_misses, dtype=torch.int64)
+    )
+    torch.testing.assert_close(
         stats[:, 4].cpu(), torch.tensor(fixture.expected_deferred, dtype=torch.int64)
     )
     # This executor stage publishes every *active* fixture receipt before the
@@ -881,8 +1100,14 @@ def _assert_executor_oracle(
         expected_rows = [[item.row, item.source, item.kv_object, item.score] for item in expected]
         if actual[:, :4].tolist() != expected_rows:
             raise AssertionError(
-                f"CandidateSeed mismatch producer={producer} actual={actual[:, :4].tolist()} "
-                f"expected={expected_rows}"
+                "CandidateSeed mismatch producer=%d actual={%s} expected={%s}"
+                % (
+                    producer,
+                    _compact_ints(actual[:, :4].reshape(-1).tolist()),
+                    _compact_ints(
+                        [word for record in expected_rows for word in record]
+                    ),
+                )
             )
         for record, item in zip(actual.tolist(), expected, strict=True):
             private_slot = int(record[4])
@@ -894,9 +1119,67 @@ def _assert_executor_oracle(
             slots_by_object[key] = private_slot
 
     if set(slots_by_object) != fixture.expected_unique_cold_objects:
-        raise AssertionError(f"private object claims mismatch: {slots_by_object}")
+        missing = fixture.expected_unique_cold_objects - set(slots_by_object)
+        unexpected = set(slots_by_object) - fixture.expected_unique_cold_objects
+        raise AssertionError(
+            "private object claims mismatch "
+            f"missing={len(missing)} unexpected={len(unexpected)} "
+            f"actual={len(slots_by_object)} expected={len(fixture.expected_unique_cold_objects)}"
+        )
     if len(set(slots_by_object.values())) != len(slots_by_object):
-        raise AssertionError(f"two distinct objects share a private slot: {slots_by_object}")
+        raise AssertionError(
+            "two distinct objects share a private slot "
+            f"unique_slots={len(set(slots_by_object.values()))} "
+            f"objects={len(slots_by_object)}"
+        )
+
+    private_object_cpu = private_object_out.cpu()
+    private_source_cpu = private_source_out.cpu()
+    private_ready_cpu = private_ready_out.cpu()
+    private_output_cpu = private_output_out.cpu()
+    get_stats_cpu = get_stats.cpu()
+    expected_lane_posts = _expected_lane_post_counts(fixture)
+    expected_lane_batches = tuple(len(waves) for waves in fixture.expected_wave_sizes)
+    expected_lane_chunks = tuple(
+        sum(
+            math.ceil(
+                sum(
+                    1
+                    for candidate in candidates
+                    if candidate.kv_object & (GET_LANE_COUNT - 1) == lane
+                )
+                / RECORDS_PER_RING_SLOT
+            )
+            for candidates in fixture.expected_candidates
+        )
+        for lane in range(GET_LANE_COUNT)
+    )
+    torch.testing.assert_close(
+        get_stats_cpu[:, 2], torch.zeros(GET_LANE_COUNT, dtype=torch.int64)
+    )
+    torch.testing.assert_close(
+        get_stats_cpu[:, 0],
+        torch.tensor(expected_lane_posts, dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        get_stats_cpu[:, 1],
+        torch.tensor(expected_lane_batches, dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        get_stats_cpu[:, 6],
+        torch.tensor(expected_lane_chunks, dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        private_head_out.cpu(),
+        torch.tensor(expected_lane_posts, dtype=torch.int32),
+    )
+
+    # Check every deduplicated object, source alias, READY transition, and
+    # payload together.  This is intentionally independent of arrival order:
+    # producers and Get lanes are asynchronous, but their final transaction
+    # state must be mathematically identical.
+    ordered_objects = sorted(slots_by_object)
+    ordered_slots = [slots_by_object[key] for key in ordered_objects]
     for (pool, kv_object), slot in slots_by_object.items():
         if int(private_object_out.cpu()[pool, kv_object]) != slot:
             raise AssertionError(f"private object map does not publish {pool, kv_object} -> {slot}")
@@ -904,33 +1187,158 @@ def _assert_executor_oracle(
         local_slot = slot % fixture.private_arena_capacity
         if int(private_ready_out.cpu()[lane, local_slot]) != PRIVATE_READY_READY:
             raise AssertionError(f"private slot {slot} is not READY after terminal CQ")
-        expected_payload = source_cpu[kv_object]
-        torch.testing.assert_close(private_output_out.cpu()[slot], expected_payload)
+    slot_index = torch.tensor(ordered_slots, dtype=torch.long)
+    object_index = torch.tensor(
+        [kv_object for _pool, kv_object in ordered_objects], dtype=torch.long
+    )
+    torch.testing.assert_close(
+        private_output_cpu.index_select(0, slot_index),
+        source_cpu.index_select(0, object_index),
+    )
+    if int((private_ready_cpu == PRIVATE_READY_READY).sum()) != len(ordered_slots):
+        raise AssertionError(
+            "unexpected ready-slot population "
+            f"actual={int((private_ready_cpu == PRIVATE_READY_READY).sum())} "
+            f"expected={len(ordered_slots)}"
+        )
+    for lane, expected_posts in enumerate(expected_lane_posts):
+        lane_slots = sorted(
+            slot
+            for slot in ordered_slots
+            if slot // fixture.private_arena_capacity == lane
+        )
+        expected_slots = list(
+            range(
+                lane * fixture.private_arena_capacity,
+                lane * fixture.private_arena_capacity + expected_posts,
+            )
+        )
+        if lane_slots != expected_slots:
+            raise AssertionError(
+                f"lane {lane} private slots are not a dense private arena "
+                f"actual={_compact_ints(lane_slots)} expected={_compact_ints(expected_slots)}"
+            )
+    for producer, expected in enumerate(fixture.expected_candidates):
+        actual = seeds[producer, : counts[producer]]
+        for record, item in zip(actual.tolist(), expected, strict=True):
+            private_slot = int(record[4])
+            if int(private_source_cpu[item.row, item.source]) != private_slot:
+                raise AssertionError(
+                    "private source map does not publish "
+                    f"row={item.row} source={item.source} slot={private_slot}"
+                )
 
-    # Four unique cold objects, split two per Direct-HCCP lane (O=4 -> lane0,
-    # O=1 -> lane1).  Candidate multiplicity is eight but must not leak into
-    # descriptor post count.
-    torch.testing.assert_close(get_stats.cpu()[:, 2], torch.zeros(GET_LANE_COUNT, dtype=torch.int64))
-    torch.testing.assert_close(get_stats.cpu()[:, 0].sum(), torch.tensor(4, dtype=torch.int64))
-    torch.testing.assert_close(private_head_out.cpu(), torch.tensor([2, 2], dtype=torch.int32))
-    # Bridge outputs are intentionally ``empty`` outside the records produced
-    # by a wave.  Check only each lane's known active prefix; summing the
-    # uninitialized tail would create a flaky test rather than a lifecycle
-    # assertion.
-    requested_per_lane = get_stats.cpu()[:, 0].tolist()
+    # The descriptor fingerprints are accumulated in device code before each
+    # Post.  Recomputing them from the final object-to-slot map makes the
+    # overwritten first A-buffer wave observable without reading stale
+    # descriptor memory after A has been reused by wave three.
+    for lane in range(GET_LANE_COUNT):
+        expected_sum = 0
+        expected_xor = 0
+        for (_pool, kv_object), slot in slots_by_object.items():
+            if kv_object & (GET_LANE_COUNT - 1) != lane:
+                continue
+            table_index = kv_object // ROWS_PER_ENTRY
+            offset = (kv_object % ROWS_PER_ENTRY) * PACKED_ENTRY_BYTES
+            fingerprint = (table_index << 32) ^ (offset << 1) ^ slot
+            expected_sum += fingerprint
+            expected_xor ^= fingerprint
+        if int(get_stats_cpu[lane, 12]) != expected_sum or int(get_stats_cpu[lane, 13]) != expected_xor:
+            raise AssertionError(
+                "descriptor hash mismatch lane=%d actual_sum=%d expected_sum=%d "
+                "actual_xor=%d expected_xor=%d"
+                % (
+                    lane,
+                    int(get_stats_cpu[lane, 12]),
+                    expected_sum,
+                    int(get_stats_cpu[lane, 13]),
+                    expected_xor,
+                )
+            )
+
+    # Only the last value written to each descriptor buffer is observable at
+    # kernel return.  A (buffer 0) is the final tail after reuse, while B
+    # retains wave two.  Validate every surviving descriptor, but do not
+    # impose a producer arrival order on asynchronous rings.
     claim_cpu = get_claim_new.cpu()
     mask_cpu = get_mask.cpu()
-    for lane, request_count in enumerate(requested_per_lane):
-        if request_count != 2:
-            raise AssertionError(f"lane {lane} posted {request_count}, expected two unique objects")
-        torch.testing.assert_close(
-            claim_cpu[lane, 0, :request_count],
-            torch.ones(request_count, dtype=torch.uint8),
+    indices_cpu = get_indices.cpu()
+    offsets_cpu = get_offsets.cpu()
+    outputs_cpu = get_output_indices.cpu()
+    seed_slots_cpu = get_candidate_seed_slots.cpu()
+    flat_seeds = seeds.reshape(-1, 5)
+    for lane in range(GET_LANE_COUNT):
+        terminal_counts = _terminal_buffer_record_counts(
+            fixture,
+            lane,
+            int(get_stats_cpu[lane, 0]),
+            int(get_stats_cpu[lane, 1]),
         )
-        torch.testing.assert_close(
-            mask_cpu[lane, 0, :request_count],
-            torch.ones(request_count, dtype=torch.uint8),
-        )
+        wave_start = 0
+        final_start = [0] * GET_DESCRIPTOR_BUFFER_COUNT
+        for wave_index, records in enumerate(fixture.expected_wave_sizes[lane]):
+            final_start[wave_index % GET_DESCRIPTOR_BUFFER_COUNT] = wave_start
+            wave_start += records
+        for buffer, request_count in enumerate(terminal_counts):
+            if request_count == 0:
+                continue
+            torch.testing.assert_close(
+                claim_cpu[lane, buffer, :request_count],
+                torch.ones(request_count, dtype=torch.uint8),
+            )
+            torch.testing.assert_close(
+                mask_cpu[lane, buffer, :request_count],
+                torch.ones(request_count, dtype=torch.uint8),
+            )
+            output_values = [
+                int(value)
+                for value in outputs_cpu[lane, buffer, :request_count].tolist()
+            ]
+            expected_output_values = list(
+                range(
+                    lane * fixture.private_arena_capacity + final_start[buffer],
+                    lane * fixture.private_arena_capacity
+                    + final_start[buffer]
+                    + request_count,
+                )
+            )
+            if sorted(output_values) != expected_output_values:
+                raise AssertionError(
+                    "terminal descriptor output range mismatch lane=%d buffer=%d "
+                    "actual={%s} expected={%s}"
+                    % (
+                        lane,
+                        buffer,
+                        _compact_ints(output_values),
+                        _compact_ints(expected_output_values),
+                    )
+                )
+            for record in range(request_count):
+                candidate_slot = int(seed_slots_cpu[lane, buffer, record])
+                if candidate_slot < 0 or candidate_slot >= flat_seeds.shape[0]:
+                    raise AssertionError(
+                        f"invalid terminal CandidateSeed slot lane={lane} buffer={buffer} record={record} value={candidate_slot}"
+                    )
+                seed = [int(value) for value in flat_seeds[candidate_slot].tolist()]
+                row, source, kv_object, _score, private_slot = seed
+                table_index = int(indices_cpu[lane, buffer, record])
+                offset = int(offsets_cpu[lane, buffer, record])
+                output_slot = output_values[record]
+                if (
+                    row < 0
+                    or source < 0
+                    or kv_object < 0
+                    or private_slot != output_slot
+                    or table_index != kv_object // ROWS_PER_ENTRY
+                    or offset != (kv_object % ROWS_PER_ENTRY) * PACKED_ENTRY_BYTES
+                    or int(private_source_cpu[row, source]) != output_slot
+                    or int(private_object_cpu[row, kv_object]) != output_slot
+                ):
+                    raise AssertionError(
+                        "terminal descriptor mismatch "
+                        f"lane={lane} buffer={buffer} record={record} "
+                        f"seed={seed} table={table_index} offset={offset} output={output_slot}"
+                    )
     expected_trace = torch.cat(
         (
             torch.arange(2000, 2000 + GET_LANE_COUNT, dtype=torch.int32),
@@ -954,6 +1362,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--frame-epoch", type=int, default=17)
+    parser.add_argument(
+        "--fixture",
+        choices=("baseline", "multiwave"),
+        default="baseline",
+        help=(
+            "baseline is the small dedup/payload proof; multiwave forces each "
+            "Get lane through fixed descriptor buffers A(64)->B(256)->A(64)"
+        ),
+    )
     parser.add_argument(
         "--candidate-mode",
         choices=("full", "none"),
@@ -979,12 +1396,13 @@ def main() -> None:
     if args.transport == "remote" and not args.cpu_service_addr:
         raise ValueError("--transport remote requires --cpu-service-addr")
 
-    fixture = _build_fixture(args.frame_epoch)
+    fixture = _build_fixture(args.frame_epoch, args.fixture)
     _assert_fixture_oracle(fixture)
     live_oracle = _assert_live_receipt_oracle(fixture)
     if args.stage == "oracle":
         print(
             "P5_SEMANTIC_PURE_ORACLE_PASS "
+            f"fixture={fixture.name} "
             f"active_windows={live_oracle['active_windows']} "
             f"inactive_windows={live_oracle['inactive_windows']} "
             f"timeout_defer_windows={live_oracle['timeout_defer_windows']} "
@@ -1006,7 +1424,7 @@ def main() -> None:
     _assert_receipt_fixture(torch, fixture, tensors)
     print(
         "P5_SEMANTIC_STAGE "
-        f"mode={args.stage} source=p2_direct_receipt_fixture "
+        f"fixture={fixture.name} mode={args.stage} source=p2_direct_receipt_fixture "
         f"device={args.device} score_carrier=int32 score_value=uint16 "
         f"candidate_mode={args.candidate_mode} "
         f"receipts={tensors['tile_receipts'].shape[0]} receipt_words={RECEIPT_WORDS} "
@@ -1015,10 +1433,18 @@ def main() -> None:
     )
     print(
         "P5_SEMANTIC_ORACLE "
+        f"fixture={fixture.name} "
         f"selected={sum(fixture.expected_selected)} hbm_hit={sum(fixture.expected_hits)} "
         f"cold_candidate_seeds={sum(len(value) for value in fixture.expected_candidates)} "
         f"unique_posts={len(fixture.expected_unique_cold_objects)} "
         f"deferred={sum(fixture.expected_deferred)} duplicate_s_to_o=1"
+    )
+    print(
+        "P5_SEMANTIC_WAVE_PLAN "
+        f"fixture={fixture.name} "
+        "lane0=" + ",".join(str(value) for value in fixture.expected_wave_sizes[0]) + " "
+        "lane1=" + ",".join(str(value) for value in fixture.expected_wave_sizes[1]) + " "
+        "descriptor_buffers=A,B,A"
     )
     print(
         "P5_SEMANTIC_LIVE_RECEIPT_ORACLE "
