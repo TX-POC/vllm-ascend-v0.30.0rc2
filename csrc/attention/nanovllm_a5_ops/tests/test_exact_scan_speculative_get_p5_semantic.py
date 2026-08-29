@@ -1461,12 +1461,23 @@ def main() -> None:
         _run_executor(torch, fixture, tensors, args, device)
         if args.candidate_mode == "full":
             print(
-                "P5_SEMANTIC_EXECUTOR_PASS candidate_mode=full "
+                "P5_SEMANTIC_EXECUTOR_PASS "
+                f"fixture={fixture.name} candidate_mode=full "
                 "candidate_exact=1 object_dedup=1 post_cq_ready=1"
             )
+            if fixture.name == "multiwave":
+                lane_posts = _expected_lane_post_counts(fixture)
+                print(
+                    "P5_MULTIWAVE_STRICT_PASS "
+                    "fixture=multiwave descriptor_reuse=A_to_B_to_A "
+                    f"lane0_requested={lane_posts[0]} "
+                    f"lane1_requested={lane_posts[1]} "
+                    "batches_per_lane=3 private_ready_payload_exact=1"
+                )
         else:
             print(
-                "P5_SEMANTIC_EXECUTOR_PASS candidate_mode=none "
+                "P5_SEMANTIC_EXECUTOR_PASS "
+                f"fixture={fixture.name} candidate_mode=none "
                 "scan_ring_terminal=1 direct_hccp_post_exercised=0"
             )
     else:
