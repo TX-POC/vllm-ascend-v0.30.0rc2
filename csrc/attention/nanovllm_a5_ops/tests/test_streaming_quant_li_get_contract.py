@@ -219,7 +219,25 @@ def require_source_contract() -> None:
         ],
         "audit Vector/Scalar score-tile lifetime",
     )
-    assert "final per-pingpong Scalar" in post_seam
+    # The full Post hook has the same score-tile ownership envelope as audit:
+    # its Scalar ExactScan may not begin before Vector has produced `outBase`,
+    # and Vector may not recycle the ping-pong tile before the scalar reader
+    # is done.  This source check is deliberately structural rather than
+    # matching a stale explanatory comment.
+    _assert_in_order(
+        post_seam,
+        [
+            "PipeBarrier<PIPE_V>();",
+            "FetchEventID(HardEvent::V_S)",
+            "SetFlag<HardEvent::V_S>",
+            "WaitFlag<HardEvent::V_S>",
+            "streamingKvafHook_.Emit",
+            "FetchEventID(HardEvent::S_V)",
+            "SetFlag<HardEvent::S_V>",
+            "WaitFlag<HardEvent::S_V>",
+        ],
+        "post Vector/Scalar score-tile lifetime",
+    )
     assert "BatchMulWeightAndReduceSum" in vector
     assert "ProcessTopK" in vector
 
@@ -256,6 +274,7 @@ def require_source_contract() -> None:
         "SCORE_WORKSPACE_INDEX = 21", "TILE_RECEIPTS_INDEX = 22",
         "STREAMING_EPOCH_INDEX = 23", "SCORE_WORKSPACE_OUTPUT_INDEX = 9",
         "TILE_RECEIPTS_OUTPUT_INDEX = 10", "STREAMING_TILE_RECEIPT_WORDS = 16",
+        "STREAMING_TELEMETRY_COLUMNS = 14",
     ):
         assert token in tiling_header, token
     for token in (
@@ -341,6 +360,8 @@ def require_source_contract() -> None:
         "kv_object_map",
         "key = int(keys[table_index])",
         "mapped_sources != len(unique_slots)",
+        "P3_POST_ONLINE_OVERLAP_PROOF",
+        "score_tiles_with_cq_pending",
         "P3_POST_PAYLOAD_FAIL",
     ):
         assert token in post_payload, token

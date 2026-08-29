@@ -927,7 +927,7 @@ def _prove_safe_hook_control(
     """Print one compact proof after the target stream has completed."""
     _assert_no_post_transaction_unchanged(transaction, snapshot)
     telemetry = outputs[7].detach().cpu().contiguous()
-    expected_shape = (QUEUE_COUNT, 13)
+    expected_shape = (QUEUE_COUNT, 14)
     if tuple(telemetry.shape) != expected_shape:
         raise RuntimeError(
             "unexpected P3 telemetry shape: "

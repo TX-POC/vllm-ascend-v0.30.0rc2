@@ -51,12 +51,13 @@ ENTRY_BYTES = ROWS_PER_ENTRY * PACKED_KV_ROW_BYTES
 STREAMING_CONTROL_WORDS = target.STREAMING_CONTROL_WORDS
 STREAMING_CONTROL_MAGIC = target.STREAMING_CONTROL_MAGIC
 STREAMING_CONTROL_VERSION = target.STREAMING_CONTROL_VERSION
-QUEUE_TELEMETRY_COLUMNS = 13
+QUEUE_TELEMETRY_COLUMNS = 14
 TELEMETRY_DOORBELL_POSTED = 8
 TELEMETRY_CQ_RETIRED_READY = 9
 TELEMETRY_CQ_RETIRED_FAILED = 10
 TELEMETRY_LEASE_RELEASED = 11
 TELEMETRY_CONTROL_REJECTED = 12
+TELEMETRY_SCORE_TILES_WITH_CQ_PENDING = 13
 DEFAULT_QUEUE_COUNT = 1
 DEFAULT_PRIVATE_ARENA_CAPACITY = 256
 MAX_DENSE_REQUESTS = 256
@@ -538,6 +539,9 @@ def _terminal_summary(
         "cq_retired_failed": int(telemetry[:, TELEMETRY_CQ_RETIRED_FAILED].sum().item()),
         "lease_released": int(telemetry[:, TELEMETRY_LEASE_RELEASED].sum().item()),
         "control_rejected": int(telemetry[:, TELEMETRY_CONTROL_REJECTED].sum().item()),
+        "score_tiles_with_cq_pending": int(
+            telemetry[:, TELEMETRY_SCORE_TILES_WITH_CQ_PENDING].sum().item()
+        ),
         "private_claims": int(telemetry[:, 5].sum().item()),
         "mapped_sources": int(torch.count_nonzero(source_to_slot >= 0).item()),
         "ready_slots": int(torch.count_nonzero(ready == 2).item()),
@@ -553,6 +557,12 @@ def _terminal_summary(
         "cq_retired_failed": summary["cq_retired_failed"] == 0,
         "failed_slots": summary["failed_slots"] == 0,
         "lease_released": summary["lease_released"] > 0,
+        # This is the strict online-pipeline gate.  The current score tile
+        # reaches the hook only after its real C8 reduction; a nonzero count
+        # means a preceding Direct-HCCP wave was still nonterminal when C8
+        # had already produced a later score tile.  Doorbell/CQ counts alone
+        # would only prove a serial post followed by a terminal drain.
+        "score_tiles_with_cq_pending": summary["score_tiles_with_cq_pending"] > 0,
         "queue_leases_zero": bool(torch.equal(leases, torch.zeros_like(leases))),
     }
     bad = [name for name, ok in required.items() if not ok]
@@ -586,6 +596,9 @@ def _probe_summary(
         "cq_retired_failed": int(telemetry[:, TELEMETRY_CQ_RETIRED_FAILED].sum().item()),
         "lease_released": int(telemetry[:, TELEMETRY_LEASE_RELEASED].sum().item()),
         "control_rejected": int(telemetry[:, TELEMETRY_CONTROL_REJECTED].sum().item()),
+        "score_tiles_with_cq_pending": int(
+            telemetry[:, TELEMETRY_SCORE_TILES_WITH_CQ_PENDING].sum().item()
+        ),
         "private_claims": int(telemetry[:, 5].sum().item()),
         "mapped_sources": int(torch.count_nonzero(source_to_slot >= 0).item()),
         "ready_slots": int(torch.count_nonzero(ready == 2).item()),
@@ -638,6 +651,7 @@ def _assert_non_payload_mode(
         "failed_slots": summary["failed_slots"] == 0,
         "cq_retired_ready": summary["cq_retired_ready"] == 0,
         "cq_retired_failed": summary["cq_retired_failed"] == 0,
+        "no_pending_cq_score_tiles": summary["score_tiles_with_cq_pending"] == 0,
     }
     if mode == "all_busy":
         common["all_busy_kept_leases"] = summary["leases_nonzero"] == transaction[
@@ -959,6 +973,14 @@ def main() -> int:
                 args.private_arena_capacity,
             )
             print(
+                "P3_POST_ONLINE_OVERLAP_PROOF "
+                f"score_tiles_with_cq_pending={terminal['score_tiles_with_cq_pending']} "
+                f"doorbell_posted={terminal['doorbell_posted']} "
+                f"cq_ready={terminal['cq_retired_ready']} "
+                "meaning=later_exact_score_tile_observed_while_prior_get_cq_nonterminal",
+                flush=True,
+            )
+            print(
                 "P3_POST_PAYLOAD_STRICT_PASS "
                 "topk=bitwise score_source_lens=exact publication=off "
                 "persistent_mapping=unchanged mapping=permuted_pool "
@@ -967,6 +989,7 @@ def main() -> int:
                 f"payload_bytes={payload['payload_bytes']} "
                 f"doorbell_posted={terminal['doorbell_posted']} "
                 f"cq_ready={terminal['cq_retired_ready']} "
+                f"score_tiles_with_cq_pending={terminal['score_tiles_with_cq_pending']} "
                 f"physical_npu={args.physical_npu_id} logical_npu=0",
                 flush=True,
             )

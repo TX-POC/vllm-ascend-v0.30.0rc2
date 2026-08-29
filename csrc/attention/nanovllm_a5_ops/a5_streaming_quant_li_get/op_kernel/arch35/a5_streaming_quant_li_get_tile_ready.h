@@ -31,7 +31,11 @@ constexpr int32_t kPrivateReadyReady = 2;
 constexpr int32_t kPrivateReadyFailed = 3;
 
 // Each producer owns one telemetry row only while it holds that queue lease.
-// Columns are intentionally compact enough for a graph-stable int64[Q,13].
+// The row is graph-stable ``int64[Q,14]``.  Column 13 is deliberately a
+// causal (rather than timing) overlap witness: `Emit()` is reached only after
+// the current C8 score tile has been reduced, so observing a live previous
+// wave here proves that Direct-HCCP/CQ was still pending while C8 moved on to
+// another exact score tile.
 enum TelemetryColumn : uint32_t {
     kTileReadyCalls = 0U,
     kScoresScanned = 1U,
@@ -46,7 +50,10 @@ enum TelemetryColumn : uint32_t {
     kCqRetiredFailed = 10U,
     kLeaseReleased = 11U,
     kControlRejected = 12U,
+    kScoreTilesWithCqPending = 13U,
 };
+
+constexpr uint32_t kTelemetryColumns = 14U;
 
 // A source-map cell is first atomically changed -1 -> -2. Only its winning
 // producer takes a bounded queue-local private slot. The caller publishes the
@@ -259,6 +266,14 @@ public:
         }
         RetireAndReleaseIfTerminal(false);
         if (hasWave_) {
+            // `BatchMulWeightAndReduceSum` for *this* C8 tile has already
+            // completed before Emit().  The older Get wave remains pending
+            // after a nonblocking CQ poll, therefore this is the strict
+            // device-side witness that HCCP DMA/CQ and later C8 score work
+            // overlap.  It is intentionally recorded before returning to
+            // Vector so the marker cannot be confused with the terminal
+            // Finish() drain.
+            AddTelemetry(wave_.lease.queue_id, kScoreTilesWithCqPending, 1);
             // One Direct-HCCP wave per lease. The next tile remains exact scan
             // work and intentionally suppresses further speculation until CQ.
             AddTelemetry(wave_.lease.queue_id, kSuppressedNoQueueOrArena, 1);
@@ -597,10 +612,11 @@ private:
     __aicore__ inline void AddTelemetry(uint32_t queue_id, uint32_t column,
                                         int64_t value)
     {
-        if (queue_id >= queueCount_ || column >= 13U) {
+        if (queue_id >= queueCount_ || column >= kTelemetryColumns) {
             return;
         }
-        const uint64_t offset = static_cast<uint64_t>(queue_id) * 13U + column;
+        const uint64_t offset = static_cast<uint64_t>(queue_id) *
+            kTelemetryColumns + column;
         telemetry_.SetValue(offset, telemetry_.GetValue(offset) + value);
     }
 
