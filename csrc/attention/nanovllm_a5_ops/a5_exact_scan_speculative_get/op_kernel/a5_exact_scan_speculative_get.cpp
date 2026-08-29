@@ -130,6 +130,11 @@ constexpr uint64_t kGetResultPrivateStateError = 0x1007U;
 // distinct result so a malformed/stale descriptor can never be mistaken for
 // a CQ failure or for the private-ready bookkeeping error above.
 constexpr uint64_t kGetResultDescriptorStateError = 0x1008U;
+// The producer and consumer both derive raw GM addresses from the ring
+// geometry.  Rejecting a stale host tiler before either side touches the ring
+// turns an OPP/bridge layout mismatch into observable telemetry instead of
+// allowing it to reinterpret a 232-word ring as the current 248-word ring.
+constexpr uint64_t kGetResultRingGeometryError = 0x1009U;
 
 // CandidateSeed is intentionally an int32 record so it can be consumed by a
 // later graph-visible reconcile stage without reconstructing a pointer-sized
@@ -309,7 +314,33 @@ public:
     {
         if ASCEND_IS_AIV {
             const uint32_t taskLane = GetBlockIdx();
-            if (taskLane < tiling_->getLaneCount) {
+            if (!HasExpectedRingGeometry()) {
+                if (taskLane < kGetLaneCount) {
+                    WriteRoleTrace(taskLane,
+                                   kRoleTraceGetBase +
+                                       static_cast<int32_t>(taskLane));
+                    WriteGetStats(taskLane, 0U, 0U,
+                                  kGetResultRingGeometryError, 0U, 0U, 0U,
+                                  0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U);
+                } else {
+                    const uint32_t producer = taskLane - kProducerAivBegin;
+                    if (producer < kProducerCount) {
+                        WriteRoleTrace(
+                            taskLane,
+                            kRoleTraceExactScanBase +
+                                static_cast<int32_t>(producer));
+                        WriteGmByPassDCache<int32_t>(candidateCounts_ + producer,
+                                                     0);
+                        WriteProducerStats(
+                            producer, 0U, 0U, 0U, 0U,
+                            static_cast<uint64_t>(-1), 0U,
+                            static_cast<uint64_t>(GetSystemCycle()), 0U, 0U,
+                            0U);
+                    }
+                }
+                return;
+            }
+            if (taskLane < kGetLaneCount) {
                 ProcessFullGetLane(taskLane);
                 return;
             }
@@ -321,6 +352,15 @@ public:
     }
 
 private:
+    __aicore__ inline bool HasExpectedRingGeometry() const
+    {
+        return tiling_->producerCount == kProducerCount &&
+               tiling_->getLaneCount == kGetLaneCount &&
+               tiling_->ringSlots == kRingSlots &&
+               tiling_->recordsPerRingSlot == kRecordsPerRingSlot &&
+               tiling_->pipelineWordsPerRing == kRingWords;
+    }
+
     __aicore__ inline RingView Ring(uint32_t producer, uint32_t lane) const
     {
         const uint32_t ringIndex = producer * kGetLaneCount + lane;
@@ -952,10 +992,17 @@ private:
                 // fill this descriptor wave and retain the remaining record
                 // range in the slot for the next wave.
                 uint32_t nextRecord = static_cast<uint32_t>(cursor64);
-                for (; nextRecord < count && queued < consumeLimit;
-                     ++nextRecord) {
+                // Advance the persistent cursor *before* processing a
+                // record.  ``queued`` can reach ``consumeLimit`` inside the
+                // body, in which case a conventional ``for (...;
+                // ++nextRecord)`` would exit before its increment expression
+                // runs and publish the already-consumed record as unread.
+                // Keeping ``nextRecord`` equal to the first unread record is
+                // the SPSC resume contract for the next descriptor wave.
+                while (nextRecord < count && queued < consumeLimit) {
+                    const uint32_t record = nextRecord++;
                     __gm__ int64_t* const words =
-                        ring.RecordWord(slot, nextRecord, 0);
+                        ring.RecordWord(slot, record, 0);
                     const uint64_t sourceOffset = LoadRingWord(words);
                     const uint64_t objectOffset = LoadRingWord(words + 1U);
                     const uint64_t candidateSlot = LoadRingWord(words + 2U);

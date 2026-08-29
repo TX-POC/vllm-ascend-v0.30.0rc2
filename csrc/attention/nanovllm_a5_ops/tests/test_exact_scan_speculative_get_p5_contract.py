@@ -279,11 +279,18 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
         ):
             self.assertIn(required, kernel)
 
-        # A seed must become visible before the SPSC ready state; otherwise a
-        # Get lane can post a descriptor reconstructed from an old seed.
-        flush = kernel.index("FlushGmRange(reinterpret_cast<__gm__ uint8_t*>(\n                                 CandidateSeedByAbsolute(candidateSlot))")
+        # CandidateSeed and the SPSC record use bypass GM writes.  The seed
+        # has to be written before TryAppendCandidate and that helper's
+        # PublishRingSlot release publishes both objects together.  Requiring
+        # a DCCI flush here would be wrong: it could clean an older cache line
+        # over a newer bypass-GM value.
+        seed_write = kernel.index(
+            "WriteCandidateSeed(producer, candidateCount, row, source,"
+        )
         append = kernel.index("TryAppendCandidate(Ring(producer, lane)")
-        self.assertLess(flush, append)
+        publish = kernel.index("DataSyncBarrier<MemDsbT::DDR>();", append)
+        self.assertLess(seed_write, append)
+        self.assertLess(append, publish)
 
     def test_post_cq_private_ready_lifecycle_and_c8_noninterference(self) -> None:
         kernel = _text(KERNEL_CPP)
@@ -310,6 +317,38 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
         self.assertIsNotNone(finish_body)
         body = finish_body.group(0)
         self.assertLess(body.index("FinishKvafDenseBatchGet"), body.index("PublishPrivateReadyForWave"))
+
+    def test_ring_cursor_always_publishes_the_first_unread_record(self) -> None:
+        """A descriptor-wave boundary must not replay its final candidate.
+
+        A ring record is a CandidateSeed but ``queued`` counts unique H2D
+        objects.  With duplicate source-to-object mappings, the body can make
+        ``queued == consumeLimit``.  The cursor must already have advanced at
+        that point; otherwise the next wave replays the final record and
+        changes the exact Post/CQ descriptor ledger.
+        """
+        kernel = _text(KERNEL_CPP)
+        expected_loop = (
+            "while (nextRecord < count && queued < consumeLimit) {\n"
+            "                    const uint32_t record = nextRecord++;\n"
+            "                    __gm__ int64_t* const words =\n"
+            "                        ring.RecordWord(slot, record, 0);"
+        )
+        self.assertIn(expected_loop, kernel)
+        self.assertNotIn(
+            "for (; nextRecord < count && queued < consumeLimit;", kernel
+        )
+        self.assertIn("kGetResultRingGeometryError = 0x1009U", kernel)
+        self.assertIn("HasExpectedRingGeometry()", kernel)
+        self.assertIn(
+            "tiling_->pipelineWordsPerRing == kRingWords", kernel
+        )
+
+        # The legacy overlap benchmark imports its allocation shape from the
+        # old test module.  It must include cursor storage as well, otherwise
+        # the host/bridge correctly reject a stale 232-word pipeline tensor.
+        legacy_test = _text(TESTS_ROOT / "test_exact_scan_speculative_get.py")
+        self.assertIn("RING_SLOT_RECORD_WORD = 3 * CACHE_LINE_WORDS", legacy_test)
 
     def test_inline_c8_score_read_has_bidirectional_ub_lifetime_fence(self) -> None:
         """Full Post may read a C8 tile only inside a V->S->V envelope.

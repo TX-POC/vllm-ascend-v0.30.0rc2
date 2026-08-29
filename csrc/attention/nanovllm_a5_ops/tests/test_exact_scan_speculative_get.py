@@ -37,7 +37,10 @@ ROWS_PER_DMA_CACHELINE = DMA_CACHELINE_BYTES // math.gcd(
 RING_SLOTS = 2
 RECORDS_PER_RING_SLOT = 32
 CACHE_LINE_WORDS = 8
-RING_SLOT_RECORD_WORD = 2 * CACHE_LINE_WORDS
+# state, record count, and resume cursor occupy three cache lines.  This must
+# stay aligned with the P5 executor's SPSC ring ABI; the overlap benchmark
+# imports this constant directly when it allocates ``pipeline_state``.
+RING_SLOT_RECORD_WORD = 3 * CACHE_LINE_WORDS
 RING_WORDS_PER_SLOT = RING_SLOT_RECORD_WORD + RECORDS_PER_RING_SLOT * 3
 PIPELINE_WORDS_PER_RING = RING_SLOTS * RING_WORDS_PER_SLOT + CACHE_LINE_WORDS
 PIPELINE_RING_COUNT = PRODUCER_COUNT * GET_LANE_COUNT
