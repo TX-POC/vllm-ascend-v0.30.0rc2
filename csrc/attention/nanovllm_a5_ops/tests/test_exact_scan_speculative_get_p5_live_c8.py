@@ -32,6 +32,63 @@ import sys
 from pathlib import Path
 from typing import Any
 
+
+P5_OPP_ENV = "NANOVLLM_A5_EXACT_SCAN_OPP"
+
+
+def _preload_p5_opp_before_acl() -> tuple[Path, Path]:
+    """Make P5's package discoverable before the process's first ACLNN call.
+
+    The P3 adapter invokes the official C8 ACLNN operator before this test
+    imports the P5 bridge.  CANN snapshots custom OPP package metadata at that
+    first ACLNN call, so merely loading the P5 bridge later is too late for
+    ``A5ExactScanSpeculativeGet``.  This function deliberately registers only
+    the *package* now.  It does not set ``NANOVLLM_CUST_OPAPI_LIB``: each
+    isolated bridge selects its own generated OPAPI DSO immediately before its
+    own call.
+    """
+    root_value = os.getenv(P5_OPP_ENV)
+    if not root_value:
+        raise RuntimeError(
+            f"{P5_OPP_ENV} must name the built P5 OPP root before this "
+            "live C8 gate starts"
+        )
+    opp_root = Path(root_value).expanduser().resolve()
+    candidates = {
+        candidate.resolve()
+        for candidate in (
+            opp_root / "op_api/lib/libcust_opapi.so",
+            *opp_root.glob("vendors/*/op_api/lib/libcust_opapi.so"),
+        )
+        if candidate.is_file()
+    }
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "P5 live C8 gate requires exactly one P5 custom OPAPI in "
+            f"{opp_root}; found={[str(path) for path in sorted(candidates)]}"
+        )
+    opapi = next(iter(candidates))
+    vendor = opapi.parents[2]
+    vendor_text = str(vendor)
+    existing = [
+        path
+        for path in os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(":")
+        if path and path != vendor_text
+    ]
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join([vendor_text, *existing])
+    print(
+        "P5_LIVE_C8_OPP_PRELOAD "
+        f"p5_vendor={vendor} p5_opapi={opapi} "
+        f"custom_opp_path={os.environ['ASCEND_CUSTOM_OPP_PATH']}",
+        flush=True,
+    )
+    return opapi, vendor
+
+
+# This must run before importing torch_npu or the P3 adapter.  The latter
+# reaches the first ACLNN call, where CANN discovers all custom OPP packages.
+_P5_OPAPI, _P5_VENDOR = _preload_p5_opp_before_acl()
+
 import torch
 import torch_npu  # noqa: F401  # Registers the NPU backend.
 

@@ -1,11 +1,12 @@
-"""Prototype-only registration for A5ExactScanSpeculativeGet.
+"""Typed bridge for the P5 ``A5ExactScanSpeculativeGet`` custom OPP.
 
-This bridge is intentionally built against an isolated P1 OPP package.  It
-must select that package *before* loading ``_C``: the C++ ACLNN launcher
-resolves the generated API symbols through ``NANOVLLM_CUST_OPAPI_LIB``.  An
-ambient normal/custom OPP with an older operator ABI can export the same
-symbol names but accept a different argument list, which otherwise surfaces
-as a misleading generic dtype/format error at GetWorkspaceSize time.
+The live P5 runner makes this package visible before its first ACLNN call so
+CANN can discover the P5 binary metadata alongside the official C8 and P3
+packages.  This bridge still selects the P5 generated OPAPI DSO before
+loading ``_C``: the C++ ACLNN launcher resolves its symbols through
+``NANOVLLM_CUST_OPAPI_LIB``.  Selection of an OPAPI DSO and discovery of every
+custom OPP package are distinct concerns; the former must not erase the
+latter's search path.
 """
 
 from __future__ import annotations
@@ -31,20 +32,24 @@ if len(_OPAPI_LIBS) != 1:
 
 _OPAPI = _OPAPI_LIBS[0].resolve()
 _VENDOR = _OPAPI.parents[2]
-# P1 is a standalone prototype and its bridge has one custom-OPAPI resolver.
-# Do not append historical vendor roots here: CANN could load this build's
-# generated API DSO while selecting metadata or a binary from an older P1
-# package with the same operator name.  A mixed-custom-OPP process needs a
-# proper multi-library resolver and is deliberately outside this probe.
-os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(_VENDOR)
+# Keep every package that was registered before the first ACLNN call.  P5 is
+# put first for clarity, but CANN has already discovered the official C8, P3,
+# and P5 package metadata by the time this bridge switches the OPAPI resolver.
+_VENDOR_TEXT = str(_VENDOR)
+_EXISTING = [
+    value
+    for value in os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(":")
+    if value and value != _VENDOR_TEXT
+]
+os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join([_VENDOR_TEXT, *_EXISTING])
 os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(_OPAPI)
 
 if os.getenv("NANOVLLM_A5_OPAPI_DEBUG") not in (None, "", "0"):
     print(
-        "P1_OPAPI_BIND "
+        "P5_OPAPI_BIND "
         f"opp_root={_LOCAL_OPP} vendor={_VENDOR} opapi={_OPAPI} "
         f"ascend_custom_opp_path={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')} "
-        "isolated=1",
+        "preserved_multi_opp_path=1",
         flush=True,
     )
 
