@@ -1002,6 +1002,25 @@ def main() -> int:
             {f"output[{index}]": value for index, value in enumerate(outputs)}
         )
         _require_output_aliases(transaction, publication, outputs)
+        # Emit the complete terminal state *before* strict C8 math can abort
+        # this process.  In particular, ``hook_off`` must prove that the
+        # device hook rejected the intentionally corrupted control word.  A
+        # math failure before this receipt used to leave two materially
+        # different causes indistinguishable:
+        #
+        #   1. the V/S score seam actually ran; or
+        #   2. merely compiling the full closure changed C8's UB layout.
+        #
+        # This is intentionally a compact host read after terminal sync, not
+        # a hot-path device operation.  It never changes graph inputs,
+        # outputs, or the strict equality gate below.
+        isolation_probe = _probe_summary(transaction, outputs)
+        if args.post_exercise != "full":
+            print(
+                "P3_POST_ISOLATION_STATE "
+                f"mode={args.post_exercise} summary={isolation_probe}",
+                flush=True,
+            )
         expected_score_source_lens = target._expected_score_source_lens(device)
         topk_equal, topk_diagnostic = _strict_tensor_diagnostic(
             "sparse_indices", official_indices, outputs[0]
