@@ -13,6 +13,14 @@ vLLM product route.  It performs one controlled target-NPU comparison:
 4. return the strict dictionary consumed by
    ``test_streaming_quant_li_get_target_equivalence.py``.
 
+For the P5 integration gate, the returned dictionary also exposes the three
+*same-allocation* publication tensors.  This is intentionally a narrow ABI
+handoff: P5 receives the C8-written score workspace and fixed tile receipts
+without repacking scores through Python or manufacturing a second receipt
+surface.  The static score-source lengths remain a separate scheduler-owned
+input on the P5 side; P5 must not use the derived terminal output as a live
+producer dependency.
+
 The P3 operator has two independent build-time selectors.  Publication modes
 are exercised through ``P3_PUBLICATION_MODE``:
 
@@ -1392,6 +1400,17 @@ def run_target_equivalence() -> dict[str, Any]:
         "publication_aliases": {
             "score_workspace": (publication["score_workspace"], outputs[9]),
             "tile_receipts": (publication["tile_receipts"], outputs[10]),
+        },
+        # The P5 live-publisher harness consumes these *exact* C8 output
+        # allocations.  Keeping them in addition to ``publication_aliases``
+        # makes the zero-copy cross-op edge explicit instead of recovering
+        # tensors by fragile output-position knowledge in a second module.
+        # ``streaming_epoch`` is graph-static forward metadata, not a C8
+        # terminal output; its identity is still part of the publication ABI.
+        "publication_tensors": {
+            "score_workspace": publication["score_workspace"],
+            "tile_receipts": publication["tile_receipts"],
+            "streaming_epoch": publication["streaming_epoch"],
         },
         "publication_summary": publication_summary,
         # A5 C8 rejects return_value=True in the reference tiling, so this
