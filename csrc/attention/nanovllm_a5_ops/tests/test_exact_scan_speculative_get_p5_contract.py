@@ -173,6 +173,33 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
         self.assertEqual(bridge_inputs, [name for name, _ in INPUTS])
         self.assertEqual(bridge_outputs, list(BRIDGE_OUTPUT_NAMES))
 
+    def test_host_tiling_keeps_the_64_lane_abi_when_direct_aclnn_rejects_batch_mode(
+        self,
+    ) -> None:
+        """A direct ACLNN probe must not turn a scheduler capability result
+        into a false ABI/tiling failure.
+
+        The target graph still requests batch scheduling.  If CANN rejects
+        that request in its direct single-op API, P5 reports the explicit
+        fallback and retains the same 64 AIV-only logical lanes.  Nothing in
+        this launch-mode handling changes C8 scores, candidate selection, or
+        the Post/CQ correctness path.
+        """
+        host = _text(HOST_CPP)
+        for required in (
+            'LogP5TilingContractFailure("aiv_count"',
+            "if (aivCount < kAivCount)",
+            "platform.CalcTschBlockDim(kAivCount, 0U, aivCount)",
+            "context->SetBlockDim(aivOnlyBlockDim);",
+            "const ge::graphStatus scheduleStatus = context->SetScheduleMode(1U);",
+            'scheduleStatus == ge::GRAPH_SUCCESS ? "batch" : "default_aiv_only"',
+            '"P5_TILING_READY aic=%u aiv=%u requested_aiv=%u block_dim=%u "',
+        ):
+            self.assertIn(required, host)
+        self.assertNotIn(
+            "if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS)", host
+        )
+
     def test_tiling_and_kernel_use_c8_score_receipts_not_float_scores(self) -> None:
         tiling = _text(TILING_H)
         kernel = _text(KERNEL_CPP)

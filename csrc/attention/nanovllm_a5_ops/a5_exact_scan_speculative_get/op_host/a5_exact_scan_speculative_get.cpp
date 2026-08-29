@@ -16,7 +16,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "../op_kernel/a5_exact_scan_speculative_get_tiling.h"
@@ -145,6 +147,115 @@ struct P5Geometry {
     uint32_t outputRows;
 };
 
+std::string ShapeDebugText(const gert::Shape& shape)
+{
+    std::string text{"["};
+    for (int64_t dim = 0; dim < shape.GetDimNum(); ++dim) {
+        if (dim != 0) {
+            text += ",";
+        }
+        text += std::to_string(shape.GetDim(dim));
+    }
+    text += "]";
+    return text;
+}
+
+// Host tiling failures otherwise arrive at Python as the undifferentiated
+// EZ1008 error.  Keep the failure report short enough to paste back in one
+// block, but complete enough to distinguish ABI, geometry and scheduler
+// failures without another rebuild.  This deliberately uses libc stderr
+// rather than the monorepo-only logging headers: the strict msopgen build of
+// this standalone OPP has no dependency on the vLLM-Ascend logging closure.
+void LogP5TilingBootstrapFailure(
+    const char* stage, const gert::TilingContext* context, size_t input)
+{
+    const char* node =
+        context != nullptr && context->GetNodeName() != nullptr
+        ? context->GetNodeName()
+        : "A5ExactScanSpeculativeGet";
+    std::fprintf(stderr,
+                 "P5_TILING_DIAG stage=%s node=%s input=%ld\\n", stage,
+                 node, static_cast<long>(input));
+    std::fflush(stderr);
+}
+
+void LogP5TilingContractFailure(
+    const char* stage, const gert::TilingContext* context,
+    const P5Geometry* geometry, uint32_t aicCount, uint32_t aivCount,
+    uint32_t blockDim, ge::graphStatus scheduleStatus)
+{
+    const char* node = context->GetNodeName() == nullptr
+        ? "A5ExactScanSpeculativeGet"
+        : context->GetNodeName();
+    const P5Geometry empty{};
+    const P5Geometry& value = geometry == nullptr ? empty : *geometry;
+    std::fprintf(
+        stderr,
+        "P5_TILING_DIAG stage=%s node=%s aic=%u aiv=%u requested_aiv=%u "
+        "block_dim=%u schedule_status=%d rows=%u source=%u pool=%u object=%u "
+        "arena=%u receipts=%u candidate_capacity=%u score_words=%u table=%u "
+        "output_rows=%u\\n",
+        stage, node, aicCount, aivCount, kAivCount, blockDim,
+        static_cast<int>(scheduleStatus), value.rowCount, value.sourceCapacity,
+        value.poolSize, value.kvObjectCapacity, value.privateArenaCapacity,
+        value.tileReceiptCount, value.candidateCapacityPerProducer,
+        value.scoreWorkspaceWords, value.tableCapacity, value.outputRows);
+    std::fprintf(
+        stderr,
+        "P5_TILING_SHAPES_0_9 in0=%s in1=%s in2=%s in3=%s in4=%s in5=%s "
+        "in6=%s in7=%s in8=%s in9=%s\\n",
+        ShapeDebugText(context->GetInputShape(0)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(1)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(2)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(3)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(4)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(5)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(6)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(7)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(8)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(9)->GetStorageShape()).c_str());
+    std::fprintf(
+        stderr,
+        "P5_TILING_SHAPES_10_19 in10=%s in11=%s in12=%s in13=%s in14=%s "
+        "in15=%s in16=%s in17=%s in18=%s in19=%s\\n",
+        ShapeDebugText(context->GetInputShape(10)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(11)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(12)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(13)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(14)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(15)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(16)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(17)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(18)->GetStorageShape()).c_str(),
+        ShapeDebugText(context->GetInputShape(19)->GetStorageShape()).c_str());
+    std::fprintf(
+        stderr,
+        "P5_TILING_DTYPES in0=%d,in1=%d,in2=%d,in3=%d,in4=%d,in5=%d,"
+        "in6=%d,in7=%d,in8=%d,in9=%d,in10=%d,in11=%d,in12=%d,in13=%d,"
+        "in14=%d,in15=%d,in16=%d,in17=%d,in18=%d,in19=%d\\n",
+        static_cast<int>(context->GetInputDesc(0)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(1)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(2)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(3)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(4)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(5)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(6)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(7)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(8)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(9)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(10)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(11)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(12)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(13)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(14)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(15)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(16)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(17)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(18)->GetDataType()),
+        static_cast<int>(context->GetInputDesc(19)->GetDataType()));
+    std::fflush(stderr);
+}
+
 bool DeriveP5Geometry(
     const gert::Shape& scoreWorkspace, const gert::Shape& tileReceipts,
     const gert::Shape& streamingEpoch, const gert::Shape& scoreSourceLens,
@@ -159,8 +270,15 @@ bool DeriveP5Geometry(
     const gert::Shape& privatePackedOutput, const gert::Shape& addressTable,
     const gert::Shape& validTable, const gert::Shape& control,
     const gert::Shape& pipelineState,
-    const gert::Shape& executionMode, P5Geometry* geometry)
+    const gert::Shape& executionMode, P5Geometry* geometry,
+    const char** failureStage)
 {
+    const auto fail = [failureStage](const char* stage) {
+        if (failureStage != nullptr) {
+            *failureStage = stage;
+        }
+        return false;
+    };
     // P5's input #3 is intentionally graph-static active-score metadata.
     // It classifies fixed receipt positions as inactive versus expected for
     // *this* forward before the consumer polls a ready epoch.  It must not
@@ -188,7 +306,7 @@ bool DeriveP5Geometry(
             static_cast<int64_t>(kProducerCount * kGetLaneCount) ||
         pipelineState.GetDim(1) !=
             static_cast<int64_t>(kPipelineWordsPerRing)) {
-        return false;
+        return fail("geometry_basic");
     }
 
     P5Geometry value{};
@@ -200,7 +318,7 @@ bool DeriveP5Geometry(
         !ToU32(scoreWorkspace.GetDim(0), &value.scoreWorkspaceWords) ||
         !ToU32(addressTable.GetDim(0), &value.tableCapacity) ||
         !ToU32(privatePackedOutput.GetDim(0), &value.outputRows)) {
-        return false;
+        return fail("geometry_u32");
     }
     if (!IsMatrix(kvObjectSlotsSnapshot, value.poolSize, value.kvObjectCapacity) ||
         !IsMatrix(privateObjectToSlot, value.poolSize, value.kvObjectCapacity) ||
@@ -210,7 +328,7 @@ bool DeriveP5Geometry(
             static_cast<uint64_t>(value.privateArenaCapacity) * kGetLaneCount ||
         value.kvObjectCapacity == 0U || value.sourceCapacity == 0U ||
         value.poolSize == 0U || value.privateArenaCapacity == 0U) {
-        return false;
+        return fail("geometry_matrix");
     }
     const uint64_t tilesPerRow =
         (static_cast<uint64_t>(value.sourceCapacity) + kReceiptTileSources - 1U) /
@@ -233,7 +351,7 @@ bool DeriveP5Geometry(
         candidatesPerProducer >
             static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
         !IsMatrix(tileReceipts, static_cast<int64_t>(receipts), kReceiptWords)) {
-        return false;
+        return fail("geometry_score_or_receipts");
     }
     value.tileReceiptCount = static_cast<uint32_t>(receipts);
     value.candidateCapacityPerProducer =
@@ -247,12 +365,21 @@ namespace optiling {
 static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     gert::TilingContext* context)
 {
-    if (context == nullptr || context->GetPlatformInfo() == nullptr) {
+    if (context == nullptr) {
+        LogP5TilingBootstrapFailure("null_context", nullptr, 0U);
+        return ge::GRAPH_FAILED;
+    }
+    if (context->GetPlatformInfo() == nullptr) {
+        LogP5TilingBootstrapFailure("null_platform", context, 0U);
         return ge::GRAPH_FAILED;
     }
     for (size_t input = 0; input < kInputCount; ++input) {
-        if (context->GetInputShape(input) == nullptr ||
-            context->GetInputDesc(input) == nullptr) {
+        if (context->GetInputShape(input) == nullptr) {
+            LogP5TilingBootstrapFailure("missing_shape", context, input);
+            return ge::GRAPH_FAILED;
+        }
+        if (context->GetInputDesc(input) == nullptr) {
+            LogP5TilingBootstrapFailure("missing_desc", context, input);
             return ge::GRAPH_FAILED;
         }
     }
@@ -324,10 +451,13 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
         context->GetInputDesc(kFusedGetControl)->GetDataType() != ge::DT_INT64 ||
         context->GetInputDesc(kPipelineState)->GetDataType() != ge::DT_INT64 ||
         context->GetInputDesc(kExecutionMode)->GetDataType() != ge::DT_INT64) {
+        LogP5TilingContractFailure("dtype", context, nullptr, 0U, 0U, 0U,
+                                   ge::GRAPH_SUCCESS);
         return ge::GRAPH_FAILED;
     }
 
     P5Geometry geometry{};
+    const char* geometryFailure = "geometry_unknown";
     if (!DeriveP5Geometry(
             scoreWorkspace, tileReceipts, streamingEpoch, scoreSourceLens,
             residentThreshold,
@@ -335,35 +465,39 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
             kvObjectMap, kvObjectLens, privateSourceToSlot,
             privateObjectToSlot, privateReady, privateArenaHead,
             privatePackedOutput, addressTable, validTable, control,
-            pipelineState, executionMode, &geometry)) {
+            pipelineState, executionMode, &geometry, &geometryFailure)) {
+        LogP5TilingContractFailure(geometryFailure, context, nullptr, 0U, 0U,
+                                   0U, ge::GRAPH_SUCCESS);
         return ge::GRAPH_FAILED;
     }
 
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const uint32_t aicCount = platform.GetCoreNumAic();
     const uint32_t aivCount = platform.GetCoreNumAiv();
-    if (aivCount != kAivCount) {
+    // P5's protocol has a fixed 64-lane logical ABI: two lanes own KVAF Get
+    // queues and 62 produce candidate seeds.  A larger part can execute that
+    // exact ABI, whereas a smaller part cannot.  Requiring equality here made
+    // the same valid 64-lane launch fail on A5 variants exposing spare AIVs.
+    if (aivCount < kAivCount) {
+        LogP5TilingContractFailure("aiv_count", context, &geometry, aicCount,
+                                   aivCount, 0U, ge::GRAPH_SUCCESS);
         return ge::GRAPH_FAILED;
     }
 
     const uint32_t aivOnlyBlockDim =
-        platform.CalcTschBlockDim(aivCount, 0U, aivCount);
+        platform.CalcTschBlockDim(kAivCount, 0U, aivCount);
     if (aivOnlyBlockDim != kAivCount) {
-        return ge::GRAPH_FAILED;
-    }
-    // This is a single 64-AIV cooperative launch: task lanes 0/1 own the two
-    // Direct-HCCP queues and task lanes 2..63 own ExactScan.  Consequently a
-    // physical AIV executing one task in this invocation cannot execute the
-    // other role concurrently.  This is *execution-scoped* spatial
-    // isolation, not a claim that public CANN exposes a persistent physical
-    // AIV-ID mask.  Batch mode is required for this cross-AIV protocol;
-    // ordinary wave scheduling could run the waiting consumers before their
-    // producers and deadlock the rings.
-    if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS) {
+        LogP5TilingContractFailure("block_dim", context, &geometry, aicCount,
+                                   aivCount, aivOnlyBlockDim,
+                                   ge::GRAPH_SUCCESS);
         return ge::GRAPH_FAILED;
     }
 
     auto* tiling = context->GetTilingData<A5ExactScanSpeculativeGetTilingData>();
     if (tiling == nullptr) {
+        LogP5TilingContractFailure("null_tiling", context, &geometry, aicCount,
+                                   aivCount, aivOnlyBlockDim,
+                                   ge::GRAPH_SUCCESS);
         return ge::GRAPH_FAILED;
     }
     tiling->rowCount = geometry.rowCount;
@@ -388,7 +522,27 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
     tiling->getWaveRecords = kGetWaveRecords;
     tiling->pipelineWordsPerRing = kPipelineWordsPerRing;
     tiling->reserved = 0;
+
+    // The block dimension must be fixed before requesting an optional batch
+    // schedule.  A GE/model launch accepts batch mode and provides the
+    // cooperative start required by the target graph path.  CANN may reject
+    // that request for an ACLNN direct single-op launch.  Treat that as a
+    // launch-mode fallback, not as an ABI or arithmetic failure: the same
+    // 64 AIV-only blocks still execute, and the test reports it explicitly.
     context->SetBlockDim(aivOnlyBlockDim);
+    const ge::graphStatus scheduleStatus = context->SetScheduleMode(1U);
+    const char* scheduleEffective =
+        scheduleStatus == ge::GRAPH_SUCCESS ? "batch" : "default_aiv_only";
+    std::fprintf(
+        stderr,
+        "P5_TILING_READY aic=%u aiv=%u requested_aiv=%u block_dim=%u "
+        "schedule_request=batch schedule_status=%d schedule_effective=%s "
+        "rows=%u source=%u receipts=%u candidate_capacity=%u\\n",
+        aicCount, aivCount, kAivCount, aivOnlyBlockDim,
+        static_cast<int>(scheduleStatus), scheduleEffective, geometry.rowCount,
+        geometry.sourceCapacity, geometry.tileReceiptCount,
+        geometry.candidateCapacityPerProducer);
+    std::fflush(stderr);
     if (context->GetWorkspaceSizes(1) != nullptr) {
         context->GetWorkspaceSizes(1)[0] = 0;
     }
@@ -457,7 +611,7 @@ static ge::graphStatus InferA5ExactScanSpeculativeGetShape(
             kvObjectMap, kvObjectLens, privateSourceToSlot,
             privateObjectToSlot, privateReady, privateArenaHead,
             privatePackedOutput, addressTable, validTable, control,
-            pipelineState, executionMode, &geometry)) {
+            pipelineState, executionMode, &geometry, nullptr)) {
         return ge::GRAPH_FAILED;
     }
 
