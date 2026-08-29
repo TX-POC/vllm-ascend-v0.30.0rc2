@@ -932,18 +932,30 @@ if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
             "${P1_OPDEF_SOURCES[@]}" >&2
         exit 1
     fi
-    P1_TILING_SCHEMA_SOURCE="${GENERATED}/op_host/a5_exact_scan_speculative_get_tiling_data.h"
-    if [[ ! -s "${P1_TILING_SCHEMA_SOURCE}" ]] || \
-       ! grep -q 'BEGIN_TILING_DATA_DEF(A5ExactScanSpeculativeGetHostTilingData)' \
-               "${P1_TILING_SCHEMA_SOURCE}" || \
-       ! grep -q 'REGISTER_TILING_DATA_CLASS(A5ExactScanSpeculativeGet,' \
-               "${P1_TILING_SCHEMA_SOURCE}"; then
-        echo "[nanovllm_a5_ops] ERROR: P1 macro-backed host tiling schema did not survive the generated-project overlay." >&2
-        echo "[nanovllm_a5_ops] expected=${P1_TILING_SCHEMA_SOURCE}" >&2
+    # P5 follows CANN's standard C++ POD tiling contract.  The exact same
+    # type is registered by the device entry point and acquired by the host
+    # through GetTilingData<T>().  Do not accept the legacy macro/raw-buffer
+    # route here: direct ACLNN would then enter the host callback with a
+    # zero-capacity payload even though the device kernel uses
+    # REGISTER_TILING_DEFAULT.
+    P1_DEVICE_TILING_HEADER="${GENERATED}/op_kernel/a5_exact_scan_speculative_get_tiling.h"
+    P1_DEVICE_TILING_SOURCE="${GENERATED}/op_kernel/a5_exact_scan_speculative_get.cpp"
+    if ! grep -q 'GetTilingData<' "${P1_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'A5ExactScanSpeculativeGetTilingData' "${P1_EXPECTED_OPDEF_SOURCE}" || \
+       grep -qE 'GetRawTilingData|SaveToBuffer|REGISTER_TILING_DATA_CLASS|BEGIN_TILING_DATA_DEF' \
+               "${P1_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'struct A5ExactScanSpeculativeGetTilingData' \
+               "${P1_DEVICE_TILING_HEADER}" || \
+       ! grep -q 'REGISTER_TILING_DEFAULT(A5ExactScanSpeculativeGetTilingData)' \
+               "${P1_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P1 standard POD tiling closure did not survive the generated-project overlay." >&2
+        echo "[nanovllm_a5_ops] host=${P1_EXPECTED_OPDEF_SOURCE}" >&2
+        echo "[nanovllm_a5_ops] kernel_header=${P1_DEVICE_TILING_HEADER}" >&2
+        echo "[nanovllm_a5_ops] kernel_source=${P1_DEVICE_TILING_SOURCE}" >&2
         exit 1
     fi
     echo "[nanovllm_a5_ops] P1 host registration closure: ${P1_OPDEF_SOURCES[0]} verified=1"
-    echo "[nanovllm_a5_ops] P1 host tiling schema closure: ${P1_TILING_SCHEMA_SOURCE} verified=1"
+    echo "[nanovllm_a5_ops] P1 standard POD tiling closure: host=${P1_EXPECTED_OPDEF_SOURCE} kernel=${P1_DEVICE_TILING_SOURCE} verified=1"
 fi
 
 if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \
@@ -973,6 +985,78 @@ if [[ "${#OPAPI_LIBS[@]}" -ne 1 ]]; then
     exit 1
 fi
 VENDOR_DIR="$(cd "$(dirname "${OPAPI_LIBS[0]}")/../.." && pwd)"
+
+# ``opParaSize`` is the preallocated payload size observed by a direct ACLNN
+# tiling callback.  The P5 kernel's shared POD is 88 bytes and CANN reserves
+# an additional eight-byte runtime header, so a P5 package with opParaSize=8
+# would deterministically recreate the zero-capacity failure before any HCCP
+# or score-publisher code runs.  Inspect the installed artifact, not merely
+# the staged source, so this catches a generator/packaging regression before
+# a target test spends time initializing Direct-HCCP.
+if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
+    P1_METADATA_FILES=()
+    while IFS= read -r -d '' P1_METADATA; do
+        P1_METADATA_FILES+=("${P1_METADATA}")
+    done < <(find "${VENDOR_DIR}" -type f -name '*.json' -print0)
+    if [[ "${#P1_METADATA_FILES[@]}" -eq 0 ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P1 installed OPP has no JSON metadata." >&2
+        echo "[nanovllm_a5_ops] vendor=${VENDOR_DIR}" >&2
+        exit 1
+    fi
+    P1_OP_PARA_SIZE="$("${PYTHON_BIN}" - "${P1_METADATA_FILES[@]}" <<'PY'
+import json
+import os
+import sys
+
+# `binary_info_config.json` may carry the op identity in its filename, in a
+# parent object, or beside the per-kernel `opParaSize` node.  Accept all three
+# standard layouts; otherwise a healthy package could be rejected merely
+# because CANN moved common metadata out of the leaf dictionary.
+needles = (
+    "a5_exact_scan_speculative_get",
+    "a5exactscanspeculativeget",
+)
+matches = []
+
+def walk(value, path, filename_matches):
+    if isinstance(value, dict):
+        encoded = json.dumps(value, sort_keys=True).lower()
+        if "opParaSize" in value and (
+                filename_matches or any(needle in encoded for needle in needles)):
+            matches.append((path, value["opParaSize"]))
+        for key, child in value.items():
+            walk(child, f"{path}.{key}", filename_matches)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            walk(child, f"{path}[{index}]", filename_matches)
+
+for filename in sys.argv[1:]:
+    try:
+        with open(filename, "r", encoding="utf-8") as handle:
+            filename_matches = any(
+                needle in os.path.basename(filename).lower()
+                for needle in needles)
+            walk(json.load(handle), filename, filename_matches)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+for path, value in matches:
+    print(f"{path}={value}")
+PY
+)"
+    if [[ -z "${P1_OP_PARA_SIZE}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P1 installed OPP metadata has no A5ExactScanSpeculativeGet opParaSize." >&2
+        printf '[nanovllm_a5_ops] metadata=%s\n' "${P1_METADATA_FILES[@]}" >&2
+        exit 1
+    fi
+    if ! printf '%s\n' "${P1_OP_PARA_SIZE}" | \
+            awk -F= '$NF + 0 >= 96 { found = 1 } END { exit found ? 0 : 1 }'; then
+        echo "[nanovllm_a5_ops] ERROR: P1 installed OPP has insufficient tiling payload; expected opParaSize>=96." >&2
+        printf '%s\n' "${P1_OP_PARA_SIZE}" >&2
+        exit 1
+    fi
+    printf '[nanovllm_a5_ops] P1 installed tiling metadata: %s\n' "${P1_OP_PARA_SIZE}"
+fi
 
 for op_name in "${OP_NAMES[@]}"; do
     if ! find "${VENDOR_DIR}" -type f -name 'binary_info_config.json' -print0 |

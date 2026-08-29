@@ -31,9 +31,6 @@ OPS_JSON = OP_ROOT / "ops.json"
 HOST_CPP = OP_ROOT / "op_host" / "a5_exact_scan_speculative_get.cpp"
 KERNEL_CPP = OP_ROOT / "op_kernel" / "a5_exact_scan_speculative_get.cpp"
 TILING_H = OP_ROOT / "op_kernel" / "a5_exact_scan_speculative_get_tiling.h"
-HOST_TILING_H = (
-    OP_ROOT / "op_host" / "a5_exact_scan_speculative_get_tiling_data.h"
-)
 BRIDGE_CPP = (
     OP_ROOT / "torch_extension" / "csrc" / "exact_scan_speculative_get.cpp"
 )
@@ -203,53 +200,46 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
             "if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS)", host
         )
 
-    def test_host_registers_a_packaging_visible_tiling_schema(self) -> None:
-        """ACLNN direct calls need a package-visible raw tiling capacity.
+    def test_host_and_kernel_share_the_standard_pod_tiling_contract(self) -> None:
+        """Direct ACLNN must use one standard C++ POD on both sides.
 
-        A hand-written TilingDef registers too late for CANN's OPP packager;
-        it can leave a direct ACLNN invocation with a zero-capacity raw
-        buffer.  The host schema must use BEGIN_TILING_DATA_DEF, while the
-        runtime code gates the serialized byte count against the device POD.
+        ``REGISTER_TILING_DEFAULT`` in the device entry point tells CANN the
+        exact fixed payload size.  The Host must acquire that payload through
+        ``GetTilingData<T>()`` and write the same struct.  Mixing it with the
+        older macro/raw-buffer contract can leave direct ACLNN with an
+        ``opParaSize`` of only eight and a zero-capacity tiling payload.
         """
         host = _text(HOST_CPP)
-        host_tiling = _text(HOST_TILING_H)
+        tiling = _text(TILING_H)
+        kernel = _text(KERNEL_CPP)
         for required in (
-            "BEGIN_TILING_DATA_DEF(A5ExactScanSpeculativeGetHostTilingData)",
-            "REGISTER_TILING_DATA_CLASS(A5ExactScanSpeculativeGet,",
-            "A5ExactScanSpeculativeGetHostTilingData",
-            "TILING_DATA_FIELD_DEF(uint32_t, rowCount)",
-            "TILING_DATA_FIELD_DEF(uint32_t, reserved)",
-            "TILING_DATA_FIELD_DEF(uint32_t, schemaAlignmentPadding)",
-        ):
-            self.assertIn(required, host_tiling)
-        for required in (
-            '#include "a5_exact_scan_speculative_get_tiling_data.h"',
-            "A5ExactScanSpeculativeGetHostTilingData tiling{};",
+            '#include "../op_kernel/a5_exact_scan_speculative_get_tiling.h"',
+            "context->GetTilingData<",
+            "A5ExactScanSpeculativeGetTilingData>();",
             "22U * sizeof(uint32_t)",
             "schemaAlignmentPadding) ==",
-            "const size_t serializedTilingBytes = tiling.GetDataSize();",
-            "tiling.set_schemaAlignmentPadding(0U);",
-            "serializedTilingBytes != kDeviceTilingBytes",
-            "schema_device_abi_mismatch",
-            "context->GetRawTilingData()",
-            'LogP5RawTilingFailure("raw_tiling_null"',
-            'LogP5RawTilingFailure("raw_tiling_capacity"',
-            "tiling.SaveToBuffer(rawTiling->GetData(), rawTiling->GetCapacity());",
-            "rawTiling->SetDataSize(serializedTilingBytes);",
-            '"P5_TILING_RAW_READY capacity=%zu schema_bytes=%zu "',
+            "tiling->schemaAlignmentPadding = 0U;",
+            '"P5_TILING_TYPED_READY bytes=%zu alignment=%zu "',
         ):
             self.assertIn(required, host)
-        self.assertNotIn("TilingRegistration final", host)
+        for forbidden in (
+            "BEGIN_TILING_DATA_DEF",
+            "REGISTER_TILING_DATA_CLASS",
+            "GetRawTilingData",
+            "SaveToBuffer",
+            "SetDataSize",
+        ):
+            self.assertNotIn(forbidden, host)
 
         # The device uses 21 semantic words plus one explicit zero padding
-        # word.  This matches CANN's 8-byte schema alignment exactly; all
-        # semantic fields must preserve the device order exactly.
-        host_fields = re.findall(
-            r"TILING_DATA_FIELD_DEF\(uint32_t,\s*([A-Za-z0-9_]+)\)",
-            host_tiling,
+        # word.  Host writes this exact shared POD rather than serializing a
+        # second schema, so the field order is the single source of truth.
+        fields = re.findall(
+            r"uint32_t\s+([A-Za-z0-9_]+);",
+            tiling,
         )
         self.assertEqual(
-            host_fields,
+            fields,
             [
                 "rowCount",
                 "sourceCapacity",
@@ -274,6 +264,10 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
                 "reserved",
                 "schemaAlignmentPadding",
             ],
+        )
+        self.assertIn(
+            "REGISTER_TILING_DEFAULT(A5ExactScanSpeculativeGetTilingData)",
+            kernel,
         )
 
     def test_tiling_and_kernel_use_c8_score_receipts_not_float_scores(self) -> None:

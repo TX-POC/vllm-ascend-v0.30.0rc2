@@ -23,7 +23,6 @@
 #include <vector>
 
 #include "../op_kernel/a5_exact_scan_speculative_get_tiling.h"
-#include "a5_exact_scan_speculative_get_tiling_data.h"
 #include "register/op_def_registry.h"
 #include "register/op_impl_registry.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -266,19 +265,18 @@ void LogP5TilingContractFailure(
     std::fflush(stderr);
 }
 
-void LogP5RawTilingFailure(
-    const char* stage, const gert::TilingContext* context, size_t capacity,
-    bool hasData)
+void LogP5TypedTilingFailure(
+    const char* stage, const gert::TilingContext* context)
 {
     const char* node = context->GetNodeName() == nullptr
         ? "A5ExactScanSpeculativeGet"
         : context->GetNodeName();
     std::fprintf(
         stderr,
-        "P5_TILING_RAW stage=%s node=%s capacity=%zu required=%zu "
-        "data_present=%d\n",
-        stage, node, capacity,
-        sizeof(A5ExactScanSpeculativeGetTilingData), hasData ? 1 : 0);
+        "P5_TILING_TYPED stage=%s node=%s required_bytes=%zu "
+        "alignment=%zu\n",
+        stage, node, sizeof(A5ExactScanSpeculativeGetTilingData),
+        alignof(A5ExactScanSpeculativeGetTilingData));
     std::fflush(stderr);
 }
 
@@ -519,64 +517,45 @@ static ge::graphStatus TilingA5ExactScanSpeculativeGet(
         return ge::GRAPH_FAILED;
     }
 
-    A5ExactScanSpeculativeGetHostTilingData tiling{};
-    tiling.set_rowCount(geometry.rowCount);
-    tiling.set_sourceCapacity(geometry.sourceCapacity);
-    tiling.set_poolSize(geometry.poolSize);
-    tiling.set_kvObjectCapacity(geometry.kvObjectCapacity);
-    tiling.set_privateArenaCapacity(geometry.privateArenaCapacity);
-    tiling.set_tileReceiptCount(geometry.tileReceiptCount);
-    tiling.set_scoreWorkspaceWords(geometry.scoreWorkspaceWords);
-    tiling.set_rowsPerEntry(kRowsPerEntry);
-    tiling.set_candidateCapacityPerProducer(
-        geometry.candidateCapacityPerProducer);
-    tiling.set_candidateSeedWords(kCandidateSeedWords);
-    tiling.set_tableCapacity(geometry.tableCapacity);
-    tiling.set_outputRows(geometry.outputRows);
-    tiling.set_controlWords(kFusedGetControlWords);
-    tiling.set_producerCount(kProducerCount);
-    tiling.set_getLaneCount(kGetLaneCount);
-    tiling.set_ringSlots(kRingSlots);
-    tiling.set_recordsPerRingSlot(kRecordsPerRingSlot);
-    tiling.set_getBootstrapRecords(kGetBootstrapRecords);
-    tiling.set_getWaveRecords(kGetWaveRecords);
-    tiling.set_pipelineWordsPerRing(kPipelineWordsPerRing);
-    tiling.set_reserved(0U);
-    tiling.set_schemaAlignmentPadding(0U);
-
-    // CANN learns the raw allocation size from the macro-backed schema above.
-    // The device ABI carries an explicit zero padding word after its 21
-    // semantic uint32 values, matching CANN's eight-byte schema alignment.
-    // This leaves all semantic offsets unchanged while retaining an exact
-    // host/device raw-byte equality gate.
-    const size_t serializedTilingBytes = tiling.GetDataSize();
-    constexpr size_t kDeviceTilingBytes =
-        sizeof(A5ExactScanSpeculativeGetTilingData);
-    if (serializedTilingBytes != kDeviceTilingBytes) {
-        LogP5RawTilingFailure("schema_device_abi_mismatch", context,
-                              serializedTilingBytes, false);
+    // This is the standard CANN C++ tiling path.  The device entry point
+    // registers this exact POD with REGISTER_TILING_DEFAULT, so CANN owns
+    // both allocation and serialization.  Do not mix it with the legacy
+    // macro/raw-buffer contract: that leaves direct ACLNN with an opParaSize
+    // of eight and therefore a zero-byte payload.
+    auto* tiling = context->GetTilingData<
+        A5ExactScanSpeculativeGetTilingData>();
+    if (tiling == nullptr) {
+        LogP5TypedTilingFailure("typed_tiling_null", context);
         return ge::GRAPH_FAILED;
     }
-
-    auto* rawTiling = context->GetRawTilingData();
-    if (rawTiling == nullptr) {
-        LogP5RawTilingFailure("raw_tiling_null", context, 0U, false);
-        return ge::GRAPH_FAILED;
-    }
-    if (rawTiling->GetData() == nullptr ||
-        rawTiling->GetCapacity() < serializedTilingBytes) {
-        LogP5RawTilingFailure("raw_tiling_capacity", context,
-                              rawTiling->GetCapacity(),
-                              rawTiling->GetData() != nullptr);
-        return ge::GRAPH_FAILED;
-    }
-    tiling.SaveToBuffer(rawTiling->GetData(), rawTiling->GetCapacity());
-    rawTiling->SetDataSize(serializedTilingBytes);
+    tiling->rowCount = geometry.rowCount;
+    tiling->sourceCapacity = geometry.sourceCapacity;
+    tiling->poolSize = geometry.poolSize;
+    tiling->kvObjectCapacity = geometry.kvObjectCapacity;
+    tiling->privateArenaCapacity = geometry.privateArenaCapacity;
+    tiling->tileReceiptCount = geometry.tileReceiptCount;
+    tiling->scoreWorkspaceWords = geometry.scoreWorkspaceWords;
+    tiling->rowsPerEntry = kRowsPerEntry;
+    tiling->candidateCapacityPerProducer =
+        geometry.candidateCapacityPerProducer;
+    tiling->candidateSeedWords = kCandidateSeedWords;
+    tiling->tableCapacity = geometry.tableCapacity;
+    tiling->outputRows = geometry.outputRows;
+    tiling->controlWords = kFusedGetControlWords;
+    tiling->producerCount = kProducerCount;
+    tiling->getLaneCount = kGetLaneCount;
+    tiling->ringSlots = kRingSlots;
+    tiling->recordsPerRingSlot = kRecordsPerRingSlot;
+    tiling->getBootstrapRecords = kGetBootstrapRecords;
+    tiling->getWaveRecords = kGetWaveRecords;
+    tiling->pipelineWordsPerRing = kPipelineWordsPerRing;
+    tiling->reserved = 0U;
+    tiling->schemaAlignmentPadding = 0U;
     std::fprintf(stderr,
-                 "P5_TILING_RAW_READY capacity=%zu schema_bytes=%zu "
-                 "device_bytes=%zu\n",
-                 rawTiling->GetCapacity(), serializedTilingBytes,
-                 kDeviceTilingBytes);
+                 "P5_TILING_TYPED_READY bytes=%zu alignment=%zu "
+                 "row_count=%u source_capacity=%u\n",
+                 sizeof(*tiling), alignof(A5ExactScanSpeculativeGetTilingData),
+                 geometry.rowCount, geometry.sourceCapacity);
     std::fflush(stderr);
 
     // The block dimension must be fixed before requesting an optional batch
@@ -785,7 +764,12 @@ public:
             .DynamicShapeSupportFlag(true)
             .NeedCheckSupportFlag(false)
             .PrecisionReduceFlag(true)
-            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn")
+            // These names are also the CANN defaults.  Stating them here
+            // makes the installed OPP metadata auditable and prevents a
+            // generator-version default from selecting a different binary.
+            .ExtendCfgInfo("opFile.value", "a5_exact_scan_speculative_get")
+            .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
         this->AICore()
             .SetTiling(optiling::TilingA5ExactScanSpeculativeGet)
             .AddConfig("ascend950", config);
