@@ -200,6 +200,34 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
             "if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS)", host
         )
 
+    def test_host_registers_and_writes_the_pod_tiling_abi_explicitly(self) -> None:
+        """ACLNN direct calls need the P5 raw tiling capacity registered.
+
+        The device kernel intentionally reads a compact 21-word POD through
+        ``GET_TILING_DATA``.  The host registration must therefore allocate
+        that exact raw buffer and write it explicitly; a typed helper with no
+        registered TilingDef turns a valid direct call into opaque EZ1008.
+        """
+        host = _text(HOST_CPP)
+        for required in (
+            '#include "register/tilingdata_base.h"',
+            "class A5ExactScanSpeculativeGetTilingRegistration final",
+            "REGISTER_TILING_DATA_CLASS(A5ExactScanSpeculativeGet,",
+            "A5ExactScanSpeculativeGetTilingRegistration",
+            "21U * sizeof(uint32_t)",
+            "context->GetRawTilingData()",
+            'LogP5RawTilingFailure("raw_tiling_null"',
+            'LogP5RawTilingFailure("raw_tiling_capacity"',
+            "std::memcpy(rawTiling->GetData(), &tiling, sizeof(tiling));",
+            "rawTiling->SetDataSize(sizeof(tiling));",
+            '"P5_TILING_RAW_READY capacity=%zu bytes=%zu\\n"',
+        ):
+            self.assertIn(required, host)
+        self.assertNotIn(
+            "context->GetTilingData<A5ExactScanSpeculativeGetTilingData>()",
+            host,
+        )
+
     def test_tiling_and_kernel_use_c8_score_receipts_not_float_scores(self) -> None:
         tiling = _text(TILING_H)
         kernel = _text(KERNEL_CPP)
