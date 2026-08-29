@@ -277,6 +277,30 @@ class P5ExactScanSpeculativeGetContractTest(unittest.TestCase):
             kernel,
         )
 
+    def test_live_gate_preflights_tiling_before_direct_hccp_setup(self) -> None:
+        """A malformed ACLNN tiling closure must fail before KVAF transport.
+
+        The preflight is a real epoch-zero P5 launch, rather than a detached
+        workspace call.  It validates the generated executor lifetime while
+        deliberately proving that no CandidateSeed or Get request is issued.
+        """
+        live = _text(TESTS_ROOT / "test_exact_scan_speculative_get_p5_live_c8.py")
+        for required in (
+            "def _run_epoch_zero_tiling_preflight(",
+            'inputs["streaming_epoch"] = torch.zeros_like(',
+            'inputs["address_table"] = torch.zeros(',
+            'inputs["valid_table"] = torch.zeros(',
+            "outputs = _call_p5(inputs)",
+            "candidate_counts.count_nonzero()",
+            "get_stats[:, :2].count_nonzero()",
+            '"P5_TILING_PREFLIGHT_PASS mode=epoch_zero_no_post "',
+        ):
+            self.assertIn(required, live)
+        self.assertLess(
+            live.index("_run_epoch_zero_tiling_preflight(publication, device)"),
+            live.index("runtime = kvaf.NpuRuntime("),
+        )
+
     def test_tiling_and_kernel_use_c8_score_receipts_not_float_scores(self) -> None:
         tiling = _text(TILING_H)
         kernel = _text(KERNEL_CPP)

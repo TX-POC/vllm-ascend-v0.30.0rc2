@@ -416,6 +416,56 @@ def _log_p5_input_abi(inputs: dict[str, torch.Tensor]) -> None:
     )
 
 
+def _run_epoch_zero_tiling_preflight(
+    publication: dict[str, torch.Tensor], device: torch.device
+) -> None:
+    """Exercise ACLNN tiling and dispatch before allocating Direct-HCCP.
+
+    This is deliberately a real kernel launch rather than a bare
+    ``GetWorkspaceSize`` call.  The generated ACLNN helper owns its executor
+    across workspace creation and launch, so separating those calls would
+    leave no safe public destruction path.  An epoch of zero makes both P5
+    paths inert: ExactScoreScan producers return before reading C8 receipts,
+    while the two Get lanes emit their documented no-request terminal state
+    without constructing or posting a Direct-HCCP descriptor.
+
+    The Host tiler itself consumes only tensor shapes and dtypes.  Therefore
+    the two device-address inputs can be zero placeholders here; the real
+    access table and fused control are still created exclusively for the
+    subsequent end-to-end Post/CQ validation.
+    """
+    inputs, table_capacity, _ = _make_p5_inputs(publication, device)
+    inputs["streaming_epoch"] = torch.zeros_like(publication["streaming_epoch"])
+    inputs["address_table"] = torch.zeros(
+        table_capacity, dtype=torch.int64, device=device
+    )
+    inputs["valid_table"] = torch.zeros(
+        table_capacity, dtype=torch.uint8, device=device
+    )
+    _log_p5_input_abi(inputs)
+    outputs = _call_p5(inputs)
+    torch.npu.synchronize()
+    if len(outputs) != 17:
+        raise AssertionError(f"P5 preflight returned {len(outputs)} outputs, expected 17")
+
+    candidate_counts = outputs[6].cpu()
+    get_stats = outputs[8].cpu()
+    private_ready = outputs[2].cpu()
+    private_head = outputs[3].cpu()
+    if int(candidate_counts.count_nonzero()) != 0:
+        raise AssertionError("epoch-zero P5 preflight emitted CandidateSeed records")
+    if int(get_stats[:, :2].count_nonzero()) != 0:
+        raise AssertionError("epoch-zero P5 preflight attempted a Get request")
+    if int(private_ready.count_nonzero()) != 0 or int(private_head.count_nonzero()) != 0:
+        raise AssertionError("epoch-zero P5 preflight mutated private Get state")
+    print(
+        "P5_TILING_PREFLIGHT_PASS mode=epoch_zero_no_post "
+        f"candidate_nonzero={int(candidate_counts.count_nonzero())} "
+        f"get_request_or_batch_nonzero={int(get_stats[:, :2].count_nonzero())}",
+        flush=True,
+    )
+
+
 def _assert_live_oracle(
     result: dict[str, Any],
     inputs: dict[str, torch.Tensor],
@@ -549,12 +599,18 @@ def _run(args: argparse.Namespace) -> None:
         if name != "score_source_lens"
     }
 
-    import kvaf
     import nanovllm_exact_scan_get  # noqa: F401  # Registers the P5 bridge.
     _require_p5_bridge_abi()
 
+    # Diagnose ACLNN package/tiling regressions without creating a Direct-HCCP
+    # runtime first.  This preserves the P3 strict proof while avoiding an
+    # expensive transport setup and a secondary teardown failure for what is
+    # fundamentally a Host tiling error.
+    _run_epoch_zero_tiling_preflight(publication, device)
+
     inputs, table_capacity, private_arena_capacity = _make_p5_inputs(publication, device)
     _log_p5_input_abi(inputs)
+    import kvaf
     runtime = kvaf.NpuRuntime(
         args.batch_get_kernel,
         0,
