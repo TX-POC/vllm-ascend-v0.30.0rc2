@@ -11,7 +11,14 @@ TORCH_EXTENSION="${ROOT}/torch_extension"
 PYTHON_BIN="${NANOVLLM_A5_OPS_PYTHON:-python3}"
 BUILD_JOBS="${NANOVLLM_A5_OPS_BUILD_JOBS:-$(nproc)}"
 SKIP_TORCH_EXTENSION="${NANOVLLM_A5_SKIP_TORCH_EXTENSION:-0}"
-A5_SOC_VERSION_RAW="${A5_SOC_VERSION:-${SOC_VERSION:-ascend950}}"
+# `SOC_VERSION` is a legacy/product-global setting and has repeatedly
+# selected the wrong CANN product in isolated A5 builds.  Do not silently
+# inherit it.  Callers must set only A5_SOC_VERSION (or accept ascend950).
+if [[ -n "${SOC_VERSION:-}" ]]; then
+    echo "[nanovllm_a5_ops] ERROR: legacy SOC_VERSION is set; unset it and use A5_SOC_VERSION=ascend950." >&2
+    exit 2
+fi
+A5_SOC_VERSION_RAW="${A5_SOC_VERSION:-ascend950}"
 case "${A5_SOC_VERSION_RAW,,}" in
     ascend950 | ascend950pr* | ascend950dt*)
         A5_SOC_VERSION="ascend950"
@@ -74,12 +81,15 @@ ALL_OP_NAMES=(
     A5ExactScanSpeculativePostProbe
     A5ExactScanSpeculativeGet
 )
-# The source-derived streaming LI and reconcile op are deliberately not in
-# ALL_OP_NAMES: both are standalone P3 probes, never default product routes.
+# The source-derived streaming LI, reconcile planner, and P7.0 receipt oracle
+# are deliberately not in ALL_OP_NAMES.  They are isolated probes, never
+# default product routes.
 SUPPORTED_OP_NAMES=(
     "${ALL_OP_NAMES[@]}"
     A5StreamingQuantLiGet
     A5ExactReconcilePrivateView
+    A5ScoreReceiptCandidateExecutor
+    A5ScoreReceiptSpeculativeExecutor
 )
 
 # A prototype operator must be buildable without replacing the normal custom
@@ -120,6 +130,14 @@ echo "[nanovllm_a5_ops] selected operators: ${OP_NAMES[*]}"
 STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY=0
 STAGE_STREAMING_QUANT_LI_GET_ONLY=0
 STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY=0
+# P7.0 is intentionally only a completed-C8 score receipt -> candidate oracle.
+# It is not the P7 dynamic Post/CQ executor and must therefore be built as one
+# operator in a fresh OPP package with no C8/KVAF/SIMT closure.
+STAGE_SCORE_RECEIPT_CANDIDATE_EXECUTOR_ONLY=0
+# P7.1 is the standalone candidate receipt -> Direct-HCCP Post/CQ executor.
+# It deliberately consumes only explicit graph-visible CandidateSeed and
+# lifecycle tensors; C8 source must never enter this OPP closure.
+STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY=0
 # P3's source-derived C8 operator has two independent compile-time axes:
 # publication (score workspace/receipts) and inline KVAF.  Default values
 # are declared before staging because this script is nounset-safe and the
@@ -144,6 +162,14 @@ if [[ "${#OP_NAMES[@]}" == "1" && \
       "${OP_NAMES[0]}" == "A5ExactReconcilePrivateView" ]]; then
     STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY=1
 fi
+if [[ "${#OP_NAMES[@]}" == "1" && \
+      "${OP_NAMES[0]}" == "A5ScoreReceiptCandidateExecutor" ]]; then
+    STAGE_SCORE_RECEIPT_CANDIDATE_EXECUTOR_ONLY=1
+fi
+if [[ "${#OP_NAMES[@]}" == "1" && \
+      "${OP_NAMES[0]}" == "A5ScoreReceiptSpeculativeExecutor" ]]; then
+    STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY=1
+fi
 if [[ " ${OP_NAMES[*]} " == *" A5StreamingQuantLiGet "* && \
       "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" != "1" ]]; then
     echo "[nanovllm_a5_ops] ERROR: A5StreamingQuantLiGet is intentionally buildable only as NANOVLLM_A5_OPS_ONLY=A5StreamingQuantLiGet." >&2
@@ -154,6 +180,18 @@ if [[ " ${OP_NAMES[*]} " == *" A5ExactReconcilePrivateView "* && \
       "${STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY}" != "1" ]]; then
     echo "[nanovllm_a5_ops] ERROR: A5ExactReconcilePrivateView is intentionally buildable only as NANOVLLM_A5_OPS_ONLY=A5ExactReconcilePrivateView." >&2
     echo "[nanovllm_a5_ops] It is a transaction-local P3 probe and must not enter the normal product OPP collection." >&2
+    exit 2
+fi
+if [[ " ${OP_NAMES[*]} " == *" A5ScoreReceiptCandidateExecutor "* && \
+      "${STAGE_SCORE_RECEIPT_CANDIDATE_EXECUTOR_ONLY}" != "1" ]]; then
+    echo "[nanovllm_a5_ops] ERROR: A5ScoreReceiptCandidateExecutor is intentionally buildable only as NANOVLLM_A5_OPS_ONLY=A5ScoreReceiptCandidateExecutor." >&2
+    echo "[nanovllm_a5_ops] It is P7.0's isolated completed-C8 candidate oracle; mixing it with C8 or KVAF sources would invalidate its source-closure gate." >&2
+    exit 2
+fi
+if [[ " ${OP_NAMES[*]} " == *" A5ScoreReceiptSpeculativeExecutor "* && \
+      "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" != "1" ]]; then
+    echo "[nanovllm_a5_ops] ERROR: A5ScoreReceiptSpeculativeExecutor is buildable only as NANOVLLM_A5_OPS_ONLY=A5ScoreReceiptSpeculativeExecutor." >&2
+    echo "[nanovllm_a5_ops] It is a standalone P7.1 PostOnly/CQ executor; mixing it with C8 or legacy source would invalidate the closure gate." >&2
     exit 2
 fi
 
@@ -525,6 +563,42 @@ elif [[ "${STAGE_EXACT_RECONCILE_PRIVATE_VIEW_ONLY}" == "1" ]]; then
     cp -a "${RECONCILE_DIR}/op_kernel/." "${OP_DEV}/op_kernel/"
     echo "[nanovllm_a5_ops] strict P3 staging: A5ExactReconcilePrivateView only"
     echo "[nanovllm_a5_ops] transaction boundary: plan-only; no Get, QSFA, or persistent cache-slot publication"
+elif [[ "${STAGE_SCORE_RECEIPT_CANDIDATE_EXECUTOR_ONLY}" == "1" ]]; then
+    P7_DIR="${ROOT}/a5_score_receipt_candidate_executor"
+    P7_SPEC="${P7_DIR}/ops.json"
+    P7_HOST="${P7_DIR}/op_host/a5_score_receipt_candidate_executor.cpp"
+    P7_KERNEL="${P7_DIR}/op_kernel/a5_score_receipt_candidate_executor.cpp"
+    P7_TILING="${P7_DIR}/op_kernel/a5_score_receipt_candidate_executor_tiling.h"
+    for P7_REQUIRED_FILE in "${P7_SPEC}" "${P7_HOST}" "${P7_KERNEL}" \
+                            "${P7_TILING}"; do
+        if [[ ! -s "${P7_REQUIRED_FILE}" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: P7.0 candidate oracle requires ${P7_REQUIRED_FILE}." >&2
+            exit 2
+        fi
+    done
+    cp "${P7_SPEC}" "${OP_DEV}/ops.json"
+    cp -a "${P7_DIR}/op_host/." "${OP_DEV}/op_host/"
+    cp -a "${P7_DIR}/op_kernel/." "${OP_DEV}/op_kernel/"
+    echo "[nanovllm_a5_ops] strict P7.0 staging: A5ScoreReceiptCandidateExecutor only"
+    echo "[nanovllm_a5_ops] P7.0 contract: completed-C8 score receipt oracle; C8/KVAF/SIMT/Post/CQ closure=absent"
+elif [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
+    P7_1_DIR="${ROOT}/a5_score_receipt_speculative_executor"
+    P7_1_SPEC="${P7_1_DIR}/ops.json"
+    P7_1_HOST="${P7_1_DIR}/op_host/a5_score_receipt_speculative_executor.cpp"
+    P7_1_KERNEL="${P7_1_DIR}/op_kernel/a5_score_receipt_speculative_executor.cpp"
+    P7_1_TILING="${P7_1_DIR}/op_kernel/a5_score_receipt_speculative_executor_tiling.h"
+    for P7_1_REQUIRED_FILE in "${P7_1_SPEC}" "${P7_1_HOST}" "${P7_1_KERNEL}" \
+                              "${P7_1_TILING}"; do
+        if [[ ! -s "${P7_1_REQUIRED_FILE}" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: P7.1 speculative executor requires ${P7_1_REQUIRED_FILE}." >&2
+            exit 2
+        fi
+    done
+    cp "${P7_1_SPEC}" "${OP_DEV}/ops.json"
+    cp -a "${P7_1_DIR}/op_host/." "${OP_DEV}/op_host/"
+    cp -a "${P7_1_DIR}/op_kernel/." "${OP_DEV}/op_kernel/"
+    echo "[nanovllm_a5_ops] strict P7.1 staging: A5ScoreReceiptSpeculativeExecutor only"
+    echo "[nanovllm_a5_ops] P7.1 contract: CandidateSeed -> dynamic queue lease -> Direct-HCCP PostOnly/CQ; C8 closure=absent"
 else
     cp "${ROOT}/ops.json" "${OP_DEV}/ops.json"
 
@@ -564,6 +638,7 @@ fi
 # deliberately score-only and therefore must not stage this transport closure.
 NEEDS_P1_DENSE_KVAF=0
 NEEDS_P3_POST_KVAF=0
+NEEDS_P7_1_STREAMING_KVAF=0
 # Never inherit an ambient shell's staging variables.  An audit-only build
 # must not accidentally validate or package a closure left by an earlier
 # post/P1 invocation in the same terminal.
@@ -580,14 +655,21 @@ if [[ "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" == "1" && \
       "${STREAMING_LI_POST_CLOSURE_MODE}" == "1" ]]; then
     NEEDS_P3_POST_KVAF=1
 fi
+if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
+    NEEDS_P7_1_STREAMING_KVAF=1
+fi
 if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
-      "${NEEDS_P3_POST_KVAF}" == "1" ]]; then
+      "${NEEDS_P3_POST_KVAF}" == "1" || \
+      "${NEEDS_P7_1_STREAMING_KVAF}" == "1" ]]; then
     KVAF_CONSUMER_NAMES=()
     if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" ]]; then
         KVAF_CONSUMER_NAMES+=("A5ExactScanSpeculativeGet")
     fi
     if [[ "${NEEDS_P3_POST_KVAF}" == "1" ]]; then
         KVAF_CONSUMER_NAMES+=("A5StreamingQuantLiGet(inline=post)")
+    fi
+    if [[ "${NEEDS_P7_1_STREAMING_KVAF}" == "1" ]]; then
+        KVAF_CONSUMER_NAMES+=("A5ScoreReceiptSpeculativeExecutor")
     fi
     if [[ -z "${KVAF_FUSED_GET_SOURCE:-}" ]]; then
         echo "[nanovllm_a5_ops] ERROR: ${KVAF_CONSUMER_NAMES[*]} requires KVAF_FUSED_GET_SOURCE=<exact KVAF checkout>." >&2
@@ -624,8 +706,19 @@ if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
     # This is a build-closure guard only: it neither changes LI score/Top-K
     # math nor the Direct-HCCP command/CQ ordering.
     KVAF_FUSED_HEAD="unavailable"
-    if [[ -e "${KVAF_FUSED_GET_SOURCE}/.git" ]]; then
-        KVAF_FUSED_HEAD="$(git -C "${KVAF_FUSED_GET_SOURCE}" rev-parse HEAD 2>/dev/null || echo unavailable)"
+    if ! git -C "${KVAF_FUSED_GET_SOURCE}" rev-parse --is-inside-work-tree \
+            >/dev/null 2>&1; then
+        echo "[nanovllm_a5_ops] ERROR: KVAF_FUSED_GET_SOURCE must be a git worktree; refuse an unverifiable transport closure." >&2
+        echo "[nanovllm_a5_ops] source=${KVAF_FUSED_GET_SOURCE}" >&2
+        exit 2
+    fi
+    KVAF_FUSED_HEAD="$(git -C "${KVAF_FUSED_GET_SOURCE}" rev-parse HEAD 2>/dev/null || echo unavailable)"
+    KVAF_FUSED_DIRTY="$(git -C "${KVAF_FUSED_GET_SOURCE}" status --porcelain --untracked-files=no 2>/dev/null || true)"
+    if [[ -n "${KVAF_FUSED_DIRTY}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: refuse KVAF transport closure from a tracked-dirty worktree." >&2
+        echo "[nanovllm_a5_ops] source=${KVAF_FUSED_GET_SOURCE} head=${KVAF_FUSED_HEAD}" >&2
+        printf '%s\n' "${KVAF_FUSED_DIRTY}" >&2
+        exit 2
     fi
     for required_token in \
         'using ::KvafStreamingBatchGetControl;' \
@@ -652,7 +745,8 @@ if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
             exit 2
         fi
     done
-    if [[ "${NEEDS_P3_POST_KVAF}" == "1" ]]; then
+    if [[ "${NEEDS_P3_POST_KVAF}" == "1" || \
+          "${NEEDS_P7_1_STREAMING_KVAF}" == "1" ]]; then
         for required_token in \
             'TryAcquireKvafStreamingBatchGetQueueFromAicore' \
             'LoadKvafStreamingBatchGetQueueTemplate' \
@@ -663,7 +757,7 @@ if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
             'GetKvafStreamingBatchGetReady' \
             'ReleaseKvafStreamingBatchGetQueueFromAicore'; do
             if ! grep -Fq "${required_token}" "${KVAF_FUSED_HEADER}"; then
-                echo "[nanovllm_a5_ops] ERROR: P3 inline KVAF closure misses ${required_token}." >&2
+                echo "[nanovllm_a5_ops] ERROR: streaming KVAF closure misses ${required_token}." >&2
                 echo "[nanovllm_a5_ops] kvaf_head=${KVAF_FUSED_HEAD} helper=${KVAF_FUSED_HEADER}" >&2
                 exit 2
             fi
@@ -763,6 +857,10 @@ for index in "${!OP_NAMES[@]}"; do
         op_spec="${ROOT}/a5_streaming_quant_li_get/ops.json"
     elif [[ "${op_name}" == "A5ExactReconcilePrivateView" ]]; then
         op_spec="${ROOT}/a5_exact_reconcile_private_view/ops.json"
+    elif [[ "${op_name}" == "A5ScoreReceiptCandidateExecutor" ]]; then
+        op_spec="${ROOT}/a5_score_receipt_candidate_executor/ops.json"
+    elif [[ "${op_name}" == "A5ScoreReceiptSpeculativeExecutor" ]]; then
+        op_spec="${ROOT}/a5_score_receipt_speculative_executor/ops.json"
     fi
     echo "[nanovllm_a5_ops] generate operator: ${op_name}"
     msopgen_args=(
@@ -810,6 +908,54 @@ if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
     echo "[nanovllm_a5_ops] P1 removed generated host OpDef stub: ${P1_GENERATED_OPDEF_STUBS[0]}"
 fi
 
+# P7.0 also overlays one checked-in host OpDef onto msopgen's generated
+# project.  Remove exactly its generated stub before the overlay.  Keeping
+# both sources would register the same operator twice and let CANN emit two
+# same-name INI sections, which is a build-closure error rather than an INI
+# formatting issue.  This guard is deliberately separate from P3/P1 so the
+# P7.0 source closure stays independent of their implementation choices.
+if [[ "${STAGE_SCORE_RECEIPT_CANDIDATE_EXECUTOR_ONLY}" == "1" ]]; then
+    P7_GENERATED_OPDEF_STUBS=()
+    while IFS= read -r -d '' P7_GENERATED_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5ScoreReceiptCandidateExecutor[[:space:]]*\)' \
+                "${P7_GENERATED_HOST_SOURCE}"; then
+            P7_GENERATED_OPDEF_STUBS+=("${P7_GENERATED_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+
+    if [[ "${#P7_GENERATED_OPDEF_STUBS[@]}" -ne 1 ]]; then
+        echo "[nanovllm_a5_ops] ERROR: expected exactly one msopgen A5ScoreReceiptCandidateExecutor host stub; found ${#P7_GENERATED_OPDEF_STUBS[@]}." >&2
+        printf '[nanovllm_a5_ops] P7 generated OpDef stub: %s\n' \
+            "${P7_GENERATED_OPDEF_STUBS[@]}" >&2
+        exit 1
+    fi
+    rm -f "${P7_GENERATED_OPDEF_STUBS[0]}"
+    echo "[nanovllm_a5_ops] P7 removed generated host OpDef stub: ${P7_GENERATED_OPDEF_STUBS[0]}"
+fi
+
+# P7.1 overlays the checked-in host contract after msopgen creates its
+# scaffold.  Remove the one generated registration first; otherwise CANN
+# sees two OP_ADD registrations and emits duplicate INI sections.
+if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
+    P7_1_GENERATED_OPDEF_STUBS=()
+    while IFS= read -r -d '' P7_1_GENERATED_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5ScoreReceiptSpeculativeExecutor[[:space:]]*\)' \
+                "${P7_1_GENERATED_HOST_SOURCE}"; then
+            P7_1_GENERATED_OPDEF_STUBS+=("${P7_1_GENERATED_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+    if [[ "${#P7_1_GENERATED_OPDEF_STUBS[@]}" -ne 1 ]]; then
+        echo "[nanovllm_a5_ops] ERROR: expected exactly one msopgen A5ScoreReceiptSpeculativeExecutor host stub; found ${#P7_1_GENERATED_OPDEF_STUBS[@]}." >&2
+        printf '[nanovllm_a5_ops] P7.1 generated OpDef stub: %s\n' \
+            "${P7_1_GENERATED_OPDEF_STUBS[@]}" >&2
+        exit 1
+    fi
+    rm -f "${P7_1_GENERATED_OPDEF_STUBS[0]}"
+    echo "[nanovllm_a5_ops] P7.1 removed generated host OpDef stub: ${P7_1_GENERATED_OPDEF_STUBS[0]}"
+fi
+
 # msopgen owns the CMake scaffold. Checked-in Host/AscendC implementation
 # sources overwrite only generated source stubs; directory structure is kept.
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
@@ -821,7 +967,8 @@ rm -f "${GENERATED}/op_host/lightning_indexer_decode_update_a5_def.cpp"
 # relative path used by the source-derived LI hook.  This makes a future
 # staging/order regression fail before CANN starts compiling kernels.
 if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
-      "${NEEDS_P3_POST_KVAF}" == "1" ]]; then
+      "${NEEDS_P3_POST_KVAF}" == "1" || \
+      "${NEEDS_P7_1_STREAMING_KVAF}" == "1" ]]; then
     KVAF_GENERATED_STAGE_DIR="${GENERATED}/op_kernel/kvaf_device"
     for generated_pair in \
         "${KVAF_FUSED_HEADER}:${KVAF_GENERATED_STAGE_DIR}/kvaf_fused_full_get_device.h" \
@@ -1024,6 +1171,147 @@ if [[ "${STAGE_EXACT_SCAN_SPECULATIVE_GET_ONLY}" == "1" ]]; then
     echo "[nanovllm_a5_ops] P1 standard POD tiling closure: host=${P1_EXPECTED_OPDEF_SOURCE} kernel=${P1_DEVICE_TILING_SOURCE} verified=1"
 fi
 
+# P7.0 is deliberately a source-closed oracle: it consumes a C8-produced
+# score workspace only after the publisher's established completion edge.  It
+# must not pull C8 source, KVAF transport, SIMT helpers, or Post/CQ code into
+# this OPP.  Enforce that property on the generated project, not merely the
+# checked-in tree, so an accidental staging/overlay regression fails before a
+# CANN build starts.
+if [[ "${STAGE_SCORE_RECEIPT_CANDIDATE_EXECUTOR_ONLY}" == "1" ]]; then
+    P7_EXPECTED_OPDEF_SOURCE="${GENERATED}/op_host/a5_score_receipt_candidate_executor.cpp"
+    P7_DEVICE_TILING_HEADER="${GENERATED}/op_kernel/a5_score_receipt_candidate_executor_tiling.h"
+    P7_DEVICE_TILING_SOURCE="${GENERATED}/op_kernel/a5_score_receipt_candidate_executor.cpp"
+    if [[ ! -f "${P7_EXPECTED_OPDEF_SOURCE}" ]] || \
+       ! cmp -s "${ROOT}/a5_score_receipt_candidate_executor/op_host/a5_score_receipt_candidate_executor.cpp" \
+                 "${P7_EXPECTED_OPDEF_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P7 checked-in candidate-oracle host implementation did not survive the generated-project overlay." >&2
+        echo "[nanovllm_a5_ops] expected=${P7_EXPECTED_OPDEF_SOURCE}" >&2
+        exit 1
+    fi
+
+    P7_OPDEF_SOURCES=()
+    while IFS= read -r -d '' P7_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5ScoreReceiptCandidateExecutor[[:space:]]*\)' \
+                "${P7_HOST_SOURCE}"; then
+            P7_OPDEF_SOURCES+=("${P7_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+
+    if [[ "${#P7_OPDEF_SOURCES[@]}" -ne 1 || \
+          "${P7_OPDEF_SOURCES[0]:-}" != "${P7_EXPECTED_OPDEF_SOURCE}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P7 requires exactly one A5ScoreReceiptCandidateExecutor OpDef from the checked-in host source; found ${#P7_OPDEF_SOURCES[@]}." >&2
+        printf '[nanovllm_a5_ops] P7 OpDef source: %s\n' \
+            "${P7_OPDEF_SOURCES[@]}" >&2
+        exit 1
+    fi
+    if ! grep -q 'GetTilingData<' "${P7_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'A5ScoreReceiptCandidateExecutorTilingData' \
+               "${P7_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'struct A5ScoreReceiptCandidateExecutorTilingData' \
+               "${P7_DEVICE_TILING_HEADER}" || \
+       ! grep -q 'REGISTER_TILING_DEFAULT(A5ScoreReceiptCandidateExecutorTilingData)' \
+               "${P7_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P7 standard POD tiling closure did not survive the generated-project overlay." >&2
+        echo "[nanovllm_a5_ops] host=${P7_EXPECTED_OPDEF_SOURCE}" >&2
+        echo "[nanovllm_a5_ops] kernel_header=${P7_DEVICE_TILING_HEADER}" >&2
+        echo "[nanovllm_a5_ops] kernel_source=${P7_DEVICE_TILING_SOURCE}" >&2
+        exit 1
+    fi
+    if grep -REn \
+        '#[[:space:]]*include[[:space:]]*[<"][^>"]*(kvaf|simt_api|quant_lightning|a5_streaming_quant)|kvaf_fused_get::|\b(TryAcquire|Begin|TryRetire|Finish)KvafStreamingBatchGet\b|\b(DirectHccp|DirectHCCP|URMA|urma_)\b' \
+        "${P7_EXPECTED_OPDEF_SOURCE}" "${P7_DEVICE_TILING_HEADER}" \
+        "${P7_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P7.0 generated source closure unexpectedly contains C8/KVAF/SIMT/Post/CQ code." >&2
+        exit 1
+    fi
+    echo "[nanovllm_a5_ops] P7 host registration closure: ${P7_OPDEF_SOURCES[0]} verified=1"
+    echo "[nanovllm_a5_ops] P7 standard POD tiling closure: host=${P7_EXPECTED_OPDEF_SOURCE} kernel=${P7_DEVICE_TILING_SOURCE} verified=1"
+    echo "[nanovllm_a5_ops] P7 source closure: c8=absent kvaf=absent simt=absent post_cq=absent verified=1"
+fi
+
+# P7.1 deliberately stages KVAF Direct-HCCP/SIMT, but it must remain entirely
+# independent of C8 source and of a fixed physical Get core.  Verify the
+# final generated project—not only the checked-in source—before invoking the
+# device compiler so stale overlay artifacts cannot masquerade as this build.
+if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
+    P7_1_EXPECTED_OPDEF_SOURCE="${GENERATED}/op_host/a5_score_receipt_speculative_executor.cpp"
+    P7_1_DEVICE_TILING_HEADER="${GENERATED}/op_kernel/a5_score_receipt_speculative_executor_tiling.h"
+    P7_1_DEVICE_TILING_SOURCE="${GENERATED}/op_kernel/a5_score_receipt_speculative_executor.cpp"
+    if [[ ! -f "${P7_1_EXPECTED_OPDEF_SOURCE}" ]] || \
+       ! cmp -s "${ROOT}/a5_score_receipt_speculative_executor/op_host/a5_score_receipt_speculative_executor.cpp" \
+                 "${P7_1_EXPECTED_OPDEF_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P7.1 checked-in speculative-executor host implementation did not survive the generated-project overlay." >&2
+        echo "[nanovllm_a5_ops] expected=${P7_1_EXPECTED_OPDEF_SOURCE}" >&2
+        exit 1
+    fi
+    P7_1_OPDEF_SOURCES=()
+    while IFS= read -r -d '' P7_1_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5ScoreReceiptSpeculativeExecutor[[:space:]]*\)' \
+                "${P7_1_HOST_SOURCE}"; then
+            P7_1_OPDEF_SOURCES+=("${P7_1_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+    if [[ "${#P7_1_OPDEF_SOURCES[@]}" -ne 1 || \
+          "${P7_1_OPDEF_SOURCES[0]:-}" != "${P7_1_EXPECTED_OPDEF_SOURCE}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P7.1 requires exactly one A5ScoreReceiptSpeculativeExecutor OpDef from the checked-in host source; found ${#P7_1_OPDEF_SOURCES[@]}." >&2
+        printf '[nanovllm_a5_ops] P7.1 OpDef source: %s\n' \
+            "${P7_1_OPDEF_SOURCES[@]}" >&2
+        exit 1
+    fi
+    if ! grep -q 'GetTilingData<' "${P7_1_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'A5ScoreReceiptSpeculativeExecutorTilingData' \
+               "${P7_1_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'struct A5ScoreReceiptSpeculativeExecutorTilingData' \
+               "${P7_1_DEVICE_TILING_HEADER}" || \
+       ! grep -q 'REGISTER_TILING_DEFAULT(A5ScoreReceiptSpeculativeExecutorTilingData)' \
+               "${P7_1_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P7.1 standard POD tiling closure did not survive the generated-project overlay." >&2
+        exit 1
+    fi
+    for P7_1_REQUIRED_TOKEN in \
+        'TryAcquireKvafStreamingBatchGetQueueFromAicore' \
+        'LoadKvafStreamingBatchGetQueueTemplate' \
+        'PublishKvafStreamingBatchGetDescriptorScratch' \
+        'BeginKvafStreamingBatchGet' \
+        'TryRetireKvafStreamingBatchGet' \
+        'FinishKvafStreamingBatchGet' \
+        'GetKvafStreamingBatchGetReady' \
+        'ReleaseKvafStreamingBatchGetQueueFromAicore' \
+        'DataSyncBarrier<MemDsbT::DDR>' \
+        'KERNEL_TYPE_AIV_ONLY'; do
+        if ! grep -Fq "${P7_1_REQUIRED_TOKEN}" "${P7_1_DEVICE_TILING_SOURCE}"; then
+            echo "[nanovllm_a5_ops] ERROR: P7.1 generated source closure misses ${P7_1_REQUIRED_TOKEN}." >&2
+            exit 1
+        fi
+    done
+    # The two bounded microbatch constants intentionally live in the shared
+    # tiling POD header, not in the device .cpp.  Check their actual source
+    # location so this gate cannot reject a correct generated overlay.
+    for P7_1_TILING_TOKEN in \
+        'kA5ScoreReceiptExecutorMicrobatchCapacity' \
+        'kA5ScoreReceiptExecutorMicrobatchSlots'; do
+        if ! grep -Fq "${P7_1_TILING_TOKEN}" "${P7_1_DEVICE_TILING_HEADER}"; then
+            echo "[nanovllm_a5_ops] ERROR: P7.1 generated tiling closure misses ${P7_1_TILING_TOKEN}." >&2
+            exit 1
+        fi
+    done
+    if grep -Fq 'KERNEL_TYPE_MIX_AIC_1_2' "${P7_1_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P7.1 must remain AIV_ONLY; MIX would reserve an unnecessary AIC lane." >&2
+        exit 1
+    fi
+    if grep -REn \
+        '#[[:space:]]*include[[:space:]]*[<"][^>"]*(quant_lightning|a5_streaming_quant|a5_official_c8)|\b(kGetLane|LI_CORE|GET_CORE|physical.*core)\b' \
+        "${P7_1_EXPECTED_OPDEF_SOURCE}" "${P7_1_DEVICE_TILING_HEADER}" \
+        "${P7_1_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P7.1 generated source closure unexpectedly contains C8 source or a fixed Get-core role." >&2
+        exit 1
+    fi
+    echo "[nanovllm_a5_ops] P7.1 host registration closure: ${P7_1_OPDEF_SOURCES[0]} verified=1"
+    echo "[nanovllm_a5_ops] P7.1 source closure: c8=absent fixed_get_core=absent kvaf=staged simt=staged post_cq=present verified=1"
+fi
+
 if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \
         "${GENERATED}/op_host" "${GENERATED}/op_kernel"; then
     echo "[nanovllm_a5_ops] ERROR: legacy add_op_to_compiled_list leaked into the CANN 9.1 generated project." >&2
@@ -1217,6 +1505,59 @@ EOF
         exit 1
     fi
     echo "[nanovllm_a5_ops] P3 target provenance: ${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE"
+fi
+
+# The P7.1 bridge refuses an un-stamped OPP.  This is intentionally separate
+# from P3 provenance: the executor has a 31-input/18-alias-output ABI and
+# a KVAF transport closure, but no C8 source closure.
+if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
+    P7_1_PROVENANCE_HEAD="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || true)"
+    if [[ ! "${P7_1_PROVENANCE_HEAD}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "[nanovllm_a5_ops] ERROR: cannot record P7.1 OPP provenance; source HEAD is unavailable." >&2
+        exit 1
+    fi
+    P7_1_PROVENANCE_DIRTY="$(git -C "${ROOT}" status --porcelain --untracked-files=no 2>/dev/null || true)"
+    if [[ -n "${P7_1_PROVENANCE_DIRTY}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: refuse P7.1 OPP build from a tracked-dirty source worktree." >&2
+        echo "[nanovllm_a5_ops] source_root=${ROOT} source_head=${P7_1_PROVENANCE_HEAD}" >&2
+        printf '%s\n' "${P7_1_PROVENANCE_DIRTY}" >&2
+        exit 1
+    fi
+    cat > "${VENDOR_DIR}/P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE" <<EOF
+format=1
+kind=standalone_score_receipt_speculative_executor
+source_root=${ROOT}
+source_head=${P7_1_PROVENANCE_HEAD}
+source_clean=1
+kvaf_source_head=${KVAF_FUSED_HEAD}
+abi=31in_18aliasout
+candidate_seed=receipt_x_128_x_4_int32
+local_microbatches=2x64
+queue_lifecycle=epoch,generation,post_sequence,state,quarantine
+private_terminal=ready_or_failed
+post_cq=real_kvaf_streaming_postonly_tryretire_finish
+c8_source_closure=absent
+fixed_get_core=absent
+operators=${OP_NAMES[*]}
+EOF
+    for P7_1_PROVENANCE_LINE in \
+        'kind=standalone_score_receipt_speculative_executor' \
+        "source_head=${P7_1_PROVENANCE_HEAD}" \
+        'source_clean=1' \
+        "kvaf_source_head=${KVAF_FUSED_HEAD}" \
+        'abi=31in_18aliasout' \
+        'local_microbatches=2x64' \
+        'queue_lifecycle=epoch,generation,post_sequence,state,quarantine' \
+        'post_cq=real_kvaf_streaming_postonly_tryretire_finish' \
+        'c8_source_closure=absent' \
+        'fixed_get_core=absent'; do
+        if ! grep -Fqx "${P7_1_PROVENANCE_LINE}" \
+                "${VENDOR_DIR}/P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE"; then
+            echo "[nanovllm_a5_ops] ERROR: P7.1 OPP provenance manifest is incomplete." >&2
+            exit 1
+        fi
+    done
+    echo "[nanovllm_a5_ops] P7.1 target provenance: ${VENDOR_DIR}/P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE"
 fi
 
 if [[ "${SKIP_TORCH_EXTENSION}" != "1" ]]; then

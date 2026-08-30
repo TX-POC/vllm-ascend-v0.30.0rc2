@@ -1,0 +1,26 @@
+[
+  {
+    "op": "A5ScoreReceiptCandidateExecutor",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "score_workspace", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "tile_receipts", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "streaming_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "score_source_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_threshold", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_threshold_valid", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "candidate_seeds", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_ready_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "receipt_status", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "receipt_owner", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "attr": []
+  }
+]
