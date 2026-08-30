@@ -240,6 +240,13 @@ public:
         producerId_ = producer_id;
         enabled_ = false;
         hasWave_ = false;
+        // A queue-release CAS mismatch is not a retryable scheduling miss.
+        // It means the caller can no longer prove exclusive ownership of the
+        // SQ/CQ pair.  Keep the terminal wave and its nonzero lease visible
+        // for the forward-terminal/runtime teardown path instead of silently
+        // treating the queue as reusable.
+        terminalReadyPublished_ = false;
+        releaseQuarantined_ = false;
         stagedCount_ = 0U;
 #if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
         candidateTileSequence_ = 0U;
@@ -301,7 +308,7 @@ public:
     // the real atomic acquire and remains the only ownership authority.
     __aicore__ inline bool MayNeedScoreObservation()
     {
-        if (!enabled_) {
+        if (!enabled_ || releaseQuarantined_) {
             return false;
         }
 #if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
@@ -324,7 +331,7 @@ public:
     // Get worker: every C8 worker calls this same opportunistic routine.
     __aicore__ inline void ProgressOwnPostAndCq()
     {
-        if (!enabled_) {
+        if (!enabled_ || releaseQuarantined_) {
             return;
         }
         RetireAndReleaseIfTerminal(false);
@@ -348,7 +355,7 @@ public:
     // *later exact score tile* completed while its HCCP request was pending.
     __aicore__ inline void ObserveCqAfterScoreTile()
     {
-        if (!enabled_ || !hasWave_) {
+        if (!enabled_ || !hasWave_ || releaseQuarantined_) {
             return;
         }
         RetireAndReleaseIfTerminal(false);
@@ -370,7 +377,7 @@ public:
         int64_t cur_aiv_s1_proc_num,
         int64_t cur_s2_idx)
     {
-        if (!enabled_) {
+        if (!enabled_ || releaseQuarantined_) {
             return;
         }
         ++localScanTiles_;
@@ -418,7 +425,7 @@ public:
                                 int64_t cur_aiv_s1_proc_num,
                                 int64_t cur_s2_idx)
     {
-        if (!enabled_) {
+        if (!enabled_ || releaseQuarantined_) {
             return;
         }
         RetireAndReleaseIfTerminal(false);
@@ -466,12 +473,16 @@ public:
         kvaf_fused_get::KvafStreamingBatchGetDescriptorScratch descriptor{};
         if (!kvaf_fused_get::LoadKvafStreamingBatchGetQueueTemplate(
                 control_, lease, &descriptor)) {
-            ReleaseUnpostedLease(lease);
+            if (!ReleaseUnpostedLease(lease)) {
+                return;
+            }
             return;
         }
         if (!ValidateDescriptorTemplate(descriptor, queueId)) {
             AddTelemetry(queueId, kControlRejected, 1);
-            ReleaseUnpostedLease(lease);
+            if (!ReleaseUnpostedLease(lease)) {
+                return;
+            }
             return;
         }
         AddTelemetry(queueId, kTileReadyCalls, 1);
@@ -494,7 +505,9 @@ public:
             }
         }
         if (stagedCount_ == 0U) {
-            ReleaseUnpostedLease(lease);
+            if (!ReleaseUnpostedLease(lease)) {
+                return;
+            }
             return;
         }
         descriptor.active_request_count = stagedCount_;
@@ -504,10 +517,11 @@ public:
             RollBackUnpostedClaims(lease, descriptor);
             // Begin marks its local wave terminal even on validation failure.
             if (wave_.lease.state == kvaf_fused_get::kStreamingBatchGetLeaseTerminal) {
-                kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(
-                    controlGm_, leaseResult_, kStreamingSimtEvent, &wave_);
-            } else {
-                ReleaseUnpostedLease(lease);
+                if (!ReleaseTerminalWaveOrQuarantine()) {
+                    return;
+                }
+            } else if (!ReleaseUnpostedLease(lease)) {
+                return;
             }
             stagedCount_ = 0U;
             return;
@@ -519,7 +533,7 @@ public:
 
     __aicore__ inline void Finish()
     {
-        if (!enabled_) {
+        if (!enabled_ || releaseQuarantined_) {
             return;
         }
 #if A5_STREAMING_LI_GET_HAS_CANDIDATE_SEED_PIPELINE
@@ -816,7 +830,9 @@ private:
                 control_, lease, &descriptor) ||
             !ValidateDescriptorTemplate(descriptor, queueId)) {
             AddTelemetry(queueId, kControlRejected, 1);
-            ReleaseUnpostedLease(lease);
+            if (!ReleaseUnpostedLease(lease)) {
+                return false;
+            }
             return false;
         }
         stagedCount_ = 0U;
@@ -828,7 +844,9 @@ private:
         if (stagedCount_ == 0U) {
             candidateSlotState_[slot] = kCandidateSlotFree;
             candidateSlotCount_[slot] = 0U;
-            ReleaseUnpostedLease(lease);
+            if (!ReleaseUnpostedLease(lease)) {
+                return false;
+            }
             return false;
         }
         descriptor.active_request_count = stagedCount_;
@@ -837,10 +855,11 @@ private:
             !kvaf_fused_get::BeginKvafStreamingBatchGet(control_, lease, &wave_)) {
             RollBackUnpostedClaims(slot, lease, descriptor);
             if (wave_.lease.state == kvaf_fused_get::kStreamingBatchGetLeaseTerminal) {
-                kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(
-                    controlGm_, leaseResult_, kStreamingSimtEvent, &wave_);
-            } else {
-                ReleaseUnpostedLease(lease);
+                if (!ReleaseTerminalWaveOrQuarantine()) {
+                    return false;
+                }
+            } else if (!ReleaseUnpostedLease(lease)) {
+                return false;
             }
             stagedCount_ = 0U;
             return false;
@@ -1115,16 +1134,54 @@ private:
         if (wave_.lease.state != kvaf_fused_get::kStreamingBatchGetLeaseTerminal) {
             return;
         }
-        PublishTerminalReadyState();
-        if (kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(
-                controlGm_, leaseResult_, kStreamingSimtEvent, &wave_)) {
-            AddTelemetry(wave_.lease.queue_id, kLeaseReleased, 1);
+        // Terminal CQ state is immutable.  Publish private READY/FAILED only
+        // once even if later score-tile boundaries revisit this local wave.
+        if (!terminalReadyPublished_) {
+            PublishTerminalReadyState();
+            terminalReadyPublished_ = true;
         }
+
+        // A failed CAS must never be retried from later score tiles: the
+        // owner word no longer proves that this worker still owns the
+        // queue.  Leaving `hasWave_` and the lease intact turns the nonzero
+        // owner table entry into a graph-visible quarantine.  The KVAF cold
+        // teardown gate rejects such a table instead of freeing transport
+        // state beneath it.
+        if (releaseQuarantined_) {
+            return;
+        }
+        const uint32_t queueId = wave_.lease.queue_id;
+        if (!ReleaseTerminalWaveOrQuarantine()) {
+            return;
+        }
+        AddTelemetry(queueId, kLeaseReleased, 1);
         hasWave_ = false;
         stagedCount_ = 0U;
+        terminalReadyPublished_ = false;
     }
 
-    __aicore__ inline void ReleaseUnpostedLease(
+    __aicore__ inline void QuarantineTerminalLease()
+    {
+        // Do not write a replacement owner marker after a failed CAS: the
+        // observed owner may be unknown.  Retaining the current word is the
+        // only safe graph-visible quarantine.  `hasWave_` deliberately stays
+        // true even for an unposted dummy wave so every caller exits without
+        // treating the lease as reusable.
+        releaseQuarantined_ = true;
+        hasWave_ = true;
+    }
+
+    __aicore__ inline bool ReleaseTerminalWaveOrQuarantine()
+    {
+        if (kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(
+                controlGm_, leaseResult_, kStreamingSimtEvent, &wave_)) {
+            return true;
+        }
+        QuarantineTerminalLease();
+        return false;
+    }
+
+    __aicore__ inline bool ReleaseUnpostedLease(
         kvaf_fused_get::KvafStreamingBatchGetLease &lease)
     {
         // Convert a never-posted held lease into a terminal dummy wave so the
@@ -1132,8 +1189,7 @@ private:
         wave_.lease = lease;
         wave_.lease.state = kvaf_fused_get::kStreamingBatchGetLeaseTerminal;
         wave_.transaction.finalized = 1U;
-        kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(
-            controlGm_, leaseResult_, kStreamingSimtEvent, &wave_);
+        return ReleaseTerminalWaveOrQuarantine();
     }
 
     __aicore__ inline void AddTelemetry(uint32_t queue_id, uint32_t column,
@@ -1200,6 +1256,13 @@ private:
 #endif
     bool enabled_ = false;
     bool hasWave_ = false;
+    // Local fault latch for the currently retained terminal wave.  It does
+    // not alter the shared owner word after a failed CAS; that would risk
+    // overwriting an unknown owner.  The nonzero owner word is the durable
+    // cross-worker quarantine marker, while this latch prevents duplicate
+    // ready publication and CAS retries in the current AIV invocation.
+    bool terminalReadyPublished_ = false;
+    bool releaseQuarantined_ = false;
 };
 
 }  // namespace streaming_li_get

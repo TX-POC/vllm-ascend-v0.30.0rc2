@@ -121,6 +121,83 @@ def main() -> None:
     )
     assert "FinishKvafStreamingBatchGet" not in post
 
+    # A terminal CQ is not permission to forget the local wave: the queue
+    # becomes reusable only after its owner-word CAS succeeds.  If that CAS
+    # fails, P6 must publish READY/FAILED once, retain its nonzero graph-visible
+    # lease, latch quarantine, and make no later score tile retry the CAS.
+    retire = _between(
+        hook,
+        "void RetireAndReleaseIfTerminal(bool finish)",
+        "void QuarantineTerminalLease()",
+    )
+    for required in (
+        "if (!terminalReadyPublished_)",
+        "PublishTerminalReadyState();",
+        "terminalReadyPublished_ = true;",
+        "if (releaseQuarantined_)",
+        "if (!ReleaseTerminalWaveOrQuarantine())",
+        "AddTelemetry(queueId, kLeaseReleased, 1);",
+        "hasWave_ = false;",
+        "terminalReadyPublished_ = false;",
+    ):
+        assert required in retire, required
+    failure = _between(
+        retire,
+        "if (!ReleaseTerminalWaveOrQuarantine())",
+        "AddTelemetry(queueId, kLeaseReleased, 1);",
+    )
+    assert "hasWave_ = false;" not in failure
+    assert "stagedCount_ = 0U;" not in failure
+    assert "!enabled_ || releaseQuarantined_" in hook
+
+    # There must be exactly one raw owner-word release site.  It is wrapped
+    # in a checked terminal helper; every unposted caller must propagate its
+    # bool result rather than silently forgetting an acquired lease.
+    raw_release = "ReleaseKvafStreamingBatchGetQueueFromAicore("
+    assert hook.count(raw_release) == 1, (
+        "every raw queue-release site must route through the checked helper"
+    )
+    terminal_release = _between(
+        hook,
+        "bool ReleaseTerminalWaveOrQuarantine()",
+        "bool ReleaseUnpostedLease(",
+    )
+    _ordered(
+        terminal_release,
+        (
+            "if (kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(",
+            "return true;",
+            "QuarantineTerminalLease();",
+            "return false;",
+        ),
+        "P6 checked terminal queue release",
+    )
+    quarantine = _between(
+        hook,
+        "void QuarantineTerminalLease()",
+        "bool ReleaseTerminalWaveOrQuarantine()",
+    )
+    assert "releaseQuarantined_ = true;" in quarantine
+    assert "hasWave_ = true;" in quarantine
+    assert "hasWave_ = false;" not in quarantine
+
+    unposted_release = _between(
+        hook,
+        "bool ReleaseUnpostedLease(",
+        "void AddTelemetry(",
+    )
+    assert "return ReleaseTerminalWaveOrQuarantine();" in unposted_release
+    unposted_call_lines = [
+        line.strip()
+        for line in hook.splitlines()
+        if "ReleaseUnpostedLease(lease)" in line
+    ]
+    assert unposted_call_lines
+    assert all(
+        "if (!ReleaseUnpostedLease(lease))" in line
+        for line in unposted_call_lines
+    ), "every unposted release caller must check and propagate failure"
+
     # The score buffer must be released before the later CQ witness.  The
     # source also retains the immediate `Emit` branch for the P3 control
     # binary, so inspect only the P6 conditional branch.
