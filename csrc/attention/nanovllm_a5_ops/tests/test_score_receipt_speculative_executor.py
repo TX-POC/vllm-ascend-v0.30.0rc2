@@ -136,16 +136,21 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     import nanovllm_score_receipt_speculative_executor as p7_runtime
 
     outputs = torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor(*inputs)
+    print("P7_1_BOUNDARY stage=torch_op_return", flush=True)
     # This is the production-shaped hand-off: capture the exact stream/token
     # boundary synchronously with dispatch and keep it in the forward's
     # RuntimeResources until QSFA has consumed the private view.  It is not a
     # test-only raw pybind cleanup call.
     terminal_lease = p7_runtime.capture_forward_terminal_lease()
+    print("P7_1_BOUNDARY stage=terminal_token_captured", flush=True)
     # This test's synchronize is the forward stream terminal. Production graph
     # execution calls the same package API only after its QSFA/forward terminal;
-    # the hook releases host descriptors and read-only Tensor keepalives, not
-    # the device-side PostOnly/CQ transaction itself.
+    # the hook releases Tensor keepalives, not the device-side PostOnly/CQ
+    # transaction itself.  ACLNN's host descriptors were released by the bridge
+    # immediately after launch and before the host TLS cleanup.
+    print("P7_1_BOUNDARY stage=stream_terminal_begin", flush=True)
     torch.npu.synchronize()
+    print("P7_1_BOUNDARY stage=stream_terminal_done", flush=True)
     released = p7_runtime.release_at_forward_terminal(terminal_lease)
     pending = p7_runtime.pending_launch_leases()
     if released != 1 or pending != 0:
@@ -155,7 +160,8 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         )
     print(
         "P7_1_TERMINAL_LEASE "
-        "released=%d pending=%d terminal=stream_synchronized token=%d"
+        "released=%d pending=%d terminal=stream_synchronized token=%d "
+        "kind=tensor_keepalive"
         % (released, pending, terminal_lease.token),
         flush=True,
     )

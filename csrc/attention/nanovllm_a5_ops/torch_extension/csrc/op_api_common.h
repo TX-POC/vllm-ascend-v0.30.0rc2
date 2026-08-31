@@ -342,38 +342,36 @@ inline void ReleaseTuple(Tuple &args) {
 }
 
 // P7.1 is the only bridge that launches ACLNN directly on the caller's
-// current stream.  CANN's generated examples retain aclTensor descriptors
-// until the stream is terminal, so a direct bridge must not destroy its 31
-// descriptors merely because aclnn(...) has returned to the host.
+// current stream.  There are two ownership domains which must remain
+// separate:
 //
-// This small registry is deliberately *not* a second execution queue: the
-// kernel is already enqueued on the NPU stream.  It only owns host-side
-// descriptors and Tensor handles until the graph Runtime calls
-// ReleaseP7DirectLaunchLeasesAtForwardTerminal(token) after the matching
-// forward's final stream terminal.  `token` is created at direct launch and
-// is bound to the exact aclrtStream that owns the queued ACLNN work.  It is
-// deliberately not a host-thread identity: graph terminal callbacks may run
+//  * aclTensor descriptors are phase-1/phase-2 *host* objects.  The checked-in
+//    CANN adapter destroys them immediately after aclnn(...) returns and
+//    before it tears down HugeMem/PTA TLS.  Keeping them alive across that TLS
+//    teardown is invalid: an aclTensor may still reference allocator-local
+//    bookkeeping even though the device kernel has already received its
+//    addresses.
+//  * the ATen tensors are graph resources.  They may still be read by the
+//    enqueued AIV kernel, so the bridge keeps those handles until the matching
+//    forward stream terminal.  Production RuntimeResources owns this terminal
+//    hand-off; the bounded registry below is only the bridge-side carrier.
+//
+// This registry is deliberately *not* an execution queue.  The device kernel
+// already owns PostOnly/DMA/CQ.  Its token is bound to the actual aclrtStream,
+// rather than to a host thread, because a graph terminal callback may execute
 // on a different runtime thread from the submitter.
-//
-// The bounded reservation fails closed if that terminal is not being
-// consumed, rather than allowing unbounded host-lifetime leakage.
 class P7DirectLaunchLeaseBase {
  public:
   virtual ~P7DirectLaunchLeaseBase() = default;
 };
 
-template <typename ConvertedTuple, typename TensorKeepaliveTuple>
+template <typename TensorKeepaliveTuple>
 class P7DirectLaunchLease final : public P7DirectLaunchLeaseBase {
  public:
-  P7DirectLaunchLease(ConvertedTuple converted,
-                      TensorKeepaliveTuple tensor_keepalive)
-      : converted_(std::move(converted)),
-        tensor_keepalive_(std::move(tensor_keepalive)) {}
-
-  ~P7DirectLaunchLease() override { ReleaseTuple(converted_); }
+  explicit P7DirectLaunchLease(TensorKeepaliveTuple tensor_keepalive)
+      : tensor_keepalive_(std::move(tensor_keepalive)) {}
 
  private:
-  ConvertedTuple converted_;
   // The tuple keeps every input, including the 13 read-only tensors that are
   // not represented by a returned Ref alias, alive through stream terminal.
   TensorKeepaliveTuple tensor_keepalive_;
@@ -446,9 +444,9 @@ class P7DirectLaunchLeaseRegistry {
       remaining.reserve(pending_.size());
       for (auto& pending : pending_) {
         // A terminal for this stream proves every earlier launch on the same
-        // stream is no longer read by the device.  It says nothing about a
-        // concurrent stream, even if that stream was submitted by the same
-        // host thread, so those descriptors remain leased.
+        // stream is no longer reading its Tensor resources.  It says nothing
+        // about a concurrent stream, even if that stream was submitted by the
+        // same host thread, so those Tensor handles remain leased.
         if (pending.stream_key == stream_key &&
             pending.token <= terminal_token) {
           completed.push_back(std::move(pending.lease));
@@ -459,8 +457,9 @@ class P7DirectLaunchLeaseRegistry {
       pending_.swap(remaining);
     }
     const int64_t released = static_cast<int64_t>(completed.size());
-    // Destruction releases aclTensor descriptors and Tensor keepalives only
-    // after the caller has established the forward stream terminal.
+    // Destruction releases only Tensor keepalives after the caller has
+    // established the forward stream terminal.  aclTensor descriptors were
+    // already released immediately after phase 2, before PTA/HugeMem cleanup.
     completed.clear();
     return released;
   }
@@ -482,12 +481,12 @@ inline P7DirectLaunchLeaseRegistry &GetP7DirectLaunchLeaseRegistry() {
   return registry;
 }
 
-template <typename ConvertedTuple, typename TensorKeepaliveTuple>
+template <typename TensorKeepaliveTuple>
 inline std::shared_ptr<P7DirectLaunchLeaseBase> MakeP7DirectLaunchLease(
-    ConvertedTuple converted, TensorKeepaliveTuple tensor_keepalive) {
+    TensorKeepaliveTuple tensor_keepalive) {
   return std::make_shared<
-      P7DirectLaunchLease<ConvertedTuple, TensorKeepaliveTuple>>(
-      std::move(converted), std::move(tensor_keepalive));
+      P7DirectLaunchLease<TensorKeepaliveTuple>>(
+      std::move(tensor_keepalive));
 }
 
 // The dispatch bridge consumes this immediately after one P7 direct launch
@@ -1008,9 +1007,11 @@ inline void LogOrderedHostDso(
 // task queue, while P7.1's real asynchronous work already lives on the device
 // stream. A P7.1 fail-closed launch reached `submit_done` and then crashed in
 // that second hand-off. The direct path below matches the repository's direct
-// ACLNN baseline: create descriptors, query workspace, enqueue, then retain
-// host-only descriptors until the graph forward terminal. PTA/HugeMem setup
-// remains a GetWorkspaceSize precondition for this CANN release.
+// ACLNN baseline: create descriptors, query workspace, enqueue, then destroy
+// the host-only descriptors *before* HugeMem/PTA TLS teardown.  Only the
+// underlying ATen tensor handles survive to the graph forward terminal.
+// PTA/HugeMem setup remains a GetWorkspaceSize precondition for this CANN
+// release.
 //
 // This is P7-specific on purpose: existing operators retain their independently
 // validated EXEC_NPU_CMD_ORDERED contracts. P7's OpDef declares zero workspace;
@@ -1090,22 +1091,24 @@ inline void LogOrderedHostDso(
     }                                                                            \
     void *workspace_ptr = nullptr;                                               \
                                                                                \
-    auto direct_async_lease = MakeP7DirectLaunchLease(                          \
-        std::move(converted), tensor_keepalive);                                 \
+    auto direct_async_lease = MakeP7DirectLaunchLease(tensor_keepalive);         \
     if (!GetP7DirectLaunchLeaseRegistry().Reserve()) {                           \
+      ReleaseTuple(converted);                                                   \
       direct_async_tls_cleanup();                                                \
       TORCH_CHECK(false,                                                         \
                   "P7 direct launch lease capacity exhausted; forward terminal ",\
                   "did not release prior P7 leases");                         \
     }                                                                            \
     auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);            \
-    /* Mirror the checked torch_npu launch contract before direct ACLNN. */     \
-    UseStreamResIfNeeded(acl_stream, false);                                     \
+    /*                                                                    */    \
+    /* No consumer-side dequeue bind here.  P7 deliberately has no      */      \
+    /* OpCommand consumer: ACLNN launches directly on this stream.      */      \
     LogOpApiLifecycle(#aclnn_api, "direct_async_launch_begin");               \
     const int launch_status =                                                     \
         launch_fn(workspace_ptr, workspace_size, executor, acl_stream);          \
     if (launch_status != 0) {                                                    \
       GetP7DirectLaunchLeaseRegistry().CancelReservation();                      \
+      ReleaseTuple(converted);                                                   \
       direct_async_tls_cleanup();                                                \
       TORCH_CHECK(false,                                                         \
                   "call " #aclnn_api " failed: ", RecentAclError());          \
@@ -1116,7 +1119,11 @@ inline void LogOrderedHostDso(
         GetP7DirectLaunchLeaseRegistry().Commit(                                 \
             std::move(direct_async_lease), acl_stream);                          \
     PublishP7DirectLaunchTokenForCurrentThread(direct_async_token);              \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_descriptor_lease_held");     \
+    /* aclTensor is phase-1/phase-2 host metadata, never a DMA resource. */    \
+    /* Commit Tensor ownership first: launch already succeeded on the stream. */\
+    ReleaseTuple(converted);                                                     \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_descriptor_release_done");  \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_tensor_keepalive_held");     \
     direct_async_tls_cleanup();                                                  \
     LogOpApiLifecycle(#aclnn_api,                                                \
                       pta_cache_active ? "direct_async_pta_cache_uninit"       \

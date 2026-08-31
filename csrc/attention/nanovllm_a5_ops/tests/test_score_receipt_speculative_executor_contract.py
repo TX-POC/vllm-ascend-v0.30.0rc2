@@ -253,6 +253,8 @@ def main() -> None:
         "mutable_refs=18",
         "Tensor(r!) worker_stats",
         "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(",
+        "P7_1_BOUNDARY stage=run_npu_after_submit",
+        "P7_1_BOUNDARY stage=run_npu_result_ready",
     ):
         _require(bridge, token, bridge_path)
     if "empty_like" in bridge:
@@ -273,10 +275,10 @@ def main() -> None:
         "ClearP7DirectLaunchTokenForCurrentThread",
         "PublishP7DirectLaunchTokenForCurrentThread",
         "stream_key",
-        "UseStreamResIfNeeded(acl_stream, false)",
         "direct_async_workspace_call_begin",
         "direct_async_launch_done",
-        "direct_async_descriptor_lease_held",
+        "direct_async_descriptor_release_done",
+        "direct_async_tensor_keepalive_held",
         "direct_async_submit_done",
         "RTLD_NOW | RTLD_LOCAL",
         "GetAclTensorApiPair()",
@@ -298,6 +300,7 @@ def main() -> None:
         "OpCommand::RunOpApi",
         "ordered_acl_call",
         "aclrtSynchronizeStream",
+        "UseStreamResIfNeeded(acl_stream, false)",
     ):
         _forbid(direct_macro, forbidden, op_api_common_path)
     converted_offset = op_api_common.find(
@@ -326,9 +329,6 @@ def main() -> None:
     direct_resolve_offset = op_api_common.find(
         "ResolveSymbol(#aclnn_api \"GetWorkspaceSize\")", direct_macro_offset
     )
-    direct_dequeue_offset = op_api_common.find(
-        "UseStreamResIfNeeded(acl_stream, false);", direct_macro_offset
-    )
     direct_launch_offset = op_api_common.find(
         "const int launch_status =", direct_macro_offset
     )
@@ -339,15 +339,21 @@ def main() -> None:
         "PublishP7DirectLaunchTokenForCurrentThread(direct_async_token);",
         direct_macro_offset,
     )
+    direct_descriptor_release_offset = op_api_common.find(
+        '"direct_async_descriptor_release_done"', direct_macro_offset
+    )
+    direct_tls_cleanup_offset = op_api_common.find(
+        "direct_async_tls_cleanup();", direct_descriptor_release_offset
+    )
     if not (
         direct_macro_offset < direct_token_clear_offset < direct_resolve_offset
-        and direct_dequeue_offset < direct_launch_offset < direct_commit_offset
-        < direct_publish_offset
+        < direct_launch_offset < direct_commit_offset < direct_publish_offset
+        < direct_descriptor_release_offset < direct_tls_cleanup_offset
     ):
         raise AssertionError(
-            "P7 direct launch must clear stale tokens before resolver work, bind "
-            "torch_npu dequeue stream resources before launch, then publish the "
-            "stream/token lease only after a successful enqueue"
+            "P7 direct launch must clear stale tokens before resolver work, keep "
+            "the successful launch's Tensor handles in the terminal registry, then "
+            "destroy aclTensor descriptors before HugeMem/PTA TLS cleanup"
         )
     runtime_package = runtime_package_path.read_text(encoding="utf-8")
     for token in (
@@ -356,6 +362,7 @@ def main() -> None:
         "release_at_forward_terminal",
         "p7_1_take_launch_token",
         "p7_1_release_after_forward_terminal(int(lease.token))",
+        "aclTensor`` descriptors have already been released immediately",
     ):
         _require(runtime_package, token, runtime_package_path)
     for forbidden in ("p7_1_release_after_forward_terminal()",):
@@ -364,9 +371,13 @@ def main() -> None:
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31'",
         "DESCRIPTOR_LEDGER",
         "direct_async_workspace_call_begin",
+        "direct_async_descriptor_release_done",
+        "direct_async_tensor_keepalive_held",
         "run_direct_async_fail_closed_case()",
         "P7_DIRECT_ASYNC_FAIL_CLOSED",
         "P7_1_TERMINAL_LEASE",
+        "P7_1_BOUNDARY stage=torch_op_return",
+        "P7_1_BOUNDARY stage=stream_terminal_done",
         "P7_REAL_FLOW_FINAL",
         "execution=direct_current_stream_then_real_hccp",
         "real_direct_hccp.log",

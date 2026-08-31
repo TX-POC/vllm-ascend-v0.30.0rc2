@@ -251,13 +251,22 @@ Result RunNpu(
         queueRequestSourceOffsets, queueRequestObjectOffsets,
         queueRequestOutputIndices, queueRequestCount, privateReadyEpoch,
         privateReadyGeneration, workerStats, rowsPerEntry);
-    return std::make_tuple(
+    if (DebugEnabled()) {
+        std::fprintf(stderr, "P7_1_BOUNDARY stage=run_npu_after_submit\n");
+        std::fflush(stderr);
+    }
+    auto result = std::make_tuple(
         privateSourceToSlot, privateObjectToSlot, privateReadyTable,
         privateArenaHead, privatePackedOutput, queueLeases, queueEpoch,
         queueGeneration, queuePostSequence, queueState, queueQuarantine,
         queueRequestSourceOffsets, queueRequestObjectOffsets,
         queueRequestOutputIndices, queueRequestCount, privateReadyEpoch,
         privateReadyGeneration, workerStats);
+    if (DebugEnabled()) {
+        std::fprintf(stderr, "P7_1_BOUNDARY stage=run_npu_result_ready\n");
+        std::fflush(stderr);
+    }
+    return result;
 }
 
 Result RunMeta(

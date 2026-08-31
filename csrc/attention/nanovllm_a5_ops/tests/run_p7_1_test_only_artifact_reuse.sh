@@ -271,12 +271,15 @@ run_direct_async_fail_closed_case() {
     local descriptor_ledger=0
     local workspace=0
     local launch=0
-    local descriptor_lease=0
+    local descriptor_release=0
+    local tensor_keepalive=0
     local pta_ready=0
     local pta_uninit=0
     local submit=0
     local task_queue_handoff=0
     local terminal_lease=0
+    local torch_return=0
+    local stream_terminal=0
     local test_pass=0
     local teardown=0
 
@@ -290,21 +293,26 @@ run_direct_async_fail_closed_case() {
     grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31' "${case_log}" && descriptor_ledger=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_workspace_call_begin' "${case_log}" && workspace=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_launch_done' "${case_log}" && launch=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_descriptor_lease_held' "${case_log}" && descriptor_lease=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_descriptor_release_done' "${case_log}" && descriptor_release=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_tensor_keepalive_held' "${case_log}" && tensor_keepalive=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_pta_cache_ready' "${case_log}" && pta_ready=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_pta_cache_uninit' "${case_log}" && pta_uninit=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_submit_done' "${case_log}" && submit=1
     grep -Fq 'handoff_runopapi_by_value' "${case_log}" && task_queue_handoff=1
     grep -Fq 'P7_1_TERMINAL_LEASE released=1 pending=0 terminal=stream_synchronized' "${case_log}" && terminal_lease=1
+    grep -Fq 'P7_1_BOUNDARY stage=torch_op_return' "${case_log}" && torch_return=1
+    grep -Fq 'P7_1_BOUNDARY stage=stream_terminal_done' "${case_log}" && stream_terminal=1
     grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
     grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
-    printf 'P7_DIRECT_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_lease=%s terminal_lease=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s real_hccp=scheduled_after_pass log=%s\n' \
+    printf 'P7_DIRECT_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_release=%s tensor_keepalive=%s torch_return=%s stream_terminal=%s terminal_lease=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s real_hccp=scheduled_after_pass log=%s\n' \
         "${case_rc}" "${descriptor_ledger}" "${workspace}" "${launch}" \
-        "${descriptor_lease}" "${terminal_lease}" "${pta_ready}" "${pta_uninit}" "${submit}" \
+        "${descriptor_release}" "${tensor_keepalive}" "${torch_return}" "${stream_terminal}" "${terminal_lease}" "${pta_ready}" "${pta_uninit}" "${submit}" \
         "${task_queue_handoff}" "${test_pass}" "${teardown}" "${case_log}"
     if [[ "${case_rc}" != "0" || "${descriptor_ledger}" != "1" || \
           "${workspace}" != "1" || "${launch}" != "1" || \
-          "${descriptor_lease}" != "1" || "${terminal_lease}" != "1" || \
+          "${descriptor_release}" != "1" || "${tensor_keepalive}" != "1" || \
+          "${torch_return}" != "1" || "${stream_terminal}" != "1" || \
+          "${terminal_lease}" != "1" || \
           "${pta_ready}" != "1" || \
           "${pta_uninit}" != "1" || "${submit}" != "1" || \
           "${task_queue_handoff}" != "0" || "${test_pass}" != "1" || \
@@ -342,7 +350,7 @@ fi
 printf 'P7_DIRECT_CURRENT_STREAM observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
     "${P7_DIRECT_CURRENT_STREAM}"
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER|TERMINAL_LEASE)|P7_(DIRECT_ASYNC_FAIL_CLOSED|DIRECT_CURRENT_STREAM|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(direct_async_enqueue_ready|direct_async_pta_cache_ready|direct_async_pta_cache_unavailable|direct_async_pta_cache_uninit|direct_async_pta_cache_not_active|direct_async_workspace_call_begin|direct_async_workspace_ready|direct_async_launch_begin|direct_async_launch_done|direct_async_descriptor_lease_held|direct_async_submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER|TERMINAL_LEASE|BOUNDARY)|P7_(DIRECT_ASYNC_FAIL_CLOSED|DIRECT_CURRENT_STREAM|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(direct_async_enqueue_ready|direct_async_pta_cache_ready|direct_async_pta_cache_unavailable|direct_async_pta_cache_uninit|direct_async_pta_cache_not_active|direct_async_workspace_call_begin|direct_async_workspace_ready|direct_async_launch_begin|direct_async_launch_done|direct_async_descriptor_release_done|direct_async_tensor_keepalive_held|direct_async_submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
         "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then

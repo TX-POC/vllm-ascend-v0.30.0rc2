@@ -90,7 +90,7 @@ from . import _C  # noqa: E402,F401
 
 @dataclass(frozen=True)
 class ForwardTerminalLease:
-    """Host ownership for one direct P7 launch until its forward terminal.
+    """Tensor keepalive ownership for one direct P7 launch.
 
     The token is created by the C++ bridge together with the exact NPU stream
     that received the ACLNN launch.  It is captured synchronously on the
@@ -116,11 +116,13 @@ def capture_forward_terminal_lease() -> ForwardTerminalLease:
 
 
 def release_at_forward_terminal(lease: ForwardTerminalLease) -> int:
-    """Release only descriptors protected by ``lease``'s stream/token boundary.
+    """Release Tensor keepalives protected by ``lease``'s stream/token boundary.
 
     The caller must establish the forward terminal first (in production, after
     the final QSFA reader; in the scoped test, after stream synchronization).
-    The underlying registry deliberately releases no work from other streams.
+    The underlying registry deliberately releases no Tensor handles from other
+    streams.  ``aclTensor`` descriptors have already been released immediately
+    after ACLNN launch, before HugeMem/PTA TLS cleanup.
     """
 
     if not isinstance(lease, ForwardTerminalLease):
@@ -131,7 +133,7 @@ def release_at_forward_terminal(lease: ForwardTerminalLease) -> int:
 
 
 def pending_launch_leases() -> int:
-    """Return the bounded host-descriptor leases not yet terminally released."""
+    """Return Tensor-keepalive leases not yet terminally released."""
 
     return int(_C.p7_1_pending_launch_leases())
 
