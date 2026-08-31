@@ -32,12 +32,18 @@ P7_PHYSICAL_NPU_ID="${P7_PHYSICAL_NPU_ID:-7}"
 P7_PYTHON="${P7_PYTHON:-$(command -v python3 2>/dev/null)}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-${ASCEND_CANN_PACKAGE_PATH:-/usr/local/Ascend/cann-9.1.0}}"
 P7_BUILD_JOBS="${P7_BUILD_JOBS:-16}"
+P7_CLEANUP_BISECT="${P7_CLEANUP_BISECT:-0}"
 P7_STAMP="$(date +%Y%m%d_%H%M%S)"
 P7_RESULT="${P7_RESULT:-$(dirname "${P7_VLLM_ROOT}")/results/p7_1_test_reuse_npu${P7_PHYSICAL_NPU_ID}_${P7_STAMP}}"
 P7_TEST="${OPS_ROOT}/tests/test_score_receipt_speculative_executor.py"
 P7_CONTRACT_TEST="${OPS_ROOT}/tests/test_score_receipt_speculative_executor_contract.py"
 P7_BRIDGE_ROOT="${OPS_ROOT}/a5_score_receipt_speculative_executor/torch_extension"
 P7_OPS_REL="${OPS_ROOT#"${P7_VLLM_ROOT}"/}"
+
+case "${P7_CLEANUP_BISECT}" in
+    0|1) ;;
+    *) fail "invalid_P7_CLEANUP_BISECT" ;;
+esac
 
 if [[ -e "${P7_RESULT}" ]]; then
     fail "result_path_already_exists"
@@ -108,9 +114,16 @@ if [[ "${P7_ARTIFACT_COMMIT_VALID}" == "1" ]] && \
     P7_ARTIFACT_ANCESTOR=1
 fi
 
+# This reuse gate intentionally names the *compiled* OPP closure instead of
+# the whole P7 directory.  The bridge and its Python fixture are host-only and
+# rebuilt below; treating them as OPP sources caused needless rebuilds and, in
+# practice, stale-artifact/checkout confusion.  Any change to schema, OpDef,
+# device kernel, tiling header, or staging script still blocks reuse.
 P7_CLOSURE_UNCHANGED=0
 if git -C "${P7_VLLM_ROOT}" diff --quiet "${P7_ARTIFACT_VLLM_SHA}" "${P7_VLLM_HEAD}" -- \
-    "${P7_OPS_REL}/a5_score_receipt_speculative_executor" \
+    "${P7_OPS_REL}/a5_score_receipt_speculative_executor/ops.json" \
+    "${P7_OPS_REL}/a5_score_receipt_speculative_executor/op_host" \
+    "${P7_OPS_REL}/a5_score_receipt_speculative_executor/op_kernel" \
     "${P7_OPS_REL}/build_nanovllm_ops.sh"; then
     P7_CLOSURE_UNCHANGED=1
 fi
@@ -125,7 +138,9 @@ while IFS= read -r changed_path; do
         "${P7_OPS_REL}/tests/run_p7_1_fail_closed_dispatch_diag.sh" | \
         "${P7_OPS_REL}/tests/test_score_receipt_speculative_executor.py" | \
         "${P7_OPS_REL}/tests/test_score_receipt_speculative_executor_contract.py" | \
-        "${P7_OPS_REL}/torch_extension/csrc/op_api_common.h") ;;
+        "${P7_OPS_REL}/torch_extension/csrc/op_api_common.h" | \
+        "${P7_OPS_REL}/a5_score_receipt_speculative_executor/torch_extension/"* | \
+        "${P7_OPS_REL}/a5_score_receipt_speculative_executor/P7_1_ABI.md") ;;
         *) P7_UNEXPECTED_PATHS="${P7_UNEXPECTED_PATHS}${changed_path}," ;;
     esac
 done <<< "${P7_CHANGED_PATHS}"
@@ -241,39 +256,160 @@ if [[ "${P7_CONTRACT_RC}" == "0" ]]; then
 else
     P7_PREFLIGHT_RC=98
 fi
-if [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
+run_fail_closed_case() {
+    local mode="$1"
+    local topology="${2:-aliases}"
+    local case_log="${P7_RESULT}/fail_closed_${mode}_${topology}.log"
+    local case_rc=0
+    local config=0
+    local completion=0
+    local test_pass=0
+    local teardown=0
+
+    # Each mode gets a fresh interpreter and a fresh torch bridge load.  That
+    # is essential: launch_only intentionally defers cleanup until process
+    # exit, so sharing an interpreter would contaminate the next checkpoint.
+    NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1 \
+    NANOVLLM_A5_OPAPI_CLEANUP_MODE="${mode}" \
+    NANOVLLM_A5_P7_OUTPUT_TOPOLOGY="${topology}" \
+    timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+        2>&1 | tee "${case_log}"
+    case_rc=${PIPESTATUS[0]}
+
+    grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=config bisect=1" "${case_log}" && config=1
+    if [[ "${mode}" == "workspace_only" ]]; then
+        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_only_return bisect=1" "${case_log}" && completion=1
+        grep -Fq 'P7_1_TEST mode=workspace_only pass=1' "${case_log}" && test_pass=1
+        grep -Fq 'P7_1_TEARDOWN mode=workspace_only stage=python_refs_collected sync=1' "${case_log}" && teardown=1
+    else
+        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=direct_stream_sync_done bisect=1" "${case_log}" && completion=1
+        grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
+        grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
+    fi
+
+    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
+        "${mode}" "${topology}" "${case_rc}" "${config}" "${completion}" \
+        "${test_pass}" "${teardown}" "${case_log}"
+
+    if [[ "${case_rc}" != "0" || "${config}" != "1" || \
+          "${completion}" != "1" || "${test_pass}" != "1" || \
+          "${teardown}" != "1" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+P7_OWNING_HANDOFF=0
+P7_REAL_RC=98
+P7_CLEANUP_BISECT_RC=98
+P7_CLEANUP_PTA_RC=98
+P7_CLEANUP_WORKSPACE_RC=98
+P7_CLEANUP_LAUNCH_ALIAS_RC=98
+P7_CLEANUP_LAUNCH_DISTINCT_RC=98
+P7_CLEANUP_RELEASE_CONVERTED_RC=98
+P7_CLEANUP_RELEASE_HUGE_RC=98
+P7_CLEANUP_UNINIT_HUGE_RC=98
+if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
+    run_fail_closed_case workspace_only aliases
+    P7_CLEANUP_WORKSPACE_RC=$?
+    if [[ "${P7_CLEANUP_WORKSPACE_RC}" == "0" ]]; then
+        run_fail_closed_case launch_only aliases
+        P7_CLEANUP_LAUNCH_ALIAS_RC=$?
+    fi
+
+    if [[ "${P7_CLEANUP_LAUNCH_ALIAS_RC}" != "0" && \
+          "${P7_CLEANUP_WORKSPACE_RC}" == "0" ]]; then
+        # The kernel ignores output-address arguments and mutates the matching
+        # input state tensors.  Re-run only the first failing launch boundary
+        # with distinct output descriptors: this cleanly answers whether 18
+        # physical graph aliases are the host-stub corruption source.
+        run_fail_closed_case launch_only distinct
+        P7_CLEANUP_LAUNCH_DISTINCT_RC=$?
+        printf 'P7_CLEANUP_ALIAS_AB mode=launch_only aliases=%s distinct=%s interpretation=%s\n' \
+            "${P7_CLEANUP_LAUNCH_ALIAS_RC}" "${P7_CLEANUP_LAUNCH_DISTINCT_RC}" \
+            "$([[ "${P7_CLEANUP_LAUNCH_DISTINCT_RC}" == "0" ]] && echo alias_descriptor_topology_suspect || echo launch_or_loader_not_alias_only)"
+    elif [[ "${P7_CLEANUP_LAUNCH_ALIAS_RC}" == "0" ]]; then
+        run_fail_closed_case release_converted aliases
+        P7_CLEANUP_RELEASE_CONVERTED_RC=$?
+        if [[ "${P7_CLEANUP_RELEASE_CONVERTED_RC}" == "0" ]]; then
+            run_fail_closed_case release_huge_mem aliases
+            P7_CLEANUP_RELEASE_HUGE_RC=$?
+        fi
+        if [[ "${P7_CLEANUP_RELEASE_HUGE_RC}" == "0" ]]; then
+            run_fail_closed_case uninit_huge_mem aliases
+            P7_CLEANUP_UNINIT_HUGE_RC=$?
+        fi
+    fi
+
+    P7_CLEANUP_BISECT_RC=1
+    if [[ "${P7_CLEANUP_WORKSPACE_RC}" == "0" && \
+          "${P7_CLEANUP_LAUNCH_ALIAS_RC}" == "0" && \
+          "${P7_CLEANUP_RELEASE_CONVERTED_RC}" == "0" && \
+          "${P7_CLEANUP_RELEASE_HUGE_RC}" == "0" && \
+          "${P7_CLEANUP_UNINIT_HUGE_RC}" == "0" ]]; then
+        P7_CLEANUP_BISECT_RC=0
+    fi
+    if [[ "${P7_CLEANUP_BISECT_RC}" == "0" ]]; then
+        # PTA has intentionally been absent from the five pre-PTA cases.  This
+        # sixth process is the complete normal cleanup sequence, only now
+        # carrying an explicit marker so a PTA failure cannot be misattributed
+        # to descriptor or huge-memory release.
+        run_fail_closed_case pta_cache
+        P7_CLEANUP_PTA_RC=$?
+    else
+        printf 'P7_CLEANUP_PTA_SKIPPED reason=pre_pta_boundary_failed\n'
+    fi
+    P7_FAIL_CLOSED_RC="${P7_CLEANUP_BISECT_RC}"
+    if [[ "${P7_CLEANUP_PTA_RC}" != "0" ]]; then
+        P7_FAIL_CLOSED_RC=1
+    fi
+    printf 'P7_CLEANUP_BISECT_FINAL status=%s workspace=%s launch_alias=%s launch_distinct=%s release_converted=%s release_huge=%s uninit_huge=%s pta_cache=%s real_hccp=not_run execution=direct_synchronized\n' \
+        "${P7_FAIL_CLOSED_RC}" "${P7_CLEANUP_WORKSPACE_RC}" \
+        "${P7_CLEANUP_LAUNCH_ALIAS_RC}" "${P7_CLEANUP_LAUNCH_DISTINCT_RC}" \
+        "${P7_CLEANUP_RELEASE_CONVERTED_RC}" "${P7_CLEANUP_RELEASE_HUGE_RC}" \
+        "${P7_CLEANUP_UNINIT_HUGE_RC}" "${P7_CLEANUP_PTA_RC}"
+elif [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
     timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         2>&1 | tee "${P7_RESULT}/fail_closed.log"
     P7_FAIL_CLOSED_RC=${PIPESTATUS[0]}
+    if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]] && \
+       grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=handoff_runopapi_by_value' \
+           "${P7_RESULT}/fail_closed.log"; then
+        P7_OWNING_HANDOFF=1
+    fi
+    if [[ "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_OWNING_HANDOFF}" != "1" ]]; then
+        # A passing tensor result from another registered bridge is not evidence
+        # that the rebuilt bridge was dispatched.  Fail before attempting HCCP.
+        P7_FAIL_CLOSED_RC=97
+    fi
+    if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]]; then
+        timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+            --fixture-module p7_1_real_direct_hccp_fixture \
+            2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
+        P7_REAL_RC=${PIPESTATUS[0]}
+    fi
 else
     P7_FAIL_CLOSED_RC=98
 fi
-P7_OWNING_HANDOFF=0
-if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]] && \
-   grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=handoff_runopapi_by_value' \
-       "${P7_RESULT}/fail_closed.log"; then
-    P7_OWNING_HANDOFF=1
-fi
 printf 'P7_REUSE_OWNING_HANDOFF observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
     "${P7_OWNING_HANDOFF}"
-if [[ "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_OWNING_HANDOFF}" != "1" ]]; then
-    # A passing tensor result from another registered bridge is not evidence
-    # that the rebuilt bridge was dispatched.  Fail before attempting HCCP.
-    P7_FAIL_CLOSED_RC=97
-fi
-if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]]; then
-    timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
-        --fixture-module p7_1_real_direct_hccp_fixture \
-        2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
-    P7_REAL_RC=${PIPESTATUS[0]}
-else
-    P7_REAL_RC=98
+if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
+    printf 'P7_CLEANUP_EXECUTION model=direct_synchronized_task_queue=not_used\n'
 fi
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|CLEANUP|ACL_DSO|HOST_DSO)|P7_CLEANUP_(CASE|ALIAS_AB|PTA_SKIPPED|BISECT_FINAL)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
-if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
-      "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
+if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
+    if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
+          "${P7_FAIL_CLOSED_RC}" == "0" ]]; then
+        printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 cleanup_bisect=0 real=not_run result=%s\n' "${P7_RESULT}"
+    else
+        printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s cleanup_bisect=%s real=not_run result=%s\n' \
+            "${P7_CONTRACT_RC}" "${P7_PREFLIGHT_RC}" "${P7_FAIL_CLOSED_RC}" "${P7_RESULT}"
+        exit 1
+    fi
+elif [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
+        "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
     printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 fail_closed=0 real=0 result=%s\n' "${P7_RESULT}"
 else
     printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s fail_closed=%s real=%s result=%s\n' \

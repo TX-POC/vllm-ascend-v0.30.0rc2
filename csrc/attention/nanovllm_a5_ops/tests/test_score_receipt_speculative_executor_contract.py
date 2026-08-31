@@ -225,7 +225,7 @@ def main() -> None:
         "31in_18aliasout",
         "aclnnA5ScoreReceiptSpeculativeExecutor",
         "CheckAlias",
-        "physical_aliases=18",
+        "physical_aliases=%d",
         "Tensor(r!) worker_stats",
     ):
         _require(bridge, token, bridge_path)
@@ -238,13 +238,15 @@ def main() -> None:
         "ordered_tensor_keepalive",
         "handoff_runopapi_by_value",
         "descriptor_release_done",
+        "OrderedCleanupPlanFromEnvironment()",
+        "NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
+        "P7_1_CLEANUP",
+        "RTLD_NOW | RTLD_LOCAL",
+        "GetAclTensorApiPair()",
+        "P7_1_ACL_DSO",
+        "P7_1_HOST_DSO",
     ):
         _require(op_api_common, token, op_api_common_path)
-    if "OpCommand::RunOpApiV2(#aclnn_api, ordered_acl_call)" in op_api_common:
-        raise AssertionError(
-            "P7.1 must not use RunOpApiV2: task-queue V2 retains stack pointers "
-            "to the callback and operation name after this launcher returns"
-        )
     for token in (
         "31in_18aliasout",
         "AIV-only",
@@ -283,7 +285,8 @@ def main() -> None:
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
-        "ordered_opapi_lifetime=1 pta_cache_lifecycle=1",
+        "ordered_opapi_lifetime=1 pta_cache_lifecycle=1 "
+        "host_cleanup_bisect=1 loader_scope_local=1 descriptor_pairing=1",
         flush=True,
     )
     print(

@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <cstdlib>
+#include <cstring>
 #include <tuple>
 
 #include <torch/extension.h>
@@ -186,6 +188,30 @@ using Result = std::tuple<
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor>;
 
+// The product ABI is 18 physical output aliases.  During the one bounded
+// host-lifetime bisect we also need to answer a precise question: does CANN's
+// generated host stub corrupt memory merely because an input descriptor and
+// its corresponding output descriptor refer to the same NPU storage?  The
+// device kernel deliberately writes only its mutable *input* addresses, so a
+// distinct output topology is a valid fail-closed diagnostic.  It is guarded
+// by the cleanup-bisect switch and can never silently alter the product path.
+bool UseDistinctOutputTopologyForCleanupBisect()
+{
+    const char* topology = std::getenv("NANOVLLM_A5_P7_OUTPUT_TOPOLOGY");
+    if (topology == nullptr || topology[0] == '\0' ||
+        std::strcmp(topology, "aliases") == 0) {
+        return false;
+    }
+    TORCH_CHECK(std::strcmp(topology, "distinct") == 0,
+                "NANOVLLM_A5_P7_OUTPUT_TOPOLOGY must be aliases or distinct");
+    const char* cleanupBisect =
+        std::getenv("NANOVLLM_A5_OPAPI_CLEANUP_BISECT");
+    TORCH_CHECK(cleanupBisect != nullptr && std::strcmp(cleanupBisect, "1") == 0,
+                "distinct P7 output topology is test-only and requires "
+                "NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1");
+    return true;
+}
+
 Result RunNpu(
     const at::Tensor& candidateSeeds, const at::Tensor& candidateCounts,
     const at::Tensor& candidateReadyEpoch, const at::Tensor& candidateStatus,
@@ -228,27 +254,32 @@ Result RunNpu(
     (void)geometry;
     CheckNpuInputSet(candidateSeeds, inputs);
 
-    // Separate Tensor handles make the alias rule explicit at both the ACLNN
-    // call boundary and the returned torch.library boundary.  They are not
-    // copies: CheckAlias below proves the exact same NPU storage is passed.
-    auto privateSourceToSlotOut = privateSourceToSlot;
-    auto privateObjectToSlotOut = privateObjectToSlot;
-    auto privateReadyTableOut = privateReadyTable;
-    auto privateArenaHeadOut = privateArenaHead;
-    auto privatePackedOutputOut = privatePackedOutput;
-    auto queueLeasesOut = queueLeases;
-    auto queueEpochOut = queueEpoch;
-    auto queueGenerationOut = queueGeneration;
-    auto queuePostSequenceOut = queuePostSequence;
-    auto queueStateOut = queueState;
-    auto queueQuarantineOut = queueQuarantine;
-    auto queueRequestSourceOffsetsOut = queueRequestSourceOffsets;
-    auto queueRequestObjectOffsetsOut = queueRequestObjectOffsets;
-    auto queueRequestOutputIndicesOut = queueRequestOutputIndices;
-    auto queueRequestCountOut = queueRequestCount;
-    auto privateReadyEpochOut = privateReadyEpoch;
-    auto privateReadyGenerationOut = privateReadyGeneration;
-    auto workerStatsOut = workerStats;
+    const bool distinctOutputs = UseDistinctOutputTopologyForCleanupBisect();
+    // Separate Tensor handles make the product alias rule explicit at both
+    // ACLNN and torch.library boundaries.  The conditional empty_like branch
+    // is reachable only from the direct+synchronized P7 cleanup bisect; it
+    // keeps the exact same 31/18 host ABI while isolating descriptor topology.
+    auto outputHandle = [distinctOutputs](const at::Tensor& input) {
+        return distinctOutputs ? at::empty_like(input) : input;
+    };
+    auto privateSourceToSlotOut = outputHandle(privateSourceToSlot);
+    auto privateObjectToSlotOut = outputHandle(privateObjectToSlot);
+    auto privateReadyTableOut = outputHandle(privateReadyTable);
+    auto privateArenaHeadOut = outputHandle(privateArenaHead);
+    auto privatePackedOutputOut = outputHandle(privatePackedOutput);
+    auto queueLeasesOut = outputHandle(queueLeases);
+    auto queueEpochOut = outputHandle(queueEpoch);
+    auto queueGenerationOut = outputHandle(queueGeneration);
+    auto queuePostSequenceOut = outputHandle(queuePostSequence);
+    auto queueStateOut = outputHandle(queueState);
+    auto queueQuarantineOut = outputHandle(queueQuarantine);
+    auto queueRequestSourceOffsetsOut = outputHandle(queueRequestSourceOffsets);
+    auto queueRequestObjectOffsetsOut = outputHandle(queueRequestObjectOffsets);
+    auto queueRequestOutputIndicesOut = outputHandle(queueRequestOutputIndices);
+    auto queueRequestCountOut = outputHandle(queueRequestCount);
+    auto privateReadyEpochOut = outputHandle(privateReadyEpoch);
+    auto privateReadyGenerationOut = outputHandle(privateReadyGeneration);
+    auto workerStatsOut = outputHandle(workerStats);
     const std::array<std::tuple<const char*, const at::Tensor*, const at::Tensor*>,
                      kOutputCount> aliases = {{
         {"private_source_to_slot", &privateSourceToSlot, &privateSourceToSlotOut},
@@ -270,13 +301,17 @@ Result RunNpu(
         {"private_ready_generation", &privateReadyGeneration, &privateReadyGenerationOut},
         {"worker_stats", &workerStats, &workerStatsOut},
     }};
-    for (const auto& alias : aliases) {
-        CheckAlias(std::get<0>(alias), *std::get<1>(alias), *std::get<2>(alias));
+    if (!distinctOutputs) {
+        for (const auto& alias : aliases) {
+            CheckAlias(std::get<0>(alias), *std::get<1>(alias), *std::get<2>(alias));
+        }
     }
     if (DebugEnabled()) {
         std::fprintf(stderr,
-                     "P7_1_ALIAS input_count=31 output_count=18 physical_aliases=18 "
-                     "candidate_receipts=%lld queues=%lld private_capacity=%lld\n",
+                     "P7_1_ALIAS input_count=31 output_count=18 physical_aliases=%d "
+                     "topology=%s candidate_receipts=%lld queues=%lld private_capacity=%lld\n",
+                     distinctOutputs ? 0 : kOutputCount,
+                     distinctOutputs ? "distinct_test_only" : "aliases",
                      static_cast<long long>(geometry.receipts),
                      static_cast<long long>(geometry.queues),
                      static_cast<long long>(geometry.private_capacity));
@@ -318,8 +353,10 @@ Result RunNpu(
         queueRequestObjectOffsetsOut, queueRequestOutputIndicesOut,
         queueRequestCountOut, privateReadyEpochOut, privateReadyGenerationOut,
         workerStatsOut);
-    for (const auto& alias : aliases) {
-        CheckAlias(std::get<0>(alias), *std::get<1>(alias), *std::get<2>(alias));
+    if (!distinctOutputs) {
+        for (const auto& alias : aliases) {
+            CheckAlias(std::get<0>(alias), *std::get<1>(alias), *std::get<2>(alias));
+        }
     }
     return std::make_tuple(
         privateSourceToSlotOut, privateObjectToSlotOut, privateReadyTableOut,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import gc
 import importlib
+import os
 from typing import Any, Iterable
 
 import torch
@@ -103,15 +104,56 @@ def _first_queue(queue_state: torch.Tensor, queue_quarantine: torch.Tensor) -> i
     return -1
 
 
-def _check_aliases(inputs: tuple[torch.Tensor, ...], outputs: Iterable[torch.Tensor]) -> None:
+def _output_topology() -> str:
+    """Return the output-descriptor topology requested by the P7 bisect.
+
+    ``distinct`` is accepted only together with the explicit C++ cleanup
+    bisect switch.  It is an ABI-preserving host-stub diagnostic: the kernel
+    still mutates the 18 documented input state tensors and deliberately
+    ignores their output-address counterparts.
+    """
+
+    topology = os.getenv("NANOVLLM_A5_P7_OUTPUT_TOPOLOGY", "aliases")
+    if topology not in {"aliases", "distinct"}:
+        raise AssertionError(f"unsupported P7 output topology: {topology!r}")
+    if topology == "distinct" and os.getenv("NANOVLLM_A5_OPAPI_CLEANUP_BISECT") != "1":
+        raise AssertionError("distinct P7 output topology requires cleanup bisect")
+    return topology
+
+
+def _check_output_topology(
+    inputs: tuple[torch.Tensor, ...], outputs: Iterable[torch.Tensor]
+) -> str:
     values = tuple(outputs)
     if len(values) != OUTPUT_COUNT:
         raise AssertionError(f"expected {OUTPUT_COUNT} outputs, got {len(values)}")
+    topology = _output_topology()
     for output_index, input_index in enumerate(MUTABLE_INPUTS):
-        if values[output_index].data_ptr() != inputs[input_index].data_ptr():
+        same_storage = values[output_index].data_ptr() == inputs[input_index].data_ptr()
+        if topology == "aliases" and not same_storage:
             raise AssertionError(
                 f"output {output_index} is not a physical alias of input {input_index}"
             )
+        if topology == "distinct" and same_storage:
+            raise AssertionError(
+                f"output {output_index} unexpectedly aliases input {input_index} in distinct bisect"
+            )
+    return topology
+
+
+def _state_outputs(
+    inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Tensor, ...], topology: str
+) -> tuple[torch.Tensor, ...]:
+    """Choose where the kernel's mutable transaction state resides.
+
+    Product topology returns the formal alias outputs.  The test-only
+    distinct topology proves whether generated ACLNN output descriptors are
+    the fault while retaining the kernel's documented input-side state writes.
+    """
+
+    if topology == "aliases":
+        return outputs
+    return tuple(inputs[index] for index in MUTABLE_INPUTS)
 
 
 def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
@@ -124,14 +166,16 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
 
     outputs = torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor(*inputs)
     torch.npu.synchronize()
-    _check_aliases(inputs, outputs)
+    _check_output_topology(inputs, outputs)
     return tuple(outputs)
 
 
 def _report(mode: str, inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Tensor, ...]) -> dict[str, int]:
-    stats = outputs[-1]
-    queue_state = outputs[9]
-    queue_quarantine = outputs[10]
+    topology = _output_topology()
+    state = _state_outputs(inputs, outputs, topology)
+    stats = state[-1]
+    queue_state = state[9]
+    queue_quarantine = state[10]
     control = inputs[16].detach().cpu().reshape(-1)
     epoch = int(inputs[4].detach().cpu().item())
     queue_count = int(inputs[17].numel())
@@ -156,12 +200,13 @@ def _report(mode: str, inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Te
     )
     first_queue = _first_queue(queue_state, queue_quarantine)
     diagnostic_queue = first_queue if first_queue >= 0 else 0
-    queue_epoch = int(outputs[6].detach().cpu().reshape(-1)[diagnostic_queue])
-    queue_generation = int(outputs[7].detach().cpu().reshape(-1)[diagnostic_queue])
-    queue_post_sequence = int(outputs[8].detach().cpu().reshape(-1)[diagnostic_queue])
+    queue_epoch = int(state[6].detach().cpu().reshape(-1)[diagnostic_queue])
+    queue_generation = int(state[7].detach().cpu().reshape(-1)[diagnostic_queue])
+    queue_post_sequence = int(state[8].detach().cpu().reshape(-1)[diagnostic_queue])
     print(
         "P7_1_SOURCE_ABI "
-        f"mode={mode} inputs=31 outputs=18 aliases=18 "
+        f"mode={mode} inputs=31 outputs=18 aliases={18 if topology == 'aliases' else 0} "
+        f"topology={topology} "
         f"candidate_seed_shape={list(inputs[0].shape)}",
         flush=True,
     )
@@ -227,6 +272,20 @@ def _teardown_checkpoint(mode: str) -> None:
     )
 
 
+def _cleanup_bisect_mode() -> str:
+    """Return the explicit host-cleanup diagnostic mode, if any.
+
+    The C++ bridge ignores the mode unless the matching bisect guard is also
+    set.  Mirror that double guard here so ordinary P7.1 tests retain their
+    original fail-closed expectation even if a user's shell happens to carry a
+    stale mode variable.
+    """
+
+    if os.getenv("NANOVLLM_A5_OPAPI_CLEANUP_BISECT") != "1":
+        return ""
+    return os.getenv("NANOVLLM_A5_OPAPI_CLEANUP_MODE", "")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
@@ -266,19 +325,38 @@ def main() -> None:
     if not args.fixture_module:
         inputs = _fail_closed_fixture(device)
         outputs = _run(inputs)
-        values = _report("fail_closed", inputs, outputs)
-        if values["control_rejected"] <= 0 or any(
-            values[key] != 0 for key in ("lease", "post", "retire", "finish", "release")
-        ):
-            raise AssertionError("invalid control must reject before lease/PostOnly/CQ")
-        print(
-            "P7_1_TEST mode=fail_closed pass=1 aliases=18 "
-            "real_hccp=not_exercised reason=invalid_control_expected",
-            flush=True,
-        )
+        cleanup_mode = _cleanup_bisect_mode()
+        report_mode = "workspace_only" if cleanup_mode == "workspace_only" else "fail_closed"
+        values = _report(report_mode, inputs, outputs)
+        if cleanup_mode == "workspace_only":
+            # The test-only C++ branch stopped after GetWorkspaceSize; an
+            # invalid control must therefore remain unread and every mutable
+            # transaction receipt must stay zero.  This partitions workspace
+            # construction from the direct-launch cleanup matrix.
+            if any(value != 0 for value in values.values()):
+                raise AssertionError(
+                    "workspace_only must not dispatch or mutate P7.1 transaction state"
+                )
+            print(
+                f"P7_1_TEST mode=workspace_only pass=1 aliases={18 if _output_topology() == 'aliases' else 0} "
+                f"topology={_output_topology()} "
+                "aclnn_dispatched=0 reason=workspace_query_only",
+                flush=True,
+            )
+        else:
+            if values["control_rejected"] <= 0 or any(
+                values[key] != 0 for key in ("lease", "post", "retire", "finish", "release")
+            ):
+                raise AssertionError("invalid control must reject before lease/PostOnly/CQ")
+            print(
+                f"P7_1_TEST mode=fail_closed pass=1 aliases={18 if _output_topology() == 'aliases' else 0} "
+                f"topology={_output_topology()} "
+                "real_hccp=not_exercised reason=invalid_control_expected",
+                flush=True,
+            )
         del outputs
         del inputs
-        _teardown_checkpoint("fail_closed")
+        _teardown_checkpoint(report_mode)
         return
 
     module = importlib.import_module(args.fixture_module)

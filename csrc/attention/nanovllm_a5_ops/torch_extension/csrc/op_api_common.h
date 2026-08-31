@@ -8,13 +8,15 @@
 // runtime may consume the queued command after the caller has released the
 // associated host objects.  We therefore use the same narrowly scoped
 // OpCommand::RunOpApi hand-off while continuing to resolve the operator
-// symbols from the repository-local OPP.  The launcher creates its callback
-// on the stack, so it deliberately uses the by-value API rather than relying
-// on the implementation-specific copy timing of RunOpApiV2.  This keeps the
-// submission asynchronous while making the callback ownership explicit.
+// symbols from the repository-local OPP.  We deliberately use the by-value
+// API because it makes the closure ownership boundary explicit in this
+// bridge.  This is an implementation choice, not a claim that RunOpApiV2 is
+// intrinsically unsafe; the P7 test-only bisect below independently removes
+// the task queue when it isolates host-lifetime failures.
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <initializer_list>
 #include <string>
@@ -84,7 +86,14 @@ inline void *OpenLibraryOnce(const char *path) {
   if (path == nullptr || path[0] == '\0') {
     return nullptr;
   }
-  return dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+  // Keep a custom OPP in its own dynamic-loader scope.  The checked-in CANN
+  // adapter uses the default local scope (dlopen(..., RTLD_LAZY)); exporting
+  // every generated custom OPP globally is both unnecessary for dlsym(handle,
+  // ...) and unsafe when several custom packages coexist in one Python
+  // process.  In particular, RTLD_GLOBAL can interpose helper symbols used by
+  // a subsequently loaded OPP.  RTLD_NOW retains the earlier fail-fast
+  // dependency check, while RTLD_LOCAL restores the important isolation.
+  return dlopen(path, RTLD_NOW | RTLD_LOCAL);
 }
 
 inline void *RepositoryCustomHandle() {
@@ -123,6 +132,75 @@ inline void *ResolveSymbol(const char *name) {
     }
   }
   return nullptr;
+}
+
+inline bool OpApiDebugEnabled() {
+  const char *value = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
+  return value != nullptr && value[0] != '\0' &&
+      !(value[0] == '0' && value[1] == '\0');
+}
+
+inline const char *DsoNameForAddress(void *address) {
+  Dl_info info{};
+  return address != nullptr && dladdr(address, &info) != 0 &&
+          info.dli_fname != nullptr
+      ? info.dli_fname
+      : "<unknown>";
+}
+
+// aclTensor descriptors must be destroyed by the same resolver domain that
+// created them.  Resolving create and destroy independently permits an
+// accidental half-match if a custom OPP exports only one of the two symbols
+// while another loaded provider exports the other.  It is a small but real
+// source of allocator corruption after an otherwise successful ACLNN call.
+// Resolve an all-or-nothing pair once from a single handle instead.
+struct AclTensorApiPair {
+  AclCreateTensorFn create = nullptr;
+  AclDestroyTensorFn destroy = nullptr;
+  const char *provider = "<unresolved>";
+};
+
+inline const AclTensorApiPair &GetAclTensorApiPair() {
+  static const AclTensorApiPair pair = []() {
+    const struct Provider {
+      const char *name;
+      void *handle;
+    } providers[] = {
+        {"repository_custom", RepositoryCustomHandle()},
+        {"system_opapi", SystemOpApiHandle()},
+    };
+    for (const Provider &provider : providers) {
+      if (provider.handle == nullptr) {
+        continue;
+      }
+      auto create = reinterpret_cast<AclCreateTensorFn>(
+          dlsym(provider.handle, "aclCreateTensor"));
+      auto destroy = reinterpret_cast<AclDestroyTensorFn>(
+          dlsym(provider.handle, "aclDestroyTensor"));
+      if (create != nullptr && destroy != nullptr) {
+        if (OpApiDebugEnabled()) {
+          std::fprintf(
+              stderr,
+              "P7_1_ACL_DSO role=acl_tensor_pair provider=%s "
+              "loader=RTLD_NOW|RTLD_LOCAL create_dso=%s destroy_dso=%s "
+              "create_addr=%p destroy_addr=%p\\n",
+              provider.name,
+              DsoNameForAddress(reinterpret_cast<void *>(create)),
+              DsoNameForAddress(reinterpret_cast<void *>(destroy)),
+              reinterpret_cast<void *>(create),
+              reinterpret_cast<void *>(destroy));
+          std::fflush(stderr);
+        }
+        return AclTensorApiPair{create, destroy, provider.name};
+      }
+    }
+    return AclTensorApiPair{};
+  }();
+  TORCH_CHECK(
+      pair.create != nullptr && pair.destroy != nullptr,
+      "aclCreateTensor/aclDestroyTensor are unavailable from one resolver "
+      "provider; refusing a cross-DSO descriptor lifecycle");
+  return pair;
 }
 
 inline aclDataType ToAclDataType(at::ScalarType dtype) {
@@ -176,9 +254,7 @@ inline aclTensor *ConvertTensor(
         tensor.is_contiguous(),
         "nanovllm A5 ACLNN launcher requires contiguous tensors");
   }
-  auto create_tensor =
-      reinterpret_cast<AclCreateTensorFn>(ResolveSymbol("aclCreateTensor"));
-  TORCH_CHECK(create_tensor != nullptr, "aclCreateTensor is unavailable");
+  const auto &acl_tensor_api = GetAclTensorApiPair();
 
   // Every checked-in custom A5 operator schema uses ND. data_ptr() already
   // points at the logical first element, so ACL offset is zero. Keeping the
@@ -188,10 +264,7 @@ inline aclTensor *ConvertTensor(
   TORCH_CHECK(acl_dtype != ACL_DT_UNDEFINED,
               "NPU ACL tensor dtype resolved to ACL_DT_UNDEFINED: ",
               tensor.scalar_type());
-  const char *debug_value = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
-  const bool debug_enabled = debug_value != nullptr && debug_value[0] != '\0' &&
-      !(debug_value[0] == '0' && debug_value[1] == '\0');
-  if (debug_enabled && tensor.scalar_type() == at::kFloat8_e4m3fn) {
+  if (OpApiDebugEnabled() && tensor.scalar_type() == at::kFloat8_e4m3fn) {
     std::fprintf(stderr,
                  "NANOVLLM_A5_ACL_TENSOR aten_dtype=%s acl_dtype=%d "
                  "shape_rank=%zu data=%p\n",
@@ -202,7 +275,7 @@ inline aclTensor *ConvertTensor(
   }
   std::vector<int64_t> storage_dims(
       tensor.sizes().begin(), tensor.sizes().end());
-  return create_tensor(
+  return acl_tensor_api.create(
       tensor.sizes().data(),
       static_cast<uint64_t>(tensor.dim()),
       acl_dtype,
@@ -231,11 +304,7 @@ inline void Release(aclTensor *tensor) {
   if (tensor == nullptr) {
     return;
   }
-  auto destroy_tensor = reinterpret_cast<AclDestroyTensorFn>(
-      ResolveSymbol("aclDestroyTensor"));
-  if (destroy_tensor != nullptr) {
-    (void)destroy_tensor(tensor);
-  }
+  (void)GetAclTensorApiPair().destroy(tensor);
 }
 
 template <typename T>
@@ -293,12 +362,6 @@ inline const char *RecentAclError() {
   return message == nullptr ? "<no ACL error message>" : message;
 }
 
-inline bool OpApiDebugEnabled() {
-  const char *value = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
-  return value != nullptr && value[0] != '\0' &&
-      !(value[0] == '0' && value[1] == '\0');
-}
-
 inline AclUseStreamResFn GetUseStreamResFn() {
   static void *handle = OpenLibraryOnce("libascendcl.so");
   static auto use_stream_res =
@@ -333,6 +396,122 @@ inline void LogOpApiLifecycle(const char *api, const char *stage) {
     return;
   }
   std::fprintf(stderr, "NANOVLLM_A5_OPAPI_LIFECYCLE api=%s stage=%s\n", api, stage);
+  std::fflush(stderr);
+}
+
+// P7.1 has a process-exit heap abort even when its device kernel rejects an
+// invalid control block before it initializes UB or touches Direct-HCCP.  The
+// normal production path below must keep its complete cleanup contract.  For
+// that one bounded diagnostic only, allow the P7 runner to enable five
+// *cumulative* cleanup checkpoints in separate Python processes:
+//
+//   workspace_only      convert inputs and query workspace, then return;
+//   launch_only        launch, then no ACLNN resource release;
+//   release_converted  additionally destroy converted aclTensor descriptors;
+//   release_huge_mem   additionally call ReleaseHugeMem;
+//   uninit_huge_mem    additionally call UnInitHugeMemThreadLocal.
+//
+// Those five cases deliberately skip the PTA-cache pair as well: that cache is
+// a separate host allocator lifecycle, so keeping it in the first five cases
+// would leave a failing ``launch_only`` result ambiguous.  Only after all five
+// pre-PTA cases return cleanly does the P7 runner issue a sixth
+// ``pta_cache`` confirmation case.  The normal default is ``full`` and is
+// byte-for-byte equivalent to the existing production cleanup sequence.
+enum class OrderedCleanupMode {
+  kFull,
+  kWorkspaceOnly,
+  kLaunchOnly,
+  kReleaseConverted,
+  kReleaseHugeMem,
+  kUninitHugeMem,
+  kPtaCache,
+};
+
+struct OrderedCleanupPlan {
+  OrderedCleanupMode mode;
+  bool bisect;
+  bool release_converted;
+  bool release_huge_mem;
+  bool uninit_huge_mem;
+  bool use_pta_cache;
+};
+
+inline const char *OrderedCleanupModeName(OrderedCleanupMode mode) {
+  switch (mode) {
+    case OrderedCleanupMode::kFull:
+      return "full";
+    case OrderedCleanupMode::kWorkspaceOnly:
+      return "workspace_only";
+    case OrderedCleanupMode::kLaunchOnly:
+      return "launch_only";
+    case OrderedCleanupMode::kReleaseConverted:
+      return "release_converted";
+    case OrderedCleanupMode::kReleaseHugeMem:
+      return "release_huge_mem";
+    case OrderedCleanupMode::kUninitHugeMem:
+      return "uninit_huge_mem";
+    case OrderedCleanupMode::kPtaCache:
+      return "pta_cache";
+  }
+  return "invalid";
+}
+
+inline bool IsEnabledEnvironmentFlag(const char *name) {
+  const char *value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' &&
+      !(value[0] == '0' && value[1] == '\0');
+}
+
+inline OrderedCleanupPlan OrderedCleanupPlanFromEnvironment() {
+  // No normal caller can accidentally change cleanup timing just by setting
+  // the mode variable.  Both variables are required and the P7-only runner
+  // starts a fresh process for every bisect case.
+  if (!IsEnabledEnvironmentFlag("NANOVLLM_A5_OPAPI_CLEANUP_BISECT")) {
+    return {OrderedCleanupMode::kFull, false, true, true, true, true};
+  }
+
+  const char *value = std::getenv("NANOVLLM_A5_OPAPI_CLEANUP_MODE");
+  TORCH_CHECK(value != nullptr && value[0] != '\0',
+              "NANOVLLM_A5_OPAPI_CLEANUP_MODE is required when "
+              "NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1");
+  if (std::strcmp(value, "workspace_only") == 0) {
+    return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, false};
+  }
+  if (std::strcmp(value, "launch_only") == 0) {
+    return {OrderedCleanupMode::kLaunchOnly, true, false, false, false, false};
+  }
+  if (std::strcmp(value, "release_converted") == 0) {
+    return {OrderedCleanupMode::kReleaseConverted, true, true, false, false, false};
+  }
+  if (std::strcmp(value, "release_huge_mem") == 0) {
+    return {OrderedCleanupMode::kReleaseHugeMem, true, true, true, false, false};
+  }
+  if (std::strcmp(value, "uninit_huge_mem") == 0) {
+    return {OrderedCleanupMode::kUninitHugeMem, true, true, true, true, false};
+  }
+  if (std::strcmp(value, "pta_cache") == 0) {
+    return {OrderedCleanupMode::kPtaCache, true, true, true, true, true};
+  }
+  TORCH_CHECK(false,
+              "unsupported NANOVLLM_A5_OPAPI_CLEANUP_MODE=", value,
+              "; expected workspace_only, launch_only, release_converted, release_huge_mem, "
+              "uninit_huge_mem, or pta_cache");
+}
+
+inline void LogOrderedCleanup(
+    const char *api,
+    const OrderedCleanupPlan &plan,
+    const char *stage) {
+  if (!plan.bisect && !OpApiDebugEnabled()) {
+    return;
+  }
+  std::fprintf(
+      stderr,
+      "P7_1_CLEANUP api=%s mode=%s stage=%s bisect=%d\n",
+      api,
+      OrderedCleanupModeName(plan.mode),
+      stage,
+      plan.bisect ? 1 : 0);
   std::fflush(stderr);
 }
 
@@ -395,11 +574,42 @@ inline void LogResolvedOpApi(
   std::fflush(stderr);
 }
 
+// Keep this deliberately compact: it records every host-side allocator /
+// descriptor boundary that can corrupt the process after a device-side
+// fail-closed result.  The P7 cleanup matrix below consumes this one line;
+// it is not a per-tensor trace.
+inline void LogOrderedHostDso(
+    const char *api,
+    void *workspace_addr,
+    void *launch_addr,
+    InitHugeMemThreadLocalFn init_huge_mem,
+    ReleaseHugeMemFn release_huge_mem,
+    UnInitHugeMemThreadLocalFn uninit_huge_mem) {
+  if (!OpApiDebugEnabled()) {
+    return;
+  }
+  std::fprintf(
+      stderr,
+      "P7_1_HOST_DSO api=%s loader=RTLD_NOW|RTLD_LOCAL "
+      "workspace_dso=%s launch_dso=%s init_huge_dso=%s "
+      "release_huge_dso=%s uninit_huge_dso=%s\\n",
+      api,
+      DsoNameForAddress(workspace_addr),
+      DsoNameForAddress(launch_addr),
+      DsoNameForAddress(reinterpret_cast<void *>(init_huge_mem)),
+      DsoNameForAddress(reinterpret_cast<void *>(release_huge_mem)),
+      DsoNameForAddress(reinterpret_cast<void *>(uninit_huge_mem)));
+  std::fflush(stderr);
+}
+
 }  // namespace nanovllm_a5_opapi
 
 #define EXEC_NPU_CMD_ORDERED(aclnn_api, tensor_keepalive, ...)                \
   do {                                                                         \
     using namespace nanovllm_a5_opapi;                                         \
+    const OrderedCleanupPlan ordered_cleanup_plan =                            \
+        OrderedCleanupPlanFromEnvironment();                                   \
+    LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "config");           \
     static void *workspace_addr_fn =                                           \
         ResolveSymbol(#aclnn_api "GetWorkspaceSize");                         \
     static void *launch_addr_fn = ResolveSymbol(#aclnn_api);                   \
@@ -413,20 +623,33 @@ inline void LogResolvedOpApi(
                                                                                \
     auto npu_stream = c10_npu::getCurrentNPUStream();                          \
     aclrtStream acl_stream = npu_stream.stream(false);                         \
-    UseStreamResIfNeeded(acl_stream, true);                                    \
-    LogOpApiLifecycle(#aclnn_api, "enqueue_ready");                           \
-    const bool pta_cache_active = InitPtaCacheForWorkspace();                  \
-    LogOpApiLifecycle(#aclnn_api,                                              \
-                      pta_cache_active ? "pta_cache_ready"                    \
-                                       : "pta_cache_unavailable");             \
+    if (!ordered_cleanup_plan.bisect) {                                        \
+      UseStreamResIfNeeded(acl_stream, true);                                  \
+      LogOpApiLifecycle(#aclnn_api, "enqueue_ready");                         \
+    } else {                                                                   \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "direct_stream"); \
+    }                                                                          \
+    const bool pta_cache_active = ordered_cleanup_plan.use_pta_cache           \
+        ? InitPtaCacheForWorkspace() : false;                                  \
+    if (ordered_cleanup_plan.use_pta_cache) {                                  \
+      LogOpApiLifecycle(#aclnn_api,                                            \
+                        pta_cache_active ? "pta_cache_ready"                  \
+                                         : "pta_cache_unavailable");           \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "pta_cache_enabled");\
+    } else {                                                                   \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "pta_cache_held"); \
+    }                                                                          \
     auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(           \
         ResolveSymbol("InitHugeMemThreadLocal"));                             \
     auto uninit_huge_mem = reinterpret_cast<UnInitHugeMemThreadLocalFn>(       \
         ResolveSymbol("UnInitHugeMemThreadLocal"));                           \
     auto release_huge_mem = reinterpret_cast<ReleaseHugeMemFn>(                \
         ResolveSymbol("ReleaseHugeMem"));                                     \
+    LogOrderedHostDso(#aclnn_api, workspace_addr_fn, launch_addr_fn,           \
+                      init_huge_mem, release_huge_mem, uninit_huge_mem);       \
     if (init_huge_mem != nullptr) {                                            \
       (void)init_huge_mem(nullptr, false);                                     \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "init_huge_mem_done");\
     }                                                                          \
                                                                                \
     uint64_t workspace_size = 0;                                               \
@@ -445,7 +668,9 @@ inline void LogResolvedOpApi(
                                                                                \
     at::Tensor workspace;                                                      \
     void *workspace_ptr = nullptr;                                             \
-    if (workspace_size != 0) {                                                 \
+    if (!(ordered_cleanup_plan.bisect &&                                      \
+          ordered_cleanup_plan.mode == OrderedCleanupMode::kWorkspaceOnly) && \
+        workspace_size != 0) {                                                \
       const auto &_workspace_ref_tensor = std::get<0>(tensor_keepalive);       \
       workspace = at::empty(                                                   \
           {static_cast<int64_t>(workspace_size)},                              \
@@ -453,38 +678,101 @@ inline void LogResolvedOpApi(
       workspace_ptr = workspace.data_ptr();                                    \
     }                                                                          \
                                                                                \
-    auto ordered_tensor_keepalive = tensor_keepalive;                          \
-    auto ordered_acl_call =                                                     \
-        [converted, workspace, workspace_ptr, workspace_size, acl_stream,     \
-         executor, ordered_tensor_keepalive, release_huge_mem]() mutable -> int { \
-      (void)workspace;                                                         \
-      (void)ordered_tensor_keepalive;                                          \
-      UseStreamResIfNeeded(acl_stream, false);                                 \
-      LogOpApiLifecycle(#aclnn_api, "launch_begin");                         \
-      auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);        \
-      const int launch_status =                                                \
-          launch_fn(workspace_ptr, workspace_size, executor, acl_stream);      \
-      TORCH_CHECK(                                                             \
-          launch_status == 0,                                                  \
-          "call " #aclnn_api " failed: ", RecentAclError());                \
-      LogOpApiLifecycle(#aclnn_api, "launch_done");                          \
-      ReleaseTuple(converted);                                                 \
-      if (release_huge_mem != nullptr) {                                       \
-        release_huge_mem(nullptr, false);                                      \
+    if (ordered_cleanup_plan.bisect) {                                        \
+      /* P7 test-only matrix: direct launch plus stream synchronization       \
+       * removes OpCommand callback/destructor timing from the equation.      \
+       * It is unreachable in normal production execution. */                 \
+      if (ordered_cleanup_plan.mode == OrderedCleanupMode::kWorkspaceOnly) { \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "workspace_only_return");                          \
+      } else {                                                                 \
+        auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);      \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "direct_launch_begin");                            \
+        const int launch_status =                                              \
+            launch_fn(workspace_ptr, workspace_size, executor, acl_stream);   \
+        TORCH_CHECK(                                                           \
+            launch_status == 0,                                                \
+            "call " #aclnn_api " failed: ", RecentAclError());              \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "direct_launch_done");                             \
+        const aclError sync_status = aclrtSynchronizeStream(acl_stream);      \
+        TORCH_CHECK(                                                           \
+            sync_status == ACL_SUCCESS,                                       \
+            "synchronize " #aclnn_api " failed: ", sync_status, "; ",     \
+            RecentAclError());                                                 \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "direct_stream_sync_done");                        \
+        if (ordered_cleanup_plan.release_converted) {                          \
+          ReleaseTuple(converted);                                             \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "release_converted_done");                       \
+        } else {                                                               \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "release_converted_held");                       \
+        }                                                                      \
+        if (ordered_cleanup_plan.release_huge_mem &&                           \
+            release_huge_mem != nullptr) {                                    \
+          release_huge_mem(nullptr, false);                                    \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "release_huge_mem_done");                        \
+        } else {                                                               \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "release_huge_mem_held");                        \
+        }                                                                      \
+        if (ordered_cleanup_plan.uninit_huge_mem &&                            \
+            uninit_huge_mem != nullptr) {                                     \
+          uninit_huge_mem(nullptr, false);                                     \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "uninit_huge_mem_done");                         \
+        } else {                                                               \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "uninit_huge_mem_held");                         \
+        }                                                                      \
       }                                                                        \
-      LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");              \
-      return launch_status;                                                    \
-    };                                                                         \
-    /* Keep an owning copy of the callback in the task queue.  Do not use     \
-     * RunOpApiV2 here: V2 queues non-owning pointers to stack state. */      \
-    LogOpApiLifecycle(#aclnn_api, "handoff_runopapi_by_value");             \
-    at_npu::native::OpCommand::RunOpApi(#aclnn_api, ordered_acl_call);        \
-    if (uninit_huge_mem != nullptr) {                                          \
-      uninit_huge_mem(nullptr, false);                                         \
+      if (ordered_cleanup_plan.use_pta_cache) {                                \
+        UnInitPtaCacheForWorkspace(pta_cache_active);                          \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "pta_uninit_done");                                \
+      } else {                                                                 \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "pta_uninit_held");                                \
+      }                                                                        \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "direct_return"); \
+    } else {                                                                   \
+      auto ordered_tensor_keepalive = tensor_keepalive;                        \
+      auto ordered_acl_call =                                                   \
+          [converted, workspace, workspace_ptr, workspace_size, acl_stream,   \
+           executor, ordered_tensor_keepalive, release_huge_mem]() mutable -> int { \
+        (void)workspace;                                                       \
+        (void)ordered_tensor_keepalive;                                        \
+        UseStreamResIfNeeded(acl_stream, false);                               \
+        LogOpApiLifecycle(#aclnn_api, "launch_begin");                       \
+        auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);      \
+        const int launch_status =                                              \
+            launch_fn(workspace_ptr, workspace_size, executor, acl_stream);   \
+        TORCH_CHECK(                                                           \
+            launch_status == 0,                                                \
+            "call " #aclnn_api " failed: ", RecentAclError());              \
+        LogOpApiLifecycle(#aclnn_api, "launch_done");                        \
+        ReleaseTuple(converted);                                               \
+        if (release_huge_mem != nullptr) {                                     \
+          release_huge_mem(nullptr, false);                                    \
+        }                                                                      \
+        LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");            \
+        return launch_status;                                                  \
+      };                                                                       \
+      /* RunOpApi takes the closure by value.  We choose it to make that      \
+       * ownership boundary explicit; this is not a claim that V2 caused P7. */\
+      LogOpApiLifecycle(#aclnn_api, "handoff_runopapi_by_value");            \
+      at_npu::native::OpCommand::RunOpApi(#aclnn_api, ordered_acl_call);      \
+      if (uninit_huge_mem != nullptr) {                                        \
+        uninit_huge_mem(nullptr, false);                                       \
+      }                                                                        \
+      UnInitPtaCacheForWorkspace(pta_cache_active);                            \
+      LogOpApiLifecycle(#aclnn_api,                                            \
+                        pta_cache_active ? "pta_cache_uninit"                \
+                                         : "pta_cache_not_active");           \
+      LogOpApiLifecycle(#aclnn_api, "submit_done");                          \
     }                                                                          \
-    UnInitPtaCacheForWorkspace(pta_cache_active);                              \
-    LogOpApiLifecycle(#aclnn_api,                                              \
-                      pta_cache_active ? "pta_cache_uninit"                  \
-                                       : "pta_cache_not_active");             \
-    LogOpApiLifecycle(#aclnn_api, "submit_done");                            \
   } while (false)
