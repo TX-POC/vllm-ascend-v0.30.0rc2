@@ -326,34 +326,26 @@ def main() -> None:
         inputs = _fail_closed_fixture(device)
         outputs = _run(inputs)
         cleanup_mode = _cleanup_bisect_mode()
-        report_mode = "workspace_only" if cleanup_mode == "workspace_only" else "fail_closed"
+        if cleanup_mode and cleanup_mode not in {
+            "phase2_noop",
+            "release_converted",
+            "release_huge_mem",
+            "uninit_huge_mem",
+            "pta_cache",
+        }:
+            raise AssertionError(f"unsupported legal P7 cleanup mode: {cleanup_mode}")
+        report_mode = "fail_closed"
         values = _report(report_mode, inputs, outputs)
-        if cleanup_mode == "workspace_only":
-            # The test-only C++ branch stopped after GetWorkspaceSize; an
-            # invalid control must therefore remain unread and every mutable
-            # transaction receipt must stay zero.  This partitions workspace
-            # construction from the direct-launch cleanup matrix.
-            if any(value != 0 for value in values.values()):
-                raise AssertionError(
-                    "workspace_only must not dispatch or mutate P7.1 transaction state"
-                )
-            print(
-                f"P7_1_TEST mode=workspace_only pass=1 aliases={18 if _output_topology() == 'aliases' else 0} "
-                f"topology={_output_topology()} "
-                "aclnn_dispatched=0 reason=workspace_query_only",
-                flush=True,
-            )
-        else:
-            if values["control_rejected"] <= 0 or any(
-                values[key] != 0 for key in ("lease", "post", "retire", "finish", "release")
-            ):
-                raise AssertionError("invalid control must reject before lease/PostOnly/CQ")
-            print(
-                f"P7_1_TEST mode=fail_closed pass=1 aliases={18 if _output_topology() == 'aliases' else 0} "
-                f"topology={_output_topology()} "
-                "real_hccp=not_exercised reason=invalid_control_expected",
-                flush=True,
-            )
+        if values["control_rejected"] <= 0 or any(
+            values[key] != 0 for key in ("lease", "post", "retire", "finish", "release")
+        ):
+            raise AssertionError("invalid control must reject before lease/PostOnly/CQ")
+        print(
+            f"P7_1_TEST mode=fail_closed pass=1 aliases={18 if _output_topology() == 'aliases' else 0} "
+            f"topology={_output_topology()} "
+            "real_hccp=not_exercised reason=invalid_control_expected",
+            flush=True,
+        )
         del outputs
         del inputs
         _teardown_checkpoint(report_mode)

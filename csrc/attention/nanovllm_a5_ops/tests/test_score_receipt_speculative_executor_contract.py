@@ -251,12 +251,12 @@ def main() -> None:
         "LogConvertedDescriptorSet(#aclnn_api, converted)",
         "P7_1_DESCRIPTOR_LEDGER",
         "P7_1_DESCRIPTOR_LEDGER api=%s tuple_args=%zu acl_tensors=%zu unique_acl_tensors=%zu\\n",
-        "return {OrderedCleanupMode::kWorkspaceOnly, true, true, true, true, true};",
-        "aclDestroyAclOpExecutor(executor)",
-        "workspace_executor_destroy_done",
-        "workspace_cleanup_done",
+        "return {OrderedCleanupMode::kPhase2Noop, true, false, false, false, false};",
+        "phase2_executor_autorelease_done",
+        "non-repeatable aclOpExecutor is",
     ):
         _require(op_api_common, token, op_api_common_path)
+    _forbid(op_api_common, "aclDestroyAclOpExecutor(executor)", op_api_common_path)
     converted_offset = op_api_common.find("auto converted = ConvertTypes(")
     ledger_offset = op_api_common.find(
         "LogConvertedDescriptorSet(#aclnn_api, converted);", converted_offset
@@ -280,11 +280,12 @@ def main() -> None:
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
         "DESCRIPTOR_LEDGER",
         "workspace_call_begin",
-        "P7_CLEANUP_WORKSPACE_BLOCKED",
-        "P7_CLEANUP_ALIAS_AB mode=launch_only",
+        "P7_CLEANUP_WORKSPACE_QUERY_NOT_STANDALONE",
+        "P7_CLEANUP_ALIAS_AB mode=phase2_noop",
         "run_normal_fail_closed_case()",
         "P7_CLEANUP_NORMAL_ASYNC",
-        "real_hccp=not_run",
+        "phase2_executor_autorelease",
+        "real_direct_hccp.log",
     ):
         _require(reuse_runner, token, reuse_runner_path)
     for token in (
@@ -327,7 +328,7 @@ def main() -> None:
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
         "ordered_opapi_lifetime=1 pta_cache_lifecycle=1 "
         "host_cleanup_bisect=1 loader_scope_local=1 descriptor_pairing=1 "
-        "descriptor_ledger=1",
+        "descriptor_ledger=1 phase2_executor_autorelease=1",
         flush=True,
     )
     print(

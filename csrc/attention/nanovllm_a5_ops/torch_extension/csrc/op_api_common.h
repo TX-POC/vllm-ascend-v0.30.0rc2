@@ -445,11 +445,10 @@ inline void LogOpApiLifecycle(const char *api, const char *stage) {
 // P7.1 has a process-exit heap abort even when its device kernel rejects an
 // invalid control block before it initializes UB or touches Direct-HCCP.  The
 // normal production path below must keep its complete cleanup contract.  For
-// that one bounded diagnostic only, allow the P7 runner to enable five
+// that one bounded diagnostic only, allow the P7 runner to enable four
 // *cumulative* cleanup checkpoints in separate Python processes:
 //
-//   workspace_only      convert inputs and query workspace, then return;
-//   launch_only        launch, then no ACLNN resource release;
+//   phase2_noop        launch phase 2, then no explicit host-side release;
 //   release_converted  additionally destroy converted aclTensor descriptors;
 //   release_huge_mem   additionally call ReleaseHugeMem;
 //   uninit_huge_mem    additionally call UnInitHugeMemThreadLocal.
@@ -458,20 +457,16 @@ inline void LogOpApiLifecycle(const char *api, const char *stage) {
 // setup used by the normal ACLNN path. A generated custom ACLNN host stub may
 // dereference PTA thread-local state while it creates an executor. Every
 // diagnostic mode therefore initializes PTA before the workspace query. The
-// modes still differ in whether that state is explicitly torn down: the first
-// direct-launch cases deliberately hold it until process exit, while the final
-// `pta_cache` case proves the complete teardown sequence.  `workspace_only`
-// is different: it never launches the generated executor, so it must destroy
-// that executor and its descriptors before releasing HugeMem/PTA.  Holding
-// those objects until process teardown and then uninitializing PTA underneath
-// them is not a valid CANN lifecycle.  This keeps the cleanup bisect meaningful
-// without testing an impossible workspace query with required TLS missing or
-// an invalid partial teardown. The normal default is `full` and remains
-// byte-for-byte equivalent to the existing production cleanup sequence.
+// modes differ only after phase 2 has run: a non-repeatable aclOpExecutor is
+// owned and automatically released by that phase. A GetWorkspaceSize-only
+// case is deliberately not a checkpoint: manually destroying that executor
+// is API-invalid unless the operator first supports and enters repeatable
+// mode, which is neither the production path nor a valid P7 gate. The normal
+// default is `full` and remains byte-for-byte equivalent to the existing
+// production cleanup sequence.
 enum class OrderedCleanupMode {
   kFull,
-  kWorkspaceOnly,
-  kLaunchOnly,
+  kPhase2Noop,
   kReleaseConverted,
   kReleaseHugeMem,
   kUninitHugeMem,
@@ -491,10 +486,8 @@ inline const char *OrderedCleanupModeName(OrderedCleanupMode mode) {
   switch (mode) {
     case OrderedCleanupMode::kFull:
       return "full";
-    case OrderedCleanupMode::kWorkspaceOnly:
-      return "workspace_only";
-    case OrderedCleanupMode::kLaunchOnly:
-      return "launch_only";
+    case OrderedCleanupMode::kPhase2Noop:
+      return "phase2_noop";
     case OrderedCleanupMode::kReleaseConverted:
       return "release_converted";
     case OrderedCleanupMode::kReleaseHugeMem:
@@ -525,14 +518,8 @@ inline OrderedCleanupPlan OrderedCleanupPlanFromEnvironment() {
   TORCH_CHECK(value != nullptr && value[0] != '\0',
               "NANOVLLM_A5_OPAPI_CLEANUP_MODE is required when "
               "NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1");
-  if (std::strcmp(value, "workspace_only") == 0) {
-    // A workspace query does not launch the executor.  It has a valid
-    // non-launch cleanup path: destroy the returned executor, release the
-    // descriptors and HugeMem state, then uninitialize PTA.
-    return {OrderedCleanupMode::kWorkspaceOnly, true, true, true, true, true};
-  }
-  if (std::strcmp(value, "launch_only") == 0) {
-    return {OrderedCleanupMode::kLaunchOnly, true, false, false, false, false};
+  if (std::strcmp(value, "phase2_noop") == 0) {
+    return {OrderedCleanupMode::kPhase2Noop, true, false, false, false, false};
   }
   if (std::strcmp(value, "release_converted") == 0) {
     return {OrderedCleanupMode::kReleaseConverted, true, true, false, false, false};
@@ -548,7 +535,7 @@ inline OrderedCleanupPlan OrderedCleanupPlanFromEnvironment() {
   }
   TORCH_CHECK(false,
               "unsupported NANOVLLM_A5_OPAPI_CLEANUP_MODE=", value,
-              "; expected workspace_only, launch_only, release_converted, release_huge_mem, "
+              "; expected phase2_noop, release_converted, release_huge_mem, "
               "uninit_huge_mem, or pta_cache");
 }
 
@@ -721,9 +708,7 @@ inline void LogOrderedHostDso(
                                                                                \
     at::Tensor workspace;                                                      \
     void *workspace_ptr = nullptr;                                             \
-    if (!(ordered_cleanup_plan.bisect &&                                      \
-          ordered_cleanup_plan.mode == OrderedCleanupMode::kWorkspaceOnly) && \
-        workspace_size != 0) {                                                \
+    if (workspace_size != 0) {                                                \
       const auto &_workspace_ref_tensor = std::get<0>(tensor_keepalive);       \
       workspace = at::empty(                                                   \
           {static_cast<int64_t>(workspace_size)},                              \
@@ -735,45 +720,25 @@ inline void LogOrderedHostDso(
       /* P7 test-only matrix: direct launch plus stream synchronization       \
        * removes OpCommand callback/destructor timing from the equation.      \
        * It is unreachable in normal production execution. */                 \
-      if (ordered_cleanup_plan.mode == OrderedCleanupMode::kWorkspaceOnly) { \
-        /* A workspace query owns an unlaunched executor.  CANN's ACLNN      \
-         * workspace-query examples destroy that executor directly before    \
-         * tearing down its descriptor wrappers. */                           \
-        if (executor != nullptr) {                                             \
-          const aclError destroy_executor_status =                             \
-              aclDestroyAclOpExecutor(executor);                               \
-          TORCH_CHECK(                                                         \
-              destroy_executor_status == ACL_SUCCESS,                         \
-              "destroy unlaunched " #aclnn_api " executor failed: ",          \
-              destroy_executor_status, "; ", RecentAclError());              \
-          executor = nullptr;                                                  \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "workspace_executor_destroy_done");               \
-        } else {                                                               \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "workspace_executor_null");                       \
-        }                                                                      \
-        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
-                          "workspace_query_done");                            \
-      } else {                                                                 \
-        auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);      \
-        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
-                          "direct_launch_begin");                            \
-        const int launch_status =                                              \
-            launch_fn(workspace_ptr, workspace_size, executor, acl_stream);   \
-        TORCH_CHECK(                                                           \
-            launch_status == 0,                                                \
-            "call " #aclnn_api " failed: ", RecentAclError());              \
-        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
-                          "direct_launch_done");                             \
-        const aclError sync_status = aclrtSynchronizeStream(acl_stream);      \
-        TORCH_CHECK(                                                           \
-            sync_status == ACL_SUCCESS,                                       \
-            "synchronize " #aclnn_api " failed: ", sync_status, "; ",     \
-            RecentAclError());                                                 \
-        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
-                          "direct_stream_sync_done");                        \
-      }                                                                        \
+      auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);        \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                     \
+                        "direct_launch_begin");                              \
+      const int launch_status =                                                \
+          launch_fn(workspace_ptr, workspace_size, executor, acl_stream);     \
+      TORCH_CHECK(                                                             \
+          launch_status == 0,                                                  \
+          "call " #aclnn_api " failed: ", RecentAclError());                \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                     \
+                        "direct_launch_done");                               \
+      const aclError sync_status = aclrtSynchronizeStream(acl_stream);        \
+      TORCH_CHECK(                                                             \
+          sync_status == ACL_SUCCESS,                                         \
+          "synchronize " #aclnn_api " failed: ", sync_status, "; ",       \
+          RecentAclError());                                                   \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                     \
+                        "phase2_executor_autorelease_done");                 \
+      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                     \
+                        "direct_stream_sync_done");                          \
       if (ordered_cleanup_plan.release_converted) {                            \
         ReleaseTuple(converted);                                               \
         LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
@@ -807,10 +772,6 @@ inline void LogOrderedHostDso(
       } else {                                                                 \
         LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
                           "pta_uninit_held");                                \
-      }                                                                        \
-      if (ordered_cleanup_plan.mode == OrderedCleanupMode::kWorkspaceOnly) { \
-        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
-                          "workspace_cleanup_done");                          \
       }                                                                        \
       LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "direct_return"); \
     } else {                                                                   \

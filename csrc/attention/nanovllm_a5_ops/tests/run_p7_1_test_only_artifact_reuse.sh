@@ -268,12 +268,12 @@ run_fail_closed_case() {
     local descriptor_ledger=0
     local workspace_call=0
     local pta_ready=0
-    local workspace_executor_destroyed=0
-    local workspace_cleanup=0
+    local phase2_executor_autorelease=0
 
     # Each mode gets a fresh interpreter and a fresh torch bridge load.  That
-    # is essential: launch_only intentionally defers cleanup until process
-    # exit, so sharing an interpreter would contaminate the next checkpoint.
+    # is essential: phase2_noop intentionally defers explicit host cleanup
+    # until process exit, so sharing an interpreter would contaminate the next
+    # checkpoint.
     NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1 \
     NANOVLLM_A5_OPAPI_CLEANUP_MODE="${mode}" \
     NANOVLLM_A5_P7_OUTPUT_TOPOLOGY="${topology}" \
@@ -287,35 +287,23 @@ run_fail_closed_case() {
     grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49' "${case_log}" && descriptor_ledger=1
     grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_call_begin bisect=1" "${case_log}" && workspace_call=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_ready' "${case_log}" && pta_ready=1
-    if [[ "${mode}" == "workspace_only" ]]; then
-        # A workspace query has no launch, so it must explicitly destroy the
-        # generated executor before releasing its descriptors and TLS state.
-        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_executor_destroy_done bisect=1" "${case_log}" && workspace_executor_destroyed=1
-        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_query_done bisect=1" "${case_log}" && completion=1
-        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_cleanup_done bisect=1" "${case_log}" && workspace_cleanup=1
-        grep -Fq 'P7_1_TEST mode=workspace_only pass=1' "${case_log}" && test_pass=1
-        grep -Fq 'P7_1_TEARDOWN mode=workspace_only stage=python_refs_collected sync=1' "${case_log}" && teardown=1
-    else
-        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=direct_stream_sync_done bisect=1" "${case_log}" && completion=1
-        grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
-        grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
-    fi
+    grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=phase2_executor_autorelease_done bisect=1" "${case_log}" && phase2_executor_autorelease=1
+    grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=direct_stream_sync_done bisect=1" "${case_log}" && completion=1
+    grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
+    grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
 
-    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s pta_ready=%s workspace_executor_destroyed=%s workspace_cleanup=%s descriptor_ledger=%s workspace_call=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
+    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s pta_ready=%s phase2_executor_autorelease=%s descriptor_ledger=%s workspace_call=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
         "${mode}" "${topology}" "${case_rc}" "${config}" \
-        "${pta_ready}" "${workspace_executor_destroyed}" "${workspace_cleanup}" "${descriptor_ledger}" "${workspace_call}" \
+        "${pta_ready}" "${phase2_executor_autorelease}" "${descriptor_ledger}" "${workspace_call}" \
         "${completion}" "${test_pass}" \
         "${teardown}" "${case_log}"
 
     if [[ "${case_rc}" != "0" || "${config}" != "1" || \
           "${pta_ready}" != "1" || "${descriptor_ledger}" != "1" || \
-          "${workspace_call}" != "1" || "${completion}" != "1" || \
+          "${workspace_call}" != "1" || "${phase2_executor_autorelease}" != "1" || \
+          "${completion}" != "1" || \
           "${test_pass}" != "1" || \
           "${teardown}" != "1" ]]; then
-        return 1
-    fi
-    if [[ "${mode}" == "workspace_only" && \
-          ( "${workspace_executor_destroyed}" != "1" || "${workspace_cleanup}" != "1" ) ]]; then
         return 1
     fi
     return 0
@@ -352,7 +340,7 @@ run_normal_fail_closed_case() {
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_uninit' "${case_log}" && pta_uninit=1
     grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
     grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
-    printf 'P7_CLEANUP_NORMAL_ASYNC rc=%s descriptor_ledger=%s handoff=%s launch=%s descriptor_release=%s pta_ready=%s pta_uninit=%s test_pass=%s teardown=%s real_hccp=not_run log=%s\n' \
+    printf 'P7_CLEANUP_NORMAL_ASYNC rc=%s descriptor_ledger=%s handoff=%s launch=%s descriptor_release=%s pta_ready=%s pta_uninit=%s test_pass=%s teardown=%s real_hccp=scheduled_after_pass log=%s\n' \
         "${case_rc}" "${descriptor_ledger}" "${handoff}" "${launch}" \
         "${descriptor_release}" "${pta_ready}" "${pta_uninit}" \
         "${test_pass}" "${teardown}" "${case_log}"
@@ -370,38 +358,31 @@ P7_OWNING_HANDOFF=0
 P7_REAL_RC=98
 P7_CLEANUP_BISECT_RC=98
 P7_CLEANUP_PTA_RC=98
-P7_CLEANUP_WORKSPACE_RC=98
-P7_CLEANUP_LAUNCH_ALIAS_RC=98
-P7_CLEANUP_LAUNCH_DISTINCT_RC=98
+P7_CLEANUP_PHASE2_ALIAS_RC=98
+P7_CLEANUP_PHASE2_DISTINCT_RC=98
 P7_CLEANUP_RELEASE_CONVERTED_RC=98
 P7_CLEANUP_RELEASE_HUGE_RC=98
 P7_CLEANUP_UNINIT_HUGE_RC=98
 P7_CLEANUP_NORMAL_ASYNC_RC=98
 if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
-    run_fail_closed_case workspace_only aliases
-    P7_CLEANUP_WORKSPACE_RC=$?
-    if [[ "${P7_CLEANUP_WORKSPACE_RC}" == "0" ]]; then
-        run_fail_closed_case launch_only aliases
-        P7_CLEANUP_LAUNCH_ALIAS_RC=$?
-    else
-        # Do not run an output-topology A/B after the earliest safe
-        # workspace query has failed.  That would classify an invalid
-        # executor/allocator teardown as an alias-ABI failure.
-        printf 'P7_CLEANUP_WORKSPACE_BLOCKED reason=workspace_query_or_process_teardown_failed\n'
-    fi
+    # The first legal boundary includes ACLNN phase 2.  That phase owns the
+    # ordinary (non-repeatable) executor and automatically releases it.  A
+    # GetWorkspaceSize-only process is not a valid CANN lifecycle checkpoint.
+    printf 'P7_CLEANUP_WORKSPACE_QUERY_NOT_STANDALONE reason=nonrepeatable_executor_phase2_owned\n'
+    run_fail_closed_case phase2_noop aliases
+    P7_CLEANUP_PHASE2_ALIAS_RC=$?
 
-    if [[ "${P7_CLEANUP_LAUNCH_ALIAS_RC}" != "0" && \
-          "${P7_CLEANUP_WORKSPACE_RC}" == "0" ]]; then
+    if [[ "${P7_CLEANUP_PHASE2_ALIAS_RC}" != "0" ]]; then
         # The kernel ignores output-address arguments and mutates the matching
         # input state tensors.  Re-run only the first failing launch boundary
         # with distinct output descriptors: this cleanly answers whether 18
         # physical graph aliases are the host-stub corruption source.
-        run_fail_closed_case launch_only distinct
-        P7_CLEANUP_LAUNCH_DISTINCT_RC=$?
-        printf 'P7_CLEANUP_ALIAS_AB mode=launch_only aliases=%s distinct=%s interpretation=%s\n' \
-            "${P7_CLEANUP_LAUNCH_ALIAS_RC}" "${P7_CLEANUP_LAUNCH_DISTINCT_RC}" \
-            "$([[ "${P7_CLEANUP_LAUNCH_DISTINCT_RC}" == "0" ]] && echo alias_descriptor_topology_suspect || echo launch_or_loader_not_alias_only)"
-    elif [[ "${P7_CLEANUP_LAUNCH_ALIAS_RC}" == "0" ]]; then
+        run_fail_closed_case phase2_noop distinct
+        P7_CLEANUP_PHASE2_DISTINCT_RC=$?
+        printf 'P7_CLEANUP_ALIAS_AB mode=phase2_noop aliases=%s distinct=%s interpretation=%s\n' \
+            "${P7_CLEANUP_PHASE2_ALIAS_RC}" "${P7_CLEANUP_PHASE2_DISTINCT_RC}" \
+            "$([[ "${P7_CLEANUP_PHASE2_DISTINCT_RC}" == "0" ]] && echo alias_descriptor_topology_suspect || echo phase2_or_loader_not_alias_only)"
+    else
         run_fail_closed_case release_converted aliases
         P7_CLEANUP_RELEASE_CONVERTED_RC=$?
         if [[ "${P7_CLEANUP_RELEASE_CONVERTED_RC}" == "0" ]]; then
@@ -415,8 +396,7 @@ if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
     fi
 
     P7_CLEANUP_BISECT_RC=1
-    if [[ "${P7_CLEANUP_WORKSPACE_RC}" == "0" && \
-          "${P7_CLEANUP_LAUNCH_ALIAS_RC}" == "0" && \
+    if [[ "${P7_CLEANUP_PHASE2_ALIAS_RC}" == "0" && \
           "${P7_CLEANUP_RELEASE_CONVERTED_RC}" == "0" && \
           "${P7_CLEANUP_RELEASE_HUGE_RC}" == "0" && \
           "${P7_CLEANUP_UNINIT_HUGE_RC}" == "0" ]]; then
@@ -435,6 +415,13 @@ if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
           "${P7_CLEANUP_PTA_RC}" == "0" ]]; then
         run_normal_fail_closed_case
         P7_CLEANUP_NORMAL_ASYNC_RC=$?
+        if [[ "${P7_CLEANUP_NORMAL_ASYNC_RC}" == "0" ]]; then
+            P7_OWNING_HANDOFF=1
+            timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+                --fixture-module p7_1_real_direct_hccp_fixture \
+                2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
+            P7_REAL_RC=${PIPESTATUS[0]}
+        fi
     else
         printf 'P7_CLEANUP_NORMAL_ASYNC_SKIPPED reason=direct_cleanup_boundary_failed\n'
     fi
@@ -445,12 +432,15 @@ if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
     if [[ "${P7_CLEANUP_NORMAL_ASYNC_RC}" != "0" ]]; then
         P7_FAIL_CLOSED_RC=1
     fi
-    printf 'P7_CLEANUP_BISECT_FINAL status=%s workspace_alias=%s launch_alias=%s launch_distinct=%s release_converted=%s release_huge=%s uninit_huge=%s pta_cache=%s normal_async=%s real_hccp=not_run execution=direct_synchronized_then_normal_async\n' \
-        "${P7_FAIL_CLOSED_RC}" "${P7_CLEANUP_WORKSPACE_RC}" \
-        "${P7_CLEANUP_LAUNCH_ALIAS_RC}" "${P7_CLEANUP_LAUNCH_DISTINCT_RC}" \
+    if [[ "${P7_REAL_RC}" != "0" ]]; then
+        P7_FAIL_CLOSED_RC=1
+    fi
+    printf 'P7_CLEANUP_BISECT_FINAL status=%s workspace_query=not_standalone phase2_alias=%s phase2_distinct=%s release_converted=%s release_huge=%s uninit_huge=%s pta_cache=%s normal_async=%s real_hccp=%s execution=direct_synchronized_then_normal_async_then_real_hccp\n' \
+        "${P7_FAIL_CLOSED_RC}" \
+        "${P7_CLEANUP_PHASE2_ALIAS_RC}" "${P7_CLEANUP_PHASE2_DISTINCT_RC}" \
         "${P7_CLEANUP_RELEASE_CONVERTED_RC}" "${P7_CLEANUP_RELEASE_HUGE_RC}" \
         "${P7_CLEANUP_UNINIT_HUGE_RC}" "${P7_CLEANUP_PTA_RC}" \
-        "${P7_CLEANUP_NORMAL_ASYNC_RC}"
+        "${P7_CLEANUP_NORMAL_ASYNC_RC}" "${P7_REAL_RC}"
 elif [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
     timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         2>&1 | tee "${P7_RESULT}/fail_closed.log"
@@ -484,11 +474,11 @@ grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|RE
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
     if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
-          "${P7_FAIL_CLOSED_RC}" == "0" ]]; then
-        printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 cleanup_bisect=0 real=not_run result=%s\n' "${P7_RESULT}"
+          "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
+        printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 cleanup_bisect=0 real=0 result=%s\n' "${P7_RESULT}"
     else
-        printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s cleanup_bisect=%s real=not_run result=%s\n' \
-            "${P7_CONTRACT_RC}" "${P7_PREFLIGHT_RC}" "${P7_FAIL_CLOSED_RC}" "${P7_RESULT}"
+        printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s cleanup_bisect=%s real=%s result=%s\n' \
+            "${P7_CONTRACT_RC}" "${P7_PREFLIGHT_RC}" "${P7_FAIL_CLOSED_RC}" "${P7_REAL_RC}" "${P7_RESULT}"
         exit 1
     fi
 elif [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
