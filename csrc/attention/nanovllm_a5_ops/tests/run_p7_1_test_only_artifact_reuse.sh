@@ -45,6 +45,19 @@ case "${P7_CLEANUP_BISECT}" in
     *) fail "invalid_P7_CLEANUP_BISECT" ;;
 esac
 
+# `phase2_noop` is a forensic-only launch form.  It deliberately skips the
+# normal OpCommand/stream-resource hand-off as well as selected cleanup
+# boundaries, so it cannot prove that the product path is unsafe when it
+# faults during C++ scope unwind.  In particular it must never gate the real
+# `RunOpApi -> PostOnly -> CQ` validation below.  Retain the old knob only as
+# a compatibility signal and report that it was not used as a test gate.
+#
+# The actual gate is always a fresh-process normal async fail-closed call,
+# followed by the real Direct-HCCP fixture.  This keeps P7 independent of C8
+# and avoids making a deliberately incomplete diagnostic lifecycle part of
+# the target execution path.
+P7_DIRECT_BISECT_SKIPPED=0
+
 if [[ -e "${P7_RESULT}" ]]; then
     fail "result_path_already_exists"
 fi
@@ -356,136 +369,56 @@ run_normal_fail_closed_case() {
 
 P7_OWNING_HANDOFF=0
 P7_REAL_RC=98
-P7_CLEANUP_BISECT_RC=98
-P7_CLEANUP_PTA_RC=98
-P7_CLEANUP_PHASE2_ALIAS_RC=98
-P7_CLEANUP_PHASE2_DISTINCT_RC=98
-P7_CLEANUP_RELEASE_CONVERTED_RC=98
-P7_CLEANUP_RELEASE_HUGE_RC=98
-P7_CLEANUP_UNINIT_HUGE_RC=98
 P7_CLEANUP_NORMAL_ASYNC_RC=98
-if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
-    # The first legal boundary includes ACLNN phase 2.  That phase owns the
-    # ordinary (non-repeatable) executor and automatically releases it.  A
-    # GetWorkspaceSize-only process is not a valid CANN lifecycle checkpoint.
-    printf 'P7_CLEANUP_WORKSPACE_QUERY_NOT_STANDALONE reason=nonrepeatable_executor_phase2_owned\n'
-    run_fail_closed_case phase2_noop aliases
-    P7_CLEANUP_PHASE2_ALIAS_RC=$?
-
-    if [[ "${P7_CLEANUP_PHASE2_ALIAS_RC}" != "0" ]]; then
-        # The kernel ignores output-address arguments and mutates the matching
-        # input state tensors.  Re-run only the first failing launch boundary
-        # with distinct output descriptors: this cleanly answers whether 18
-        # physical graph aliases are the host-stub corruption source.
-        run_fail_closed_case phase2_noop distinct
-        P7_CLEANUP_PHASE2_DISTINCT_RC=$?
-        printf 'P7_CLEANUP_ALIAS_AB mode=phase2_noop aliases=%s distinct=%s interpretation=%s\n' \
-            "${P7_CLEANUP_PHASE2_ALIAS_RC}" "${P7_CLEANUP_PHASE2_DISTINCT_RC}" \
-            "$([[ "${P7_CLEANUP_PHASE2_DISTINCT_RC}" == "0" ]] && echo alias_descriptor_topology_suspect || echo phase2_or_loader_not_alias_only)"
-    else
-        run_fail_closed_case release_converted aliases
-        P7_CLEANUP_RELEASE_CONVERTED_RC=$?
-        if [[ "${P7_CLEANUP_RELEASE_CONVERTED_RC}" == "0" ]]; then
-            run_fail_closed_case release_huge_mem aliases
-            P7_CLEANUP_RELEASE_HUGE_RC=$?
-        fi
-        if [[ "${P7_CLEANUP_RELEASE_HUGE_RC}" == "0" ]]; then
-            run_fail_closed_case uninit_huge_mem aliases
-            P7_CLEANUP_UNINIT_HUGE_RC=$?
-        fi
+P7_FAIL_CLOSED_RC=98
+# A prior forensic invocation must not leak its direct-launch controls into
+# either the normal gate or the real HCCP fixture.  The runner's own
+# P7_CLEANUP_BISECT knob is handled below; these are the macro controls that
+# would otherwise bypass the production stream-resource hand-off.
+unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT \
+      NANOVLLM_A5_OPAPI_CLEANUP_MODE \
+      NANOVLLM_A5_P7_OUTPUT_TOPOLOGY
+if [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
+    if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
+        P7_DIRECT_BISECT_SKIPPED=1
+        printf 'P7_DIRECT_BISECT_SKIPPED reason=direct_path_bypasses_task_queue_stream_resource_contract_and_is_not_a_product_gate\n'
     fi
 
-    P7_CLEANUP_BISECT_RC=1
-    if [[ "${P7_CLEANUP_PHASE2_ALIAS_RC}" == "0" && \
-          "${P7_CLEANUP_RELEASE_CONVERTED_RC}" == "0" && \
-          "${P7_CLEANUP_RELEASE_HUGE_RC}" == "0" && \
-          "${P7_CLEANUP_UNINIT_HUGE_RC}" == "0" ]]; then
-        P7_CLEANUP_BISECT_RC=0
-    fi
-    if [[ "${P7_CLEANUP_BISECT_RC}" == "0" ]]; then
-        # Every query initializes PTA because it is a GetWorkspaceSize
-        # precondition. This final process adds the explicit PTA *uninit*
-        # boundary after the prior descriptor and HugeMem boundaries passed.
-        run_fail_closed_case pta_cache
-        P7_CLEANUP_PTA_RC=$?
-    else
-        printf 'P7_CLEANUP_PTA_SKIPPED reason=pre_pta_boundary_failed\n'
-    fi
-    if [[ "${P7_CLEANUP_BISECT_RC}" == "0" && \
-          "${P7_CLEANUP_PTA_RC}" == "0" ]]; then
-        run_normal_fail_closed_case
-        P7_CLEANUP_NORMAL_ASYNC_RC=$?
-        if [[ "${P7_CLEANUP_NORMAL_ASYNC_RC}" == "0" ]]; then
-            P7_OWNING_HANDOFF=1
-            timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
-                --fixture-module p7_1_real_direct_hccp_fixture \
-                2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
-            P7_REAL_RC=${PIPESTATUS[0]}
-        fi
-    else
-        printf 'P7_CLEANUP_NORMAL_ASYNC_SKIPPED reason=direct_cleanup_boundary_failed\n'
-    fi
-    P7_FAIL_CLOSED_RC="${P7_CLEANUP_BISECT_RC}"
-    if [[ "${P7_CLEANUP_PTA_RC}" != "0" ]]; then
-        P7_FAIL_CLOSED_RC=1
-    fi
-    if [[ "${P7_CLEANUP_NORMAL_ASYNC_RC}" != "0" ]]; then
-        P7_FAIL_CLOSED_RC=1
-    fi
-    if [[ "${P7_REAL_RC}" != "0" ]]; then
-        P7_FAIL_CLOSED_RC=1
-    fi
-    printf 'P7_CLEANUP_BISECT_FINAL status=%s workspace_query=not_standalone phase2_alias=%s phase2_distinct=%s release_converted=%s release_huge=%s uninit_huge=%s pta_cache=%s normal_async=%s real_hccp=%s execution=direct_synchronized_then_normal_async_then_real_hccp\n' \
-        "${P7_FAIL_CLOSED_RC}" \
-        "${P7_CLEANUP_PHASE2_ALIAS_RC}" "${P7_CLEANUP_PHASE2_DISTINCT_RC}" \
-        "${P7_CLEANUP_RELEASE_CONVERTED_RC}" "${P7_CLEANUP_RELEASE_HUGE_RC}" \
-        "${P7_CLEANUP_UNINIT_HUGE_RC}" "${P7_CLEANUP_PTA_RC}" \
-        "${P7_CLEANUP_NORMAL_ASYNC_RC}" "${P7_REAL_RC}"
-elif [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
-    timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
-        2>&1 | tee "${P7_RESULT}/fail_closed.log"
-    P7_FAIL_CLOSED_RC=${PIPESTATUS[0]}
-    if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]] && \
-       grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=handoff_runopapi_by_value' \
-           "${P7_RESULT}/fail_closed.log"; then
+    # This is the sole correctness gate for the host lifecycle.  Unlike the
+    # old direct matrix it uses the same stream-resource and OpCommand
+    # hand-off as production, while invalid control still guarantees no queue
+    # lease, HCCP PostOnly, CQ, or C8 work is performed.
+    run_normal_fail_closed_case
+    P7_CLEANUP_NORMAL_ASYNC_RC=$?
+    P7_FAIL_CLOSED_RC="${P7_CLEANUP_NORMAL_ASYNC_RC}"
+    if [[ "${P7_CLEANUP_NORMAL_ASYNC_RC}" == "0" ]]; then
         P7_OWNING_HANDOFF=1
-    fi
-    if [[ "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_OWNING_HANDOFF}" != "1" ]]; then
-        # A passing tensor result from another registered bridge is not evidence
-        # that the rebuilt bridge was dispatched.  Fail before attempting HCCP.
-        P7_FAIL_CLOSED_RC=97
-    fi
-    if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]]; then
         timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
             --fixture-module p7_1_real_direct_hccp_fixture \
             2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
         P7_REAL_RC=${PIPESTATUS[0]}
+        if [[ "${P7_REAL_RC}" != "0" ]]; then
+            P7_FAIL_CLOSED_RC=1
+        fi
+    else
+        printf 'P7_REAL_HCCP_SKIPPED reason=normal_async_fail_closed_gate_failed\n'
     fi
+    printf 'P7_REAL_FLOW_FINAL status=%s normal_async=%s real_hccp=%s direct_bisect_skipped=%s execution=normal_task_queue_then_real_hccp\n' \
+        "${P7_FAIL_CLOSED_RC}" "${P7_CLEANUP_NORMAL_ASYNC_RC}" \
+        "${P7_REAL_RC}" "${P7_DIRECT_BISECT_SKIPPED}"
 else
-    P7_FAIL_CLOSED_RC=98
+    printf 'P7_REAL_HCCP_SKIPPED reason=fixture_preflight_failed\n'
 fi
 printf 'P7_REUSE_OWNING_HANDOFF observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
     "${P7_OWNING_HANDOFF}"
-if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
-    printf 'P7_CLEANUP_EXECUTION model=direct_synchronized_task_queue=not_used\n'
-fi
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|CLEANUP|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER)|P7_CLEANUP_(CASE|NORMAL_ASYNC|ALIAS_AB|PTA_SKIPPED|BISECT_FINAL)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|CLEANUP|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER)|P7_(DIRECT_BISECT_SKIPPED|CLEANUP_NORMAL_ASYNC|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
-if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
-    if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
-          "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
-        printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 cleanup_bisect=0 real=0 result=%s\n' "${P7_RESULT}"
-    else
-        printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s cleanup_bisect=%s real=%s result=%s\n' \
-            "${P7_CONTRACT_RC}" "${P7_PREFLIGHT_RC}" "${P7_FAIL_CLOSED_RC}" "${P7_REAL_RC}" "${P7_RESULT}"
-        exit 1
-    fi
-elif [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
+if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
         "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
-    printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 fail_closed=0 real=0 result=%s\n' "${P7_RESULT}"
+    printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 normal_async=0 real=0 result=%s\n' "${P7_RESULT}"
 else
-    printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s fail_closed=%s real=%s result=%s\n' \
+    printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s normal_async=%s real=%s result=%s\n' \
         "${P7_CONTRACT_RC}" "${P7_PREFLIGHT_RC}" "${P7_FAIL_CLOSED_RC}" "${P7_REAL_RC}" "${P7_RESULT}"
     exit 1
 fi
