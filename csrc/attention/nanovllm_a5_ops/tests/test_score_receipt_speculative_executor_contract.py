@@ -228,7 +228,7 @@ def main() -> None:
         "31in_18aliasout",
         "aclnnA5ScoreReceiptSpeculativeExecutor",
         "CheckAlias",
-        "physical_aliases=%d",
+        "physical_aliases=%lld",
         "Tensor(r!) worker_stats",
     ):
         _require(bridge, token, bridge_path)
@@ -257,18 +257,26 @@ def main() -> None:
     ledger_offset = op_api_common.find(
         "LogConvertedDescriptorSet(#aclnn_api, converted);", converted_offset
     )
+    workspace_boundary_offset = op_api_common.find(
+        '"workspace_call_begin"', ledger_offset
+    )
     workspace_offset = op_api_common.find(
         "auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);",
         converted_offset,
     )
-    if not (converted_offset >= 0 and converted_offset < ledger_offset < workspace_offset):
+    if not (
+        converted_offset >= 0
+        and converted_offset < ledger_offset < workspace_boundary_offset < workspace_offset
+    ):
         raise AssertionError(
-            "P7 descriptor ledger must run after ConvertTypes and before "
+            "P7 descriptor ledger/workspace boundary must run after ConvertTypes and before "
             "GetWorkspaceSize"
         )
     for token in (
-        "grep -Fqx 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
+        "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
         "DESCRIPTOR_LEDGER",
+        "workspace_call_begin",
+        "P7_CLEANUP_ALIAS_AB mode=workspace_only",
         "run_normal_fail_closed_case()",
         "P7_CLEANUP_NORMAL_ASYNC",
         "real_hccp=not_run",

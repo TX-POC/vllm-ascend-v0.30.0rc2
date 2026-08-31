@@ -184,7 +184,7 @@ inline const AclTensorApiPair &GetAclTensorApiPair() {
               stderr,
               "P7_1_ACL_DSO role=acl_tensor_pair provider=%s "
               "loader=RTLD_NOW|RTLD_LOCAL create_dso=%s destroy_dso=%s "
-              "create_addr=%p destroy_addr=%p\\n",
+              "create_addr=%p destroy_addr=%p\n",
               provider.name,
               DsoNameForAddress(reinterpret_cast<void *>(create)),
               DsoNameForAddress(reinterpret_cast<void *>(destroy)),
@@ -454,11 +454,15 @@ inline void LogOpApiLifecycle(const char *api, const char *stage) {
 //   release_huge_mem   additionally call ReleaseHugeMem;
 //   uninit_huge_mem    additionally call UnInitHugeMemThreadLocal.
 //
-// Those five cases deliberately skip the PTA-cache pair as well: that cache is
-// a separate host allocator lifecycle, so keeping it in the first five cases
-// would leave a failing ``launch_only`` result ambiguous.  Only after all five
-// pre-PTA cases return cleanly does the P7 runner issue a sixth
-// ``pta_cache`` confirmation case.  The normal default is ``full`` and is
+// `GetWorkspaceSize` is not a valid boundary without the host TLS allocator
+// setup used by the normal ACLNN path. A generated custom ACLNN host stub may
+// dereference PTA thread-local state while it creates an executor. Every
+// diagnostic mode therefore initializes PTA before the workspace query. The
+// modes still differ in whether that state is explicitly torn down: the first
+// direct-launch cases deliberately hold it until process exit, while the final
+// `pta_cache` case proves the complete teardown sequence. This keeps the
+// cleanup bisect meaningful without testing an impossible workspace query
+// with required TLS missing. The normal default is `full` and remains
 // byte-for-byte equivalent to the existing production cleanup sequence.
 enum class OrderedCleanupMode {
   kFull,
@@ -476,7 +480,7 @@ struct OrderedCleanupPlan {
   bool release_converted;
   bool release_huge_mem;
   bool uninit_huge_mem;
-  bool use_pta_cache;
+  bool uninit_pta_cache;
 };
 
 inline const char *OrderedCleanupModeName(OrderedCleanupMode mode) {
@@ -518,7 +522,7 @@ inline OrderedCleanupPlan OrderedCleanupPlanFromEnvironment() {
               "NANOVLLM_A5_OPAPI_CLEANUP_MODE is required when "
               "NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1");
   if (std::strcmp(value, "workspace_only") == 0) {
-    return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, false};
+    return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, true};
   }
   if (std::strcmp(value, "launch_only") == 0) {
     return {OrderedCleanupMode::kLaunchOnly, true, false, false, false, false};
@@ -635,7 +639,7 @@ inline void LogOrderedHostDso(
       stderr,
       "P7_1_HOST_DSO api=%s loader=RTLD_NOW|RTLD_LOCAL "
       "workspace_dso=%s launch_dso=%s init_huge_dso=%s "
-      "release_huge_dso=%s uninit_huge_dso=%s\\n",
+      "release_huge_dso=%s uninit_huge_dso=%s\n",
       api,
       DsoNameForAddress(workspace_addr),
       DsoNameForAddress(launch_addr),
@@ -672,16 +676,12 @@ inline void LogOrderedHostDso(
     } else {                                                                   \
       LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "direct_stream"); \
     }                                                                          \
-    const bool pta_cache_active = ordered_cleanup_plan.use_pta_cache           \
-        ? InitPtaCacheForWorkspace() : false;                                  \
-    if (ordered_cleanup_plan.use_pta_cache) {                                  \
-      LogOpApiLifecycle(#aclnn_api,                                            \
-                        pta_cache_active ? "pta_cache_ready"                  \
-                                         : "pta_cache_unavailable");           \
-      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "pta_cache_enabled");\
-    } else {                                                                   \
-      LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "pta_cache_held"); \
-    }                                                                          \
+    /* PTA TLS is a GetWorkspaceSize precondition, not optional cleanup. */    \
+    const bool pta_cache_active = InitPtaCacheForWorkspace();                  \
+    LogOpApiLifecycle(#aclnn_api,                                              \
+                      pta_cache_active ? "pta_cache_ready"                    \
+                                       : "pta_cache_unavailable");             \
+    LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "pta_cache_enabled");\
     auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(           \
         ResolveSymbol("InitHugeMemThreadLocal"));                             \
     auto uninit_huge_mem = reinterpret_cast<UnInitHugeMemThreadLocalFn>(       \
@@ -702,6 +702,8 @@ inline void LogOrderedHostDso(
     auto converted = ConvertTypes(                                             \
         __VA_ARGS__, workspace_size_ptr, executor_ptr);                        \
     LogConvertedDescriptorSet(#aclnn_api, converted);                          \
+    LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                        \
+                      "workspace_call_begin");                               \
     auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);       \
     int workspace_status = CallTuple(workspace_fn, converted);                 \
     TORCH_CHECK(                                                               \
@@ -774,7 +776,7 @@ inline void LogOrderedHostDso(
                             "uninit_huge_mem_held");                         \
         }                                                                      \
       }                                                                        \
-      if (ordered_cleanup_plan.use_pta_cache) {                                \
+      if (ordered_cleanup_plan.uninit_pta_cache) {                             \
         UnInitPtaCacheForWorkspace(pta_cache_active);                          \
         LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
                           "pta_uninit_done");                                \

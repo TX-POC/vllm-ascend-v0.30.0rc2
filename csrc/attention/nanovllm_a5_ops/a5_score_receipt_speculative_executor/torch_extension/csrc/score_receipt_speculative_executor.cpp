@@ -10,7 +10,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <cstdlib>
 #include <cstring>
 #include <tuple>
 
@@ -308,9 +307,9 @@ Result RunNpu(
     }
     if (DebugEnabled()) {
         std::fprintf(stderr,
-                     "P7_1_ALIAS input_count=31 output_count=18 physical_aliases=%d "
+                     "P7_1_ALIAS input_count=31 output_count=18 physical_aliases=%lld "
                      "topology=%s candidate_receipts=%lld queues=%lld private_capacity=%lld\n",
-                     distinctOutputs ? 0 : kOutputCount,
+                     static_cast<long long>(distinctOutputs ? 0 : kOutputCount),
                      distinctOutputs ? "distinct_test_only" : "aliases",
                      static_cast<long long>(geometry.receipts),
                      static_cast<long long>(geometry.queues),
