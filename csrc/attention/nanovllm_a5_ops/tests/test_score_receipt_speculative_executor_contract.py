@@ -164,9 +164,11 @@ def main() -> None:
         / "__init__.py"
     )
     runtime_test_path = ops_root / "tests" / "test_score_receipt_speculative_executor.py"
+    assembly_alias_path = ops_root / "tests" / "run_p7_1_assembly.sh"
     reuse_runner_path = ops_root / "tests" / "run_p7_1_test_only_artifact_reuse.sh"
     full_runner_path = ops_root / "tests" / "run_p7_1_speculative_executor.sh"
     diag_runner_path = ops_root / "tests" / "run_p7_1_fail_closed_dispatch_diag.sh"
+    build_script_path = ops_root / "build_nanovllm_ops.sh"
     real_fixture_path = p7_root / "torch_extension" / "p7_1_real_direct_hccp_fixture.py"
     abi_path = p7_root / "P7_1_ABI.md"
     for path in (
@@ -178,9 +180,11 @@ def main() -> None:
         op_api_common_path,
         runtime_package_path,
         runtime_test_path,
+        assembly_alias_path,
         reuse_runner_path,
         full_runner_path,
         diag_runner_path,
+        build_script_path,
         real_fixture_path,
         abi_path,
     ):
@@ -221,6 +225,8 @@ def main() -> None:
     reuse_runner = reuse_runner_path.read_text(encoding="utf-8")
     full_runner = full_runner_path.read_text(encoding="utf-8")
     diag_runner = diag_runner_path.read_text(encoding="utf-8")
+    assembly_alias = assembly_alias_path.read_text(encoding="utf-8")
+    build_script = build_script_path.read_text(encoding="utf-8")
     abi = abi_path.read_text(encoding="utf-8")
     for token in REQUIRED_KERNEL:
         _require(kernel, token, kernel_path)
@@ -366,6 +372,10 @@ def main() -> None:
         )
     runtime_package = runtime_package_path.read_text(encoding="utf-8")
     for token in (
+        "P7_ASSEMBLY_MANIFEST",
+        "def _load_assembly()",
+        "direct artifact selection is disabled",
+        "bridge package is not the one recorded by the assembly",
         "class ForwardTerminalLease",
         "capture_forward_terminal_lease",
         "release_at_forward_terminal",
@@ -388,6 +398,7 @@ def main() -> None:
         "_enqueue_invalid_control_predecessor",
         "P7_1_ORDERING_SENTINEL",
         "P7_1_ORDERING_RECEIPT",
+        "P7_1_ASSEMBLY_GATE stage=before_fixture_cold_bind",
         "predecessor=control_zero_queued",
         "required_consumer_observation=invalid_control",
     ):
@@ -405,67 +416,53 @@ def main() -> None:
             "fail-closed runtime test must establish valid zero-work control, "
             "queue control.zero_ without synchronizing, then submit P7"
         )
-    for token in (
-        "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31'",
-        "DESCRIPTOR_LEDGER",
-        "stage=workspace_call_begin",
-        "stage=descriptor_release_done",
-        "P7_1_ORDERED_SUBMISSION token=",
-        "run_ordered_async_fail_closed_case()",
-        "run_ordered_async_teardown_probe()",
-        "run_real_direct_hccp_case()",
-        "P7_1_TEST_EXIT_AFTER_RECEIPT=1",
-        "P7_ORDERED_ASYNC_FAIL_CLOSED",
-        "P7_ORDERED_ASYNC_TEARDOWN_PROBE",
-        "P7_REAL_DIRECT_HCCP",
-        "P7_1_TERMINAL_LEASE",
-        "P7_1_FAIL_CLOSED_NOOP",
-        "P7_1_ORDERING_RECEIPT",
-        "P7_1_BOUNDARY stage=torch_op_return",
-        "P7_1_BOUNDARY stage=stream_terminal_done",
-        "P7_1_FINAL_RECEIPT",
-        "P7_1_TEST_PROCESS_EXIT_DIAG=1",
-        "P7_REAL_FLOW_FINAL",
-        "execution=framework_ordered_submit_then_device_post_cq",
-        "real_direct_hccp.log",
-        "NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
-        "NANOVLLM_A5_OPAPI_DEBUG=1",
-        "P7_ARTIFACT_RUNTIME_EXACT",
-        "artifact_exact=%s",
-        "P7_1_ORDERING_RECEIPT",
-        "fail_closed_ordered_async.log",
-        "emit_failure_excerpt()",
+    assembly_gate_pos = runtime_test.find(
+        "P7_1_ASSEMBLY_GATE stage=before_fixture_cold_bind"
+    )
+    fixture_import_pos = runtime_test.find(
+        "module = importlib.import_module(args.fixture_module)"
+    )
+    if min(assembly_gate_pos, fixture_import_pos) < 0 or assembly_gate_pos > fixture_import_pos:
+        raise AssertionError(
+            "P7 assembly must be imported in the real test child before the "
+            "fixture cold-binds Direct-HCCP"
+        )
+    # One runner owns artifact assembly. The historical names remain only as
+    # compatibility redirects; none may rediscover or reuse a prior OPP.
+    for runner, path in (
+        (assembly_alias, assembly_alias_path),
+        (reuse_runner, reuse_runner_path),
+        (diag_runner, diag_runner_path),
     ):
-        _require(reuse_runner, token, reuse_runner_path)
-    _forbid(reuse_runner, "fail_closed_direct_async.log", reuse_runner_path)
+        for token in (
+            "run_p7_1_speculative_executor.sh",
+            "fresh_canonical_assembly",
+            "exec bash",
+        ):
+            _require(runner, token, path)
+        for forbidden in ("find ", "build_ext", "P7_REUSE_OPP_ROOT", "P7_ARTIFACT_RUNTIME_EXACT"):
+            _forbid(runner, forbidden, path)
     for token in (
+        "git_branch_commit",
+        "worktree add --detach",
+        "P7_RUN_ROOT",
+        "p7_1_fresh_",
+        "cmake -S",
+        "NANOVLLM_A5_OPS_ONLY=A5ScoreReceiptSpeculativeExecutor",
+        "build_py",
+        "--build-lib",
+        "--build-temp",
+        "P7_ASSEMBLY_MANIFEST",
+        "P7_1_PACKAGE_IMPORT",
         "P7_1_TEST_EXIT_AFTER_RECEIPT=1",
         "P7_1_ORDERING_RECEIPT",
-        "P7_FAIL_CLOSED_ORDERING_RECEIPT",
-        "NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
-        "NANOVLLM_A5_OPAPI_DEBUG=1",
-        "emit_failure_excerpt()",
+        "P7_1_FINAL_RECEIPT",
+        "P7_PHYSICAL_NPU_ID",
     ):
         _require(full_runner, token, full_runner_path)
-    # Every runner that accepts a pre-built OPP has the same exact-provenance
-    # rule.  Otherwise a diagnostic invocation can silently restore the old
-    # "ancestor OPP + newer bridge" mixed-ABI path that the reuse runner now
-    # rejects.
-    for token in (
-        "P7_ARTIFACT_RUNTIME_EXACT",
-        '"${P7_ARTIFACT_VLLM_SHA}" == "${P7_RUNTIME_VLLM_SHA}"',
-        "P7_KVAF_BUILD_HEAD_MATCH",
-        ".p7_kvaf_source_head",
-        "artifact_exact=%s",
-        "unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE",
-        'contract["mutable_ref_outputs"]',
-    ):
-        _require(diag_runner, token, diag_runner_path)
-    if '"${P7_ARTIFACT_ANCESTOR}" == "1"' in diag_runner:
-        raise AssertionError(
-            "P7 diagnostic runner must never admit an ancestor OPP; it must "
-            "require an exact runtime source match"
-        )
+    for forbidden in ("find ", "--inplace", "P7_ARTIFACT_RUNTIME_EXACT", ".p7_kvaf_source_head"):
+        _forbid(full_runner, forbidden, full_runner_path)
+    _forbid(build_script, "P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE", build_script_path)
     for token in (
         "31tensor_18refout",
         "torch_schema=31in_18aliasout",

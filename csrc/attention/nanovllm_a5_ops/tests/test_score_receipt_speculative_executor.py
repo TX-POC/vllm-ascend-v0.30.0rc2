@@ -500,6 +500,13 @@ def main() -> str | None:
             flush=True,
         )
         return None
+
+    # The real fixture cold-binds KVAF/Direct-HCCP while building its input
+    # transaction.  Verify the one selected P7 assembly in this *same* child
+    # before importing that fixture, not only later inside _run().
+    import nanovllm_score_receipt_speculative_executor  # noqa: F401
+    print("P7_1_ASSEMBLY_GATE stage=before_fixture_cold_bind pass=1", flush=True)
+
     if not args.fixture_module:
         inputs = _fail_closed_fixture(device)
         outputs = _run(inputs, expect_no_mutation=True)

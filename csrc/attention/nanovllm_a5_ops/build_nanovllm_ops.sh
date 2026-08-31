@@ -1507,62 +1507,6 @@ EOF
     echo "[nanovllm_a5_ops] P3 target provenance: ${VENDOR_DIR}/P3_STREAMING_LI_PROVENANCE"
 fi
 
-# The P7.1 bridge refuses an un-stamped OPP.  This is intentionally separate
-# from P3 provenance: the executor has a 31-tensor ACLNN ABI with 18 mutable
-# Ref outputs (and a 31-in/18-alias-out Torch schema), plus a KVAF transport
-# closure but no C8 source closure.
-if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
-    P7_1_PROVENANCE_HEAD="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || true)"
-    if [[ ! "${P7_1_PROVENANCE_HEAD}" =~ ^[0-9a-f]{40}$ ]]; then
-        echo "[nanovllm_a5_ops] ERROR: cannot record P7.1 OPP provenance; source HEAD is unavailable." >&2
-        exit 1
-    fi
-    P7_1_PROVENANCE_DIRTY="$(git -C "${ROOT}" status --porcelain --untracked-files=no 2>/dev/null || true)"
-    if [[ -n "${P7_1_PROVENANCE_DIRTY}" ]]; then
-        echo "[nanovllm_a5_ops] ERROR: refuse P7.1 OPP build from a tracked-dirty source worktree." >&2
-        echo "[nanovllm_a5_ops] source_root=${ROOT} source_head=${P7_1_PROVENANCE_HEAD}" >&2
-        printf '%s\n' "${P7_1_PROVENANCE_DIRTY}" >&2
-        exit 1
-    fi
-    cat > "${VENDOR_DIR}/P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE" <<EOF
-format=1
-kind=standalone_score_receipt_speculative_executor
-source_root=${ROOT}
-source_head=${P7_1_PROVENANCE_HEAD}
-source_clean=1
-kvaf_source_head=${KVAF_FUSED_HEAD}
-abi=31tensor_18refout
-torch_schema=31in_18aliasout
-candidate_seed=receipt_x_128_x_4_int32
-local_microbatches=2x64
-queue_lifecycle=epoch,generation,post_sequence,state,quarantine
-private_terminal=ready_or_failed
-post_cq=real_kvaf_streaming_postonly_tryretire_finish
-c8_source_closure=absent
-fixed_get_core=absent
-operators=${OP_NAMES[*]}
-EOF
-    for P7_1_PROVENANCE_LINE in \
-        'kind=standalone_score_receipt_speculative_executor' \
-        "source_head=${P7_1_PROVENANCE_HEAD}" \
-        'source_clean=1' \
-        "kvaf_source_head=${KVAF_FUSED_HEAD}" \
-        'abi=31tensor_18refout' \
-        'torch_schema=31in_18aliasout' \
-        'local_microbatches=2x64' \
-        'queue_lifecycle=epoch,generation,post_sequence,state,quarantine' \
-        'post_cq=real_kvaf_streaming_postonly_tryretire_finish' \
-        'c8_source_closure=absent' \
-        'fixed_get_core=absent'; do
-        if ! grep -Fqx "${P7_1_PROVENANCE_LINE}" \
-                "${VENDOR_DIR}/P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE"; then
-            echo "[nanovllm_a5_ops] ERROR: P7.1 OPP provenance manifest is incomplete." >&2
-            exit 1
-        fi
-    done
-    echo "[nanovllm_a5_ops] P7.1 target provenance: ${VENDOR_DIR}/P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE"
-fi
-
 if [[ "${SKIP_TORCH_EXTENSION}" != "1" ]]; then
     # Legacy standalone mode retained for local operator development only.
     # The normal vLLM-Ascend package build sets SKIP_TORCH_EXTENSION=1 and

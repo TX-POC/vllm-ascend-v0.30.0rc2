@@ -1,87 +1,135 @@
-"""Bind exactly one fresh P7.1 OPP before loading the isolated bridge.
+"""Bind the P7.1 bridge to the one fresh assembly selected by its runner.
 
-P7.1 is C8-free by construction.  Importing it must never resolve a P3/P6
-OPP left in ``ASCEND_CUSTOM_OPP_PATH``; the runner supplies a newly built OPP
-root and this module resets the custom-op resolver to that single vendor.
+P7 does not search for an OPP, a bridge, or a KVAF build. The runner creates
+one short ``assembly.env`` after all three have been built from the same two
+Git commits, then this module only accepts the paths recorded in that file.
 """
 
 from __future__ import annotations
 
 import os
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 
 
-OPS_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_OPP = OPS_ROOT / "_custom_opp_score_receipt_speculative_executor"
-OPP_ROOT = Path(
-    os.getenv(
-        "NANOVLLM_A5_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_OPP", str(DEFAULT_OPP)
-    )
-).resolve()
-MANIFESTS = tuple(
-    (OPP_ROOT / "vendors").glob(
-        "*/P7_1_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_PROVENANCE"
-    )
-)
-if len(MANIFESTS) != 1:
-    raise RuntimeError(
-        "P7.1 requires exactly one fresh provenance manifest under "
-        f"{OPP_ROOT}/vendors; set "
-        "NANOVLLM_A5_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_OPP to the current build."
-    )
-
-MANIFEST = MANIFESTS[0].resolve()
-FIELDS: dict[str, str] = {}
-for line in MANIFEST.read_text(encoding="utf-8").splitlines():
-    if "=" in line:
-        key, value = line.split("=", 1)
-        FIELDS[key] = value
-
-REQUIRED = {
-    "kind": "standalone_score_receipt_speculative_executor",
-    "abi": "31tensor_18refout",
-    "torch_schema": "31in_18aliasout",
-    "local_microbatches": "2x64",
-    "queue_lifecycle": "epoch,generation,post_sequence,state,quarantine",
-    "post_cq": "real_kvaf_streaming_postonly_tryretire_finish",
-    "c8_source_closure": "absent",
-    "fixed_get_core": "absent",
-}
-for key, expected in REQUIRED.items():
-    if FIELDS.get(key) != expected:
+def _load_assembly() -> dict[str, str]:
+    manifest_text = os.getenv("P7_ASSEMBLY_MANIFEST", "")
+    if not manifest_text:
         raise RuntimeError(
-            f"P7.1 OPP manifest mismatch for {key}: "
-            f"actual={FIELDS.get(key)!r} expected={expected!r}; manifest={MANIFEST}"
+            "P7.1 requires P7_ASSEMBLY_MANIFEST from "
+            "run_p7_1_speculative_executor.sh; direct artifact selection is disabled."
+        )
+    manifest = Path(manifest_text).resolve()
+    if not manifest.is_file():
+        raise RuntimeError(f"P7.1 assembly manifest is missing: {manifest}")
+
+    fields: dict[str, str] = {}
+    for number, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise RuntimeError(f"P7.1 invalid manifest line {number}: {line!r}")
+        key, value = line.split("=", 1)
+        if not key or not value or key in fields:
+            raise RuntimeError(f"P7.1 invalid manifest field line {number}: {line!r}")
+        fields[key] = value
+
+    required = (
+        "schema",
+        "ready",
+        "assembly_root",
+        "vllm_sha",
+        "kvaf_sha",
+        "kvaf_build",
+        "batch_get_kernel",
+        "batch_put_kernel",
+        "opp_vendor",
+        "opapi",
+        "bridge_python_root",
+        "bridge_so",
+        "p7_abi",
+    )
+    missing = [key for key in required if key not in fields]
+    if missing or fields.get("schema") != "1" or fields.get("ready") != "1" or \
+       fields.get("p7_abi") != "31tensor_18refout":
+        raise RuntimeError(
+            "P7.1 assembly manifest is incomplete: "
+            f"missing={','.join(missing) or 'none'} ready={fields.get('ready')!r}"
         )
 
-expected_source = os.getenv("P7_EXPECTED_VLLM_SHA")
-if expected_source and FIELDS.get("source_head") != expected_source:
-    raise RuntimeError(
-        "P7.1 OPP source revision mismatch: "
-        f"actual={FIELDS.get('source_head')} expected={expected_source}"
-    )
-expected_kvaf = os.getenv("P7_EXPECTED_KVAF_SHA")
-if expected_kvaf and FIELDS.get("kvaf_source_head") != expected_kvaf:
-    raise RuntimeError(
-        "P7.1 OPP KVAF revision mismatch: "
-        f"actual={FIELDS.get('kvaf_source_head')} expected={expected_kvaf}"
-    )
+    root = Path(fields["assembly_root"]).resolve()
+    if root != manifest.parent:
+        raise RuntimeError(
+            f"P7.1 manifest root mismatch: root={root} manifest={manifest}"
+        )
 
-OPAPI = MANIFEST.parent / "op_api" / "lib" / "libcust_opapi.so"
-if not OPAPI.is_file():
-    raise RuntimeError(f"P7.1 OPP has no op_api library: {OPAPI}")
+    def within_root(name: str) -> Path:
+        candidate = Path(fields[name]).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as error:
+            raise RuntimeError(
+                f"P7.1 manifest path escapes its assembly: {name}={candidate}"
+            ) from error
+        return candidate
 
-# Do not append: an older P3/P6 vendor can otherwise win symbol resolution.
-os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(MANIFEST.parent)
+    paths = {
+        name: within_root(name)
+        for name in (
+            "kvaf_build",
+            "batch_get_kernel",
+            "batch_put_kernel",
+            "opp_vendor",
+            "opapi",
+            "bridge_python_root",
+            "bridge_so",
+        )
+    }
+    if not paths["kvaf_build"].is_dir() or not paths["opp_vendor"].is_dir():
+        raise RuntimeError("P7.1 manifest names a missing build directory")
+    for name in ("batch_get_kernel", "batch_put_kernel", "opapi", "bridge_so"):
+        if not paths[name].is_file():
+            raise RuntimeError(f"P7.1 manifest names a missing artifact: {name}={paths[name]}")
+
+    package = Path(__file__).resolve().parent
+    expected_package = paths["bridge_python_root"] / package.name
+    suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    if package != expected_package or paths["bridge_so"] != package / f"_C{suffix}":
+        raise RuntimeError(
+            "P7.1 bridge package is not the one recorded by the assembly: "
+            f"loaded={package} expected={expected_package}"
+        )
+
+    for name, env_name in (
+        ("vllm_sha", "P7_ASSEMBLY_VLLM_SHA"),
+        ("kvaf_sha", "P7_ASSEMBLY_KVAF_SHA"),
+    ):
+        expected = os.getenv(env_name)
+        if expected and expected != fields[name]:
+            raise RuntimeError(
+                f"P7.1 {name} differs from selected assembly: "
+                f"runtime={expected} assembly={fields[name]}"
+            )
+    fields["_opp_vendor"] = str(paths["opp_vendor"])
+    fields["_opapi"] = str(paths["opapi"])
+    return fields
+
+
+FIELDS = _load_assembly()
+OPP_VENDOR = Path(FIELDS["_opp_vendor"])
+OPAPI = Path(FIELDS["_opapi"])
+
+# Do not append: an old P3/P6 vendor must not win symbol resolution.
+os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(OPP_VENDOR)
 os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(OPAPI)
 
 if os.getenv("NANOVLLM_A5_OPAPI_DEBUG") not in (None, "", "0"):
     print(
         "P7_1_OPAPI_BIND "
-        f"opp_root={OPP_ROOT} vendor={MANIFEST.parent} opapi={OPAPI} "
-        f"source_head={FIELDS.get('source_head')} "
-        f"kvaf_head={FIELDS.get('kvaf_source_head')} abi=31tensor_18refout",
+        f"manifest={os.environ['P7_ASSEMBLY_MANIFEST']} vendor={OPP_VENDOR} "
+        f"opapi={OPAPI} vllm={FIELDS['vllm_sha']} kvaf={FIELDS['kvaf_sha']} "
+        "abi=31tensor_18refout",
         flush=True,
     )
 
@@ -105,7 +153,7 @@ def capture_forward_terminal_lease() -> ForwardTerminalLease:
     """Move the latest ordered-submission token into RuntimeResources.
 
     Call this immediately after the P7 torch op returns, before scheduling a
-    later forward on the same runtime worker.  This does not synchronize the
+    later forward on the same runtime worker. This does not synchronize the
     NPU or alter P7's device-side PostOnly/CQ execution.
     """
 
@@ -121,7 +169,7 @@ def release_at_forward_terminal(lease: ForwardTerminalLease) -> int:
     The caller must establish the forward terminal first (in production, after
     the final QSFA reader; in the scoped test, after stream synchronization).
     The underlying registry deliberately releases no Tensor handles from other
-    streams.  ``aclTensor`` descriptors have already been released immediately
+    streams. ``aclTensor`` descriptors have already been released immediately
     after ACLNN launch, before HugeMem/PTA TLS cleanup.
     """
 
