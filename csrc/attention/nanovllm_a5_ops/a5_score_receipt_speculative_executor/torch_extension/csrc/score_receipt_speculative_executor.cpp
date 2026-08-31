@@ -238,19 +238,104 @@ Result RunNpu(
         queueRequestSourceOffsets, queueRequestObjectOffsets,
         queueRequestOutputIndices, queueRequestCount, privateReadyEpoch,
         privateReadyGeneration, workerStats, rowsPerEntry);
-    // P7.1 directly enqueues ACLNN on the caller's current stream. The device
-    // kernel, not a torch_npu-private host task queue, owns PostOnly/CQ work.
-    EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(
-        aclnnA5ScoreReceiptSpeculativeExecutor, keepalive,
-        candidateSeeds, candidateCounts, candidateReadyEpoch, candidateStatus,
-        streamingEpoch, sourceLens, kvObjectAddressDomain, reqPoolEntries,
-        kvObjectMap, kvObjectLens, kvObjectSlotsSnapshot, privateSourceToSlot,
-        privateObjectToSlot, privateReadyTable, privateArenaHead,
-        privatePackedOutput, fusedGetControl, queueLeases, queueEpoch,
-        queueGeneration, queuePostSequence, queueState, queueQuarantine,
-        queueRequestSourceOffsets, queueRequestObjectOffsets,
-        queueRequestOutputIndices, queueRequestCount, privateReadyEpoch,
-        privateReadyGeneration, workerStats, rowsPerEntry);
+    // P7.1 has exactly one host submission per forward, but it must be in the
+    // same torch_npu task-queue order as the preceding Tensor producers.
+    // `stream(false)` is used here only as a stable lease identity. It is not
+    // used for a raw ACLNN launch: EXEC_NPU_CMD_ORDERED performs the framework
+    // producer/consumer hand-off and its consumer closure launches ACLNN.
+    //
+    // The P7 device executor remains asynchronous after that one ordered
+    // launch. Its AIV workers own CandidateSeed -> PostOnly -> HCCP DMA -> CQ;
+    // this bridge never waits for a queue, DMA, or CQ result.
+    ClearP7DirectLaunchTokenForCurrentThread();
+    const OrderedCleanupPlan p7_submission_plan =
+        OrderedCleanupPlanFromEnvironment();
+    TORCH_CHECK(!p7_submission_plan.bisect,
+                "P7.1 ordered async submission rejects cleanup-bisect mode; ",
+                "it would bypass the torch_npu task-queue ownership contract");
+    auto p7_terminal_stream = c10_npu::getCurrentNPUStream();
+    const bool p7_task_queue_enabled =
+        c10_npu::option::OptionsManager::GetTaskQueueEnable();
+    const bool p7_sync_launch_stream = p7_terminal_stream.isSyncLaunchStream();
+    // P7 has one valid host contract: RunOpApi must enqueue its closure into
+    // torch_npu's ordinary task queue.  The inline/sync fallback can throw a
+    // consumer exception before a RuntimeResources terminal token is
+    // publishable, so it is intentionally unsupported rather than repaired
+    // with an unsafe early Tensor-keepalive release.
+    TORCH_CHECK(p7_task_queue_enabled && !p7_sync_launch_stream,
+                "P7.1 requires torch_npu task queue enabled and a non-sync "
+                "launch stream; refusing inline ACLNN execution without a "
+                "RuntimeResources terminal owner. task_queue_enabled=",
+                p7_task_queue_enabled, " sync_launch_stream=",
+                p7_sync_launch_stream);
+    if (DebugEnabled()) {
+        std::fprintf(stderr,
+                     "P7_1_ORDERED_HOST_GATE task_queue_enabled=1 "
+                     "sync_launch_stream=0\n");
+        std::fflush(stderr);
+    }
+    const aclrtStream p7_terminal_acl_stream = p7_terminal_stream.stream(false);
+    TORCH_CHECK(p7_terminal_acl_stream != nullptr,
+                "P7.1 has no current NPU stream for its terminal lease");
+    const uint64_t p7_terminal_token =
+        GetP7DirectLaunchLeaseRegistry().ReserveEnqueued(
+            MakeP7DirectLaunchLease(keepalive), p7_terminal_acl_stream);
+    // The observer is only host-side failure bookkeeping.  It is carried with
+    // the ordered closure so a queue-consumer failure transitions this exact
+    // pre-reserved token to HOST_FAILED before torch_npu propagates the
+    // original exception.  It does not participate in the ACLNN ABI.
+    auto p7_failure_observer = MakeP7OrderedLaunchFailureObserver(
+        p7_terminal_token, p7_terminal_acl_stream);
+    auto p7_ordered_keepalive = std::tuple_cat(
+        keepalive, std::make_tuple(p7_failure_observer));
+    try {
+        EXEC_NPU_CMD_ORDERED(
+            aclnnA5ScoreReceiptSpeculativeExecutor, p7_ordered_keepalive,
+            candidateSeeds, candidateCounts, candidateReadyEpoch, candidateStatus,
+            streamingEpoch, sourceLens, kvObjectAddressDomain, reqPoolEntries,
+            kvObjectMap, kvObjectLens, kvObjectSlotsSnapshot, privateSourceToSlot,
+            privateObjectToSlot, privateReadyTable, privateArenaHead,
+            privatePackedOutput, fusedGetControl, queueLeases, queueEpoch,
+            queueGeneration, queuePostSequence, queueState, queueQuarantine,
+            queueRequestSourceOffsets, queueRequestObjectOffsets,
+            queueRequestOutputIndices, queueRequestCount, privateReadyEpoch,
+            privateReadyGeneration, workerStats, rowsPerEntry);
+    } catch (...) {
+        // There is not yet a RuntimeResources terminal owner: Publish happens
+        // only after RunOpApi returns.  Distinguish the two sound cases here.
+        // A still-enqueued token means producer-side submission failed before
+        // the consumer owned it, so it is normally cancelled.  Any failed or
+        // handoff-accepted token is deliberately retained/quarantined: it may
+        // have partially submitted device work and must not lose keepalives at
+        // this pre-publish exception boundary.  The strict task-queue gate
+        // above makes a failed pre-publish state an invariant failure; normal
+        // post-return asynchronous failures are published and terminal-owned.
+        const auto p7_abort_action =
+            GetP7DirectLaunchLeaseRegistry().ResolvePrePublishAbortNoThrow(
+                p7_terminal_token, p7_terminal_acl_stream);
+        std::fprintf(
+            stderr,
+            "P7_1_DISPATCH_ABORT token=%llu action=%s "
+            "terminal_owner=none_before_publish failed_or_handoff=retained\n",
+            static_cast<unsigned long long>(p7_terminal_token),
+            P7DirectLaunchLeaseRegistry::PrePublishAbortActionName(
+                p7_abort_action));
+        std::fflush(stderr);
+        throw;
+    }
+    const bool p7_handoff_accepted =
+        GetP7DirectLaunchLeaseRegistry().MarkHostHandoffAccepted(
+            p7_terminal_token, p7_terminal_acl_stream);
+    PublishP7DirectLaunchTokenForCurrentThread(p7_terminal_token);
+    if (DebugEnabled()) {
+        std::fprintf(stderr,
+                     "P7_1_ORDERED_SUBMISSION token=%llu host_handoff=%s "
+                     "device_post_cq=asynchronous\n",
+                     static_cast<unsigned long long>(p7_terminal_token),
+                     p7_handoff_accepted ? "accepted"
+                                         : "consumer_failed_quarantined");
+        std::fflush(stderr);
+    }
     if (DebugEnabled()) {
         std::fprintf(stderr, "P7_1_BOUNDARY stage=run_npu_after_submit\n");
         std::fflush(stderr);
@@ -372,7 +457,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             nanovllm_a5_opapi::TakeP7DirectLaunchTokenForCurrentThread();
         TORCH_CHECK(
             token != 0,
-            "P7.1 has no direct-launch token on this dispatch thread; capture "
+            "P7.1 has no ordered-submission token on this dispatch thread; capture "
             "the terminal lease immediately after score_receipt_speculative_executor");
         return static_cast<int64_t>(token);
     });

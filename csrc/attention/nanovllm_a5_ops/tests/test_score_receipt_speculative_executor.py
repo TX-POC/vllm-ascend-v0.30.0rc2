@@ -3,8 +3,8 @@
 
 Default ``fail_closed`` mode launches the real P7.1 ACLNN op with a malformed
 zero KVAF control block. It proves the 31-tensor/18-Ref ACLNN ABI, graph-visible
-18-alias Torch outputs, and that the kernel refuses to touch queues before a
-valid Direct-HCCP binding exists.
+18-alias Torch outputs, and that the kernel returns without mutating any
+transaction state before a valid Direct-HCCP binding exists.
 
 ``--fixture-module`` is the real transport mode.  The module must define
 ``build_p7_1_fixture(device)`` and return ``{"inputs": tuple_of_31_tensors}``
@@ -128,7 +128,136 @@ def _check_ref_outputs(
             )
 
 
-def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+def _snapshot_mutable_refs(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    """Take a synchronized baseline of every mutable Ref input.
+
+    The fail-closed ordering test below must isolate one dependency only:
+    ``valid control -> queued control.zero_() -> P7``.  Snapshot work is
+    therefore completed *before* that dependency is installed; using clone
+    operations themselves as the predecessor made the old test only a weak
+    timing observation rather than a data-order proof.
+    """
+
+    snapshots = tuple(inputs[index].detach().clone() for index in MUTABLE_INPUTS)
+    torch.npu.synchronize()
+    return snapshots
+
+
+def _as_signed_int64_bits(value: int) -> int:
+    """Preserve a uint64 ABI word when constructing a torch.int64 control."""
+
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+def _install_valid_zero_candidate_control(inputs: tuple[torch.Tensor, ...]) -> None:
+    """Install a deliberately valid, but zero-work, streaming control record.
+
+    This record passes the kernel's *first* control validation and its later
+    geometry checks.  It nevertheless cannot post HCCP work because the sole
+    receipt has ``candidate_count == 0``.  We synchronize this setup before
+    queuing its invalidating predecessor, so the next P7 dispatch has a real
+    and unambiguous producer dependency instead of a host-side race.
+    """
+
+    control = inputs[16]
+    queue_state = inputs[21]
+    private_packed_output = inputs[15]
+    queue_leases = inputs[17]
+    words = (
+        0x4B5641465354524D,  # KVAF_STREAMING_BATCH_GET_CONTROL_MAGIC
+        1,                   # KVAF_STREAMING_BATCH_GET_CONTROL_VERSION
+        1,                   # channel_entity: non-null, never used at count=0
+        queue_state.data_ptr(),
+        1,                   # core_status: non-null, never used at count=0
+        private_packed_output.data_ptr(),
+        queue_leases.data_ptr(),
+        1,                   # descriptor_scratch: never dereferenced at count=0
+        1,                   # queue_count
+        private_packed_output.size(0),
+        private_packed_output.size(0) * 656,
+        0,                   # output_offset_bytes
+        1,                   # jettys_per_core
+        656,                 # block_bytes
+        1,                   # descriptor_templates: never dereferenced at count=0
+        1,                   # descriptor_template_count
+    )
+    if len(words) != 16:
+        raise AssertionError(f"streaming control must have 16 words, got {len(words)}")
+    control.copy_(
+        torch.tensor(
+            tuple(_as_signed_int64_bits(int(word)) for word in words),
+            dtype=torch.int64,
+            device=control.device,
+        )
+    )
+    torch.npu.synchronize()
+    observed_magic = int(control.detach().cpu().reshape(-1)[0])
+    if observed_magic != words[0]:
+        raise AssertionError(
+            "could not establish valid control baseline before ordered sentinel: "
+            f"observed_magic={observed_magic}"
+        )
+    print(
+        "P7_1_ORDERING_SENTINEL "
+        "baseline=valid_zero_candidate_control baseline_sync=1 "
+        "candidate_count=0",
+        flush=True,
+    )
+
+
+def _enqueue_invalid_control_predecessor(inputs: tuple[torch.Tensor, ...]) -> None:
+    """Queue the actual producer that P7 must observe before its consumer runs."""
+
+    inputs[16].zero_()
+    print(
+        "P7_1_ORDERING_SENTINEL "
+        "predecessor=control_zero_queued predecessor_sync=0 "
+        "required_consumer_observation=invalid_control",
+        flush=True,
+    )
+
+
+def _assert_mutable_refs_unchanged(
+    inputs: tuple[torch.Tensor, ...], snapshots: tuple[torch.Tensor, ...]
+) -> None:
+    changed: list[int] = []
+    for input_index, snapshot in zip(MUTABLE_INPUTS, snapshots, strict=True):
+        if not torch.equal(inputs[input_index], snapshot):
+            changed.append(input_index)
+    if changed:
+        raise AssertionError(
+            "invalid control changed mutable transaction state at inputs="
+            f"{changed}"
+        )
+    control_words = inputs[16].detach().cpu().reshape(-1)
+    if int(torch.count_nonzero(control_words).item()) != 0:
+        raise AssertionError(
+            "ordered fail-closed consumer did not observe the queued invalid "
+            f"control: first_word={int(control_words[0])}"
+        )
+    rejected = _stat_sum(inputs[29], STAT_CONTROL_REJECTED)
+    if rejected != 0:
+        raise AssertionError(
+            "invalid control reached post-validation transaction code: "
+            f"control_rejected={rejected}"
+        )
+    print(
+        "P7_1_ORDERING_RECEIPT "
+        "baseline_valid=1 predecessor_invalid_observed=1 "
+        "control_rejected=0 mutable_refs_unchanged=18",
+        flush=True,
+    )
+    print(
+        "P7_1_FAIL_CLOSED_NOOP mutable_refs_unchanged=18 "
+        "queue_or_private_write=0 control_stat_write=0 "
+        "ordered_control_predecessor=1",
+        flush=True,
+    )
+
+
+def _run(
+    inputs: tuple[torch.Tensor, ...], *, expect_no_mutation: bool = False
+) -> tuple[torch.Tensor, ...]:
     if len(inputs) != INPUT_COUNT:
         raise ValueError(f"fixture must provide exactly {INPUT_COUNT} inputs")
     # Keep the fail-closed fixture preflight independent of an OPP package.
@@ -136,6 +265,11 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     # importing the bridge belongs only to the actual ACLNN dispatch path.
     import nanovllm_score_receipt_speculative_executor as p7_runtime
 
+    snapshots = _snapshot_mutable_refs(inputs) if expect_no_mutation else ()
+    if expect_no_mutation:
+        _install_valid_zero_candidate_control(inputs)
+        _enqueue_invalid_control_predecessor(inputs)
+        print("P7_1_BOUNDARY stage=ordered_control_predecessor_enqueued", flush=True)
     outputs = torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor(*inputs)
     print("P7_1_BOUNDARY stage=torch_op_return", flush=True)
     # This is the production-shaped hand-off: capture the exact stream/token
@@ -156,7 +290,7 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     pending = p7_runtime.pending_launch_leases()
     if released != 1 or pending != 0:
         raise AssertionError(
-            "P7.1 direct launch lease terminal mismatch: "
+            "P7.1 ordered-submission lease terminal mismatch: "
             f"released={released} pending={pending}"
         )
     print(
@@ -167,6 +301,8 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         flush=True,
     )
     _check_ref_outputs(inputs, tuple(outputs))
+    if expect_no_mutation:
+        _assert_mutable_refs_unchanged(inputs, snapshots)
     return tuple(outputs)
 
 
@@ -366,7 +502,7 @@ def main() -> str | None:
         return None
     if not args.fixture_module:
         inputs = _fail_closed_fixture(device)
-        outputs = _run(inputs)
+        outputs = _run(inputs, expect_no_mutation=True)
         cleanup_mode = _cleanup_bisect_mode()
         if cleanup_mode and cleanup_mode not in {
             "phase2_noop",
@@ -378,13 +514,16 @@ def main() -> str | None:
             raise AssertionError(f"unsupported legal P7 cleanup mode: {cleanup_mode}")
         report_mode = "fail_closed"
         values = _report(report_mode, inputs, outputs)
-        if values["control_rejected"] <= 0 or any(
-            values[key] != 0 for key in ("lease", "post", "retire", "finish", "release")
-        ):
-            raise AssertionError("invalid control must reject before lease/PostOnly/CQ")
+        if any(values[key] != 0 for key in (
+            "lease", "post", "retire", "finish", "release", "ready",
+            "failed", "quarantine", "control_rejected",
+        )):
+            raise AssertionError(
+                "invalid control must return without queue/private/stat mutation"
+            )
         print(
             "P7_1_TEST mode=fail_closed pass=1 refs=18 aclnn_tensors=31 "
-            "real_hccp=not_exercised reason=invalid_control_expected",
+            "real_hccp=not_exercised reason=invalid_control_noop",
             flush=True,
         )
         del outputs

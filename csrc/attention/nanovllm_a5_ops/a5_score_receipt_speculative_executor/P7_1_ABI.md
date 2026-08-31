@@ -23,23 +23,27 @@ queue 时仍启动几十个 worker 空转抢 lease，造成无收益的 CAS/queu
 
 ## 宿主提交边界
 
-P7.1 的宿主侧只做一次**直接 ACLNN 入流**：创建 31 个 tensor descriptor，调用
-`GetWorkspaceSize`，随后在调用者当前 NPU stream 直接调用
-`aclnnA5ScoreReceiptSpeculativeExecutor`。这个调用只把 AIV-only kernel 排入当前
-stream，**不等待** DMA 或 CQ，也不通过 `torch_npu::OpCommand` 再包一层 host
-task queue。原因不是绕开异步，而是 P7.1 的真实异步工作已经在设备端：
-`PostOnly -> DMA -> CQ`。再添加一个私有 host callback 会增加资源所有权边界，且曾在
-kernel fail-closed 后造成 post-submit 进程崩溃。
+P7.1 的宿主侧只做一次 **framework-ordered ACLNN 提交**：创建 31 个 tensor
+descriptor，调用 `GetWorkspaceSize`，再经 `torch_npu::OpCommand::RunOpApi` 将 ACLNN
+launch closure 放进当前 stream 的 host task queue。它不是 CPU/GIL 逐候选提交，也不是
+等待 HCCP 的同步包装；它只保证此前由 Torch 排队的张量生产操作先于 P7 launch 进入同一
+stream。
 
-host 返回后，CANN stream 继续执行 P7.1 kernel；kernel 内部才动态租 queue、发布
-descriptor、PostOnly，并在后续 receipt 中非阻塞 drain CQ。因此这里没有回到 CPU/GIL
-逐候选提交，也没有把 Get 固定给某些 AIV。
+不能使用 `stream(false)` 直接把 ACLNN 插进 raw stream：该调用不会 drain task queue，
+此前的 `.to(device).contiguous()` 等 producer 仍可能尚未被 consumer 提交。P7 若抢先
+direct launch，`torch.npu.synchronize()` 才会在 drain + device terminal 时暴露乱序。正确
+顺序是：producer 侧 `UseStreamResIfNeeded(..., true)`，queue consumer closure 侧
+`UseStreamResIfNeeded(..., false)`，随后 consumer launch ACLNN。两者不是 use/unuse 对，
+也不应由 P7 手工调用 `aclrtUnuse...`。
 
-当前 P7.1 tiling 明确声明 `workspace=0`，bridge 也对此做 fail-closed 检查。因而
-direct launch 没有一个在 host 返回后还要单独保活的临时 workspace Tensor；31 个输入和
-18 个 Ref 状态本来就是 graph `RuntimeResources`，其生命周期至少覆盖本 forward 的
-stream terminal。未来若算子需要非零 workspace，必须先补上可验证的 stream-owned
-workspace 生命周期，不能悄悄复用这里的零 workspace 路径。
+host closure 被接受后，CANN stream 继续执行 P7.1 kernel；kernel 内部才动态租 queue、
+发布 descriptor、PostOnly，并在后续 receipt 中非阻塞 drain CQ。因此仍然没有回到
+CPU/GIL 逐候选提交，也没有把 Get 固定给某些 AIV。P7 的真实异步区间仍是设备端：
+`CandidateSeed -> PostOnly -> DMA -> CQ`。
+
+当前 P7.1 tiling 声明 `workspace=0`；即便未来需要非零 workspace，标准 ordered
+closure 也会把 workspace Tensor 捕获到 consumer launch 后才释放，不能回退到 raw direct
+stream 路径。
 
 但 `workspace=0` **不等于**不需要区分两种不同寿命的 host 对象。P7.1 按 CANN
 标准 adapter 的顺序处理它们：
@@ -47,31 +51,39 @@ workspace 生命周期，不能悄悄复用这里的零 workspace 路径。
 1. `aclTensor` descriptor 只属于 ACLNN 的 phase-1/phase-2 host 调用。`launch`
    成功返回后，设备已经拿到了所需地址；bridge 必须立刻销毁 31 个 descriptor，**再**
    执行 `ReleaseHugeMem -> UnInitHugeMem -> UnInitPTA`。
-2. 31 个 ATen Tensor handle 才是设备流仍可能读取的 graph resource。它们被放进一个
-   有上限的 `direct-launch lease`，直到同一 forward 的 stream terminal 才释放。
+2. 31 个 ATen Tensor handle 才是设备流仍可能读取的 graph resource。它们在 host queue
+   handoff **之前**被放进一个有上限的 `host-submission lease`，直到同一 forward 的
+   stream terminal 才释放。
 
 这个 lease 不执行 DMA、也不轮询 CQ；它只保活真实 Tensor，绝不把短命的
 `aclTensor` descriptor 跨过 PTA/HugeMem TLS 边界保存。
 
-每次直接入流成功时，bridge 同时生成一个单调的 `launch token`，并把 token 绑定到
-**这一次 ACLNN 实际入流的 `aclrtStream`**。dispatch return 后，Runtime 立即调用
+每次 host queue 接受提交时，bridge 同时生成一个单调的 `launch token`，并把 token 绑定到
+**这一次 ACLNN 将要进入的 `aclrtStream`**。dispatch return 后，Runtime 立即调用
 `capture_forward_terminal_lease()`，将这个 token 放进本 forward 的 `RuntimeResources`；
 这一步不等待 NPU。等到本 forward 的最终 stream terminal（`forward stream terminal`，实际产品中是 QSFA terminal）已经
 确认后，Runtime 在任意 host 线程调用 `release_at_forward_terminal(lease)`。registry 只会释放
-“同一 stream 且 token 不晚于该 terminal”的 **Tensor keepalives**：一个 stream 的 terminal
-绝不会把并发 stream 的 lease 一起清掉，也不要求 terminal 回调与入流回调在同一 host thread。
+**该 terminal lease 携带的精确 token** 的 Tensor keepalive；绝不能使用“同一 stream 且 token
+不晚于 terminal”的批量捷径。否则，较早 reserve、较晚真正进入 consumer 的并发 callback 可能被
+另一个 forward 的 terminal 提前释放。精确 token 也不要求 terminal 回调与入流回调在同一 host thread。
 
 这里的 token 是 host-side Tensor-keepalive 生命周期身份，不替代设备端的
 `streaming_epoch + queue_generation + post_sequence`。后者仍由 P7.1 kernel/CQ 用于拒绝旧 wave
 completion；token 只回答“哪些 Tensor handle 在该 stream terminal 后可以释放”。若 forward
 没有走 terminal，lease 池会在固定上限前 fail-closed，而不是无限积压。
 
-这仍然没有重新引入 `OpCommand`、CPU/GIL 逐候选提交或固定 Get 核：设备端的
-`PostOnly -> DMA -> CQ` 从 P7.1 kernel 入流后持续异步执行；terminal hook 只处理已经
+这确实使用了 `OpCommand`，但只用于**一条 P7 executor launch**的框架有序提交；没有
+CPU/GIL 逐候选提交或固定 Get 核。设备端的 `PostOnly -> DMA -> CQ` 从 P7.1 kernel 入流后
+持续异步执行；terminal hook 只处理已经
 不再被设备读取的 Tensor keepalive 生命周期。当前 standalone P7.1 测试已走同一
 `capture -> stream terminal -> release` API；产品图路径接入时必须把 capture 的返回值放进
 transaction `RuntimeResources`，并由现有 QSFA terminal 取出释放，不能直接调用底层 pybind
 接口或按进程全局清空 lease。
+
+P7.1 不支持 task queue 关闭或 sync-launch stream 的“同步降级”。这两种模式会让 ACLNN
+consumer 在 token 交给 `RuntimeResources` 之前内联执行；一旦 consumer 失败，就无法证明
+没有部分 device work，因而不能安全释放 Tensor keepalive。此时 bridge 必须在提交前
+fail-closed，而不能换回 raw stream 或猜测性地做 early release。
 
 ### 测试进程退出与产品路径要分开
 
@@ -80,7 +92,7 @@ fixture 已完成 `Finish/Release`”。这几个条件完成后，测试进程�
 和动态库还会依次做各自的全局析构；这不是一次 forward 的执行步骤。
 
 因此 scoped runner 使用三个**独立子进程**：第一个以无效 control 运行到
-`P7_1_FINAL_RECEIPT` 后用测试专用 `os._exit(0)` 结束，证明直接 ACLNN 入流、stream terminal 和
+`P7_1_FINAL_RECEIPT` 后用测试专用 `os._exit(0)` 结束，证明 framework-ordered ACLNN 入流、stream terminal 和
 lease 生命周期；第二个用真实 cold-bound KVAF control，在 `Finish/Release/cleanup` 全部结束后才
 发出同类 receipt，证明真正的 Direct-HCCP transaction；第三个保持正常 Python 退出，仅记录
 `P7_1_PROCESS_EXIT`，用于定位 CPython/ELF/CANN teardown。`os._exit` 绝不出现在产品 runtime

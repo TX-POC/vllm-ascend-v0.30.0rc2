@@ -2,13 +2,10 @@
 
 // Minimal, self-contained ACLNN launcher for nanovllm_dsa_a5.
 //
-// Most bridges below use torch_npu's OpCommand task-queue contract.  That is
-// the existing contract for their independently validated launch paths.  P7.1
-// is deliberately different: its CANN ABI has zero workspace and its actual
-// PostOnly/CQ asynchronous work is already device-side, so it uses the same
-// direct-current-stream ACLNN form as the repository's original standalone
-// baseline.  Keep that exception local to P7.1 rather than changing the
-// ownership rule for every other bridge.
+// Bridges below use torch_npu's OpCommand task-queue contract.  Device-side
+// PostOnly/CQ work can remain asynchronous without bypassing this host-order
+// contract: one ordered ACLNN submission preserves all preceding Tensor
+// producer dependencies on the same stream.
 
 #include <algorithm>
 #include <cstdlib>
@@ -34,6 +31,7 @@
 #include <torch/extension.h>
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
 // Each standalone validation bridge owns a distinct resolver domain.  The
@@ -341,9 +339,8 @@ inline void ReleaseTuple(Tuple &args) {
   ReleaseTuple(args, std::make_index_sequence<kSize>{});
 }
 
-// P7.1 is the only bridge that launches ACLNN directly on the caller's
-// current stream.  There are two ownership domains which must remain
-// separate:
+// P7.1 launches one ACLNN executor through torch_npu's ordinary host task
+// queue.  There are two ownership domains which must remain separate:
 //
 //  * aclTensor descriptors are phase-1/phase-2 *host* objects.  The checked-in
 //    CANN adapter destroys them immediately after aclnn(...) returns and
@@ -356,10 +353,19 @@ inline void ReleaseTuple(Tuple &args) {
 //    forward stream terminal.  Production RuntimeResources owns this terminal
 //    hand-off; the bounded registry below is only the bridge-side carrier.
 //
-// This registry is deliberately *not* an execution queue.  The device kernel
-// already owns PostOnly/DMA/CQ.  Its token is bound to the actual aclrtStream,
-// rather than to a host thread, because a graph terminal callback may execute
-// on a different runtime thread from the submitter.
+// This registry is deliberately *not* an execution queue. The device kernel
+// already owns CandidateSeed -> PostOnly -> DMA -> CQ. Its token is bound to
+// the actual aclrtStream, rather than to a host thread, because a graph
+// terminal callback may execute on a different runtime thread from the
+// submitter. The registry tracks only host ownership of Tensor handles:
+//
+//   HOST_ENQUEUED -> HOST_HANDOFF_ACCEPTED -> FORWARD_TERMINAL_RELEASED
+//                        \-> HOST_FAILED (kept until abort/terminal)
+//
+// It intentionally does not duplicate the device queue state machine. In
+// particular, HOST_HANDOFF_ACCEPTED means torch_npu accepted one executor
+// closure for ordered launch; it does not claim that ACLNN, HCCP DMA, or CQ
+// has completed.
 class P7DirectLaunchLeaseBase {
  public:
   virtual ~P7DirectLaunchLeaseBase() = default;
@@ -379,52 +385,192 @@ class P7DirectLaunchLease final : public P7DirectLaunchLeaseBase {
 
 class P7DirectLaunchLeaseRegistry {
  private:
+  enum class HostSubmissionState : uint8_t {
+    kEnqueued = 1,
+    kHandoffAccepted = 2,
+    kFailed = 3,
+  };
+
   struct PendingLease {
     uint64_t token;
     uintptr_t stream_key;
+    HostSubmissionState state;
     std::shared_ptr<P7DirectLaunchLeaseBase> lease;
   };
 
  public:
+  // This result is used only while RunOpApi itself throws before RunNpu can
+  // publish the token into RuntimeResources.  The ordinary reclaiming case is
+  // deliberately narrow:
+  //
+  // * kCancelledEnqueued: the producer failed before the consumer owned the
+  //   closure, so removing the pre-reserved lease is ordinary cancellation.
+  // * kFailedBeforePublishQuarantined: this should be unreachable after the
+  //   bridge rejects task-queue-disabled and sync-launch streams.  Do not
+  //   release it here: an unexpected consumer may have partially submitted
+  //   device work.  Retain/quarantine it and fail the dispatch instead.
+  //
+  // A handoff-accepted token is never reclaimed here: a post-return consumer
+  // failure must remain owned by the forward terminal.
+  enum class PrePublishAbortAction : uint8_t {
+    kCancelledEnqueued = 1,
+    kFailedBeforePublishQuarantined = 2,
+    kUnexpectedHandoffAccepted = 3,
+    kNotPending = 4,
+    kWrongStream = 5,
+    kInternalFailure = 6,
+  };
+
   static constexpr size_t kMaxPendingLeases = 16;
 
   P7DirectLaunchLeaseRegistry() { pending_.reserve(kMaxPendingLeases); }
 
-  bool Reserve() {
-    std::lock_guard<std::mutex> guard(mutex_);
-    if (pending_.size() + reservations_ >= kMaxPendingLeases) {
-      return false;
-    }
-    ++reservations_;
-    return true;
-  }
-
-  void CancelReservation() {
-    std::lock_guard<std::mutex> guard(mutex_);
-    TORCH_CHECK(reservations_ > 0,
-                "P7 direct launch lease reservation underflow");
-    --reservations_;
-  }
-
-  uint64_t Commit(std::shared_ptr<P7DirectLaunchLeaseBase> lease,
-                  aclrtStream stream) {
+  // Allocate and retain the terminal token *before* RunOpApi hands the
+  // closure to torch_npu. The consumer may launch before the producer returns
+  // to Python, so a post-callback Commit would race capture_forward_terminal.
+  uint64_t ReserveEnqueued(std::shared_ptr<P7DirectLaunchLeaseBase> lease,
+                           aclrtStream stream) {
     TORCH_CHECK(lease != nullptr, "P7 direct launch lease is null");
     TORCH_CHECK(stream != nullptr,
                 "P7 direct launch lease requires a non-null ACL stream");
     std::lock_guard<std::mutex> guard(mutex_);
-    TORCH_CHECK(reservations_ > 0,
-                "P7 direct launch lease commit without reservation");
+    TORCH_CHECK(pending_.size() < kMaxPendingLeases,
+                "P7 ordered launch lease capacity exhausted; forward terminal ",
+                "did not release prior P7 leases");
     TORCH_CHECK(next_token_ != 0,
                 "P7 direct launch token space exhausted");
     const uint64_t token = next_token_++;
-    --reservations_;
     pending_.push_back(
-        {token, reinterpret_cast<uintptr_t>(stream), std::move(lease)});
+        {token, reinterpret_cast<uintptr_t>(stream),
+         HostSubmissionState::kEnqueued, std::move(lease)});
     return token;
+  }
+
+  // Returns false only when the queue-consumer closure had already failed and
+  // quarantined this exact token before the producer observed RunOpApi's
+  // successful enqueue return.  That race is valid with an eager task queue:
+  // the failure must remain terminal-owned, not be overwritten as accepted.
+  bool MarkHostHandoffAccepted(uint64_t token, aclrtStream stream) {
+    TORCH_CHECK(stream != nullptr,
+                "P7 ordered launch state update requires a non-null stream");
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto pending = FindPendingLocked(token);
+    TORCH_CHECK(pending != pending_.end(),
+                "P7 ordered launch token is not pending during host handoff "
+                "accepted: ", token);
+    TORCH_CHECK(pending->stream_key == reinterpret_cast<uintptr_t>(stream),
+                "P7 ordered launch token belongs to a different stream: ",
+                token);
+    if (pending->state == HostSubmissionState::kFailed) {
+      return false;
+    }
+    TORCH_CHECK(pending->state == HostSubmissionState::kEnqueued,
+                "P7 ordered launch token has invalid host state during "
+                "handoff: ", token);
+    pending->state = HostSubmissionState::kHandoffAccepted;
+    return true;
+  }
+
+  // This runs while the torch_npu queue consumer is already unwinding an
+  // exception.  It is therefore intentionally noexcept: a bookkeeping fault
+  // must never replace the original ACLNN / queue-consumer exception with a
+  // process-terminating second exception.  A false result still leaves the
+  // original consumer failure visible to torch_npu.
+  bool MarkHostFailedNoThrow(uint64_t token, aclrtStream stream) noexcept {
+    if (token == 0 || stream == nullptr) {
+      return false;
+    }
+    try {
+      std::lock_guard<std::mutex> guard(mutex_);
+      const auto pending = FindPendingLocked(token);
+      if (pending == pending_.end() ||
+          pending->stream_key != reinterpret_cast<uintptr_t>(stream)) {
+        return false;
+      }
+      // A late observer after terminal release is not an ownership error: the
+      // terminal was already established.  Otherwise retain the tensor lease
+      // for forward abort/terminal cleanup instead of silently releasing it.
+      pending->state = HostSubmissionState::kFailed;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // Resolve the producer-side exception boundary before Publish token.  It is
+  // noexcept because it runs while preserving the original RunOpApi error.
+  // Tensor handles are deliberately destroyed after releasing mutex_: neither
+  // a Tensor destructor nor Python refcount work may run under the registry
+  // lock.  This function never releases a failed or handoff-accepted token:
+  // those states may have device work and must remain quarantined rather than
+  // losing keepalives before a proven terminal.
+  PrePublishAbortAction ResolvePrePublishAbortNoThrow(
+      uint64_t token, aclrtStream stream) noexcept {
+    std::shared_ptr<P7DirectLaunchLeaseBase> released;
+    PrePublishAbortAction action = PrePublishAbortAction::kInternalFailure;
+    try {
+      if (token == 0 || stream == nullptr) {
+        return PrePublishAbortAction::kInternalFailure;
+      }
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto pending = FindPendingLocked(token);
+        if (pending == pending_.end()) {
+          action = PrePublishAbortAction::kNotPending;
+        } else if (pending->stream_key != reinterpret_cast<uintptr_t>(stream)) {
+          action = PrePublishAbortAction::kWrongStream;
+        } else if (pending->state == HostSubmissionState::kEnqueued) {
+          // No consumer closure owns this lease.  This is ordinary synchronous
+          // producer cancellation, not a queue quarantine.
+          released = std::move(pending->lease);
+          pending_.erase(pending);
+          action = PrePublishAbortAction::kCancelledEnqueued;
+        } else if (pending->state == HostSubmissionState::kFailed) {
+          // Never free this lease from an exception path.  A consumer that
+          // reached this state may have submitted part of an ACLNN launch.
+          // With the strict task-queue gate below this is an invariant failure,
+          // not an alternate cleanup path: preserve the quarantine and let the
+          // original dispatch failure abort the forward/process path.
+          action = PrePublishAbortAction::kFailedBeforePublishQuarantined;
+        } else {
+          // Do not free a token that reached handoff.  If this invariant is
+          // ever observed, retaining the bounded lease is safer than allowing
+          // a live asynchronous launch to lose its Tensor keepalives.
+          action = PrePublishAbortAction::kUnexpectedHandoffAccepted;
+        }
+      }
+      released.reset();
+      return action;
+    } catch (...) {
+      return PrePublishAbortAction::kInternalFailure;
+    }
+  }
+
+  static const char *PrePublishAbortActionName(
+      PrePublishAbortAction action) noexcept {
+    switch (action) {
+      case PrePublishAbortAction::kCancelledEnqueued:
+        return "cancel_enqueued";
+      case PrePublishAbortAction::kFailedBeforePublishQuarantined:
+        return "failed_pre_publish_quarantined_fatal";
+      case PrePublishAbortAction::kUnexpectedHandoffAccepted:
+        return "unexpected_handoff_retained";
+      case PrePublishAbortAction::kNotPending:
+        return "not_pending";
+      case PrePublishAbortAction::kWrongStream:
+        return "wrong_stream";
+      case PrePublishAbortAction::kInternalFailure:
+        return "internal_failure";
+    }
+    return "unknown";
   }
 
   int64_t ReleaseAtForwardTerminal(uint64_t terminal_token) {
     std::vector<std::shared_ptr<P7DirectLaunchLeaseBase>> completed;
+    // Exact-token release moves one shared_ptr while holding the registry
+    // mutex. Reserve first so allocation cannot throw after that move and
+    // strand a lease in neither owner.
+    completed.reserve(1);
     {
       std::lock_guard<std::mutex> guard(mutex_);
       TORCH_CHECK(terminal_token != 0,
@@ -439,22 +585,19 @@ class P7DirectLaunchLeaseRegistry {
           "P7 forward-terminal token is not pending; it was either already "
           "retired or belongs to a different process: ",
           terminal_token);
-      const uintptr_t stream_key = terminal->stream_key;
-      std::vector<PendingLease> remaining;
-      remaining.reserve(pending_.size());
-      for (auto& pending : pending_) {
-        // A terminal for this stream proves every earlier launch on the same
-        // stream is no longer reading its Tensor resources.  It says nothing
-        // about a concurrent stream, even if that stream was submitted by the
-        // same host thread, so those Tensor handles remain leased.
-        if (pending.stream_key == stream_key &&
-            pending.token <= terminal_token) {
-          completed.push_back(std::move(pending.lease));
-        } else {
-          remaining.push_back(std::move(pending));
-        }
-      }
-      pending_.swap(remaining);
+      TORCH_CHECK(
+          terminal->state == HostSubmissionState::kHandoffAccepted ||
+              terminal->state == HostSubmissionState::kFailed,
+          "P7 forward-terminal token was never handed to the ordered "
+          "consumer: ", terminal_token);
+      // Do not use a same-stream `token <= terminal_token` shortcut here.
+      // A later producer can enqueue/terminal ahead of an earlier producer
+      // whose token was reserved before RunOpApi hand-off.  Releasing that
+      // earlier lease would allow its tensors to die before its consumer
+      // closure reaches ACLNN.  RuntimeResources owns one exact token, so the
+      // only sound terminal operation is exact-token destruction.
+      completed.push_back(std::move(terminal->lease));
+      pending_.erase(terminal);
     }
     const int64_t released = static_cast<int64_t>(completed.size());
     // Destruction releases only Tensor keepalives after the caller has
@@ -470,8 +613,14 @@ class P7DirectLaunchLeaseRegistry {
   }
 
  private:
+  std::vector<PendingLease>::iterator FindPendingLocked(
+      uint64_t token) {
+    return std::find_if(
+        pending_.begin(), pending_.end(),
+        [token](const PendingLease& pending) { return pending.token == token; });
+  }
+
   mutable std::mutex mutex_;
-  size_t reservations_ = 0;
   uint64_t next_token_ = 1;
   std::vector<PendingLease> pending_;
 };
@@ -487,6 +636,62 @@ inline P7DirectLaunchLeaseRegistry &GetP7DirectLaunchLeaseRegistry() {
   return *registry;
 }
 
+// An observer is carried in a bridge's existing tensor keepalive tuple.  The
+// generic ordered launcher knows nothing about P7 state, but on a consumer
+// exception it can notify the observer before it rethrows into torch_npu's
+// task queue.  Other bridges simply do not carry one and pay no behavioural
+// cost.
+class OrderedLaunchFailureObserver {
+ public:
+  virtual ~OrderedLaunchFailureObserver() = default;
+  virtual void OnOrderedLaunchFailure() noexcept = 0;
+};
+
+inline void NotifyOrderedLaunchFailure(
+    const std::shared_ptr<OrderedLaunchFailureObserver> &observer) noexcept {
+  if (observer != nullptr) {
+    observer->OnOrderedLaunchFailure();
+  }
+}
+
+template <typename T>
+inline void NotifyOrderedLaunchFailure(const T &) noexcept {}
+
+template <typename Tuple, size_t... I>
+inline void NotifyOrderedLaunchFailureTuple(
+    const Tuple &tuple, std::index_sequence<I...>) noexcept {
+  (void)std::initializer_list<int>{
+      (NotifyOrderedLaunchFailure(std::get<I>(tuple)), 0)...};
+}
+
+template <typename Tuple>
+inline void NotifyOrderedLaunchFailureTuple(const Tuple &tuple) noexcept {
+  constexpr size_t kSize = std::tuple_size<Tuple>::value;
+  NotifyOrderedLaunchFailureTuple(tuple, std::make_index_sequence<kSize>{});
+}
+
+class P7OrderedLaunchFailureObserver final
+    : public OrderedLaunchFailureObserver {
+ public:
+  P7OrderedLaunchFailureObserver(uint64_t token, aclrtStream stream)
+      : token_(token), stream_(stream) {}
+
+  void OnOrderedLaunchFailure() noexcept override {
+    (void)GetP7DirectLaunchLeaseRegistry().MarkHostFailedNoThrow(token_, stream_);
+  }
+
+ private:
+  uint64_t token_;
+  aclrtStream stream_;
+};
+
+inline std::shared_ptr<OrderedLaunchFailureObserver>
+MakeP7OrderedLaunchFailureObserver(uint64_t token, aclrtStream stream) {
+  TORCH_CHECK(token != 0 && stream != nullptr,
+              "P7 ordered launch failure observer requires token and stream");
+  return std::make_shared<P7OrderedLaunchFailureObserver>(token, stream);
+}
+
 template <typename TensorKeepaliveTuple>
 inline std::shared_ptr<P7DirectLaunchLeaseBase> MakeP7DirectLaunchLease(
     TensorKeepaliveTuple tensor_keepalive) {
@@ -495,7 +700,8 @@ inline std::shared_ptr<P7DirectLaunchLeaseBase> MakeP7DirectLaunchLease(
       std::move(tensor_keepalive));
 }
 
-// The dispatch bridge consumes this immediately after one P7 direct launch
+// The dispatch bridge consumes this immediately after one ordered P7 host
+// submission
 // and stores it in the forward's RuntimeResources.  It is thread-local only
 // for hand-off from the synchronous dispatch return to that RuntimeResources
 // object; terminal release itself is intentionally allowed from any thread.
@@ -505,12 +711,20 @@ inline uint64_t& LastP7DirectLaunchTokenForCurrentThread() {
 }
 
 inline void ClearP7DirectLaunchTokenForCurrentThread() {
-  LastP7DirectLaunchTokenForCurrentThread() = 0;
+  uint64_t &token = LastP7DirectLaunchTokenForCurrentThread();
+  TORCH_CHECK(
+      token == 0,
+      "P7 previous ordered-submission token was not captured before the next "
+      "submission; refusing to discard terminal ownership: ", token);
 }
 
 inline void PublishP7DirectLaunchTokenForCurrentThread(uint64_t token) {
-  TORCH_CHECK(token != 0, "P7 direct launch token must be non-zero");
-  LastP7DirectLaunchTokenForCurrentThread() = token;
+  TORCH_CHECK(token != 0, "P7 ordered submission token must be non-zero");
+  uint64_t &previous = LastP7DirectLaunchTokenForCurrentThread();
+  TORCH_CHECK(previous == 0,
+              "P7 ordered submission token would overwrite uncaptured token: ",
+              previous);
+  previous = token;
 }
 
 inline uint64_t TakeP7DirectLaunchTokenForCurrentThread() {
@@ -968,23 +1182,32 @@ inline void LogOrderedHostDso(
       auto ordered_acl_call =                                                   \
           [converted, workspace, workspace_ptr, workspace_size, acl_stream,   \
            executor, ordered_tensor_keepalive, release_huge_mem]() mutable -> int { \
-        (void)workspace;                                                       \
-        (void)ordered_tensor_keepalive;                                        \
-        UseStreamResIfNeeded(acl_stream, false);                               \
-        LogOpApiLifecycle(#aclnn_api, "launch_begin");                       \
-        auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);      \
-        const int launch_status =                                              \
-            launch_fn(workspace_ptr, workspace_size, executor, acl_stream);   \
-        TORCH_CHECK(                                                           \
-            launch_status == 0,                                                \
-            "call " #aclnn_api " failed: ", RecentAclError());              \
-        LogOpApiLifecycle(#aclnn_api, "launch_done");                        \
-        ReleaseTuple(converted);                                               \
-        if (release_huge_mem != nullptr) {                                     \
-          release_huge_mem(nullptr, false);                                    \
+        try {                                                                  \
+          (void)workspace;                                                     \
+          (void)ordered_tensor_keepalive;                                      \
+          UseStreamResIfNeeded(acl_stream, false);                             \
+          LogOpApiLifecycle(#aclnn_api, "launch_begin");                     \
+          auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);    \
+          const int launch_status =                                            \
+              launch_fn(workspace_ptr, workspace_size, executor, acl_stream); \
+          TORCH_CHECK(                                                         \
+              launch_status == 0,                                              \
+              "call " #aclnn_api " failed: ", RecentAclError());            \
+          LogOpApiLifecycle(#aclnn_api, "launch_done");                      \
+          ReleaseTuple(converted);                                             \
+          if (release_huge_mem != nullptr) {                                   \
+            release_huge_mem(nullptr, false);                                  \
+          }                                                                    \
+          LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");          \
+          return launch_status;                                                \
+        } catch (...) {                                                        \
+          /* P7 optionally carries one observer in this tuple.  Mark that     \
+           * exact terminal lease failed before torch_npu receives the        \
+           * original exception. Other bridges carry no observer. */          \
+          NotifyOrderedLaunchFailureTuple(ordered_tensor_keepalive);           \
+          LogOpApiLifecycle(#aclnn_api, "consumer_failed_quarantined");     \
+          throw;                                                               \
         }                                                                      \
-        LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");            \
-        return launch_status;                                                  \
       };                                                                       \
       /* RunOpApi takes the closure by value.  We choose it to make that      \
        * ownership boundary explicit; this is not a claim that V2 caused P7. */\
@@ -999,140 +1222,4 @@ inline void LogOrderedHostDso(
                                          : "pta_cache_not_active");           \
       LogOpApiLifecycle(#aclnn_api, "submit_done");                          \
     }                                                                          \
-  } while (false)
-
-// P7.1 is a standalone device-side PostOnly/CQ executor. Its host launch uses
-// the public ACLNN stream ABI directly: ACLNN enqueues work on the caller's
-// current NPU stream and returns without waiting for DMA or CQ. The 31 input
-// tensors and 18 mutable Ref tensors are graph RuntimeResources: their
-// lifetime is required to cover this forward's stream terminal. This macro
-// deliberately introduces no temporary workspace Tensor whose lifetime would
-// end at the host return boundary.
-//
-// Do not route P7.1 through torch_npu::OpCommand. OpCommand is a private host
-// task queue, while P7.1's real asynchronous work already lives on the device
-// stream. A P7.1 fail-closed launch reached `submit_done` and then crashed in
-// that second hand-off. The direct path below matches the repository's direct
-// ACLNN baseline: create descriptors, query workspace, enqueue, then destroy
-// the host-only descriptors *before* HugeMem/PTA TLS teardown.  Only the
-// underlying ATen tensor handles survive to the graph forward terminal.
-// PTA/HugeMem setup remains a GetWorkspaceSize precondition for this CANN
-// release.
-//
-// This is P7-specific on purpose: existing operators retain their independently
-// validated EXEC_NPU_CMD_ORDERED contracts. P7's OpDef declares zero workspace;
-// fail closed if that changes instead of silently introducing an untracked
-// temporary tensor lifetime into the asynchronous device path.
-#define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(aclnn_api, tensor_keepalive, ...) \
-  do {                                                                           \
-    using namespace nanovllm_a5_opapi;                                           \
-    /* Do not let a prior failed/successful dispatch leak a stale token. */     \
-    ClearP7DirectLaunchTokenForCurrentThread();                                  \
-    static void *workspace_addr_fn =                                             \
-        ResolveSymbol(#aclnn_api "GetWorkspaceSize");                          \
-    static void *launch_addr_fn = ResolveSymbol(#aclnn_api);                    \
-    TORCH_CHECK(                                                                 \
-        workspace_addr_fn != nullptr && launch_addr_fn != nullptr,               \
-        #aclnn_api,                                                              \
-        " or ",                                                                \
-        #aclnn_api "GetWorkspaceSize is missing from repository-local ",        \
-        "libcust_opapi.so");                                                   \
-    LogResolvedOpApi(#aclnn_api, workspace_addr_fn, launch_addr_fn);             \
-    auto npu_stream = c10_npu::getCurrentNPUStream();                            \
-    const aclrtStream acl_stream = npu_stream.stream(false);                     \
-    /* Keep torch_npu core-control stream ownership in the direct path. */      \
-    UseStreamResIfNeeded(acl_stream, true);                                      \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_enqueue_ready");             \
-                                                                               \
-    const bool pta_cache_active = InitPtaCacheForWorkspace();                    \
-    LogOpApiLifecycle(#aclnn_api,                                                \
-                      pta_cache_active ? "direct_async_pta_cache_ready"        \
-                                       : "direct_async_pta_cache_unavailable"); \
-    auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(             \
-        ResolveSymbol("InitHugeMemThreadLocal"));                               \
-    auto uninit_huge_mem = reinterpret_cast<UnInitHugeMemThreadLocalFn>(         \
-        ResolveSymbol("UnInitHugeMemThreadLocal"));                             \
-    auto release_huge_mem = reinterpret_cast<ReleaseHugeMemFn>(                  \
-        ResolveSymbol("ReleaseHugeMem"));                                       \
-    LogOrderedHostDso(#aclnn_api, workspace_addr_fn, launch_addr_fn,             \
-                      init_huge_mem, release_huge_mem, uninit_huge_mem);         \
-    if (init_huge_mem != nullptr) {                                              \
-      (void)init_huge_mem(nullptr, false);                                       \
-    }                                                                            \
-                                                                               \
-    uint64_t workspace_size = 0;                                                 \
-    uint64_t *workspace_size_ptr = &workspace_size;                              \
-    aclOpExecutor *executor = nullptr;                                           \
-    aclOpExecutor **executor_ptr = &executor;                                    \
-    auto converted = ConvertTypes(                                               \
-        __VA_ARGS__, workspace_size_ptr, executor_ptr);                          \
-    LogConvertedDescriptorSet(#aclnn_api, converted);                            \
-    auto direct_async_tls_cleanup = [&]() {                                     \
-      if (release_huge_mem != nullptr) {                                        \
-        release_huge_mem(nullptr, false);                                        \
-      }                                                                          \
-      if (uninit_huge_mem != nullptr) {                                         \
-        uninit_huge_mem(nullptr, false);                                         \
-      }                                                                          \
-      UnInitPtaCacheForWorkspace(pta_cache_active);                              \
-    };                                                                           \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_workspace_call_begin");       \
-    auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);         \
-    const int workspace_status = CallTuple(workspace_fn, converted);             \
-    if (workspace_status != 0) {                                                 \
-      ReleaseTuple(converted);                                                   \
-      direct_async_tls_cleanup();                                                \
-      TORCH_CHECK(false,                                                         \
-                  "call " #aclnn_api "GetWorkspaceSize failed: ",             \
-                  RecentAclError());                                             \
-    }                                                                            \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_workspace_ready");           \
-                                                                               \
-    if (workspace_size != 0) {                                                   \
-      ReleaseTuple(converted);                                                   \
-      direct_async_tls_cleanup();                                                \
-      TORCH_CHECK(false,                                                         \
-                  "P7 direct async ABI requires zero CANN workspace; nonzero ", \
-                  "workspace needs an explicit stream-owned lifetime contract");\
-    }                                                                            \
-    void *workspace_ptr = nullptr;                                               \
-                                                                               \
-    auto direct_async_lease = MakeP7DirectLaunchLease(tensor_keepalive);         \
-    if (!GetP7DirectLaunchLeaseRegistry().Reserve()) {                           \
-      ReleaseTuple(converted);                                                   \
-      direct_async_tls_cleanup();                                                \
-      TORCH_CHECK(false,                                                         \
-                  "P7 direct launch lease capacity exhausted; forward terminal ",\
-                  "did not release prior P7 leases");                         \
-    }                                                                            \
-    auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);            \
-    /*                                                                    */    \
-    /* No consumer-side dequeue bind here.  P7 deliberately has no      */      \
-    /* OpCommand consumer: ACLNN launches directly on this stream.      */      \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_launch_begin");               \
-    const int launch_status =                                                     \
-        launch_fn(workspace_ptr, workspace_size, executor, acl_stream);          \
-    if (launch_status != 0) {                                                    \
-      GetP7DirectLaunchLeaseRegistry().CancelReservation();                      \
-      ReleaseTuple(converted);                                                   \
-      direct_async_tls_cleanup();                                                \
-      TORCH_CHECK(false,                                                         \
-                  "call " #aclnn_api " failed: ", RecentAclError());          \
-    }                                                                            \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_launch_done");                \
-                                                                               \
-    const uint64_t direct_async_token =                                         \
-        GetP7DirectLaunchLeaseRegistry().Commit(                                 \
-            std::move(direct_async_lease), acl_stream);                          \
-    PublishP7DirectLaunchTokenForCurrentThread(direct_async_token);              \
-    /* aclTensor is phase-1/phase-2 host metadata, never a DMA resource. */    \
-    /* Commit Tensor ownership first: launch already succeeded on the stream. */\
-    ReleaseTuple(converted);                                                     \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_descriptor_release_done");  \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_tensor_keepalive_held");     \
-    direct_async_tls_cleanup();                                                  \
-    LogOpApiLifecycle(#aclnn_api,                                                \
-                      pta_cache_active ? "direct_async_pta_cache_uninit"       \
-                                       : "direct_async_pta_cache_not_active");  \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_submit_done");                \
   } while (false)

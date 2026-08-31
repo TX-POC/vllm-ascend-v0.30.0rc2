@@ -14,9 +14,18 @@ set +e
 set +u
 set -o pipefail
 
+emit_failure_excerpt() {
+    local result_dir="${P7_RESULT:-}"
+    [[ -d "${result_dir}" ]] || return 0
+    printf 'P7_1_FAILURE_EXCERPT result=%s\n' "${result_dir}"
+    grep -hE '^(P7_1_(SOURCE|NPU|CONTROL|ORDERING_|BOUNDARY|FAILURE|TEST_FAIL|FINAL_RECEIPT|TERMINAL_LEASE|FAIL_CLOSED_NOOP)|P7_(ORDERED|REAL|REUSE)|NANOVLLM_A5_OPAPI_LIFECYCLE)' \
+        "${result_dir}"/*.log 2>/dev/null | tail -n 96
+}
+
 fail() {
     local reason="$1"
     printf 'P7_1_FINAL status=1 reason=%s\n' "${reason}"
+    emit_failure_excerpt
     exit 1
 }
 
@@ -41,6 +50,11 @@ P7_BRIDGE_ROOT="${OPS_ROOT}/a5_score_receipt_speculative_executor/torch_extensio
 P7_TEST="${OPS_ROOT}/tests/test_score_receipt_speculative_executor.py"
 P7_CONTRACT_TEST="${OPS_ROOT}/tests/test_score_receipt_speculative_executor_contract.py"
 P7_BUILD_SCRIPT="${OPS_ROOT}/build_nanovllm_ops.sh"
+
+# Test-only cleanup bisects change descriptor/PTA lifetime and can make an
+# ordered host-submission failure look like a device-side fault.  Product and
+# diagnostic runs always begin from the normal lifecycle.
+unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE
 
 # A P7.1 run is provenance-sensitive.  Never reuse an arbitrary caller
 # directory: an old manifest/opapi can otherwise survive a source update and
@@ -227,6 +241,8 @@ unset NANOVLLM_CUST_OPAPI_LIB
 source "${P7_OPP_ROOT}/vendors/customize/bin/set_env.bash"
 unset SOC_VERSION
 export A5_SOC_VERSION=ascend950
+# A vendor environment must not resurrect a caller's diagnostic bisect.
+unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE
 unset ASCEND_VISIBLE_DEVICES
 export ASCEND_RT_VISIBLE_DEVICES="${P7_PHYSICAL_NPU_ID}"
 export NANOVLLM_A5_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_OPP="${P7_OPP_ROOT}"
@@ -235,6 +251,9 @@ export P7_EXPECTED_KVAF_SHA="${P7_KVAF_HEAD}"
 export P7_KVAF_BATCH_GET_KERNEL="${P7_KVAF_GET}"
 export P7_KVAF_BATCH_PUT_KERNEL="${P7_KVAF_PUT}"
 export PYTHONPATH="${P7_BRIDGE_ROOT}:${P7_KVAF_BUILD}/python${PYTHONPATH:+:${PYTHONPATH}}"
+# Keep the lifecycle receipt enabled for this scoped standalone runner.  The
+# compact markers are mandatory evidence for any failure report.
+export NANOVLLM_A5_OPAPI_DEBUG=1
 
 (
     cd "${P7_BRIDGE_ROOT}" || exit 1
@@ -251,27 +270,50 @@ if [[ "${P7_BRIDGE_RC}" != "0" || -z "${P7_BRIDGE_SO}" ]]; then
 fi
 printf 'P7_1_BRIDGE status=0 artifact=%s aliases=18\n' "${P7_BRIDGE_SO}"
 
-# First prove invalid KVAF control fails before acquiring a queue.  It is a
-# guard only, never reported as real HCCP success.
+# First prove invalid KVAF control is a no-op before acquiring a queue.  The
+# child exits only after its stream-terminal and mutable-Ref receipts have
+# been emitted, so Python/ELF teardown cannot be mistaken for an executor
+# result.
+P7_1_TEST_EXIT_AFTER_RECEIPT=1 \
 timeout -k 15s "${P7_RUNTIME_TIMEOUT}" "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
     2>&1 | tee "${P7_RESULT}/fail_closed.log"
 P7_FAIL_CLOSED_RC=${PIPESTATUS[0]}
-if [[ "${P7_FAIL_CLOSED_RC}" != "0" ]]; then
+P7_FAIL_CLOSED_NOOP=0
+P7_FAIL_CLOSED_ORDERED=0
+P7_FAIL_CLOSED_ORDERING_RECEIPT=0
+grep -Fq 'P7_1_FAIL_CLOSED_NOOP mutable_refs_unchanged=18 queue_or_private_write=0 control_stat_write=0' \
+    "${P7_RESULT}/fail_closed.log" && P7_FAIL_CLOSED_NOOP=1
+grep -Fq 'P7_1_ORDERING_RECEIPT baseline_valid=1 predecessor_invalid_observed=1 control_rejected=0 mutable_refs_unchanged=18' \
+    "${P7_RESULT}/fail_closed.log" && P7_FAIL_CLOSED_ORDERING_RECEIPT=1
+grep -Fq 'P7_1_ORDERED_SUBMISSION token=' "${P7_RESULT}/fail_closed.log" && \
+    P7_FAIL_CLOSED_ORDERED=1
+if [[ "${P7_FAIL_CLOSED_RC}" != "0" || "${P7_FAIL_CLOSED_NOOP}" != "1" || \
+      "${P7_FAIL_CLOSED_ORDERED}" != "1" || \
+      "${P7_FAIL_CLOSED_ORDERING_RECEIPT}" != "1" ]]; then
+    printf 'P7_1_FAIL_CLOSED rc=%s noop=%s ordered_submission=%s ordering_receipt=%s\n' \
+        "${P7_FAIL_CLOSED_RC}" "${P7_FAIL_CLOSED_NOOP}" \
+        "${P7_FAIL_CLOSED_ORDERED}" "${P7_FAIL_CLOSED_ORDERING_RECEIPT}"
     fail "p7_1_fail_closed_guard_failed"
 fi
 
 # Default final test is a real local KVAF transaction: cold bind -> dynamic
 # device lease -> descriptor publish/PostOnly -> CQ terminal Finish -> release.
 # It must not report PASS if the concrete fixture cannot initialize.
+P7_1_TEST_EXIT_AFTER_RECEIPT=1 \
 timeout -k 15s "${P7_RUNTIME_TIMEOUT}" "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
     --fixture-module p7_1_real_direct_hccp_fixture \
     2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
 P7_REAL_RC=${PIPESTATUS[0]}
-if [[ "${P7_REAL_RC}" != "0" ]]; then
+P7_REAL_FINAL_RECEIPT=0
+grep -Fq 'P7_1_FINAL_RECEIPT mode=real_direct_hccp pass=1 terminal=stream_synchronized teardown=complete exit_strategy=os__exit' \
+    "${P7_RESULT}/real_direct_hccp.log" && P7_REAL_FINAL_RECEIPT=1
+if [[ "${P7_REAL_RC}" != "0" || "${P7_REAL_FINAL_RECEIPT}" != "1" ]]; then
+    printf 'P7_1_REAL_DIRECT_HCCP rc=%s final_receipt=%s\n' \
+        "${P7_REAL_RC}" "${P7_REAL_FINAL_RECEIPT}"
     fail "p7_1_real_direct_hccp_failed"
 fi
 
-grep -hE '^P7_1_(SOURCE|NPU|KVAF_BUILD|OPP|MANIFEST|BRIDGE|CONTROL|RECEIPTS|QUEUE|TRANSPORT|CANN_COMPILER|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|FINAL)' \
+grep -hE '^P7_1_(SOURCE|NPU|KVAF_BUILD|OPP|MANIFEST|BRIDGE|CONTROL|ORDERING_|RECEIPTS|QUEUE|TRANSPORT|CANN_COMPILER|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|FINAL|ORDERED_SUBMISSION|FAIL_CLOSED_NOOP|TERMINAL_LEASE)' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 80
 printf 'P7_1_FINAL status=0 physical_npu=%s logical_npu=0 result=%s real_direct_hccp=1\n' \
     "${P7_PHYSICAL_NPU_ID}" "${P7_RESULT}"

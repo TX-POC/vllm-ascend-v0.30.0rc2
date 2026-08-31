@@ -165,6 +165,8 @@ def main() -> None:
     )
     runtime_test_path = ops_root / "tests" / "test_score_receipt_speculative_executor.py"
     reuse_runner_path = ops_root / "tests" / "run_p7_1_test_only_artifact_reuse.sh"
+    full_runner_path = ops_root / "tests" / "run_p7_1_speculative_executor.sh"
+    diag_runner_path = ops_root / "tests" / "run_p7_1_fail_closed_dispatch_diag.sh"
     real_fixture_path = p7_root / "torch_extension" / "p7_1_real_direct_hccp_fixture.py"
     abi_path = p7_root / "P7_1_ABI.md"
     for path in (
@@ -177,6 +179,8 @@ def main() -> None:
         runtime_package_path,
         runtime_test_path,
         reuse_runner_path,
+        full_runner_path,
+        diag_runner_path,
         real_fixture_path,
         abi_path,
     ):
@@ -215,6 +219,8 @@ def main() -> None:
     bridge = bridge_path.read_text(encoding="utf-8")
     op_api_common = op_api_common_path.read_text(encoding="utf-8")
     reuse_runner = reuse_runner_path.read_text(encoding="utf-8")
+    full_runner = full_runner_path.read_text(encoding="utf-8")
+    diag_runner = diag_runner_path.read_text(encoding="utf-8")
     abi = abi_path.read_text(encoding="utf-8")
     for token in REQUIRED_KERNEL:
         _require(kernel, token, kernel_path)
@@ -223,14 +229,39 @@ def main() -> None:
     for ref_name in expected_ref_names:
         _require(kernel, f"GM_ADDR {ref_name}_ref", kernel_path)
         _require(kernel, f"(void){ref_name}_ref", kernel_path)
-    control_validation = kernel.find(
-        "IsKvafStreamingBatchGetControlValidForAicore(control_)"
+    # The CANN entry macro itself materializes tiling from GM.  A malformed
+    # fused_get_control must therefore be rejected in the global entry *before*
+    # GET_TILING_DATA, not merely at the beginning of Kernel::Init after the
+    # tiling load has already happened.  Init repeats the check defensively,
+    # but it is not the primary no-side-effect boundary.
+    entry_control_gate = kernel.find("auto* entryControl")
+    entry_control_value = kernel.find("entryControlValue", entry_control_gate)
+    entry_get_tiling = kernel.find("GET_TILING_DATA(tilingData, tiling)")
+    init_control_gate = kernel.find("auto* initControl")
+    init_control_validation = kernel.find(
+        "IsKvafStreamingBatchGetControlValidForAicore(\n                control_)"
     )
+    first_tiling_access = kernel.find("worker_ >= tiling_->workerCount")
+    first_epoch_access = kernel.find("ReadGmByPassDCache<int64_t>(streamingEpoch_)")
+    first_domain_access = kernel.find("ReadGmByPassDCache<int32_t>(kvObjectAddressDomain_)")
+    first_barrier = kernel.find("DataSyncBarrier<MemDsbT::DDR>()")
+    first_stat_access = kernel.find("AddStat(kStatControlRejected")
     first_ub_allocation = kernel.find("pipe_->InitBuffer(seedBuffers_[0]")
-    if control_validation < 0 or first_ub_allocation < 0 or \
-       first_ub_allocation <= control_validation:
+    if min(entry_control_gate, entry_control_value, entry_get_tiling,
+           init_control_gate, init_control_validation, first_tiling_access,
+           first_epoch_access, first_domain_access, first_barrier,
+           first_stat_access, first_ub_allocation) < 0 or not (
+               entry_control_gate < entry_control_value < entry_get_tiling
+               and init_control_gate < init_control_validation < first_tiling_access
+               and init_control_validation < first_epoch_access
+               and init_control_validation < first_domain_access
+               and init_control_validation < first_barrier
+               and init_control_validation < first_stat_access
+               and init_control_validation < first_ub_allocation):
         raise AssertionError(
-            "invalid KVAF control must be rejected before P7.1 initializes UB buffers"
+            "invalid control must be rejected in the global entry before tiling, "
+            "then revalidated before GM transaction state, DDR barrier, worker "
+            "statistics, or UB allocation"
         )
     for token in (
         "kInputCount",
@@ -252,7 +283,14 @@ def main() -> None:
         "P7_1_REF_ABI",
         "mutable_refs=18",
         "Tensor(r!) worker_stats",
-        "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(",
+        "EXEC_NPU_CMD_ORDERED(",
+        "ReserveEnqueued(",
+        "MarkHostHandoffAccepted(",
+        "P7_1_ORDERED_SUBMISSION",
+        "P7_1_ORDERED_HOST_GATE",
+        "GetTaskQueueEnable()",
+        "isSyncLaunchStream()",
+        "p7_submission_plan.bisect",
         "P7_1_BOUNDARY stage=run_npu_after_submit",
         "P7_1_BOUNDARY stage=run_npu_result_ready",
     ):
@@ -263,23 +301,30 @@ def main() -> None:
             "independent output descriptors"
         )
     for token in (
-        "#define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC",
+        "#define EXEC_NPU_CMD_ORDERED",
         "InitPtaCacheForWorkspace()",
         "UnInitPtaCacheForWorkspace(pta_cache_active)",
-        "workspace_size != 0",
-        "UseStreamResIfNeeded(acl_stream, true)",
         "MakeP7DirectLaunchLease",
-        "Commit(std::shared_ptr<P7DirectLaunchLeaseBase> lease,",
+        "ReserveEnqueued(std::shared_ptr<P7DirectLaunchLeaseBase> lease,",
+        "MarkHostHandoffAccepted",
+        "MarkHostFailedNoThrow(uint64_t token, aclrtStream stream) noexcept",
+        "OrderedLaunchFailureObserver",
+        "NotifyOrderedLaunchFailure",
+        "PrePublishAbortAction",
+        "ResolvePrePublishAbortNoThrow(",
+        "kCancelledEnqueued",
+        "kFailedBeforePublishQuarantined",
+        "kUnexpectedHandoffAccepted",
+        "PrePublishAbortActionName(",
         "ReleaseP7DirectLaunchLeasesAtForwardTerminal(",
         "TakeP7DirectLaunchTokenForCurrentThread",
         "ClearP7DirectLaunchTokenForCurrentThread",
         "PublishP7DirectLaunchTokenForCurrentThread",
         "stream_key",
-        "direct_async_workspace_call_begin",
-        "direct_async_launch_done",
-        "direct_async_descriptor_release_done",
-        "direct_async_tensor_keepalive_held",
-        "direct_async_submit_done",
+        "handoff_runopapi_by_value",
+        "UseStreamResIfNeeded(acl_stream, true)",
+        "UseStreamResIfNeeded(acl_stream, false)",
+        "torch_npu/csrc/core/npu/register/OptionsManager.h",
         "RTLD_NOW | RTLD_LOCAL",
         "GetAclTensorApiPair()",
         "P7_1_ACL_DSO",
@@ -292,70 +337,32 @@ def main() -> None:
     ):
         _require(op_api_common, token, op_api_common_path)
     _forbid(op_api_common, "aclDestroyAclOpExecutor(executor)", op_api_common_path)
-    direct_macro_offset = op_api_common.find(
-        "#define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC"
-    )
-    direct_macro = op_api_common[direct_macro_offset:]
-    if direct_macro_offset < 0:
-        raise AssertionError("missing P7 direct ACLNN macro")
-    for forbidden in (
-        "OpCommand::RunOpApi",
-        "ordered_acl_call",
-        "aclrtSynchronizeStream",
-        "UseStreamResIfNeeded(acl_stream, false)",
-    ):
-        _forbid(direct_macro, forbidden, op_api_common_path)
-    converted_offset = op_api_common.find(
-        "auto converted = ConvertTypes(", direct_macro_offset
-    )
-    ledger_offset = op_api_common.find(
-        "LogConvertedDescriptorSet(#aclnn_api, converted);", direct_macro_offset
-    )
-    workspace_boundary_offset = op_api_common.find(
-        '"direct_async_workspace_call_begin"', ledger_offset
-    )
-    workspace_offset = op_api_common.find(
-        "auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);", direct_macro_offset
-    )
-    if not (
-        direct_macro_offset >= 0 and converted_offset >= 0
-        and converted_offset < ledger_offset < workspace_boundary_offset < workspace_offset
-    ):
+    if "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC" in op_api_common or \
+       "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC" in bridge:
         raise AssertionError(
-            "P7 descriptor ledger/workspace boundary must run after ConvertTypes and before "
-            "GetWorkspaceSize"
+            "P7 must not retain or invoke a raw-current-stream ACLNN macro; "
+            "the only allowed host path is EXEC_NPU_CMD_ORDERED"
         )
-    direct_token_clear_offset = op_api_common.find(
-        "ClearP7DirectLaunchTokenForCurrentThread();", direct_macro_offset
-    )
-    direct_resolve_offset = op_api_common.find(
-        "ResolveSymbol(#aclnn_api \"GetWorkspaceSize\")", direct_macro_offset
-    )
-    direct_launch_offset = op_api_common.find(
-        "const int launch_status =", direct_macro_offset
-    )
-    direct_commit_offset = op_api_common.find(
-        "Commit(", direct_macro_offset
-    )
-    direct_publish_offset = op_api_common.find(
-        "PublishP7DirectLaunchTokenForCurrentThread(direct_async_token);",
-        direct_macro_offset,
-    )
-    direct_descriptor_release_offset = op_api_common.find(
-        '"direct_async_descriptor_release_done"', direct_macro_offset
-    )
-    direct_tls_cleanup_offset = op_api_common.find(
-        "direct_async_tls_cleanup();", direct_descriptor_release_offset
-    )
-    if not (
-        direct_macro_offset < direct_token_clear_offset < direct_resolve_offset
-        < direct_launch_offset < direct_commit_offset < direct_publish_offset
-        < direct_descriptor_release_offset < direct_tls_cleanup_offset
+    if "pending.token <= token" in op_api_common:
+        raise AssertionError(
+            "P7 terminal release must reclaim the exact token only; a later "
+            "forward must never release an earlier queued callback's inputs"
+        )
+    abort_pos = bridge.find("ResolvePrePublishAbortNoThrow(")
+    abort_log_pos = bridge.find("P7_1_DISPATCH_ABORT", abort_pos)
+    publish_pos = bridge.find("PublishP7DirectLaunchTokenForCurrentThread(")
+    ordered_submit_pos = bridge.find("EXEC_NPU_CMD_ORDERED(")
+    host_gate_pos = bridge.find("P7_1_ORDERED_HOST_GATE")
+    reserve_pos = bridge.find("ReserveEnqueued(")
+    if min(abort_pos, abort_log_pos, publish_pos, ordered_submit_pos,
+           host_gate_pos, reserve_pos) < 0 or not (
+        host_gate_pos < reserve_pos < ordered_submit_pos < abort_pos
+        < abort_log_pos < publish_pos
     ):
         raise AssertionError(
-            "P7 direct launch must clear stale tokens before resolver work, keep "
-            "the successful launch's Tensor handles in the terminal registry, then "
-            "destroy aclTensor descriptors before HugeMem/PTA TLS cleanup"
+            "P7 must reject inline host execution before lease reservation, "
+            "then resolve a synchronous pre-publish dispatch abort after "
+            "ordered submission and before the terminal token is published"
         )
     runtime_package = runtime_package_path.read_text(encoding="utf-8")
     for token in (
@@ -377,38 +384,95 @@ def main() -> None:
         "P7_1_PROCESS_EXIT stage=python_atexit",
         "os._exit(0)",
         "after every P7 assertion, terminal release, and real",
+        "_install_valid_zero_candidate_control",
+        "_enqueue_invalid_control_predecessor",
+        "P7_1_ORDERING_SENTINEL",
+        "P7_1_ORDERING_RECEIPT",
+        "predecessor=control_zero_queued",
+        "required_consumer_observation=invalid_control",
     ):
         _require(runtime_test, token, runtime_test_path)
+    snapshot_pos = runtime_test.find("snapshots = _snapshot_mutable_refs(inputs)")
+    install_pos = runtime_test.find("_install_valid_zero_candidate_control(inputs)")
+    enqueue_pos = runtime_test.find("_enqueue_invalid_control_predecessor(inputs)")
+    dispatch_pos = runtime_test.find(
+        "torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor"
+    )
+    if min(snapshot_pos, install_pos, enqueue_pos, dispatch_pos) < 0 or not (
+        snapshot_pos < install_pos < enqueue_pos < dispatch_pos
+    ):
+        raise AssertionError(
+            "fail-closed runtime test must establish valid zero-work control, "
+            "queue control.zero_ without synchronizing, then submit P7"
+        )
     for token in (
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31'",
         "DESCRIPTOR_LEDGER",
-        "direct_async_workspace_call_begin",
-        "direct_async_descriptor_release_done",
-        "direct_async_tensor_keepalive_held",
-        "run_direct_async_fail_closed_case()",
-        "run_direct_async_teardown_probe()",
+        "stage=workspace_call_begin",
+        "stage=descriptor_release_done",
+        "P7_1_ORDERED_SUBMISSION token=",
+        "run_ordered_async_fail_closed_case()",
+        "run_ordered_async_teardown_probe()",
         "run_real_direct_hccp_case()",
         "P7_1_TEST_EXIT_AFTER_RECEIPT=1",
-        "P7_DIRECT_ASYNC_FAIL_CLOSED",
-        "P7_DIRECT_ASYNC_TEARDOWN_PROBE",
+        "P7_ORDERED_ASYNC_FAIL_CLOSED",
+        "P7_ORDERED_ASYNC_TEARDOWN_PROBE",
         "P7_REAL_DIRECT_HCCP",
         "P7_1_TERMINAL_LEASE",
+        "P7_1_FAIL_CLOSED_NOOP",
+        "P7_1_ORDERING_RECEIPT",
         "P7_1_BOUNDARY stage=torch_op_return",
         "P7_1_BOUNDARY stage=stream_terminal_done",
         "P7_1_FINAL_RECEIPT",
         "P7_1_TEST_PROCESS_EXIT_DIAG=1",
         "P7_REAL_FLOW_FINAL",
-        "execution=direct_current_stream_then_real_hccp",
+        "execution=framework_ordered_submit_then_device_post_cq",
         "real_direct_hccp.log",
+        "NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
+        "NANOVLLM_A5_OPAPI_DEBUG=1",
+        "P7_ARTIFACT_RUNTIME_EXACT",
+        "artifact_exact=%s",
+        "P7_1_ORDERING_RECEIPT",
+        "fail_closed_ordered_async.log",
+        "emit_failure_excerpt()",
     ):
         _require(reuse_runner, token, reuse_runner_path)
+    _forbid(reuse_runner, "fail_closed_direct_async.log", reuse_runner_path)
+    for token in (
+        "P7_1_TEST_EXIT_AFTER_RECEIPT=1",
+        "P7_1_ORDERING_RECEIPT",
+        "P7_FAIL_CLOSED_ORDERING_RECEIPT",
+        "NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
+        "NANOVLLM_A5_OPAPI_DEBUG=1",
+        "emit_failure_excerpt()",
+    ):
+        _require(full_runner, token, full_runner_path)
+    # Every runner that accepts a pre-built OPP has the same exact-provenance
+    # rule.  Otherwise a diagnostic invocation can silently restore the old
+    # "ancestor OPP + newer bridge" mixed-ABI path that the reuse runner now
+    # rejects.
+    for token in (
+        "P7_ARTIFACT_RUNTIME_EXACT",
+        '"${P7_ARTIFACT_VLLM_SHA}" == "${P7_RUNTIME_VLLM_SHA}"',
+        "P7_KVAF_BUILD_HEAD_MATCH",
+        ".p7_kvaf_source_head",
+        "artifact_exact=%s",
+        "unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE",
+        'contract["mutable_ref_outputs"]',
+    ):
+        _require(diag_runner, token, diag_runner_path)
+    if '"${P7_ARTIFACT_ANCESTOR}" == "1"' in diag_runner:
+        raise AssertionError(
+            "P7 diagnostic runner must never admit an ancestor OPP; it must "
+            "require an exact runtime source match"
+        )
     for token in (
         "31tensor_18refout",
         "torch_schema=31in_18aliasout",
         "AIV-only",
         "MAPPED_OBJECT",
         "FREE -> FILLING -> POSTED -> CQ_TERMINAL",
-        "直接 ACLNN 入流",
+        "framework-ordered ACLNN 入流",
         "forward stream terminal",
     ):
         _require(abi, token, abi_path)
@@ -443,8 +507,8 @@ def main() -> None:
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
-        "direct_current_stream_enqueue=1 pta_cache_lifecycle=1 "
-        "host_task_queue=0 zero_workspace_gate=1 "
+        "fail_closed_control_only=1 pta_cache_lifecycle=1 "
+        "host_task_queue=ordered workspace_lifetime=framework_owned "
         "loader_scope_local=1 descriptor_pairing=1 descriptor_ledger=1",
         flush=True,
     )

@@ -319,6 +319,23 @@ public:
         GM_ADDR private_ready_epoch, GM_ADDR private_ready_generation,
         GM_ADDR worker_stats, GM_ADDR rows_per_entry)
     {
+        // Fail-closed diagnostic boundary: an intentionally invalid control
+        // is permitted to read *only its own 16-word control record*. Before
+        // this return it must not inspect tiling, epoch/address-domain,
+        // worker statistics, any mutable Ref, DDR visibility state, UB, SIMT,
+        // or Direct-HCCP. This makes the malformed-control fixture a genuine
+        // host-order/ABI gate instead of a hidden transaction attempt.
+        auto* initControl = reinterpret_cast<
+            __gm__ const kvaf_fused_get::KvafStreamingBatchGetControl*>(
+            fused_get_control);
+        if (initControl == nullptr ||
+            !kvaf_fused_get::LoadKvafStreamingBatchGetControlFromGmForAicore(
+                initControl, &control_) ||
+            !kvaf_fused_get::IsKvafStreamingBatchGetControlValidForAicore(
+                control_)) {
+            return;
+        }
+
         // The entry point declares KERNEL_TYPE_AIV_ONLY.  Keep this code free
         // of ASCEND_IS_AIV conditionals: that macro expands to a constexpr
         // statement (not a boolean expression), so negating it is invalid in
@@ -390,10 +407,7 @@ public:
             AddStat(kStatControlRejected, 1U);
             return;
         }
-        if (!kvaf_fused_get::LoadKvafStreamingBatchGetControlFromGmForAicore(
-                controlGm_, &control_) ||
-            !kvaf_fused_get::IsKvafStreamingBatchGetControlValidForAicore(control_) ||
-            control_.queue_count != tiling_->queueCount ||
+        if (control_.queue_count != tiling_->queueCount ||
             control_.queue_leases != reinterpret_cast<uint64_t>(queueLeases_) ||
             control_.output != reinterpret_cast<uint64_t>(privatePackedOutput_) ||
             control_.output_rows != tiling_->privatePackedRows ||
@@ -1241,6 +1255,26 @@ extern "C" __global__ __aicore__ void a5_score_receipt_speculative_executor(
     // standalone executor from reserving otherwise-unused LI cube resources.
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(A5ScoreReceiptSpeculativeExecutorTilingData);
+
+    // The malformed-control path is an ABI/order diagnostic.  It must not
+    // even fetch tiling before it has established that the only GM record it
+    // is allowed to inspect is a valid streaming-Get control.  In particular,
+    // GET_TILING_DATA may dereference a host-provided GM address, so keeping
+    // this gate in Init() alone was too late for a true no-side-effect return.
+    // Init() re-loads and re-validates the record as a TOCTOU defense before
+    // it starts the normal transaction.
+    auto* entryControl = reinterpret_cast<
+        __gm__ const kvaf_fused_get::KvafStreamingBatchGetControl*>(
+        fused_get_control);
+    kvaf_fused_get::KvafStreamingBatchGetControl entryControlValue{};
+    if (entryControl == nullptr ||
+        !kvaf_fused_get::LoadKvafStreamingBatchGetControlFromGmForAicore(
+            entryControl, &entryControlValue) ||
+        !kvaf_fused_get::IsKvafStreamingBatchGetControlValidForAicore(
+            entryControlValue)) {
+        return;
+    }
+
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
     A5ScoreReceiptSpeculativeExecutorKernel op(&pipe, &tilingData);

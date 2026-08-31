@@ -15,6 +15,12 @@ set +e
 set +u
 set -o pipefail
 
+# A cleanup-bisect changes host descriptor/PTA lifetime and is not a valid
+# diagnostic of P7's normal ordered hand-off.  Start from the same clean
+# lifecycle as the full and artifact-reuse runners; an inherited shell option
+# must not choose a different execution contract.
+unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE
+
 finish() {
     local status="$1"
     local reason="$2"
@@ -70,11 +76,21 @@ P7_ARTIFACT_KVAF_SHA="$(sed -n 's/^kvaf_source_head=//p' "${P7_MANIFEST}" 2>/dev
 P7_RUNTIME_VLLM_SHA="$(git -C "${P7_VLLM_ROOT}" rev-parse HEAD 2>/dev/null || true)"
 P7_RUNTIME_KVAF_SHA="$(git -C "${P7_KVAF_SOURCE}" rev-parse HEAD 2>/dev/null || true)"
 
+# An OPP package and its bridge are one ABI/provenance unit.  Do not turn an
+# ancestor package into an apparent valid diagnostic merely because a later
+# source checkout can rebuild the bridge: that was precisely how an old raw
+# ACLNN path was mixed with a newer test harness.  Keep the ancestor bit only
+# as a diagnostic clue; exact source equality is the admission gate.
 P7_ARTIFACT_ANCESTOR=0
 if [[ "${P7_ARTIFACT_VLLM_SHA}" =~ ^[0-9a-f]{40}$ ]] && \
    git -C "${P7_VLLM_ROOT}" merge-base --is-ancestor \
        "${P7_ARTIFACT_VLLM_SHA}" "${P7_RUNTIME_VLLM_SHA}"; then
     P7_ARTIFACT_ANCESTOR=1
+fi
+P7_ARTIFACT_RUNTIME_EXACT=0
+if [[ "${P7_ARTIFACT_VLLM_SHA}" =~ ^[0-9a-f]{40}$ && \
+      "${P7_ARTIFACT_VLLM_SHA}" == "${P7_RUNTIME_VLLM_SHA}" ]]; then
+    P7_ARTIFACT_RUNTIME_EXACT=1
 fi
 
 P7_KVAF_SOURCE_REAL="$(cd "${P7_KVAF_SOURCE}" && pwd -P)"
@@ -94,20 +110,32 @@ if [[ -z "${P7_KVAF_BUILD}" ]]; then
     done
 fi
 
+# The selected kernel/python build also has to belong to the exact KVAF
+# checkout.  A compatible-looking object file is not sufficient when the
+# P7 descriptor/CQ ABI evolves.
+P7_KVAF_BUILD_HEAD="$(sed -n '1p' "${P7_KVAF_BUILD}/.p7_kvaf_source_head" 2>/dev/null || true)"
+P7_KVAF_BUILD_HEAD_MATCH=0
+if [[ "${P7_KVAF_BUILD_HEAD}" == "${P7_RUNTIME_KVAF_SHA}" ]]; then
+    P7_KVAF_BUILD_HEAD_MATCH=1
+fi
+
 P7_READY=0
 if [[ "${P7_MANIFEST_COUNT}" == "1" && -f "${P7_MANIFEST}" && \
-      -s "${P7_OPAPI}" && "${P7_ARTIFACT_ANCESTOR}" == "1" && \
+      -s "${P7_OPAPI}" && "${P7_ARTIFACT_RUNTIME_EXACT}" == "1" && \
       "${P7_ARTIFACT_KVAF_SHA}" == "${P7_RUNTIME_KVAF_SHA}" && \
+      "${P7_KVAF_BUILD_HEAD_MATCH}" == "1" && \
       -s "${P7_KVAF_BUILD}/bin/kvaf_execute_batch_get_kernels.o" && \
       -s "${P7_KVAF_BUILD}/bin/kvaf_execute_batch_put_kernels.o" && \
       -d "${P7_KVAF_BUILD}/python" && \
       -f "${P7_REUSE_OPP_ROOT}/vendors/customize/bin/set_env.bash" ]]; then
     P7_READY=1
 fi
-printf 'P7_DIAG_GATE ready=%s runtime_vllm=%s artifact_vllm=%s artifact_ancestor=%s runtime_kvaf=%s artifact_kvaf=%s kvaf_build=%s\n' \
+printf 'P7_DIAG_GATE ready=%s runtime_vllm=%s artifact_vllm=%s artifact_exact=%s artifact_ancestor=%s runtime_kvaf=%s artifact_kvaf=%s kvaf_build=%s kvaf_build_head=%s kvaf_build_head_match=%s\n' \
     "${P7_READY}" "${P7_RUNTIME_VLLM_SHA}" "${P7_ARTIFACT_VLLM_SHA:-missing}" \
-    "${P7_ARTIFACT_ANCESTOR}" "${P7_RUNTIME_KVAF_SHA}" \
-    "${P7_ARTIFACT_KVAF_SHA:-missing}" "${P7_KVAF_BUILD:-missing}"
+    "${P7_ARTIFACT_RUNTIME_EXACT}" "${P7_ARTIFACT_ANCESTOR}" \
+    "${P7_RUNTIME_KVAF_SHA}" "${P7_ARTIFACT_KVAF_SHA:-missing}" \
+    "${P7_KVAF_BUILD:-missing}" "${P7_KVAF_BUILD_HEAD:-missing}" \
+    "${P7_KVAF_BUILD_HEAD_MATCH}"
 if [[ "${P7_READY}" != "1" ]]; then
     finish 1 "provenance_or_runtime_gate_failed"
     exit $?
@@ -129,6 +157,9 @@ source "${P7_REUSE_OPP_ROOT}/vendors/customize/bin/set_env.bash"
 unset ASCEND_VISIBLE_DEVICES
 export ASCEND_RT_VISIBLE_DEVICES="${P7_PHYSICAL_NPU_ID}"
 export NPU_ID=0 DEVICE_ID=0
+# Vendor setup is allowed to set package paths, but not to resurrect a
+# test-only lifecycle bisect from the invoking shell.
+unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE
 export NANOVLLM_A5_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_OPP="${P7_REUSE_OPP_ROOT}"
 export P7_EXPECTED_VLLM_SHA="${P7_ARTIFACT_VLLM_SHA}"
 export P7_EXPECTED_KVAF_SHA="${P7_ARTIFACT_KVAF_SHA}"
@@ -190,7 +221,7 @@ import nanovllm_score_receipt_speculative_executor as package
 mark("bridge_imported", module=package.__name__, opapi=os.environ.get("NANOVLLM_CUST_OPAPI_LIB"))
 import nanovllm_score_receipt_speculative_executor._C as bridge
 contract = bridge.p7_1_abi_contract()
-mark("bridge_contract", abi=contract["abi"], aliases=contract["physical_alias_outputs"])
+mark("bridge_contract", abi=contract["abi"], aliases=contract["mutable_ref_outputs"])
 op = torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor
 mark("torch_registration_ready", op=str(op).split(".")[-1])
 torch.npu.synchronize()

@@ -90,19 +90,19 @@ from . import _C  # noqa: E402,F401
 
 @dataclass(frozen=True)
 class ForwardTerminalLease:
-    """Tensor keepalive ownership for one direct P7 launch.
+    """Tensor keepalive ownership for one ordered P7 submission.
 
     The token is created by the C++ bridge together with the exact NPU stream
-    that received the ACLNN launch.  It is captured synchronously on the
-    dispatch thread, then may be released from any graph/runtime thread once
-    that *same forward's* QSFA/stream terminal has completed.
+    that will receive the ordered ACLNN launch. It is captured synchronously
+    on the dispatch thread, then may be released from any graph/runtime thread
+    once that *same forward's* QSFA/stream terminal has completed.
     """
 
     token: int
 
 
 def capture_forward_terminal_lease() -> ForwardTerminalLease:
-    """Move the latest direct-launch token into forward RuntimeResources.
+    """Move the latest ordered-submission token into RuntimeResources.
 
     Call this immediately after the P7 torch op returns, before scheduling a
     later forward on the same runtime worker.  This does not synchronize the
@@ -111,7 +111,7 @@ def capture_forward_terminal_lease() -> ForwardTerminalLease:
 
     token = int(_C.p7_1_take_launch_token())
     if token <= 0:
-        raise RuntimeError(f"P7.1 returned invalid direct-launch token {token}")
+        raise RuntimeError(f"P7.1 returned invalid ordered-submission token {token}")
     return ForwardTerminalLease(token=token)
 
 

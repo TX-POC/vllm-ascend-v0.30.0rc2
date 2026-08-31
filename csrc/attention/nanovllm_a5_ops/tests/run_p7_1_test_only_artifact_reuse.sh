@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Re-run P7.1 Python tests without recompiling an OPP only when the compiled
-# OPP closure is unchanged. The small torch bridge is deliberately rebuilt:
-# it owns ACLNN descriptor/workspace lifetime and is not part of the OPP
-# kernel/op-host artifact. This is intentionally for bridge/test retries,
-# not for kernel/host/KVAF development.
+# OPP manifest names the exact runtime/KVAF revisions. The small torch bridge
+# is deliberately rebuilt because it owns ACLNN descriptor/workspace lifetime.
+# This is intentionally for bridge/test retries, not kernel/host/KVAF changes.
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     printf 'P7_REUSE_FINAL status=2 reason=runner_must_be_executed_with_bash_not_sourced\n' >&2
@@ -14,8 +13,17 @@ set +e
 set +u
 set -o pipefail
 
+emit_failure_excerpt() {
+    local result_dir="${P7_RESULT:-}"
+    [[ -d "${result_dir}" ]] || return 0
+    printf 'P7_REUSE_FAILURE_EXCERPT result=%s\n' "${result_dir}"
+    grep -hE '^(P7_1_(SOURCE|NPU|CONTROL|ORDERING_|BOUNDARY|FAILURE|TEST_FAIL|FINAL_RECEIPT|TERMINAL_LEASE|FAIL_CLOSED_NOOP)|P7_(ORDERED|REAL|REUSE)|NANOVLLM_A5_OPAPI_LIFECYCLE)' \
+        "${result_dir}"/*.log 2>/dev/null | tail -n 96
+}
+
 fail() {
     printf 'P7_REUSE_FINAL status=1 reason=%s result=%s\n' "$1" "${P7_RESULT:-missing}"
+    emit_failure_excerpt
     exit 1
 }
 
@@ -39,10 +47,10 @@ P7_CONTRACT_TEST="${OPS_ROOT}/tests/test_score_receipt_speculative_executor_cont
 P7_BRIDGE_ROOT="${OPS_ROOT}/a5_score_receipt_speculative_executor/torch_extension"
 P7_OPS_REL="${OPS_ROOT#"${P7_VLLM_ROOT}"/}"
 
-# The product gate is one fresh-process direct-current-stream fail-closed
-# launch, followed by the real Direct-HCCP fixture. The old cleanup-bisect
-# variables are explicitly removed so a stale shell cannot re-enable a
-# torch_npu task-queue path that P7.1 no longer uses.
+# The product gate is one fresh-process framework-ordered fail-closed launch,
+# followed by the real Direct-HCCP fixture. The old cleanup-bisect variables
+# are explicitly removed: P7.1 must use the normal torch_npu producer/consumer
+# hand-off, never its test-only raw direct-stream bisect route.
 unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE
 
 if [[ -e "${P7_RESULT}" ]]; then
@@ -69,10 +77,10 @@ P7_KVAF_HEAD="$(git -C "${P7_KVAF_SOURCE}" rev-parse HEAD 2>/dev/null || true)"
 P7_VLLM_DIRTY="$(git -C "${P7_VLLM_ROOT}" status --porcelain --untracked-files=no)"
 P7_KVAF_DIRTY="$(git -C "${P7_KVAF_SOURCE}" status --porcelain --untracked-files=no)"
 
-# An artifact may legitimately come from an older ancestor when only the
-# bridge changes, but the *checkout that builds that bridge* must be exactly
-# the revision requested by the caller. This prevents a fetch race from being
-# silently diagnosed as an OPP/bridge mismatch.
+# The bridge and OPP are one provenance unit.  Even a source ancestor with an
+# unchanged-looking kernel is not reusable here: it may contain the former raw
+# direct submission path or a different generated ACLNN closure.  Refuse it
+# rather than creating another stale-artifact/bridge combination.
 P7_RUNTIME_SHA_MATCH=1
 P7_KVAF_SHA_MATCH=1
 if [[ -n "${P7_REQUIRED_RUNTIME_SHA}" && \
@@ -114,12 +122,15 @@ if [[ "${P7_ARTIFACT_COMMIT_VALID}" == "1" ]] && \
    git -C "${P7_VLLM_ROOT}" merge-base --is-ancestor "${P7_ARTIFACT_VLLM_SHA}" "${P7_VLLM_HEAD}"; then
     P7_ARTIFACT_ANCESTOR=1
 fi
+P7_ARTIFACT_RUNTIME_EXACT=0
+if [[ "${P7_ARTIFACT_COMMIT_VALID}" == "1" && \
+      "${P7_ARTIFACT_VLLM_SHA}" == "${P7_VLLM_HEAD}" ]]; then
+    P7_ARTIFACT_RUNTIME_EXACT=1
+fi
 
-# This reuse gate intentionally names the *compiled* OPP closure instead of
-# the whole P7 directory.  The bridge and its Python fixture are host-only and
-# rebuilt below; treating them as OPP sources caused needless rebuilds and, in
-# practice, stale-artifact/checkout confusion.  Any change to schema, OpDef,
-# device kernel, tiling header, or staging script still blocks reuse.
+# The closure diff remains a diagnostic receipt, but exact manifest provenance
+# above is the non-negotiable execution gate.  It prevents a host-only bridge
+# rebuild from pairing with a stale OPP whose generated ACLNN ABI predates it.
 P7_CLOSURE_UNCHANGED=0
 if git -C "${P7_VLLM_ROOT}" diff --quiet "${P7_ARTIFACT_VLLM_SHA}" "${P7_VLLM_HEAD}" -- \
     "${P7_OPS_REL}/a5_score_receipt_speculative_executor/ops.json" \
@@ -178,7 +189,7 @@ fi
 
 P7_REUSE_READY=0
 if [[ "${P7_MANIFEST_VALID}" == "1" && "${P7_ARTIFACT_COMMIT_VALID}" == "1" && \
-      "${P7_ARTIFACT_ANCESTOR}" == "1" && \
+      "${P7_ARTIFACT_RUNTIME_EXACT}" == "1" && \
       "${P7_ARTIFACT_KVAF_SHA}" == "${P7_KVAF_HEAD}" && \
       -z "${P7_VLLM_DIRTY}" && -z "${P7_KVAF_DIRTY}" && \
       "${P7_RUNTIME_SHA_MATCH}" == "1" && \
@@ -191,25 +202,24 @@ if [[ "${P7_MANIFEST_VALID}" == "1" && "${P7_ARTIFACT_COMMIT_VALID}" == "1" && \
     P7_REUSE_READY=1
 fi
 
-printf 'P7_REUSE_GATE ready=%s runtime_vllm=%s required_runtime=%s runtime_match=%s artifact_vllm=%s artifact_ancestor=%s runtime_kvaf=%s required_kvaf=%s kvaf_match=%s artifact_kvaf=%s manifest_valid=%s closure_unchanged=%s kvaf_build_valid=%s kvaf_build_head=%s kvaf_build_head_match=%s unexpected_paths=<%s>\n' \
+printf 'P7_REUSE_GATE ready=%s runtime_vllm=%s required_runtime=%s runtime_match=%s artifact_vllm=%s artifact_exact=%s artifact_ancestor=%s runtime_kvaf=%s required_kvaf=%s kvaf_match=%s artifact_kvaf=%s manifest_valid=%s closure_unchanged=%s kvaf_build_valid=%s kvaf_build_head=%s kvaf_build_head_match=%s unexpected_paths=<%s>\n' \
     "${P7_REUSE_READY}" "${P7_VLLM_HEAD}" "${P7_REQUIRED_RUNTIME_SHA:-none}" \
     "${P7_RUNTIME_SHA_MATCH}" \
-    "${P7_ARTIFACT_VLLM_SHA:-missing}" "${P7_ARTIFACT_ANCESTOR}" \
+    "${P7_ARTIFACT_VLLM_SHA:-missing}" "${P7_ARTIFACT_RUNTIME_EXACT}" "${P7_ARTIFACT_ANCESTOR}" \
     "${P7_KVAF_HEAD}" "${P7_REQUIRED_KVAF_SHA:-none}" "${P7_KVAF_SHA_MATCH}" \
     "${P7_ARTIFACT_KVAF_SHA:-missing}" \
     "${P7_MANIFEST_VALID}" "${P7_CLOSURE_UNCHANGED}" "${P7_KVAF_BUILD_VALID}" \
     "${P7_KVAF_BUILD_HEAD:-missing}" "${P7_KVAF_BUILD_HEAD_MATCH}" \
     "${P7_UNEXPECTED_PATHS:-none}"
 if [[ "${P7_REUSE_READY}" != "1" ]]; then
-    fail "closure_or_provenance_gate_failed"
+    fail "exact_opp_provenance_gate_failed"
 fi
 
-printf 'P7_REUSE_BRIDGE_PROVENANCE bridge_source=%s opp_source=%s bridge_only_rebuild=1 opp_closure_unchanged=%s\n' \
-    "${P7_VLLM_HEAD}" "${P7_ARTIFACT_VLLM_SHA}" "${P7_CLOSURE_UNCHANGED}"
+printf 'P7_REUSE_BRIDGE_PROVENANCE bridge_source=%s opp_source=%s exact_opp_source=1 bridge_rebuild=1\n' \
+    "${P7_VLLM_HEAD}" "${P7_ARTIFACT_VLLM_SHA}"
 
-# The artifact source SHA is intentionally exported here: the package checks
-# the binary that is actually loaded. The gate above proves the compiled OPP
-# closure is unchanged; the bridge itself is rebuilt from P7_VLLM_HEAD.
+# The package verifies the exact binary it loads.  The gate above already
+# proved that its OPP and the bridge checkout have one shared source revision.
 unset SOC_VERSION ASCEND_VISIBLE_DEVICES
 export A5_SOC_VERSION=ascend950
 export ASCEND_HOME_PATH
@@ -224,6 +234,7 @@ source "${P7_REUSE_OPP_ROOT}/vendors/customize/bin/set_env.bash"
 unset ASCEND_VISIBLE_DEVICES
 export ASCEND_RT_VISIBLE_DEVICES="${P7_PHYSICAL_NPU_ID}"
 export NPU_ID=0 DEVICE_ID=0
+unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT NANOVLLM_A5_OPAPI_CLEANUP_MODE
 unset P7_EXPECTED_VLLM_SHA P7_EXPECTED_KVAF_SHA
 export NANOVLLM_A5_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_OPP="${P7_REUSE_OPP_ROOT}"
 export P7_EXPECTED_VLLM_SHA="${P7_ARTIFACT_VLLM_SHA}"
@@ -232,7 +243,7 @@ export P7_KVAF_BATCH_GET_KERNEL="${P7_KVAF_BUILD}/bin/kvaf_execute_batch_get_ker
 export P7_KVAF_BATCH_PUT_KERNEL="${P7_KVAF_BUILD}/bin/kvaf_execute_batch_put_kernels.o"
 export PYTHONPATH="${P7_BRIDGE_ROOT}:${P7_KVAF_BUILD}/python${PYTHONPATH:+:${PYTHONPATH}}"
 # This is intentionally on for the scoped P7.1 retry. The marker proves that
-# the bridge directly enqueued on the caller's current NPU stream.
+# the bridge handed an executor closure to torch_npu's ordered task queue.
 export NANOVLLM_A5_OPAPI_DEBUG=1
 
 "${P7_PYTHON}" -c 'import os, torch, torch_npu; torch.npu.set_device(0); print("P7_REUSE_NPU physical=%s logical=0 device=%s" % (os.environ.get("ASCEND_RT_VISIBLE_DEVICES"), torch.npu.get_device_name(0)))' \
@@ -265,8 +276,8 @@ if [[ "${P7_CONTRACT_RC}" == "0" ]]; then
 else
     P7_PREFLIGHT_RC=98
 fi
-run_direct_async_fail_closed_case() {
-    local case_log="${P7_RESULT}/fail_closed_direct_async.log"
+run_ordered_async_fail_closed_case() {
+    local case_log="${P7_RESULT}/fail_closed_ordered_async.log"
     local case_rc=0
     local descriptor_ledger=0
     local workspace=0
@@ -283,36 +294,40 @@ run_direct_async_fail_closed_case() {
     local test_pass=0
     local teardown=0
     local final_receipt=0
+    local noop=0
+    local ordering_receipt=0
 
-    # The invalid control rejects in the device kernel before lease/PostOnly/CQ.
-    # It still proves the product host path is direct-current-stream and does
-    # not introduce the old torch_npu task-queue ownership boundary.  This
-    # disposable child exits only after every stream-terminal assertion and
-    # receipt has been flushed; a separate child below probes Python/ELF exit.
+    # The fixture first establishes a valid zero-work control, then queues
+    # control.zero_ without synchronizing.  P7 must consume that exact queued
+    # invalidation through torch_npu's ordered hand-off; it returns before
+    # queue/PostOnly/CQ only if the consumer observes the predecessor.
     P7_1_TEST_EXIT_AFTER_RECEIPT=1 \
         timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         2>&1 | tee "${case_log}"
     case_rc=${PIPESTATUS[0]}
 
     grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31' "${case_log}" && descriptor_ledger=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_workspace_call_begin' "${case_log}" && workspace=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_launch_done' "${case_log}" && launch=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_descriptor_release_done' "${case_log}" && descriptor_release=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_tensor_keepalive_held' "${case_log}" && tensor_keepalive=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_pta_cache_ready' "${case_log}" && pta_ready=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_pta_cache_uninit' "${case_log}" && pta_uninit=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_submit_done' "${case_log}" && submit=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=workspace_call_begin' "${case_log}" && workspace=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=launch_done' "${case_log}" && launch=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=descriptor_release_done' "${case_log}" && descriptor_release=1
+    grep -Fq 'P7_1_ORDERED_SUBMISSION token=' "${case_log}" && tensor_keepalive=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_ready' "${case_log}" && pta_ready=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_uninit' "${case_log}" && pta_uninit=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=submit_done' "${case_log}" && submit=1
     grep -Fq 'handoff_runopapi_by_value' "${case_log}" && task_queue_handoff=1
+    grep -Fq 'P7_1_FAIL_CLOSED_NOOP mutable_refs_unchanged=18 queue_or_private_write=0 control_stat_write=0 ordered_control_predecessor=1' "${case_log}" && noop=1
+    grep -Fq 'P7_1_ORDERING_RECEIPT baseline_valid=1 predecessor_invalid_observed=1 control_rejected=0 mutable_refs_unchanged=18' "${case_log}" && ordering_receipt=1
     grep -Fq 'P7_1_TERMINAL_LEASE released=1 pending=0 terminal=stream_synchronized' "${case_log}" && terminal_lease=1
     grep -Fq 'P7_1_BOUNDARY stage=torch_op_return' "${case_log}" && torch_return=1
     grep -Fq 'P7_1_BOUNDARY stage=stream_terminal_done' "${case_log}" && stream_terminal=1
     grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
     grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
     grep -Fq 'P7_1_FINAL_RECEIPT mode=fail_closed pass=1 terminal=stream_synchronized teardown=complete exit_strategy=os__exit' "${case_log}" && final_receipt=1
-    printf 'P7_DIRECT_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_release=%s tensor_keepalive=%s torch_return=%s stream_terminal=%s terminal_lease=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s final_receipt=%s real_hccp=scheduled_after_pass log=%s\n' \
+    printf 'P7_ORDERED_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_release=%s terminal_lease_published=%s torch_return=%s stream_terminal=%s terminal_lease=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s noop=%s ordering_receipt=%s real_hccp=scheduled_after_pass log=%s\n' \
         "${case_rc}" "${descriptor_ledger}" "${workspace}" "${launch}" \
         "${descriptor_release}" "${tensor_keepalive}" "${torch_return}" "${stream_terminal}" "${terminal_lease}" "${pta_ready}" "${pta_uninit}" "${submit}" \
-        "${task_queue_handoff}" "${test_pass}" "${teardown}" "${final_receipt}" "${case_log}"
+        "${task_queue_handoff}" "${test_pass}" "${teardown}" "${noop}" \
+        "${ordering_receipt}" "${case_log}"
     if [[ "${case_rc}" != "0" || "${descriptor_ledger}" != "1" || \
           "${workspace}" != "1" || "${launch}" != "1" || \
           "${descriptor_release}" != "1" || "${tensor_keepalive}" != "1" || \
@@ -320,20 +335,21 @@ run_direct_async_fail_closed_case() {
           "${terminal_lease}" != "1" || \
           "${pta_ready}" != "1" || \
           "${pta_uninit}" != "1" || "${submit}" != "1" || \
-          "${task_queue_handoff}" != "0" || "${test_pass}" != "1" || \
-          "${teardown}" != "1" || "${final_receipt}" != "1" ]]; then
+          "${task_queue_handoff}" != "1" || "${test_pass}" != "1" || \
+          "${teardown}" != "1" || "${final_receipt}" != "1" || \
+          "${noop}" != "1" || "${ordering_receipt}" != "1" ]]; then
         return 1
     fi
     return 0
 }
 
-# The direct child above validates functionality.  This normal-exit child is a
+# The receipt-complete child above validates functionality.  This normal-exit child is a
 # *diagnostic only*: it must not suppress a fresh-process real HCCP attempt
 # after a fully completed stream terminal.  Its compact receipts say whether a
 # remaining crash is before Python atexit, or after it in loader/runtime exit.
 P7_TEARDOWN_PROBE_CHILD_RC=98
 P7_TEARDOWN_PROBE_CLASS=not_run
-run_direct_async_teardown_probe() {
+run_ordered_async_teardown_probe() {
     local probe_log="${P7_RESULT}/fail_closed_process_teardown_probe.log"
     local probe_rc=0
     local test_pass=0
@@ -367,7 +383,7 @@ run_direct_async_teardown_probe() {
         P7_TEARDOWN_PROBE_CLASS=unclassified
     fi
 
-    printf 'P7_DIRECT_ASYNC_TEARDOWN_PROBE child_rc=%s test_pass=%s teardown=%s final_receipt=%s python_atexit=%s classification=%s gating=diagnostic_only log=%s\n' \
+    printf 'P7_ORDERED_ASYNC_TEARDOWN_PROBE child_rc=%s test_pass=%s teardown=%s final_receipt=%s python_atexit=%s classification=%s gating=diagnostic_only log=%s\n' \
         "${probe_rc}" "${test_pass}" "${teardown}" "${final_receipt}" \
         "${python_atexit}" "${P7_TEARDOWN_PROBE_CLASS}" "${probe_log}"
 
@@ -407,44 +423,44 @@ run_real_direct_hccp_case() {
     return 0
 }
 
-P7_DIRECT_CURRENT_STREAM=0
+P7_ORDERED_HOST_SUBMISSION=0
 P7_REAL_RC=98
-P7_DIRECT_ASYNC_RC=98
+P7_ORDERED_ASYNC_RC=98
 P7_FAIL_CLOSED_RC=98
 if [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
-    run_direct_async_fail_closed_case
-    P7_DIRECT_ASYNC_RC=$?
-    P7_FAIL_CLOSED_RC="${P7_DIRECT_ASYNC_RC}"
-    if [[ "${P7_DIRECT_ASYNC_RC}" == "0" ]]; then
-        P7_DIRECT_CURRENT_STREAM=1
+    run_ordered_async_fail_closed_case
+    P7_ORDERED_ASYNC_RC=$?
+    P7_FAIL_CLOSED_RC="${P7_ORDERED_ASYNC_RC}"
+    if [[ "${P7_ORDERED_ASYNC_RC}" == "0" ]]; then
+        P7_ORDERED_HOST_SUBMISSION=1
         run_real_direct_hccp_case
         P7_REAL_RC=$?
         if [[ "${P7_REAL_RC}" != "0" ]]; then
             P7_FAIL_CLOSED_RC=1
         fi
-        run_direct_async_teardown_probe
+        run_ordered_async_teardown_probe
         P7_TEARDOWN_PROBE_RC=$?
     else
-        printf 'P7_REAL_HCCP_SKIPPED reason=direct_async_fail_closed_gate_failed\n'
+        printf 'P7_REAL_HCCP_SKIPPED reason=ordered_async_fail_closed_gate_failed\n'
     fi
-    printf 'P7_REAL_FLOW_FINAL status=%s direct_async=%s real_hccp=%s teardown_probe=%s teardown_probe_child=%s teardown_class=%s execution=direct_current_stream_then_real_hccp\n' \
-        "${P7_FAIL_CLOSED_RC}" "${P7_DIRECT_ASYNC_RC}" "${P7_REAL_RC}" \
+    printf 'P7_REAL_FLOW_FINAL status=%s ordered_async=%s real_hccp=%s teardown_probe=%s teardown_probe_child=%s teardown_class=%s execution=framework_ordered_submit_then_device_post_cq\n' \
+        "${P7_FAIL_CLOSED_RC}" "${P7_ORDERED_ASYNC_RC}" "${P7_REAL_RC}" \
         "${P7_TEARDOWN_PROBE_RC:-98}" "${P7_TEARDOWN_PROBE_CHILD_RC}" \
         "${P7_TEARDOWN_PROBE_CLASS}"
 else
     printf 'P7_REAL_HCCP_SKIPPED reason=fixture_preflight_failed\n'
 fi
-printf 'P7_DIRECT_CURRENT_STREAM observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
-    "${P7_DIRECT_CURRENT_STREAM}"
+printf 'P7_ORDERED_HOST_SUBMISSION observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
+    "${P7_ORDERED_HOST_SUBMISSION}"
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|FINAL_RECEIPT|PROCESS_EXIT|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER|TERMINAL_LEASE|BOUNDARY)|P7_(DIRECT_ASYNC_FAIL_CLOSED|DIRECT_ASYNC_TEARDOWN_PROBE|DIRECT_CURRENT_STREAM|REAL_DIRECT_HCCP|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(direct_async_enqueue_ready|direct_async_pta_cache_ready|direct_async_pta_cache_unavailable|direct_async_pta_cache_uninit|direct_async_pta_cache_not_active|direct_async_workspace_call_begin|direct_async_workspace_ready|direct_async_launch_begin|direct_async_launch_done|direct_async_descriptor_release_done|direct_async_tensor_keepalive_held|direct_async_submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|FINAL_RECEIPT|PROCESS_EXIT|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER|TERMINAL_LEASE|BOUNDARY|ORDERED_SUBMISSION|FAIL_CLOSED_NOOP)|P7_(ORDERED_ASYNC_FAIL_CLOSED|ORDERED_ASYNC_TEARDOWN_PROBE|ORDERED_HOST_SUBMISSION|REAL_DIRECT_HCCP|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(enqueue_ready|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|workspace_call_begin|workspace_ready|launch_begin|launch_done|descriptor_release_done|submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
         "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
-    printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 direct_async=0 real=0 teardown_probe_child=%s teardown_class=%s result=%s\n' \
+    printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 ordered_async=0 real=0 teardown_probe_child=%s teardown_class=%s result=%s\n' \
         "${P7_TEARDOWN_PROBE_CHILD_RC}" "${P7_TEARDOWN_PROBE_CLASS}" "${P7_RESULT}"
 else
-    printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s direct_async=%s real=%s result=%s\n' \
+    printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s ordered_async=%s real=%s result=%s\n' \
         "${P7_CONTRACT_RC}" "${P7_PREFLIGHT_RC}" "${P7_FAIL_CLOSED_RC}" "${P7_REAL_RC}" "${P7_RESULT}"
     exit 1
 fi
