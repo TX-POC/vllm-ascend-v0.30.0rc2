@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Re-run P7.1 Python tests without recompiling an OPP only when the compiled
-# closure is unchanged.  This is intentionally for test-harness retries, not
-# for kernel/host/KVAF development.
+# OPP closure is unchanged. The small torch bridge is deliberately rebuilt:
+# it owns ACLNN descriptor/workspace lifetime and is not part of the OPP
+# kernel/op-host artifact. This is intentionally for bridge/test retries,
+# not for kernel/host/KVAF development.
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     printf 'P7_REUSE_FINAL status=2 reason=runner_must_be_executed_with_bash_not_sourced\n' >&2
@@ -24,6 +26,8 @@ P7_VLLM_ROOT="${P7_VLLM_ROOT:-${VLLM_ROOT_DEFAULT}}"
 P7_KVAF_SOURCE="${P7_KVAF_SOURCE:-${KVAF_FUSED_GET_SOURCE:-}}"
 P7_REUSE_OPP_ROOT="${P7_REUSE_OPP_ROOT:-}"
 P7_KVAF_BUILD="${P7_KVAF_BUILD:-}"
+P7_REQUIRED_RUNTIME_SHA="${P7_REQUIRED_RUNTIME_SHA:-}"
+P7_REQUIRED_KVAF_SHA="${P7_REQUIRED_KVAF_SHA:-}"
 P7_PHYSICAL_NPU_ID="${P7_PHYSICAL_NPU_ID:-7}"
 P7_PYTHON="${P7_PYTHON:-$(command -v python3 2>/dev/null)}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-${ASCEND_CANN_PACKAGE_PATH:-/usr/local/Ascend/cann-9.1.0}}"
@@ -58,6 +62,21 @@ P7_VLLM_HEAD="$(git -C "${P7_VLLM_ROOT}" rev-parse HEAD 2>/dev/null || true)"
 P7_KVAF_HEAD="$(git -C "${P7_KVAF_SOURCE}" rev-parse HEAD 2>/dev/null || true)"
 P7_VLLM_DIRTY="$(git -C "${P7_VLLM_ROOT}" status --porcelain --untracked-files=no)"
 P7_KVAF_DIRTY="$(git -C "${P7_KVAF_SOURCE}" status --porcelain --untracked-files=no)"
+
+# An artifact may legitimately come from an older ancestor when only the
+# bridge changes, but the *checkout that builds that bridge* must be exactly
+# the revision requested by the caller. This prevents a fetch race from being
+# silently diagnosed as an OPP/bridge mismatch.
+P7_RUNTIME_SHA_MATCH=1
+P7_KVAF_SHA_MATCH=1
+if [[ -n "${P7_REQUIRED_RUNTIME_SHA}" && \
+      "${P7_VLLM_HEAD}" != "${P7_REQUIRED_RUNTIME_SHA}" ]]; then
+    P7_RUNTIME_SHA_MATCH=0
+fi
+if [[ -n "${P7_REQUIRED_KVAF_SHA}" && \
+      "${P7_KVAF_HEAD}" != "${P7_REQUIRED_KVAF_SHA}" ]]; then
+    P7_KVAF_SHA_MATCH=0
+fi
 
 P7_MANIFEST_VALID=0
 P7_OPAPI="$(dirname "${P7_MANIFEST}")/op_api/lib/libcust_opapi.so"
@@ -105,7 +124,8 @@ while IFS= read -r changed_path; do
         "${P7_OPS_REL}/tests/run_p7_1_test_only_artifact_reuse.sh" | \
         "${P7_OPS_REL}/tests/run_p7_1_fail_closed_dispatch_diag.sh" | \
         "${P7_OPS_REL}/tests/test_score_receipt_speculative_executor.py" | \
-        "${P7_OPS_REL}/tests/test_score_receipt_speculative_executor_contract.py") ;;
+        "${P7_OPS_REL}/tests/test_score_receipt_speculative_executor_contract.py" | \
+        "${P7_OPS_REL}/torch_extension/csrc/op_api_common.h") ;;
         *) P7_UNEXPECTED_PATHS="${P7_UNEXPECTED_PATHS}${changed_path}," ;;
     esac
 done <<< "${P7_CHANGED_PATHS}"
@@ -139,6 +159,8 @@ if [[ "${P7_MANIFEST_VALID}" == "1" && "${P7_ARTIFACT_COMMIT_VALID}" == "1" && \
       "${P7_ARTIFACT_ANCESTOR}" == "1" && \
       "${P7_ARTIFACT_KVAF_SHA}" == "${P7_KVAF_HEAD}" && \
       -z "${P7_VLLM_DIRTY}" && -z "${P7_KVAF_DIRTY}" && \
+      "${P7_RUNTIME_SHA_MATCH}" == "1" && \
+      "${P7_KVAF_SHA_MATCH}" == "1" && \
       "${P7_CLOSURE_UNCHANGED}" == "1" && -z "${P7_UNEXPECTED_PATHS}" && \
       "${P7_KVAF_BUILD_VALID}" == "1" && \
       -f "${P7_BRIDGE_ROOT}/score_receipt_speculative_executor_setup.py" && \
@@ -146,18 +168,24 @@ if [[ "${P7_MANIFEST_VALID}" == "1" && "${P7_ARTIFACT_COMMIT_VALID}" == "1" && \
     P7_REUSE_READY=1
 fi
 
-printf 'P7_REUSE_GATE ready=%s runtime_vllm=%s artifact_vllm=%s artifact_ancestor=%s runtime_kvaf=%s artifact_kvaf=%s manifest_valid=%s closure_unchanged=%s kvaf_build_valid=%s unexpected_paths=<%s>\n' \
-    "${P7_REUSE_READY}" "${P7_VLLM_HEAD}" "${P7_ARTIFACT_VLLM_SHA:-missing}" \
-    "${P7_ARTIFACT_ANCESTOR}" "${P7_KVAF_HEAD}" "${P7_ARTIFACT_KVAF_SHA:-missing}" \
+printf 'P7_REUSE_GATE ready=%s runtime_vllm=%s required_runtime=%s runtime_match=%s artifact_vllm=%s artifact_ancestor=%s runtime_kvaf=%s required_kvaf=%s kvaf_match=%s artifact_kvaf=%s manifest_valid=%s closure_unchanged=%s kvaf_build_valid=%s unexpected_paths=<%s>\n' \
+    "${P7_REUSE_READY}" "${P7_VLLM_HEAD}" "${P7_REQUIRED_RUNTIME_SHA:-none}" \
+    "${P7_RUNTIME_SHA_MATCH}" \
+    "${P7_ARTIFACT_VLLM_SHA:-missing}" "${P7_ARTIFACT_ANCESTOR}" \
+    "${P7_KVAF_HEAD}" "${P7_REQUIRED_KVAF_SHA:-none}" "${P7_KVAF_SHA_MATCH}" \
+    "${P7_ARTIFACT_KVAF_SHA:-missing}" \
     "${P7_MANIFEST_VALID}" "${P7_CLOSURE_UNCHANGED}" "${P7_KVAF_BUILD_VALID}" \
     "${P7_UNEXPECTED_PATHS:-none}"
 if [[ "${P7_REUSE_READY}" != "1" ]]; then
     fail "closure_or_provenance_gate_failed"
 fi
 
+printf 'P7_REUSE_BRIDGE_PROVENANCE bridge_source=%s opp_source=%s bridge_only_rebuild=1 opp_closure_unchanged=%s\n' \
+    "${P7_VLLM_HEAD}" "${P7_ARTIFACT_VLLM_SHA}" "${P7_CLOSURE_UNCHANGED}"
+
 # The artifact source SHA is intentionally exported here: the package checks
-# the binary that is actually loaded, while the gate above proves the current
-# checkout differs only in non-compiled P7 test infrastructure.
+# the binary that is actually loaded. The gate above proves the compiled OPP
+# closure is unchanged; the bridge itself is rebuilt from P7_VLLM_HEAD.
 unset SOC_VERSION ASCEND_VISIBLE_DEVICES
 export A5_SOC_VERSION=ascend950
 export ASCEND_HOME_PATH

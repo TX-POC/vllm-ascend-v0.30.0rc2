@@ -156,6 +156,7 @@ def main() -> None:
         / "csrc"
         / "score_receipt_speculative_executor.cpp"
     )
+    op_api_common_path = ops_root / "torch_extension" / "csrc" / "op_api_common.h"
     runtime_test_path = ops_root / "tests" / "test_score_receipt_speculative_executor.py"
     real_fixture_path = p7_root / "torch_extension" / "p7_1_real_direct_hccp_fixture.py"
     abi_path = p7_root / "P7_1_ABI.md"
@@ -165,6 +166,7 @@ def main() -> None:
         kernel_path,
         tiling_path,
         bridge_path,
+        op_api_common_path,
         runtime_test_path,
         real_fixture_path,
         abi_path,
@@ -191,6 +193,7 @@ def main() -> None:
     host = host_path.read_text(encoding="utf-8")
     tiling = tiling_path.read_text(encoding="utf-8")
     bridge = bridge_path.read_text(encoding="utf-8")
+    op_api_common = op_api_common_path.read_text(encoding="utf-8")
     abi = abi_path.read_text(encoding="utf-8")
     for token in REQUIRED_KERNEL:
         _require(kernel, token, kernel_path)
@@ -226,6 +229,14 @@ def main() -> None:
         "Tensor(r!) worker_stats",
     ):
         _require(bridge, token, bridge_path)
+    for token in (
+        "OpCommand::RunOpApiV2",
+        "UseStreamResIfNeeded(acl_stream, true)",
+        "UseStreamResIfNeeded(acl_stream, false)",
+        "ordered_tensor_keepalive",
+        "descriptor_release_done",
+    ):
+        _require(op_api_common, token, op_api_common_path)
     for token in (
         "31in_18aliasout",
         "AIV-only",
@@ -263,7 +274,8 @@ def main() -> None:
         "P7_1_CANN_COMPILER_CONTRACT "
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
-        "entry_owned_tpipe=1 fail_closed_before_ub=1",
+        "entry_owned_tpipe=1 fail_closed_before_ub=1 "
+        "ordered_opapi_lifetime=1",
         flush=True,
     )
     print(

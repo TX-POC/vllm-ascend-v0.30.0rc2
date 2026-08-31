@@ -2,11 +2,13 @@
 
 // Minimal, self-contained ACLNN launcher for nanovllm_dsa_a5.
 //
-// Do NOT include torch_npu's OpCommand/OpPreparation helpers here. Those are
-// private C++ implementation details whose exported ABI varies across
-// torch_npu releases. This adapter only depends on ATen, ACL runtime and the
-// public NPU stream wrapper, while resolving ACLNN symbols dynamically from
-// the repository-local libcust_opapi.so.
+// ACLNN descriptor/workspace ownership must follow torch_npu's task-queue
+// contract.  A direct aclnn launch followed by immediate descriptor release
+// is unsafe when the current NPU stream is enqueued asynchronously: the
+// runtime may consume the queued command after the caller has released the
+// associated host objects.  We therefore use the same narrowly scoped
+// OpCommand::RunOpApiV2 hand-off as the checked-in torch_npu adapter while
+// continuing to resolve the operator symbols from the repository-local OPP.
 
 #include <cstdlib>
 #include <cstdio>
@@ -26,6 +28,7 @@
 #include <torch/extension.h>
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 
 // Each standalone validation bridge owns a distinct resolver domain.  The
 // production/P3 bridge keeps the historical default, while the source-matched
@@ -69,6 +72,7 @@ using OpApiLaunchFn = int (*)(
 using InitHugeMemThreadLocalFn = int (*)(void *, bool);
 using UnInitHugeMemThreadLocalFn = void (*)(void *, bool);
 using ReleaseHugeMemFn = void (*)(void *, bool);
+using AclUseStreamResFn = aclError (*)(aclrtStream);
 
 inline void *OpenLibraryOnce(const char *path) {
   if (path == nullptr || path[0] == '\0') {
@@ -289,6 +293,43 @@ inline bool OpApiDebugEnabled() {
       !(value[0] == '0' && value[1] == '\0');
 }
 
+inline AclUseStreamResFn GetUseStreamResFn() {
+  static void *handle = OpenLibraryOnce("libascendcl.so");
+  static auto use_stream_res =
+      handle == nullptr
+          ? nullptr
+          : reinterpret_cast<AclUseStreamResFn>(
+                dlsym(handle, "aclrtUseStreamResInCurrentThread"));
+  return use_stream_res;
+}
+
+inline void UseStreamResIfNeeded(aclrtStream stream, bool enqueue) {
+  const bool needed = enqueue ? c10_npu::check_enqueue_need_use(stream)
+                              : c10_npu::check_dequeue_need_use(stream);
+  if (!needed) {
+    return;
+  }
+  auto use_stream_res = GetUseStreamResFn();
+  TORCH_CHECK(
+      use_stream_res != nullptr,
+      "aclrtUseStreamResInCurrentThread is unavailable for ordered ACLNN launch");
+  const aclError status = use_stream_res(stream);
+  TORCH_CHECK(
+      status == ACL_SUCCESS,
+      "aclrtUseStreamResInCurrentThread failed: ",
+      status,
+      "; ",
+      RecentAclError());
+}
+
+inline void LogOpApiLifecycle(const char *api, const char *stage) {
+  if (!OpApiDebugEnabled()) {
+    return;
+  }
+  std::fprintf(stderr, "NANOVLLM_A5_OPAPI_LIFECYCLE api=%s stage=%s\n", api, stage);
+  std::fflush(stderr);
+}
+
 // An ACLNN custom operator may have the same exported symbol name in several
 // local OPP packages.  When that happens, a stale ABI often fails later with a
 // generic "dtype or format" message.  This one compact line identifies the
@@ -334,6 +375,10 @@ inline void LogResolvedOpApi(
         "libcust_opapi.so");                                                 \
     LogResolvedOpApi(#aclnn_api, workspace_addr_fn, launch_addr_fn);            \
                                                                                \
+    auto npu_stream = c10_npu::getCurrentNPUStream();                          \
+    aclrtStream acl_stream = npu_stream.stream(false);                         \
+    UseStreamResIfNeeded(acl_stream, true);                                    \
+    LogOpApiLifecycle(#aclnn_api, "enqueue_ready");                           \
     auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(           \
         ResolveSymbol("InitHugeMemThreadLocal"));                             \
     auto uninit_huge_mem = reinterpret_cast<UnInitHugeMemThreadLocalFn>(       \
@@ -356,6 +401,7 @@ inline void LogResolvedOpApi(
         workspace_status == 0,                                                 \
         "call " #aclnn_api "GetWorkspaceSize failed: ",                     \
         RecentAclError());                                                     \
+    LogOpApiLifecycle(#aclnn_api, "workspace_ready");                        \
                                                                                \
     at::Tensor workspace;                                                      \
     void *workspace_ptr = nullptr;                                             \
@@ -367,22 +413,31 @@ inline void LogResolvedOpApi(
       workspace_ptr = workspace.data_ptr();                                    \
     }                                                                          \
                                                                                \
-    auto npu_stream = c10_npu::getCurrentNPUStream();                          \
-    aclrtStream acl_stream = npu_stream.stream(false);                         \
-    auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);          \
-    int launch_status =                                                        \
-        launch_fn(workspace_ptr, workspace_size, executor, acl_stream);        \
-    TORCH_CHECK(                                                               \
-        launch_status == 0,                                                    \
-        "call " #aclnn_api " failed: ", RecentAclError());                  \
-                                                                               \
-    ReleaseTuple(converted);                                                   \
-    if (release_huge_mem != nullptr) {                                         \
-      release_huge_mem(nullptr, false);                                        \
-    }                                                                          \
+    auto ordered_tensor_keepalive = tensor_keepalive;                          \
+    auto ordered_acl_call =                                                     \
+        [converted, workspace, workspace_ptr, workspace_size, acl_stream,     \
+         executor, ordered_tensor_keepalive, release_huge_mem]() mutable -> int { \
+      (void)workspace;                                                         \
+      (void)ordered_tensor_keepalive;                                          \
+      UseStreamResIfNeeded(acl_stream, false);                                 \
+      LogOpApiLifecycle(#aclnn_api, "launch_begin");                         \
+      auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);        \
+      const int launch_status =                                                \
+          launch_fn(workspace_ptr, workspace_size, executor, acl_stream);      \
+      TORCH_CHECK(                                                             \
+          launch_status == 0,                                                  \
+          "call " #aclnn_api " failed: ", RecentAclError());                \
+      LogOpApiLifecycle(#aclnn_api, "launch_done");                          \
+      ReleaseTuple(converted);                                                 \
+      if (release_huge_mem != nullptr) {                                       \
+        release_huge_mem(nullptr, false);                                      \
+      }                                                                        \
+      LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");              \
+      return launch_status;                                                    \
+    };                                                                         \
+    at_npu::native::OpCommand::RunOpApiV2(#aclnn_api, ordered_acl_call);      \
     if (uninit_huge_mem != nullptr) {                                          \
       uninit_huge_mem(nullptr, false);                                         \
     }                                                                          \
-    (void)workspace;                                                           \
-    (void)tensor_keepalive;                                                    \
+    LogOpApiLifecycle(#aclnn_api, "submit_done");                            \
   } while (false)

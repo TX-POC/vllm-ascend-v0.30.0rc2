@@ -17,6 +17,7 @@ callback verifies payload/transaction-specific expectations.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 from typing import Any, Iterable
 
@@ -209,6 +210,23 @@ def _report(mode: str, inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Te
     return values
 
 
+def _teardown_checkpoint(mode: str) -> None:
+    """Make Python-level ownership release visible before interpreter teardown.
+
+    `_run` has already synchronized the NPU stream.  This checkpoint therefore
+    does not change the transaction; it only makes a future bridge destructor
+    failure appear in a compact, attributable position rather than as a bare
+    process-exit abort.
+    """
+
+    gc.collect()
+    torch.npu.synchronize()
+    print(
+        f"P7_1_TEARDOWN mode={mode} stage=python_refs_collected sync=1",
+        flush=True,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
@@ -247,7 +265,8 @@ def main() -> None:
         return
     if not args.fixture_module:
         inputs = _fail_closed_fixture(device)
-        values = _report("fail_closed", inputs, _run(inputs))
+        outputs = _run(inputs)
+        values = _report("fail_closed", inputs, outputs)
         if values["control_rejected"] <= 0 or any(
             values[key] != 0 for key in ("lease", "post", "retire", "finish", "release")
         ):
@@ -257,6 +276,9 @@ def main() -> None:
             "real_hccp=not_exercised reason=invalid_control_expected",
             flush=True,
         )
+        del outputs
+        del inputs
+        _teardown_checkpoint("fail_closed")
         return
 
     module = importlib.import_module(args.fixture_module)
@@ -289,6 +311,9 @@ def main() -> None:
             "real_hccp=acquire_post_retire_finish_release",
             flush=True,
         )
+        del outputs
+        del inputs
+        _teardown_checkpoint("real_direct_hccp")
     finally:
         if cleanup is not None:
             cleanup()
