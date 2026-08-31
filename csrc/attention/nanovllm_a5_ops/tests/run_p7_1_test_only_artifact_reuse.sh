@@ -268,7 +268,8 @@ run_fail_closed_case() {
     local descriptor_ledger=0
     local workspace_call=0
     local pta_ready=0
-    local pta_held=0
+    local workspace_executor_destroyed=0
+    local workspace_cleanup=0
 
     # Each mode gets a fresh interpreter and a fresh torch bridge load.  That
     # is essential: launch_only intentionally defers cleanup until process
@@ -287,11 +288,11 @@ run_fail_closed_case() {
     grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_call_begin bisect=1" "${case_log}" && workspace_call=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_ready' "${case_log}" && pta_ready=1
     if [[ "${mode}" == "workspace_only" ]]; then
-        # `GetWorkspaceSize` created a generated executor, but this diagnostic
-        # intentionally does not launch/release it.  Releasing PTA TLS here is
-        # invalid: CANN can still use it while tearing down the live executor.
-        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=pta_uninit_held bisect=1" "${case_log}" && pta_held=1
-        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_only_return bisect=1" "${case_log}" && completion=1
+        # A workspace query has no launch, so it must explicitly destroy the
+        # generated executor before releasing its descriptors and TLS state.
+        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_executor_destroy_done bisect=1" "${case_log}" && workspace_executor_destroyed=1
+        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_query_done bisect=1" "${case_log}" && completion=1
+        grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_cleanup_done bisect=1" "${case_log}" && workspace_cleanup=1
         grep -Fq 'P7_1_TEST mode=workspace_only pass=1' "${case_log}" && test_pass=1
         grep -Fq 'P7_1_TEARDOWN mode=workspace_only stage=python_refs_collected sync=1' "${case_log}" && teardown=1
     else
@@ -300,9 +301,9 @@ run_fail_closed_case() {
         grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
     fi
 
-    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s pta_ready=%s pta_held=%s descriptor_ledger=%s workspace_call=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
+    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s pta_ready=%s workspace_executor_destroyed=%s workspace_cleanup=%s descriptor_ledger=%s workspace_call=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
         "${mode}" "${topology}" "${case_rc}" "${config}" \
-        "${pta_ready}" "${pta_held}" "${descriptor_ledger}" "${workspace_call}" \
+        "${pta_ready}" "${workspace_executor_destroyed}" "${workspace_cleanup}" "${descriptor_ledger}" "${workspace_call}" \
         "${completion}" "${test_pass}" \
         "${teardown}" "${case_log}"
 
@@ -313,7 +314,8 @@ run_fail_closed_case() {
           "${teardown}" != "1" ]]; then
         return 1
     fi
-    if [[ "${mode}" == "workspace_only" && "${pta_held}" != "1" ]]; then
+    if [[ "${mode}" == "workspace_only" && \
+          ( "${workspace_executor_destroyed}" != "1" || "${workspace_cleanup}" != "1" ) ]]; then
         return 1
     fi
     return 0

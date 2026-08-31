@@ -460,14 +460,14 @@ inline void LogOpApiLifecycle(const char *api, const char *stage) {
 // diagnostic mode therefore initializes PTA before the workspace query. The
 // modes still differ in whether that state is explicitly torn down: the first
 // direct-launch cases deliberately hold it until process exit, while the final
-// `pta_cache` case proves the complete teardown sequence.  In particular,
-// `workspace_only` has created a generated executor but has neither launched
-// it nor released its 49 aclTensor descriptors.  It must *not* uninitialize
-// the allocator TLS underneath those still-live CANN objects.  This keeps the
-// cleanup bisect meaningful without testing an impossible workspace query
-// with required TLS missing or an invalid partial teardown. The normal default
-// is `full` and remains byte-for-byte equivalent to the existing production
-// cleanup sequence.
+// `pta_cache` case proves the complete teardown sequence.  `workspace_only`
+// is different: it never launches the generated executor, so it must destroy
+// that executor and its descriptors before releasing HugeMem/PTA.  Holding
+// those objects until process teardown and then uninitializing PTA underneath
+// them is not a valid CANN lifecycle.  This keeps the cleanup bisect meaningful
+// without testing an impossible workspace query with required TLS missing or
+// an invalid partial teardown. The normal default is `full` and remains
+// byte-for-byte equivalent to the existing production cleanup sequence.
 enum class OrderedCleanupMode {
   kFull,
   kWorkspaceOnly,
@@ -526,11 +526,10 @@ inline OrderedCleanupPlan OrderedCleanupPlanFromEnvironment() {
               "NANOVLLM_A5_OPAPI_CLEANUP_MODE is required when "
               "NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1");
   if (std::strcmp(value, "workspace_only") == 0) {
-    // Querying workspace constructs a generated executor.  Its descriptors
-    // and HugeMem state deliberately remain live for this single-process
-    // diagnostic, so keep PTA TLS live as well.  The `pta_cache` mode is the
-    // only direct diagnostic that validates explicit final PTA teardown.
-    return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, false};
+    // A workspace query does not launch the executor.  It has a valid
+    // non-launch cleanup path: destroy the returned executor, release the
+    // descriptors and HugeMem state, then uninitialize PTA.
+    return {OrderedCleanupMode::kWorkspaceOnly, true, true, true, true, true};
   }
   if (std::strcmp(value, "launch_only") == 0) {
     return {OrderedCleanupMode::kLaunchOnly, true, false, false, false, false};
@@ -737,8 +736,25 @@ inline void LogOrderedHostDso(
        * removes OpCommand callback/destructor timing from the equation.      \
        * It is unreachable in normal production execution. */                 \
       if (ordered_cleanup_plan.mode == OrderedCleanupMode::kWorkspaceOnly) { \
+        /* A workspace query owns an unlaunched executor.  CANN's ACLNN      \
+         * workspace-query examples destroy that executor directly before    \
+         * tearing down its descriptor wrappers. */                           \
+        if (executor != nullptr) {                                             \
+          const aclError destroy_executor_status =                             \
+              aclDestroyAclOpExecutor(executor);                               \
+          TORCH_CHECK(                                                         \
+              destroy_executor_status == ACL_SUCCESS,                         \
+              "destroy unlaunched " #aclnn_api " executor failed: ",          \
+              destroy_executor_status, "; ", RecentAclError());              \
+          executor = nullptr;                                                  \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "workspace_executor_destroy_done");               \
+        } else {                                                               \
+          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
+                            "workspace_executor_null");                       \
+        }                                                                      \
         LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
-                          "workspace_only_return");                          \
+                          "workspace_query_done");                            \
       } else {                                                                 \
         auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);      \
         LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
@@ -757,32 +773,32 @@ inline void LogOrderedHostDso(
             RecentAclError());                                                 \
         LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
                           "direct_stream_sync_done");                        \
-        if (ordered_cleanup_plan.release_converted) {                          \
-          ReleaseTuple(converted);                                             \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "release_converted_done");                       \
-        } else {                                                               \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "release_converted_held");                       \
-        }                                                                      \
-        if (ordered_cleanup_plan.release_huge_mem &&                           \
-            release_huge_mem != nullptr) {                                    \
-          release_huge_mem(nullptr, false);                                    \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "release_huge_mem_done");                        \
-        } else {                                                               \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "release_huge_mem_held");                        \
-        }                                                                      \
-        if (ordered_cleanup_plan.uninit_huge_mem &&                            \
-            uninit_huge_mem != nullptr) {                                     \
-          uninit_huge_mem(nullptr, false);                                     \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "uninit_huge_mem_done");                         \
-        } else {                                                               \
-          LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                 \
-                            "uninit_huge_mem_held");                         \
-        }                                                                      \
+      }                                                                        \
+      if (ordered_cleanup_plan.release_converted) {                            \
+        ReleaseTuple(converted);                                               \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "release_converted_done");                         \
+      } else {                                                                 \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "release_converted_held");                         \
+      }                                                                        \
+      if (ordered_cleanup_plan.release_huge_mem &&                             \
+          release_huge_mem != nullptr) {                                      \
+        release_huge_mem(nullptr, false);                                      \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "release_huge_mem_done");                          \
+      } else {                                                                 \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "release_huge_mem_held");                          \
+      }                                                                        \
+      if (ordered_cleanup_plan.uninit_huge_mem &&                              \
+          uninit_huge_mem != nullptr) {                                       \
+        uninit_huge_mem(nullptr, false);                                       \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "uninit_huge_mem_done");                           \
+      } else {                                                                 \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "uninit_huge_mem_held");                           \
       }                                                                        \
       if (ordered_cleanup_plan.uninit_pta_cache) {                             \
         UnInitPtaCacheForWorkspace(pta_cache_active);                          \
@@ -791,6 +807,10 @@ inline void LogOrderedHostDso(
       } else {                                                                 \
         LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
                           "pta_uninit_held");                                \
+      }                                                                        \
+      if (ordered_cleanup_plan.mode == OrderedCleanupMode::kWorkspaceOnly) { \
+        LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan,                   \
+                          "workspace_cleanup_done");                          \
       }                                                                        \
       LogOrderedCleanup(#aclnn_api, ordered_cleanup_plan, "direct_return"); \
     } else {                                                                   \

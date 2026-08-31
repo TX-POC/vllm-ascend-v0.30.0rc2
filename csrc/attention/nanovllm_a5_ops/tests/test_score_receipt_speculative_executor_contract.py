@@ -251,7 +251,10 @@ def main() -> None:
         "LogConvertedDescriptorSet(#aclnn_api, converted)",
         "P7_1_DESCRIPTOR_LEDGER",
         "P7_1_DESCRIPTOR_LEDGER api=%s tuple_args=%zu acl_tensors=%zu unique_acl_tensors=%zu\\n",
-        "return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, false};",
+        "return {OrderedCleanupMode::kWorkspaceOnly, true, true, true, true, true};",
+        "aclDestroyAclOpExecutor(executor)",
+        "workspace_executor_destroy_done",
+        "workspace_cleanup_done",
     ):
         _require(op_api_common, token, op_api_common_path)
     converted_offset = op_api_common.find("auto converted = ConvertTypes(")
