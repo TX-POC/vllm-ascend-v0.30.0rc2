@@ -251,6 +251,7 @@ def main() -> None:
         "LogConvertedDescriptorSet(#aclnn_api, converted)",
         "P7_1_DESCRIPTOR_LEDGER",
         "P7_1_DESCRIPTOR_LEDGER api=%s tuple_args=%zu acl_tensors=%zu unique_acl_tensors=%zu\\n",
+        "return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, false};",
     ):
         _require(op_api_common, token, op_api_common_path)
     converted_offset = op_api_common.find("auto converted = ConvertTypes(")
@@ -276,7 +277,8 @@ def main() -> None:
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
         "DESCRIPTOR_LEDGER",
         "workspace_call_begin",
-        "P7_CLEANUP_ALIAS_AB mode=workspace_only",
+        "P7_CLEANUP_WORKSPACE_BLOCKED",
+        "P7_CLEANUP_ALIAS_AB mode=launch_only",
         "run_normal_fail_closed_case()",
         "P7_CLEANUP_NORMAL_ASYNC",
         "real_hccp=not_run",

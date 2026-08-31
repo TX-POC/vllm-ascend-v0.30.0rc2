@@ -460,10 +460,14 @@ inline void LogOpApiLifecycle(const char *api, const char *stage) {
 // diagnostic mode therefore initializes PTA before the workspace query. The
 // modes still differ in whether that state is explicitly torn down: the first
 // direct-launch cases deliberately hold it until process exit, while the final
-// `pta_cache` case proves the complete teardown sequence. This keeps the
+// `pta_cache` case proves the complete teardown sequence.  In particular,
+// `workspace_only` has created a generated executor but has neither launched
+// it nor released its 49 aclTensor descriptors.  It must *not* uninitialize
+// the allocator TLS underneath those still-live CANN objects.  This keeps the
 // cleanup bisect meaningful without testing an impossible workspace query
-// with required TLS missing. The normal default is `full` and remains
-// byte-for-byte equivalent to the existing production cleanup sequence.
+// with required TLS missing or an invalid partial teardown. The normal default
+// is `full` and remains byte-for-byte equivalent to the existing production
+// cleanup sequence.
 enum class OrderedCleanupMode {
   kFull,
   kWorkspaceOnly,
@@ -522,7 +526,11 @@ inline OrderedCleanupPlan OrderedCleanupPlanFromEnvironment() {
               "NANOVLLM_A5_OPAPI_CLEANUP_MODE is required when "
               "NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1");
   if (std::strcmp(value, "workspace_only") == 0) {
-    return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, true};
+    // Querying workspace constructs a generated executor.  Its descriptors
+    // and HugeMem state deliberately remain live for this single-process
+    // diagnostic, so keep PTA TLS live as well.  The `pta_cache` mode is the
+    // only direct diagnostic that validates explicit final PTA teardown.
+    return {OrderedCleanupMode::kWorkspaceOnly, true, false, false, false, false};
   }
   if (std::strcmp(value, "launch_only") == 0) {
     return {OrderedCleanupMode::kLaunchOnly, true, false, false, false, false};
