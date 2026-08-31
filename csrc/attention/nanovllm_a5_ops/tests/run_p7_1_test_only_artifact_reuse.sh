@@ -103,7 +103,8 @@ if [[ "${P7_MANIFEST_COUNT}" == "1" && -f "${P7_MANIFEST}" && -f "${P7_OPAPI}" ]
     P7_MANIFEST_VALID=1
     for required_line in \
         'kind=standalone_score_receipt_speculative_executor' \
-        'abi=31in_18aliasout' \
+        'abi=31tensor_18refout' \
+        'torch_schema=31in_18aliasout' \
         'local_microbatches=2x64' \
         'queue_lifecycle=epoch,generation,post_sequence,state,quarantine' \
         'post_cq=real_kvaf_streaming_postonly_tryretire_finish' \
@@ -271,8 +272,7 @@ else
 fi
 run_fail_closed_case() {
     local mode="$1"
-    local topology="${2:-aliases}"
-    local case_log="${P7_RESULT}/fail_closed_${mode}_${topology}.log"
+    local case_log="${P7_RESULT}/fail_closed_${mode}.log"
     local case_rc=0
     local config=0
     local completion=0
@@ -289,7 +289,6 @@ run_fail_closed_case() {
     # checkpoint.
     NANOVLLM_A5_OPAPI_CLEANUP_BISECT=1 \
     NANOVLLM_A5_OPAPI_CLEANUP_MODE="${mode}" \
-    NANOVLLM_A5_P7_OUTPUT_TOPOLOGY="${topology}" \
     timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         2>&1 | tee "${case_log}"
     case_rc=${PIPESTATUS[0]}
@@ -297,7 +296,7 @@ run_fail_closed_case() {
     grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=config bisect=1" "${case_log}" && config=1
     # Search the explicit field sequence rather than an exact physical line:
     # an external CANN logger may append a suffix to the same stderr record.
-    grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49' "${case_log}" && descriptor_ledger=1
+    grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31' "${case_log}" && descriptor_ledger=1
     grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_call_begin bisect=1" "${case_log}" && workspace_call=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_ready' "${case_log}" && pta_ready=1
     grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=phase2_executor_autorelease_done bisect=1" "${case_log}" && phase2_executor_autorelease=1
@@ -305,8 +304,8 @@ run_fail_closed_case() {
     grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
     grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
 
-    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s pta_ready=%s phase2_executor_autorelease=%s descriptor_ledger=%s workspace_call=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
-        "${mode}" "${topology}" "${case_rc}" "${config}" \
+    printf 'P7_CLEANUP_CASE mode=%s rc=%s config=%s pta_ready=%s phase2_executor_autorelease=%s descriptor_ledger=%s workspace_call=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
+        "${mode}" "${case_rc}" "${config}" \
         "${pta_ready}" "${phase2_executor_autorelease}" "${descriptor_ledger}" "${workspace_call}" \
         "${completion}" "${test_pass}" \
         "${teardown}" "${case_log}"
@@ -340,12 +339,11 @@ run_normal_fail_closed_case() {
     # rejects before any queue lease, DMA PostOnly, or CQ operation.
     env -u NANOVLLM_A5_OPAPI_CLEANUP_BISECT \
         -u NANOVLLM_A5_OPAPI_CLEANUP_MODE \
-        -u NANOVLLM_A5_P7_OUTPUT_TOPOLOGY \
         timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         2>&1 | tee "${case_log}"
     case_rc=${PIPESTATUS[0]}
 
-    grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49' "${case_log}" && descriptor_ledger=1
+    grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31' "${case_log}" && descriptor_ledger=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=handoff_runopapi_by_value' "${case_log}" && handoff=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=launch_done' "${case_log}" && launch=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=descriptor_release_done' "${case_log}" && descriptor_release=1
@@ -376,8 +374,7 @@ P7_FAIL_CLOSED_RC=98
 # P7_CLEANUP_BISECT knob is handled below; these are the macro controls that
 # would otherwise bypass the production stream-resource hand-off.
 unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT \
-      NANOVLLM_A5_OPAPI_CLEANUP_MODE \
-      NANOVLLM_A5_P7_OUTPUT_TOPOLOGY
+      NANOVLLM_A5_OPAPI_CLEANUP_MODE
 if [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
     if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
         P7_DIRECT_BISECT_SKIPPED=1

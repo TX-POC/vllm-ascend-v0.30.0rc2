@@ -1201,37 +1201,40 @@ extern "C" __global__ __aicore__ void a5_score_receipt_speculative_executor(
     GM_ADDR queue_request_output_indices, GM_ADDR queue_request_count,
     GM_ADDR private_ready_epoch, GM_ADDR private_ready_generation,
     GM_ADDR worker_stats, GM_ADDR rows_per_entry,
-    GM_ADDR private_source_to_slot_out, GM_ADDR private_object_to_slot_out,
-    GM_ADDR private_ready_table_out, GM_ADDR private_arena_head_out,
-    GM_ADDR private_packed_output_out, GM_ADDR queue_leases_out,
-    GM_ADDR queue_epoch_out, GM_ADDR queue_generation_out,
-    GM_ADDR queue_post_sequence_out, GM_ADDR queue_state_out,
-    GM_ADDR queue_quarantine_out, GM_ADDR queue_request_source_offsets_out,
-    GM_ADDR queue_request_object_offsets_out,
-    GM_ADDR queue_request_output_indices_out, GM_ADDR queue_request_count_out,
-    GM_ADDR private_ready_epoch_out, GM_ADDR private_ready_generation_out,
-    GM_ADDR worker_stats_out, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR private_source_to_slot_ref, GM_ADDR private_object_to_slot_ref,
+    GM_ADDR private_ready_table_ref, GM_ADDR private_arena_head_ref,
+    GM_ADDR private_packed_output_ref, GM_ADDR queue_leases_ref,
+    GM_ADDR queue_epoch_ref, GM_ADDR queue_generation_ref,
+    GM_ADDR queue_post_sequence_ref, GM_ADDR queue_state_ref,
+    GM_ADDR queue_quarantine_ref, GM_ADDR queue_request_source_offsets_ref,
+    GM_ADDR queue_request_object_offsets_ref,
+    GM_ADDR queue_request_output_indices_ref, GM_ADDR queue_request_count_ref,
+    GM_ADDR private_ready_epoch_ref, GM_ADDR private_ready_generation_ref,
+    GM_ADDR worker_stats_ref, GM_ADDR workspace, GM_ADDR tiling)
 {
-    // All outputs are intentional graph aliases of their matching mutable
-    // inputs.  The bridge passes the same storage for both positions.
-    (void)private_source_to_slot_out;
-    (void)private_object_to_slot_out;
-    (void)private_ready_table_out;
-    (void)private_arena_head_out;
-    (void)private_packed_output_out;
-    (void)queue_leases_out;
-    (void)queue_epoch_out;
-    (void)queue_generation_out;
-    (void)queue_post_sequence_out;
-    (void)queue_state_out;
-    (void)queue_quarantine_out;
-    (void)queue_request_source_offsets_out;
-    (void)queue_request_object_offsets_out;
-    (void)queue_request_output_indices_out;
-    (void)queue_request_count_out;
-    (void)private_ready_epoch_out;
-    (void)private_ready_generation_out;
-    (void)worker_stats_out;
+    // CANN keeps Ref ports in the kernel ABI as trailing `*_ref` GM addresses,
+    // even though GetWorkspaceSize receives only the corresponding mutable
+    // input descriptor. They are the same physical state and this kernel
+    // writes through the input positions, so the trailing aliases are only
+    // retained to match the generated kernel calling convention.
+    (void)private_source_to_slot_ref;
+    (void)private_object_to_slot_ref;
+    (void)private_ready_table_ref;
+    (void)private_arena_head_ref;
+    (void)private_packed_output_ref;
+    (void)queue_leases_ref;
+    (void)queue_epoch_ref;
+    (void)queue_generation_ref;
+    (void)queue_post_sequence_ref;
+    (void)queue_state_ref;
+    (void)queue_quarantine_ref;
+    (void)queue_request_source_offsets_ref;
+    (void)queue_request_object_offsets_ref;
+    (void)queue_request_output_indices_ref;
+    (void)queue_request_count_ref;
+    (void)private_ready_epoch_ref;
+    (void)private_ready_generation_ref;
+    (void)worker_stats_ref;
     (void)workspace;
     // Queue lease CAS and Direct-HCCP helpers use a vector-side SIMT service;
     // they do not require a separate AIC lane.  AIV_ONLY prevents this

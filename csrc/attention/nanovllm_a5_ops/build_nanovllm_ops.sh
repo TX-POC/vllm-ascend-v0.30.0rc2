@@ -1508,8 +1508,9 @@ EOF
 fi
 
 # The P7.1 bridge refuses an un-stamped OPP.  This is intentionally separate
-# from P3 provenance: the executor has a 31-input/18-alias-output ABI and
-# a KVAF transport closure, but no C8 source closure.
+# from P3 provenance: the executor has a 31-tensor ACLNN ABI with 18 mutable
+# Ref outputs (and a 31-in/18-alias-out Torch schema), plus a KVAF transport
+# closure but no C8 source closure.
 if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
     P7_1_PROVENANCE_HEAD="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || true)"
     if [[ ! "${P7_1_PROVENANCE_HEAD}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -1530,7 +1531,8 @@ source_root=${ROOT}
 source_head=${P7_1_PROVENANCE_HEAD}
 source_clean=1
 kvaf_source_head=${KVAF_FUSED_HEAD}
-abi=31in_18aliasout
+abi=31tensor_18refout
+torch_schema=31in_18aliasout
 candidate_seed=receipt_x_128_x_4_int32
 local_microbatches=2x64
 queue_lifecycle=epoch,generation,post_sequence,state,quarantine
@@ -1545,7 +1547,8 @@ EOF
         "source_head=${P7_1_PROVENANCE_HEAD}" \
         'source_clean=1' \
         "kvaf_source_head=${KVAF_FUSED_HEAD}" \
-        'abi=31in_18aliasout' \
+        'abi=31tensor_18refout' \
+        'torch_schema=31in_18aliasout' \
         'local_microbatches=2x64' \
         'queue_lifecycle=epoch,generation,post_sequence,state,quarantine' \
         'post_cq=real_kvaf_streaming_postonly_tryretire_finish' \

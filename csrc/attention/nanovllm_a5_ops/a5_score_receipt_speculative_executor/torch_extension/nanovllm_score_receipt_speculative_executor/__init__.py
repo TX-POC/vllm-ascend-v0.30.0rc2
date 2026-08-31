@@ -39,7 +39,8 @@ for line in MANIFEST.read_text(encoding="utf-8").splitlines():
 
 REQUIRED = {
     "kind": "standalone_score_receipt_speculative_executor",
-    "abi": "31in_18aliasout",
+    "abi": "31tensor_18refout",
+    "torch_schema": "31in_18aliasout",
     "local_microbatches": "2x64",
     "queue_lifecycle": "epoch,generation,post_sequence,state,quarantine",
     "post_cq": "real_kvaf_streaming_postonly_tryretire_finish",
@@ -79,7 +80,7 @@ if os.getenv("NANOVLLM_A5_OPAPI_DEBUG") not in (None, "", "0"):
         "P7_1_OPAPI_BIND "
         f"opp_root={OPP_ROOT} vendor={MANIFEST.parent} opapi={OPAPI} "
         f"source_head={FIELDS.get('source_head')} "
-        f"kvaf_head={FIELDS.get('kvaf_source_head')} abi=31in_18aliasout",
+        f"kvaf_head={FIELDS.get('kvaf_source_head')} abi=31tensor_18refout",
         flush=True,
     )
 

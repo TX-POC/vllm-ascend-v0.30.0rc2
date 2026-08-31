@@ -21,9 +21,14 @@ host tiling 的 worker 数是 `min(available_AIV, receipt_count, queue_count)`�
 并按 stride 继续处理多个 receipt。该上限只是避免已压缩的候选只有 `Q` 个 in-flight
 queue 时仍启动几十个 worker 空转抢 lease，造成无收益的 CAS/queue-busy 抖动。
 
-## 31 输入 / 18 原地别名输出
+## 31 个 ACLNN 张量 / 18 个原地 Ref 输出
 
-本 op 的输入 ABI 是 `31in_18aliasout`。前 7 个输入定义 receipt 与地址域：
+Torch 侧 schema 仍是 `torch_schema=31in_18aliasout`，这样图能看到 18 个可变状态的
+别名输出；但 **ACLNN 调用 ABI** 是 `abi=31tensor_18refout`。也就是说，18 对
+可变 input/output 在 `ops.json` 中使用同一个端口名，CANN 自动生成一个
+可写的 `...Ref` 参数，而不是再附加 18 个 `_out` descriptor。这样
+`GetWorkspaceSize` 只接收 31 个 tensor（CANN 的单算子输入上限是 32），
+不会走 49 descriptor 的未支持路径。前 7 个输入定义 receipt 与地址域：
 
 | index | tensor | shape | 含义 |
 |---:|---|---|---|
@@ -33,9 +38,9 @@ queue 时仍启动几十个 worker 空转抢 lease，造成无收益的 CAS/queu
 | 6 | `kv_object_address_domain` | `int32[1]` | 当前 P7.1 **只接受** `1=MAPPED_OBJECT`：`O` 必须等于 `kv_object_map[P,S]`，并作为 KVAF descriptor object index。`0=RAW_TOKEN` 尚无显式转换/table ABI，会 fail-closed，绝不被悄悄当成 object index |
 
 其余输入是 `S -> O` 映射、resident snapshot、KVAF control/queue descriptor
-ledger、private mapping/ready tag 与 telemetry。输出严格别名输入 11..15、17..29：
-bridge 将每个 output 传给 ACLNN 时使用相同 physical tensor storage，且在调用前后
-校验对应 `data_ptr()` 相等；不能用 copy 代替 alias。
+ledger、private mapping/ready tag 与 telemetry。逻辑输出严格别名输入
+11..15、17..29；Torch 返回同一 Tensor，而 ACLNN 只拿对应的可写 Ref
+descriptor。不能用 copy 或额外 `_out` descriptor 代替 Ref。
 
 ## 图可见状态
 

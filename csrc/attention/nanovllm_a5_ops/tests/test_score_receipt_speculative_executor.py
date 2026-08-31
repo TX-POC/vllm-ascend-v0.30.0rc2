@@ -2,8 +2,9 @@
 """P7.1 bridge/lifecycle diagnostic with compact, copyable receipts.
 
 Default ``fail_closed`` mode launches the real P7.1 ACLNN op with a malformed
-zero KVAF control block.  It proves 31-in/18-alias dispatch and that the
-kernel refuses to touch queues before a valid Direct-HCCP binding exists.
+zero KVAF control block. It proves the 31-tensor/18-Ref ACLNN ABI, graph-visible
+18-alias Torch outputs, and that the kernel refuses to touch queues before a
+valid Direct-HCCP binding exists.
 
 ``--fixture-module`` is the real transport mode.  The module must define
 ``build_p7_1_fixture(device)`` and return ``{"inputs": tuple_of_31_tensors}``
@@ -20,7 +21,7 @@ import argparse
 import gc
 import importlib
 import os
-from typing import Any, Iterable
+from typing import Any
 
 import torch
 import torch_npu  # noqa: F401
@@ -104,56 +105,26 @@ def _first_queue(queue_state: torch.Tensor, queue_quarantine: torch.Tensor) -> i
     return -1
 
 
-def _output_topology() -> str:
-    """Return the output-descriptor topology requested by the P7 bisect.
+def _check_ref_outputs(
+    inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Tensor, ...]
+) -> None:
+    """Check the graph-visible aliases of the 18 ACLNN mutable Ref tensors.
 
-    ``distinct`` is accepted only together with the explicit C++ cleanup
-    bisect switch.  It is an ABI-preserving host-stub diagnostic: the kernel
-    still mutates the 18 documented input state tensors and deliberately
-    ignores their output-address counterparts.
+    The single-op interface intentionally returns the transaction state so
+    graph replay sees all writes.  The generated ACLNN interface must *not*
+    receive a second descriptor for these values: matching input/output names
+    turn them into 18 mutable ``Ref`` parameters within the 31-tensor ABI.
     """
 
-    topology = os.getenv("NANOVLLM_A5_P7_OUTPUT_TOPOLOGY", "aliases")
-    if topology not in {"aliases", "distinct"}:
-        raise AssertionError(f"unsupported P7 output topology: {topology!r}")
-    if topology == "distinct" and os.getenv("NANOVLLM_A5_OPAPI_CLEANUP_BISECT") != "1":
-        raise AssertionError("distinct P7 output topology requires cleanup bisect")
-    return topology
-
-
-def _check_output_topology(
-    inputs: tuple[torch.Tensor, ...], outputs: Iterable[torch.Tensor]
-) -> str:
     values = tuple(outputs)
     if len(values) != OUTPUT_COUNT:
         raise AssertionError(f"expected {OUTPUT_COUNT} outputs, got {len(values)}")
-    topology = _output_topology()
     for output_index, input_index in enumerate(MUTABLE_INPUTS):
         same_storage = values[output_index].data_ptr() == inputs[input_index].data_ptr()
-        if topology == "aliases" and not same_storage:
+        if not same_storage:
             raise AssertionError(
-                f"output {output_index} is not a physical alias of input {input_index}"
+                f"Ref output {output_index} is not a physical alias of input {input_index}"
             )
-        if topology == "distinct" and same_storage:
-            raise AssertionError(
-                f"output {output_index} unexpectedly aliases input {input_index} in distinct bisect"
-            )
-    return topology
-
-
-def _state_outputs(
-    inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Tensor, ...], topology: str
-) -> tuple[torch.Tensor, ...]:
-    """Choose where the kernel's mutable transaction state resides.
-
-    Product topology returns the formal alias outputs.  The test-only
-    distinct topology proves whether generated ACLNN output descriptors are
-    the fault while retaining the kernel's documented input-side state writes.
-    """
-
-    if topology == "aliases":
-        return outputs
-    return tuple(inputs[index] for index in MUTABLE_INPUTS)
 
 
 def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
@@ -166,13 +137,12 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
 
     outputs = torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor(*inputs)
     torch.npu.synchronize()
-    _check_output_topology(inputs, outputs)
+    _check_ref_outputs(inputs, tuple(outputs))
     return tuple(outputs)
 
 
 def _report(mode: str, inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Tensor, ...]) -> dict[str, int]:
-    topology = _output_topology()
-    state = _state_outputs(inputs, outputs, topology)
+    state = outputs
     stats = state[-1]
     queue_state = state[9]
     queue_quarantine = state[10]
@@ -205,8 +175,7 @@ def _report(mode: str, inputs: tuple[torch.Tensor, ...], outputs: tuple[torch.Te
     queue_post_sequence = int(state[8].detach().cpu().reshape(-1)[diagnostic_queue])
     print(
         "P7_1_SOURCE_ABI "
-        f"mode={mode} inputs=31 outputs=18 aliases={18 if topology == 'aliases' else 0} "
-        f"topology={topology} "
+        f"mode={mode} torch_inputs=31 logical_outputs=18 aclnn_tensors=31 refs=18 "
         f"candidate_seed_shape={list(inputs[0].shape)}",
         flush=True,
     )
@@ -341,8 +310,7 @@ def main() -> None:
         ):
             raise AssertionError("invalid control must reject before lease/PostOnly/CQ")
         print(
-            f"P7_1_TEST mode=fail_closed pass=1 aliases={18 if _output_topology() == 'aliases' else 0} "
-            f"topology={_output_topology()} "
+            "P7_1_TEST mode=fail_closed pass=1 refs=18 aclnn_tensors=31 "
             "real_hccp=not_exercised reason=invalid_control_expected",
             flush=True,
         )

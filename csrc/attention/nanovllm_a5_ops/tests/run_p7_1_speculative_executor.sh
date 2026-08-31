@@ -207,7 +207,8 @@ if [[ "${P7_OPP_RC}" != "0" || "${P7_MANIFEST_COUNT}" != "1" || -z "${P7_MANIFES
 fi
 if ! grep -Fqx "source_head=${P7_VLLM_HEAD}" "${P7_MANIFEST}" || \
    ! grep -Fqx "kvaf_source_head=${P7_KVAF_HEAD}" "${P7_MANIFEST}" || \
-   ! grep -Fqx 'abi=31in_18aliasout' "${P7_MANIFEST}" || \
+   ! grep -Fqx 'abi=31tensor_18refout' "${P7_MANIFEST}" || \
+   ! grep -Fqx 'torch_schema=31in_18aliasout' "${P7_MANIFEST}" || \
    ! grep -Fqx 'post_cq=real_kvaf_streaming_postonly_tryretire_finish' "${P7_MANIFEST}" || \
    ! grep -Fqx 'c8_source_closure=absent' "${P7_MANIFEST}" || \
    ! grep -Fqx 'fixed_get_core=absent' "${P7_MANIFEST}"; then
@@ -215,7 +216,7 @@ if ! grep -Fqx "source_head=${P7_VLLM_HEAD}" "${P7_MANIFEST}" || \
     fail "p7_1_manifest_mismatch"
 fi
 printf 'P7_1_OPP status=0 root=%s\n' "${P7_OPP_ROOT}"
-printf 'P7_1_MANIFEST source=%s kvaf=%s abi=31in_18aliasout c8_closure=absent\n' \
+printf 'P7_1_MANIFEST source=%s kvaf=%s abi=31tensor_18refout torch_schema=31in_18aliasout c8_closure=absent\n' \
     "${P7_VLLM_HEAD}" "${P7_KVAF_HEAD}"
 
 # Source only the new package.  The bridge then replaces, rather than appends,

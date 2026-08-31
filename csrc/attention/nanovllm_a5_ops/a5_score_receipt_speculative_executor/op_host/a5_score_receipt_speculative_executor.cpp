@@ -405,15 +405,19 @@ public:
             ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT64,
             ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT64,
             ge::DT_INT64, ge::DT_INT64};
+        // CANN ACLNN turns an input/output pair with the same name into one
+        // mutable `...Ref` argument.  These are transaction-state refs, not
+        // 18 independent outputs: keeping separate `_out` names produced a
+        // 49-descriptor GetWorkspaceSize ABI and crashed before tiling.
         const char* outputNames[kOutputCount] = {
-            "private_source_to_slot_out", "private_object_to_slot_out",
-            "private_ready_table_out", "private_arena_head_out",
-            "private_packed_output_out", "queue_leases_out", "queue_epoch_out",
-            "queue_generation_out", "queue_post_sequence_out", "queue_state_out",
-            "queue_quarantine_out", "queue_request_source_offsets_out",
-            "queue_request_object_offsets_out", "queue_request_output_indices_out",
-            "queue_request_count_out", "private_ready_epoch_out",
-            "private_ready_generation_out", "worker_stats_out"};
+            "private_source_to_slot", "private_object_to_slot",
+            "private_ready_table", "private_arena_head",
+            "private_packed_output", "queue_leases", "queue_epoch",
+            "queue_generation", "queue_post_sequence", "queue_state",
+            "queue_quarantine", "queue_request_source_offsets",
+            "queue_request_object_offsets", "queue_request_output_indices",
+            "queue_request_count", "private_ready_epoch",
+            "private_ready_generation", "worker_stats"};
         for (size_t output = 0; output < kOutputCount; ++output) {
             const std::vector<ge::DataType>* types = &int32Types;
             if (outputTypes[output] == ge::DT_INT64) {

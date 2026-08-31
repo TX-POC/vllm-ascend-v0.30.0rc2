@@ -3,7 +3,7 @@
 
 This is intentionally a *closure* contract, not a synthetic HCCP benchmark.
 It proves that the generated build will receive the real KVAF PostOnly/CQ
-helpers, the 31-in/18-alias ABI, two bounded 64-seed local buffers, and no C8
+helpers, the 31-tensor/18-Ref ACLNN ABI, two bounded 64-seed local buffers, and no C8
 or fixed-core source dependency.  The companion runtime test additionally
 executes the bridge in fail-closed and, when supplied, real-control modes.
 """
@@ -190,6 +190,17 @@ def main() -> None:
         "kv_object_address_domain",
     ]:
         raise AssertionError("P7.1 ABI input 5/6 must be source_lens/address_domain")
+    mutable_input_indices = (
+        11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29,
+    )
+    expected_ref_names = [inputs[index]["name"] for index in mutable_input_indices]
+    actual_ref_names = [output["name"] for output in outputs]
+    if actual_ref_names != expected_ref_names:
+        raise AssertionError(
+            "P7.1 output ports must reuse their mutable input names so CANN emits "
+            f"31 tensor Ref ABI, got outputs={actual_ref_names} expected={expected_ref_names}"
+        )
 
     kernel = kernel_path.read_text(encoding="utf-8")
     host = host_path.read_text(encoding="utf-8")
@@ -202,6 +213,9 @@ def main() -> None:
         _require(kernel, token, kernel_path)
     for token in FORBIDDEN_KERNEL:
         _forbid(kernel, token, kernel_path)
+    for ref_name in expected_ref_names:
+        _require(kernel, f"GM_ADDR {ref_name}_ref", kernel_path)
+        _require(kernel, f"(void){ref_name}_ref", kernel_path)
     control_validation = kernel.find(
         "IsKvafStreamingBatchGetControlValidForAicore(control_)"
     )
@@ -225,13 +239,19 @@ def main() -> None:
     ):
         _require(tiling, token, tiling_path)
     for token in (
-        "31in_18aliasout",
+        "31tensor_18refout",
+        "torch_schema",
         "aclnnA5ScoreReceiptSpeculativeExecutor",
-        "CheckAlias",
-        "physical_aliases=%lld",
+        "P7_1_REF_ABI",
+        "mutable_refs=18",
         "Tensor(r!) worker_stats",
     ):
         _require(bridge, token, bridge_path)
+    if "empty_like" in bridge:
+        raise AssertionError(
+            "P7.1 bridge must return the 18 mutable Torch aliases, not allocate "
+            "independent output descriptors"
+        )
     for token in (
         "OpCommand::RunOpApi(#aclnn_api, ordered_acl_call)",
         "UseStreamResIfNeeded(acl_stream, true)",
@@ -277,7 +297,7 @@ def main() -> None:
             "GetWorkspaceSize"
         )
     for token in (
-        "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
+        "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31'",
         "DESCRIPTOR_LEDGER",
         "workspace_call_begin",
         "run_normal_fail_closed_case()",
@@ -290,7 +310,8 @@ def main() -> None:
     ):
         _require(reuse_runner, token, reuse_runner_path)
     for token in (
-        "31in_18aliasout",
+        "31tensor_18refout",
+        "torch_schema=31in_18aliasout",
         "AIV-only",
         "MAPPED_OBJECT",
         "FREE -> FILLING -> POSTED -> CQ_TERMINAL",
@@ -333,8 +354,8 @@ def main() -> None:
         flush=True,
     )
     print(
-        "P7_1_DESCRIPTOR_CONTRACT tuple_args=51 acl_tensors=49 "
-        "unique_acl_tensors=49 gate=before_workspace",
+        "P7_1_DESCRIPTOR_CONTRACT tuple_args=33 acl_tensors=31 "
+        "unique_acl_tensors=31 refs=18 gate=before_workspace",
         flush=True,
     )
     print(
@@ -344,7 +365,7 @@ def main() -> None:
     )
     print(
         "P7_1_CONTRACT_PASS source=1 abi=1 lifecycle=1 transport=1 "
-        "alias_bridge=1 c8_closure=0",
+        "ref_bridge=1 c8_closure=0",
         flush=True,
     )
 
