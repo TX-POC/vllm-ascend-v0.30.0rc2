@@ -34,6 +34,7 @@ REQUIRED_KERNEL = (
     "LoadGmInt64ForSimt",
     "__simt_callee__ inline int32_t LoadGmInt32ForSimt",
     "__simt_callee__ inline int64_t LoadGmInt64ForSimt",
+    "event_t simtEvent_ = static_cast<event_t>(EVENT_ID0);",
     "seedBuffers_[0].Get<int32_t>().GetPhyAddr()",
     "leaseBuffer_.Get<uint8_t>().GetPhyAddr()",
     "claimBuffer_.Get<uint8_t>().GetPhyAddr()",
@@ -50,6 +51,7 @@ FORBIDDEN_KERNEL = (
     "ReadGmByPassDCache<int64_t>(private_ready_generation",
     "ReadGmByPassDCache<int32_t>(private_ready +",
     "!ASCEND_IS_AIV",
+    "static constexpr event_t kSimtEvent",
     "seedBuffers_[0].Get<int32_t>();",
     "seedBuffers_[1].Get<int32_t>();",
     "leaseBuffer_.Get<uint8_t>());",
@@ -174,7 +176,7 @@ def main() -> None:
     print(
         "P7_1_CANN_COMPILER_CONTRACT "
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
-        "ub_physical_address_conversion=1",
+        "ub_physical_address_conversion=1 nonconst_event_t=1",
         flush=True,
     )
     print(

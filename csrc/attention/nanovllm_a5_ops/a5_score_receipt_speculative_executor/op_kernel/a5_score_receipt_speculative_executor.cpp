@@ -458,7 +458,13 @@ private:
     // P7.1 is a standalone task: EVENT_ID0 is reserved only for its serial
     // PIPE_S <-> PIPE_V SIMT acquire/claim/release services.  It is never
     // shared with C8 or with a score-pipeline dependency.
-    static constexpr event_t kSimtEvent = EVENT_ID0;
+    //
+    // CANN's `set_flag`/`wait_flag` validates the argument through its exact
+    // expression type.  A `constexpr` class member is `const event_t` at the
+    // call site and is rejected on A5; keep a non-const `event_t` field so
+    // both direct VF hand-offs and the KVAF AIC wrappers receive the ABI type
+    // CANN requires.
+    event_t simtEvent_ = static_cast<event_t>(EVENT_ID0);
     // Local slot states are deliberately independent of queue ownership.
     static constexpr uint32_t kBatchFree = 0U;
     static constexpr uint32_t kBatchReady = 1U;
@@ -584,16 +590,16 @@ private:
                                              uint32_t queueId)
     {
         claimResult_->success = 0U;
-        set_flag(PIPE_S, PIPE_V, kSimtEvent);
-        wait_flag(PIPE_S, PIPE_V, kSimtEvent);
+        set_flag(PIPE_S, PIPE_V, simtEvent_);
+        wait_flag(PIPE_S, PIPE_V, simtEvent_);
         AscendC::Simt::VF_CALL<ClaimPrivateSlotSimt>(
             AscendC::Simt::Dim3{1U, 1U, 1U}, privateSourceToSlot_,
             privateObjectToSlot_, privateReady_, privateArenaHead_,
             privateReadyEpoch_, privateReadyGeneration_, sourceOffset,
             objectOffset, queueId, tiling_->privateArenaCapacity,
             tiling_->privatePackedRows, epoch_, waveGeneration_, claimResult_);
-        set_flag(PIPE_V, PIPE_S, kSimtEvent);
-        wait_flag(PIPE_V, PIPE_S, kSimtEvent);
+        set_flag(PIPE_V, PIPE_S, simtEvent_);
+        wait_flag(PIPE_V, PIPE_S, simtEvent_);
         return claimResult_->success != 0U;
     }
 
@@ -602,14 +608,14 @@ private:
                                                 int32_t outputIndex)
     {
         claimResult_->success = 0U;
-        set_flag(PIPE_S, PIPE_V, kSimtEvent);
-        wait_flag(PIPE_S, PIPE_V, kSimtEvent);
+        set_flag(PIPE_S, PIPE_V, simtEvent_);
+        wait_flag(PIPE_S, PIPE_V, simtEvent_);
         AscendC::Simt::VF_CALL<PublishPrivateClaimSimt>(
             AscendC::Simt::Dim3{1U, 1U, 1U}, privateSourceToSlot_,
             privateObjectToSlot_, sourceOffset, objectOffset, outputIndex,
             claimResult_);
-        set_flag(PIPE_V, PIPE_S, kSimtEvent);
-        wait_flag(PIPE_V, PIPE_S, kSimtEvent);
+        set_flag(PIPE_V, PIPE_S, simtEvent_);
+        wait_flag(PIPE_V, PIPE_S, simtEvent_);
         return claimResult_->success != 0U;
     }
 
@@ -621,14 +627,14 @@ private:
             return;
         }
         claimResult_->success = 0U;
-        set_flag(PIPE_S, PIPE_V, kSimtEvent);
-        wait_flag(PIPE_S, PIPE_V, kSimtEvent);
+        set_flag(PIPE_S, PIPE_V, simtEvent_);
+        wait_flag(PIPE_S, PIPE_V, simtEvent_);
         AscendC::Simt::VF_CALL<RollbackPrivateClaimSimt>(
             AscendC::Simt::Dim3{1U, 1U, 1U}, privateSourceToSlot_,
             privateObjectToSlot_, privateReady_, sourceOffset, objectOffset,
             static_cast<uint64_t>(outputIndex), claimResult_);
-        set_flag(PIPE_V, PIPE_S, kSimtEvent);
-        wait_flag(PIPE_V, PIPE_S, kSimtEvent);
+        set_flag(PIPE_V, PIPE_S, simtEvent_);
+        wait_flag(PIPE_V, PIPE_S, simtEvent_);
         WriteGmByPassDCache<int64_t>(privateReadyEpoch_ + outputIndex, 0);
         WriteGmByPassDCache<int64_t>(privateReadyGeneration_ + outputIndex, 0);
     }
@@ -704,7 +710,7 @@ private:
             DataSyncBarrier<MemDsbT::DDR>();
         }
         if (kvaf_fused_get::ReleaseKvafStreamingBatchGetQueueFromAicore(
-                controlGm_, leaseResult_, kSimtEvent, &wave_)) {
+                controlGm_, leaseResult_, simtEvent_, &wave_)) {
             // A control/identity failure may deliberately quarantine an
             // otherwise releasable lease.  Releasing the KVAF owner does not
             // make that graph-visible queue trustworthy for this forward.
@@ -866,7 +872,7 @@ private:
         }
         kvaf_fused_get::KvafStreamingBatchGetLease lease{};
         if (!kvaf_fused_get::TryAcquireKvafStreamingBatchGetQueueFromAicore(
-                controlGm_, worker_, hint, leaseResult_, kSimtEvent, &lease)) {
+                controlGm_, worker_, hint, leaseResult_, simtEvent_, &lease)) {
             AddStat(kStatQueueBusy, 1U);
             return false;
         }
@@ -970,14 +976,14 @@ private:
             const int32_t outputIndex = ReadGmByPassDCache<int32_t>(
                 queueRequestOutputIndices_ + base + request);
             claimResult_->success = 0U;
-            set_flag(PIPE_S, PIPE_V, kSimtEvent);
-            wait_flag(PIPE_S, PIPE_V, kSimtEvent);
+            set_flag(PIPE_S, PIPE_V, simtEvent_);
+            wait_flag(PIPE_S, PIPE_V, simtEvent_);
             AscendC::Simt::VF_CALL<ClearTerminalFailedMappingSimt>(
                 AscendC::Simt::Dim3{1U, 1U, 1U}, privateSourceToSlot_,
                 privateObjectToSlot_, sourceOffset, objectOffset, outputIndex,
                 claimResult_);
-            set_flag(PIPE_V, PIPE_S, kSimtEvent);
-            wait_flag(PIPE_V, PIPE_S, kSimtEvent);
+            set_flag(PIPE_V, PIPE_S, simtEvent_);
+            wait_flag(PIPE_V, PIPE_S, simtEvent_);
         }
         DataSyncBarrier<MemDsbT::DDR>();
     }
