@@ -10,7 +10,9 @@
 // baseline.  Keep that exception local to P7.1 rather than changing the
 // ownership rule for every other bridge.
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
@@ -18,7 +20,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <unordered_set>
@@ -348,19 +349,17 @@ inline void ReleaseTuple(Tuple &args) {
 // This small registry is deliberately *not* a second execution queue: the
 // kernel is already enqueued on the NPU stream.  It only owns host-side
 // descriptors and Tensor handles until the graph Runtime calls
-// ReleaseP7DirectLaunchLeasesAtForwardTerminal() after its final stream
-// terminal.  The bounded reservation fails closed if that terminal is not
-// being consumed, rather than allowing unbounded host-lifetime leakage.
+// ReleaseP7DirectLaunchLeasesAtForwardTerminal(token) after the matching
+// forward's final stream terminal.  `token` is created at direct launch and
+// is bound to the exact aclrtStream that owns the queued ACLNN work.  It is
+// deliberately not a host-thread identity: graph terminal callbacks may run
+// on a different runtime thread from the submitter.
+//
+// The bounded reservation fails closed if that terminal is not being
+// consumed, rather than allowing unbounded host-lifetime leakage.
 class P7DirectLaunchLeaseBase {
  public:
-  explicit P7DirectLaunchLeaseBase(std::thread::id owner_thread)
-      : owner_thread_(owner_thread) {}
   virtual ~P7DirectLaunchLeaseBase() = default;
-
-  std::thread::id owner_thread() const { return owner_thread_; }
-
- private:
-  std::thread::id owner_thread_;
 };
 
 template <typename ConvertedTuple, typename TensorKeepaliveTuple>
@@ -368,8 +367,7 @@ class P7DirectLaunchLease final : public P7DirectLaunchLeaseBase {
  public:
   P7DirectLaunchLease(ConvertedTuple converted,
                       TensorKeepaliveTuple tensor_keepalive)
-      : P7DirectLaunchLeaseBase(std::this_thread::get_id()),
-        converted_(std::move(converted)),
+      : converted_(std::move(converted)),
         tensor_keepalive_(std::move(tensor_keepalive)) {}
 
   ~P7DirectLaunchLease() override { ReleaseTuple(converted_); }
@@ -382,6 +380,13 @@ class P7DirectLaunchLease final : public P7DirectLaunchLeaseBase {
 };
 
 class P7DirectLaunchLeaseRegistry {
+ private:
+  struct PendingLease {
+    uint64_t token;
+    uintptr_t stream_key;
+    std::shared_ptr<P7DirectLaunchLeaseBase> lease;
+  };
+
  public:
   static constexpr size_t kMaxPendingLeases = 16;
 
@@ -403,28 +408,55 @@ class P7DirectLaunchLeaseRegistry {
     --reservations_;
   }
 
-  void Commit(std::shared_ptr<P7DirectLaunchLeaseBase> lease) {
+  uint64_t Commit(std::shared_ptr<P7DirectLaunchLeaseBase> lease,
+                  aclrtStream stream) {
     TORCH_CHECK(lease != nullptr, "P7 direct launch lease is null");
+    TORCH_CHECK(stream != nullptr,
+                "P7 direct launch lease requires a non-null ACL stream");
     std::lock_guard<std::mutex> guard(mutex_);
     TORCH_CHECK(reservations_ > 0,
                 "P7 direct launch lease commit without reservation");
+    TORCH_CHECK(next_token_ != 0,
+                "P7 direct launch token space exhausted");
+    const uint64_t token = next_token_++;
     --reservations_;
-    pending_.push_back(std::move(lease));
+    pending_.push_back(
+        {token, reinterpret_cast<uintptr_t>(stream), std::move(lease)});
+    return token;
   }
 
-  int64_t ReleaseAtForwardTerminal() {
+  int64_t ReleaseAtForwardTerminal(uint64_t terminal_token) {
     std::vector<std::shared_ptr<P7DirectLaunchLeaseBase>> completed;
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      const std::thread::id caller = std::this_thread::get_id();
-      for (const auto &lease : pending_) {
-        TORCH_CHECK(
-            lease->owner_thread() == caller,
-            "P7 direct launch leases must be released by the same host "
-            "thread that enqueued them; call the graph forward terminal on "
-            "the owning runtime thread");
+      TORCH_CHECK(terminal_token != 0,
+                  "P7 forward-terminal token must be non-zero");
+      const auto terminal = std::find_if(
+          pending_.begin(), pending_.end(),
+          [terminal_token](const PendingLease& pending) {
+            return pending.token == terminal_token;
+          });
+      TORCH_CHECK(
+          terminal != pending_.end(),
+          "P7 forward-terminal token is not pending; it was either already "
+          "retired or belongs to a different process: ",
+          terminal_token);
+      const uintptr_t stream_key = terminal->stream_key;
+      std::vector<PendingLease> remaining;
+      remaining.reserve(pending_.size());
+      for (auto& pending : pending_) {
+        // A terminal for this stream proves every earlier launch on the same
+        // stream is no longer read by the device.  It says nothing about a
+        // concurrent stream, even if that stream was submitted by the same
+        // host thread, so those descriptors remain leased.
+        if (pending.stream_key == stream_key &&
+            pending.token <= terminal_token) {
+          completed.push_back(std::move(pending.lease));
+        } else {
+          remaining.push_back(std::move(pending));
+        }
       }
-      completed.swap(pending_);
+      pending_.swap(remaining);
     }
     const int64_t released = static_cast<int64_t>(completed.size());
     // Destruction releases aclTensor descriptors and Tensor keepalives only
@@ -441,7 +473,8 @@ class P7DirectLaunchLeaseRegistry {
  private:
   mutable std::mutex mutex_;
   size_t reservations_ = 0;
-  std::vector<std::shared_ptr<P7DirectLaunchLeaseBase>> pending_;
+  uint64_t next_token_ = 1;
+  std::vector<PendingLease> pending_;
 };
 
 inline P7DirectLaunchLeaseRegistry &GetP7DirectLaunchLeaseRegistry() {
@@ -457,8 +490,35 @@ inline std::shared_ptr<P7DirectLaunchLeaseBase> MakeP7DirectLaunchLease(
       std::move(converted), std::move(tensor_keepalive));
 }
 
-inline int64_t ReleaseP7DirectLaunchLeasesAtForwardTerminal() {
-  return GetP7DirectLaunchLeaseRegistry().ReleaseAtForwardTerminal();
+// The dispatch bridge consumes this immediately after one P7 direct launch
+// and stores it in the forward's RuntimeResources.  It is thread-local only
+// for hand-off from the synchronous dispatch return to that RuntimeResources
+// object; terminal release itself is intentionally allowed from any thread.
+inline uint64_t& LastP7DirectLaunchTokenForCurrentThread() {
+  static thread_local uint64_t token = 0;
+  return token;
+}
+
+inline void ClearP7DirectLaunchTokenForCurrentThread() {
+  LastP7DirectLaunchTokenForCurrentThread() = 0;
+}
+
+inline void PublishP7DirectLaunchTokenForCurrentThread(uint64_t token) {
+  TORCH_CHECK(token != 0, "P7 direct launch token must be non-zero");
+  LastP7DirectLaunchTokenForCurrentThread() = token;
+}
+
+inline uint64_t TakeP7DirectLaunchTokenForCurrentThread() {
+  uint64_t& token = LastP7DirectLaunchTokenForCurrentThread();
+  const uint64_t result = token;
+  token = 0;
+  return result;
+}
+
+inline int64_t ReleaseP7DirectLaunchLeasesAtForwardTerminal(
+    uint64_t terminal_token) {
+  return GetP7DirectLaunchLeaseRegistry().ReleaseAtForwardTerminal(
+      terminal_token);
 }
 
 inline int64_t PendingP7DirectLaunchLeases() {
@@ -959,6 +1019,8 @@ inline void LogOrderedHostDso(
 #define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(aclnn_api, tensor_keepalive, ...) \
   do {                                                                           \
     using namespace nanovllm_a5_opapi;                                           \
+    /* Do not let a prior failed/successful dispatch leak a stale token. */     \
+    ClearP7DirectLaunchTokenForCurrentThread();                                  \
     static void *workspace_addr_fn =                                             \
         ResolveSymbol(#aclnn_api "GetWorkspaceSize");                          \
     static void *launch_addr_fn = ResolveSymbol(#aclnn_api);                    \
@@ -1037,6 +1099,8 @@ inline void LogOrderedHostDso(
                   "did not release prior P7 leases");                         \
     }                                                                            \
     auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);            \
+    /* Mirror the checked torch_npu launch contract before direct ACLNN. */     \
+    UseStreamResIfNeeded(acl_stream, false);                                     \
     LogOpApiLifecycle(#aclnn_api, "direct_async_launch_begin");               \
     const int launch_status =                                                     \
         launch_fn(workspace_ptr, workspace_size, executor, acl_stream);          \
@@ -1048,7 +1112,10 @@ inline void LogOrderedHostDso(
     }                                                                            \
     LogOpApiLifecycle(#aclnn_api, "direct_async_launch_done");                \
                                                                                \
-    GetP7DirectLaunchLeaseRegistry().Commit(std::move(direct_async_lease));     \
+    const uint64_t direct_async_token =                                         \
+        GetP7DirectLaunchLeaseRegistry().Commit(                                 \
+            std::move(direct_async_lease), acl_stream);                          \
+    PublishP7DirectLaunchTokenForCurrentThread(direct_async_token);              \
     LogOpApiLifecycle(#aclnn_api, "direct_async_descriptor_lease_held");     \
     direct_async_tls_cleanup();                                                  \
     LogOpApiLifecycle(#aclnn_api,                                                \

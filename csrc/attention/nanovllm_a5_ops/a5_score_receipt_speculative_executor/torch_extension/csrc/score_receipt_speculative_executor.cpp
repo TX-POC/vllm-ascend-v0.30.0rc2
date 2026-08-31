@@ -358,16 +358,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         contract["fixed_get_core"] = false;
         return contract;
     });
-    m.def("p7_1_release_after_forward_terminal", [] {
+    m.def("p7_1_take_launch_token", [] {
+        const uint64_t token =
+            nanovllm_a5_opapi::TakeP7DirectLaunchTokenForCurrentThread();
+        TORCH_CHECK(
+            token != 0,
+            "P7.1 has no direct-launch token on this dispatch thread; capture "
+            "the terminal lease immediately after score_receipt_speculative_executor");
+        return static_cast<int64_t>(token);
+    });
+    m.def("p7_1_release_after_forward_terminal", [](int64_t terminal_token) {
+        TORCH_CHECK(terminal_token > 0,
+                    "P7.1 forward-terminal token must be positive");
         const int64_t released =
-            nanovllm_a5_opapi::ReleaseP7DirectLaunchLeasesAtForwardTerminal();
+            nanovllm_a5_opapi::ReleaseP7DirectLaunchLeasesAtForwardTerminal(
+                static_cast<uint64_t>(terminal_token));
         if (DebugEnabled()) {
             std::fprintf(stderr,
                          "P7_1_TERMINAL_LEASE released=%lld pending=%lld "
-                         "terminal=caller_confirmed_stream_terminal\n",
+                         "token=%lld terminal=caller_confirmed_stream_terminal\n",
                          static_cast<long long>(released),
                          static_cast<long long>(
-                             nanovllm_a5_opapi::PendingP7DirectLaunchLeases()));
+                             nanovllm_a5_opapi::PendingP7DirectLaunchLeases()),
+                         static_cast<long long>(terminal_token));
             std::fflush(stderr);
         }
         return released;

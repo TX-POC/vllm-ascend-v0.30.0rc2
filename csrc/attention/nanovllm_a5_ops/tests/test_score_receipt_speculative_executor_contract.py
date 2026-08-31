@@ -157,6 +157,12 @@ def main() -> None:
         / "score_receipt_speculative_executor.cpp"
     )
     op_api_common_path = ops_root / "torch_extension" / "csrc" / "op_api_common.h"
+    runtime_package_path = (
+        p7_root
+        / "torch_extension"
+        / "nanovllm_score_receipt_speculative_executor"
+        / "__init__.py"
+    )
     runtime_test_path = ops_root / "tests" / "test_score_receipt_speculative_executor.py"
     reuse_runner_path = ops_root / "tests" / "run_p7_1_test_only_artifact_reuse.sh"
     real_fixture_path = p7_root / "torch_extension" / "p7_1_real_direct_hccp_fixture.py"
@@ -168,6 +174,7 @@ def main() -> None:
         tiling_path,
         bridge_path,
         op_api_common_path,
+        runtime_package_path,
         runtime_test_path,
         reuse_runner_path,
         real_fixture_path,
@@ -260,7 +267,13 @@ def main() -> None:
         "workspace_size != 0",
         "UseStreamResIfNeeded(acl_stream, true)",
         "MakeP7DirectLaunchLease",
-        "ReleaseP7DirectLaunchLeasesAtForwardTerminal",
+        "Commit(std::shared_ptr<P7DirectLaunchLeaseBase> lease,",
+        "ReleaseP7DirectLaunchLeasesAtForwardTerminal(",
+        "TakeP7DirectLaunchTokenForCurrentThread",
+        "ClearP7DirectLaunchTokenForCurrentThread",
+        "PublishP7DirectLaunchTokenForCurrentThread",
+        "stream_key",
+        "UseStreamResIfNeeded(acl_stream, false)",
         "direct_async_workspace_call_begin",
         "direct_async_launch_done",
         "direct_async_descriptor_lease_held",
@@ -307,6 +320,46 @@ def main() -> None:
             "P7 descriptor ledger/workspace boundary must run after ConvertTypes and before "
             "GetWorkspaceSize"
         )
+    direct_token_clear_offset = op_api_common.find(
+        "ClearP7DirectLaunchTokenForCurrentThread();", direct_macro_offset
+    )
+    direct_resolve_offset = op_api_common.find(
+        "ResolveSymbol(#aclnn_api \"GetWorkspaceSize\")", direct_macro_offset
+    )
+    direct_dequeue_offset = op_api_common.find(
+        "UseStreamResIfNeeded(acl_stream, false);", direct_macro_offset
+    )
+    direct_launch_offset = op_api_common.find(
+        "const int launch_status =", direct_macro_offset
+    )
+    direct_commit_offset = op_api_common.find(
+        "Commit(", direct_macro_offset
+    )
+    direct_publish_offset = op_api_common.find(
+        "PublishP7DirectLaunchTokenForCurrentThread(direct_async_token);",
+        direct_macro_offset,
+    )
+    if not (
+        direct_macro_offset < direct_token_clear_offset < direct_resolve_offset
+        and direct_dequeue_offset < direct_launch_offset < direct_commit_offset
+        < direct_publish_offset
+    ):
+        raise AssertionError(
+            "P7 direct launch must clear stale tokens before resolver work, bind "
+            "torch_npu dequeue stream resources before launch, then publish the "
+            "stream/token lease only after a successful enqueue"
+        )
+    runtime_package = runtime_package_path.read_text(encoding="utf-8")
+    for token in (
+        "class ForwardTerminalLease",
+        "capture_forward_terminal_lease",
+        "release_at_forward_terminal",
+        "p7_1_take_launch_token",
+        "p7_1_release_after_forward_terminal(int(lease.token))",
+    ):
+        _require(runtime_package, token, runtime_package_path)
+    for forbidden in ("p7_1_release_after_forward_terminal()",):
+        _forbid(runtime_package, forbidden, runtime_package_path)
     for token in (
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31'",
         "DESCRIPTOR_LEDGER",

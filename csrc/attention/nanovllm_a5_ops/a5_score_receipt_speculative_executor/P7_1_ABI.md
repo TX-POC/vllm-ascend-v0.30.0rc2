@@ -44,13 +44,27 @@ workspace 生命周期，不能悄悄复用这里的零 workspace 路径。
 但 `workspace=0` **不等于** host descriptor 可以在 `aclnn(...)` 返回后立即销毁。
 P7.1 因此把 31 个 `aclTensor` descriptor 与 31 个 Tensor handle 作为一个有上限的
 `direct-launch lease` 暂存；此 lease 不执行 DMA、也不轮询 CQ，它只保护 host-side
-ACLNN 输入。Graph runtime 在本 forward 的最终 stream terminal（`forward stream terminal`，
-实际产品中是 QSFA terminal）确认之后调用 `p7_1_release_after_forward_terminal()` 统一释放。若上一个
-forward 没有 terminal，lease 池会在固定上限前 fail-closed，而不是无限积压。
+ACLNN 输入。
+
+每次直接入流成功时，bridge 同时生成一个单调的 `launch token`，并把 token 绑定到
+**这一次 ACLNN 实际入流的 `aclrtStream`**。dispatch return 后，Runtime 立即调用
+`capture_forward_terminal_lease()`，将这个 token 放进本 forward 的 `RuntimeResources`；
+这一步不等待 NPU。等到本 forward 的最终 stream terminal（`forward stream terminal`，实际产品中是 QSFA terminal）已经
+确认后，Runtime 在任意 host 线程调用 `release_at_forward_terminal(lease)`。registry 只会释放
+“同一 stream 且 token 不晚于该 terminal”的 descriptors：一个 stream 的 terminal 绝不会把
+并发 stream 的 lease 一起清掉，也不要求 terminal 回调与入流回调在同一 host thread。
+
+这里的 token 是 host-side descriptor 生命周期身份，不替代设备端的
+`streaming_epoch + queue_generation + post_sequence`。后者仍由 P7.1 kernel/CQ 用于拒绝旧 wave
+completion；token 只回答“哪个 ACLNN descriptor 现在可以安全析构”。若 forward 没有走 terminal，
+lease 池会在固定上限前 fail-closed，而不是无限积压。
 
 这仍然没有重新引入 `OpCommand`、CPU/GIL 逐候选提交或固定 Get 核：设备端的
 `PostOnly -> DMA -> CQ` 从 P7.1 kernel 入流后持续异步执行；terminal hook 只处理已经
-不再被设备读取的 host descriptor 生命周期。
+不再被设备读取的 host descriptor 生命周期。当前 standalone P7.1 测试已走同一
+`capture -> stream terminal -> release` API；产品图路径接入时必须把 capture 的返回值放进
+transaction `RuntimeResources`，并由现有 QSFA terminal 取出释放，不能直接调用底层 pybind
+接口或按进程全局清空 lease。
 
 ## 31 个 ACLNN 张量 / 18 个原地 Ref 输出
 

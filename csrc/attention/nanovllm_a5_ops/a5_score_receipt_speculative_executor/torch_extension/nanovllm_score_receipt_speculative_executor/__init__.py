@@ -8,6 +8,7 @@ root and this module resets the custom-op resolver to that single vendor.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -86,4 +87,58 @@ if os.getenv("NANOVLLM_A5_OPAPI_DEBUG") not in (None, "", "0"):
 
 from . import _C  # noqa: E402,F401
 
-__all__ = []
+
+@dataclass(frozen=True)
+class ForwardTerminalLease:
+    """Host ownership for one direct P7 launch until its forward terminal.
+
+    The token is created by the C++ bridge together with the exact NPU stream
+    that received the ACLNN launch.  It is captured synchronously on the
+    dispatch thread, then may be released from any graph/runtime thread once
+    that *same forward's* QSFA/stream terminal has completed.
+    """
+
+    token: int
+
+
+def capture_forward_terminal_lease() -> ForwardTerminalLease:
+    """Move the latest direct-launch token into forward RuntimeResources.
+
+    Call this immediately after the P7 torch op returns, before scheduling a
+    later forward on the same runtime worker.  This does not synchronize the
+    NPU or alter P7's device-side PostOnly/CQ execution.
+    """
+
+    token = int(_C.p7_1_take_launch_token())
+    if token <= 0:
+        raise RuntimeError(f"P7.1 returned invalid direct-launch token {token}")
+    return ForwardTerminalLease(token=token)
+
+
+def release_at_forward_terminal(lease: ForwardTerminalLease) -> int:
+    """Release only descriptors protected by ``lease``'s stream/token boundary.
+
+    The caller must establish the forward terminal first (in production, after
+    the final QSFA reader; in the scoped test, after stream synchronization).
+    The underlying registry deliberately releases no work from other streams.
+    """
+
+    if not isinstance(lease, ForwardTerminalLease):
+        raise TypeError("lease must be a P7.1 ForwardTerminalLease")
+    if lease.token <= 0:
+        raise ValueError(f"P7.1 terminal token must be positive, got {lease.token}")
+    return int(_C.p7_1_release_after_forward_terminal(int(lease.token)))
+
+
+def pending_launch_leases() -> int:
+    """Return the bounded host-descriptor leases not yet terminally released."""
+
+    return int(_C.p7_1_pending_launch_leases())
+
+
+__all__ = [
+    "ForwardTerminalLease",
+    "capture_forward_terminal_lease",
+    "pending_launch_leases",
+    "release_at_forward_terminal",
+]

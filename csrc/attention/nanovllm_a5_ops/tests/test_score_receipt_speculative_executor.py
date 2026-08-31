@@ -133,16 +133,21 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     # Keep the fail-closed fixture preflight independent of an OPP package.
     # The runner executes that preflight before any expensive KVAF/OPP build;
     # importing the bridge belongs only to the actual ACLNN dispatch path.
-    from nanovllm_score_receipt_speculative_executor import _C as p7_bridge
+    import nanovllm_score_receipt_speculative_executor as p7_runtime
 
     outputs = torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor(*inputs)
+    # This is the production-shaped hand-off: capture the exact stream/token
+    # boundary synchronously with dispatch and keep it in the forward's
+    # RuntimeResources until QSFA has consumed the private view.  It is not a
+    # test-only raw pybind cleanup call.
+    terminal_lease = p7_runtime.capture_forward_terminal_lease()
     # This test's synchronize is the forward stream terminal. Production graph
-    # execution calls the same bridge hook only after its QSFA/forward terminal;
+    # execution calls the same package API only after its QSFA/forward terminal;
     # the hook releases host descriptors and read-only Tensor keepalives, not
     # the device-side PostOnly/CQ transaction itself.
     torch.npu.synchronize()
-    released = int(p7_bridge.p7_1_release_after_forward_terminal())
-    pending = int(p7_bridge.p7_1_pending_launch_leases())
+    released = p7_runtime.release_at_forward_terminal(terminal_lease)
+    pending = p7_runtime.pending_launch_leases()
     if released != 1 or pending != 0:
         raise AssertionError(
             "P7.1 direct launch lease terminal mismatch: "
@@ -150,7 +155,8 @@ def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         )
     print(
         "P7_1_TERMINAL_LEASE "
-        f"released={released} pending={pending} terminal=stream_synchronized",
+        "released=%d pending=%d terminal=stream_synchronized token=%d"
+        % (released, pending, terminal_lease.token),
         flush=True,
     )
     _check_ref_outputs(inputs, tuple(outputs))
