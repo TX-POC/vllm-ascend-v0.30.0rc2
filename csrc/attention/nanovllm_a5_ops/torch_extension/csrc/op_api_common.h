@@ -477,8 +477,14 @@ class P7DirectLaunchLeaseRegistry {
 };
 
 inline P7DirectLaunchLeaseRegistry &GetP7DirectLaunchLeaseRegistry() {
-  static P7DirectLaunchLeaseRegistry registry;
-  return registry;
+  // This bridge is loaded into CPython beside Torch/CANN.  A normal forward
+  // terminal must leave `pending_` empty, but destroying this mutex/vector
+  // during extension unload can still race an external runtime's teardown
+  // order.  Keep the bounded registry process-lifetime instead: it changes no
+  // forward semantics or memory bound (16 pending leases), and removes this
+  // bridge-owned non-trivial static destructor from that order.
+  static auto *registry = new P7DirectLaunchLeaseRegistry();
+  return *registry;
 }
 
 template <typename TensorKeepaliveTuple>

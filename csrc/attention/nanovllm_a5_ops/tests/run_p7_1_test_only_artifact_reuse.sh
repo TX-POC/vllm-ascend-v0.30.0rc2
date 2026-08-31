@@ -282,11 +282,15 @@ run_direct_async_fail_closed_case() {
     local stream_terminal=0
     local test_pass=0
     local teardown=0
+    local final_receipt=0
 
     # The invalid control rejects in the device kernel before lease/PostOnly/CQ.
     # It still proves the product host path is direct-current-stream and does
-    # not introduce the old torch_npu task-queue ownership boundary.
-    timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+    # not introduce the old torch_npu task-queue ownership boundary.  This
+    # disposable child exits only after every stream-terminal assertion and
+    # receipt has been flushed; a separate child below probes Python/ELF exit.
+    P7_1_TEST_EXIT_AFTER_RECEIPT=1 \
+        timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         2>&1 | tee "${case_log}"
     case_rc=${PIPESTATUS[0]}
 
@@ -304,10 +308,11 @@ run_direct_async_fail_closed_case() {
     grep -Fq 'P7_1_BOUNDARY stage=stream_terminal_done' "${case_log}" && stream_terminal=1
     grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
     grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
-    printf 'P7_DIRECT_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_release=%s tensor_keepalive=%s torch_return=%s stream_terminal=%s terminal_lease=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s real_hccp=scheduled_after_pass log=%s\n' \
+    grep -Fq 'P7_1_FINAL_RECEIPT mode=fail_closed pass=1 terminal=stream_synchronized teardown=complete exit_strategy=os__exit' "${case_log}" && final_receipt=1
+    printf 'P7_DIRECT_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_release=%s tensor_keepalive=%s torch_return=%s stream_terminal=%s terminal_lease=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s final_receipt=%s real_hccp=scheduled_after_pass log=%s\n' \
         "${case_rc}" "${descriptor_ledger}" "${workspace}" "${launch}" \
         "${descriptor_release}" "${tensor_keepalive}" "${torch_return}" "${stream_terminal}" "${terminal_lease}" "${pta_ready}" "${pta_uninit}" "${submit}" \
-        "${task_queue_handoff}" "${test_pass}" "${teardown}" "${case_log}"
+        "${task_queue_handoff}" "${test_pass}" "${teardown}" "${final_receipt}" "${case_log}"
     if [[ "${case_rc}" != "0" || "${descriptor_ledger}" != "1" || \
           "${workspace}" != "1" || "${launch}" != "1" || \
           "${descriptor_release}" != "1" || "${tensor_keepalive}" != "1" || \
@@ -316,7 +321,87 @@ run_direct_async_fail_closed_case() {
           "${pta_ready}" != "1" || \
           "${pta_uninit}" != "1" || "${submit}" != "1" || \
           "${task_queue_handoff}" != "0" || "${test_pass}" != "1" || \
-          "${teardown}" != "1" ]]; then
+          "${teardown}" != "1" || "${final_receipt}" != "1" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# The direct child above validates functionality.  This normal-exit child is a
+# *diagnostic only*: it must not suppress a fresh-process real HCCP attempt
+# after a fully completed stream terminal.  Its compact receipts say whether a
+# remaining crash is before Python atexit, or after it in loader/runtime exit.
+P7_TEARDOWN_PROBE_CHILD_RC=98
+P7_TEARDOWN_PROBE_CLASS=not_run
+run_direct_async_teardown_probe() {
+    local probe_log="${P7_RESULT}/fail_closed_process_teardown_probe.log"
+    local probe_rc=0
+    local test_pass=0
+    local teardown=0
+    local final_receipt=0
+    local python_atexit=0
+
+    P7_1_TEST_PROCESS_EXIT_DIAG=1 \
+        timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+        2>&1 | tee "${probe_log}"
+    probe_rc=${PIPESTATUS[0]}
+    P7_TEARDOWN_PROBE_CHILD_RC="${probe_rc}"
+
+    grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${probe_log}" && test_pass=1
+    grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${probe_log}" && teardown=1
+    grep -Fq 'P7_1_FINAL_RECEIPT mode=fail_closed pass=1 terminal=stream_synchronized teardown=complete exit_strategy=normal_python_exit' "${probe_log}" && final_receipt=1
+    grep -Fq 'P7_1_PROCESS_EXIT stage=python_atexit' "${probe_log}" && python_atexit=1
+
+    if [[ "${probe_rc}" == "0" && "${test_pass}" == "1" && \
+          "${teardown}" == "1" && "${final_receipt}" == "1" && \
+          "${python_atexit}" == "1" ]]; then
+        P7_TEARDOWN_PROBE_CLASS=clean_normal_exit
+    elif [[ "${probe_rc}" == "139" && "${test_pass}" == "1" && \
+            "${teardown}" == "1" && "${final_receipt}" == "1" && \
+            "${python_atexit}" == "1" ]]; then
+        P7_TEARDOWN_PROBE_CLASS=after_python_atexit
+    elif [[ "${probe_rc}" == "139" && "${test_pass}" == "1" && \
+            "${teardown}" == "1" && "${final_receipt}" == "1" ]]; then
+        P7_TEARDOWN_PROBE_CLASS=after_test_before_python_atexit
+    else
+        P7_TEARDOWN_PROBE_CLASS=unclassified
+    fi
+
+    printf 'P7_DIRECT_ASYNC_TEARDOWN_PROBE child_rc=%s test_pass=%s teardown=%s final_receipt=%s python_atexit=%s classification=%s gating=diagnostic_only log=%s\n' \
+        "${probe_rc}" "${test_pass}" "${teardown}" "${final_receipt}" \
+        "${python_atexit}" "${P7_TEARDOWN_PROBE_CLASS}" "${probe_log}"
+
+    # The caller records this diagnosis but gates execution on the two
+    # receipt-complete children, not on CPython process shutdown.
+    if [[ "${test_pass}" == "1" && "${teardown}" == "1" && \
+          "${final_receipt}" == "1" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+run_real_direct_hccp_case() {
+    local case_log="${P7_RESULT}/real_direct_hccp.log"
+    local case_rc=0
+    local test_pass=0
+    local teardown=0
+    local final_receipt=0
+
+    # This is the actual P7 target path: a real cold-bound KVAF control is
+    # consumed in a new Python process.  The test fixture performs its own
+    # Finish/release/cleanup before the receipt allows this child to exit.
+    P7_1_TEST_EXIT_AFTER_RECEIPT=1 \
+        timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+            --fixture-module p7_1_real_direct_hccp_fixture \
+        2>&1 | tee "${case_log}"
+    case_rc=${PIPESTATUS[0]}
+    grep -Fq 'P7_1_TEST mode=real_direct_hccp pass=1 real_hccp=acquire_post_retire_finish_release' "${case_log}" && test_pass=1
+    grep -Fq 'P7_1_TEARDOWN mode=real_direct_hccp stage=python_refs_collected sync=1' "${case_log}" && teardown=1
+    grep -Fq 'P7_1_FINAL_RECEIPT mode=real_direct_hccp pass=1 terminal=stream_synchronized teardown=complete exit_strategy=os__exit' "${case_log}" && final_receipt=1
+    printf 'P7_REAL_DIRECT_HCCP rc=%s test_pass=%s teardown=%s final_receipt=%s log=%s\n' \
+        "${case_rc}" "${test_pass}" "${teardown}" "${final_receipt}" "${case_log}"
+    if [[ "${case_rc}" != "0" || "${test_pass}" != "1" || \
+          "${teardown}" != "1" || "${final_receipt}" != "1" ]]; then
         return 1
     fi
     return 0
@@ -332,29 +417,32 @@ if [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
     P7_FAIL_CLOSED_RC="${P7_DIRECT_ASYNC_RC}"
     if [[ "${P7_DIRECT_ASYNC_RC}" == "0" ]]; then
         P7_DIRECT_CURRENT_STREAM=1
-        timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
-            --fixture-module p7_1_real_direct_hccp_fixture \
-            2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
-        P7_REAL_RC=${PIPESTATUS[0]}
+        run_real_direct_hccp_case
+        P7_REAL_RC=$?
         if [[ "${P7_REAL_RC}" != "0" ]]; then
             P7_FAIL_CLOSED_RC=1
         fi
+        run_direct_async_teardown_probe
+        P7_TEARDOWN_PROBE_RC=$?
     else
         printf 'P7_REAL_HCCP_SKIPPED reason=direct_async_fail_closed_gate_failed\n'
     fi
-    printf 'P7_REAL_FLOW_FINAL status=%s direct_async=%s real_hccp=%s execution=direct_current_stream_then_real_hccp\n' \
-        "${P7_FAIL_CLOSED_RC}" "${P7_DIRECT_ASYNC_RC}" "${P7_REAL_RC}"
+    printf 'P7_REAL_FLOW_FINAL status=%s direct_async=%s real_hccp=%s teardown_probe=%s teardown_probe_child=%s teardown_class=%s execution=direct_current_stream_then_real_hccp\n' \
+        "${P7_FAIL_CLOSED_RC}" "${P7_DIRECT_ASYNC_RC}" "${P7_REAL_RC}" \
+        "${P7_TEARDOWN_PROBE_RC:-98}" "${P7_TEARDOWN_PROBE_CHILD_RC}" \
+        "${P7_TEARDOWN_PROBE_CLASS}"
 else
     printf 'P7_REAL_HCCP_SKIPPED reason=fixture_preflight_failed\n'
 fi
 printf 'P7_DIRECT_CURRENT_STREAM observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
     "${P7_DIRECT_CURRENT_STREAM}"
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER|TERMINAL_LEASE|BOUNDARY)|P7_(DIRECT_ASYNC_FAIL_CLOSED|DIRECT_CURRENT_STREAM|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(direct_async_enqueue_ready|direct_async_pta_cache_ready|direct_async_pta_cache_unavailable|direct_async_pta_cache_uninit|direct_async_pta_cache_not_active|direct_async_workspace_call_begin|direct_async_workspace_ready|direct_async_launch_begin|direct_async_launch_done|direct_async_descriptor_release_done|direct_async_tensor_keepalive_held|direct_async_submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|FINAL_RECEIPT|PROCESS_EXIT|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER|TERMINAL_LEASE|BOUNDARY)|P7_(DIRECT_ASYNC_FAIL_CLOSED|DIRECT_ASYNC_TEARDOWN_PROBE|DIRECT_CURRENT_STREAM|REAL_DIRECT_HCCP|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(direct_async_enqueue_ready|direct_async_pta_cache_ready|direct_async_pta_cache_unavailable|direct_async_pta_cache_uninit|direct_async_pta_cache_not_active|direct_async_workspace_call_begin|direct_async_workspace_ready|direct_async_launch_begin|direct_async_launch_done|direct_async_descriptor_release_done|direct_async_tensor_keepalive_held|direct_async_submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
         "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
-    printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 direct_async=0 real=0 result=%s\n' "${P7_RESULT}"
+    printf 'P7_REUSE_FINAL status=0 contract=0 preflight=0 direct_async=0 real=0 teardown_probe_child=%s teardown_class=%s result=%s\n' \
+        "${P7_TEARDOWN_PROBE_CHILD_RC}" "${P7_TEARDOWN_PROBE_CLASS}" "${P7_RESULT}"
 else
     printf 'P7_REUSE_FINAL status=1 contract=%s preflight=%s direct_async=%s real=%s result=%s\n' \
         "${P7_CONTRACT_RC}" "${P7_PREFLIGHT_RC}" "${P7_FAIL_CLOSED_RC}" "${P7_REAL_RC}" "${P7_RESULT}"

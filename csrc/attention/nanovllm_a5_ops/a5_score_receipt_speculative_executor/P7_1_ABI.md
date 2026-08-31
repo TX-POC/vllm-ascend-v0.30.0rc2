@@ -73,6 +73,23 @@ completion；token 只回答“哪些 Tensor handle 在该 stream terminal 后�
 transaction `RuntimeResources`，并由现有 QSFA terminal 取出释放，不能直接调用底层 pybind
 接口或按进程全局清空 lease。
 
+### 测试进程退出与产品路径要分开
+
+P7.1 的正确性 gate 是“ACLNN 已入同一 stream、该 stream 已 terminal、lease 已释放、真实
+fixture 已完成 `Finish/Release`”。这几个条件完成后，测试进程再退出时，CPython、Torch、CANN
+和动态库还会依次做各自的全局析构；这不是一次 forward 的执行步骤。
+
+因此 scoped runner 使用三个**独立子进程**：第一个以无效 control 运行到
+`P7_1_FINAL_RECEIPT` 后用测试专用 `os._exit(0)` 结束，证明直接 ACLNN 入流、stream terminal 和
+lease 生命周期；第二个用真实 cold-bound KVAF control，在 `Finish/Release/cleanup` 全部结束后才
+发出同类 receipt，证明真正的 Direct-HCCP transaction；第三个保持正常 Python 退出，仅记录
+`P7_1_PROCESS_EXIT`，用于定位 CPython/ELF/CANN teardown。`os._exit` 绝不出现在产品 runtime
+路径，也不跳过 fixture 的 `Finish/Release/cleanup`：真实 HCCP receipt 只能在这些都结束后发出。
+
+桥接内部唯一含 mutex/vector 的 lease registry 采用进程生命周期分配。它在运行期仍严格限制
+最多 16 个 pending lease，forward terminal 仍必须使其清零；改变的只是让这个 bridge-owned
+对象不参与 Python/Torch/CANN 的退出析构排序，避免没有业务价值的 shutdown-order 风险。
+
 ## 31 个 ACLNN 张量 / 18 个原地 Ref 输出
 
 Torch 侧 schema 仍是 `torch_schema=31in_18aliasout`，这样图能看到 18 个可变状态的

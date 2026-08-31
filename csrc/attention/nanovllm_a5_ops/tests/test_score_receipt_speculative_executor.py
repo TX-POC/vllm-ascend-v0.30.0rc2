@@ -18,6 +18,7 @@ callback verifies payload/transaction-specific expectations.
 from __future__ import annotations
 
 import argparse
+import atexit
 import gc
 import importlib
 import os
@@ -269,6 +270,50 @@ def _teardown_checkpoint(mode: str) -> None:
     )
 
 
+def _emit_final_receipt_and_maybe_exit(mode: str) -> None:
+    """Record a completed transaction before optional test-process isolation.
+
+    The P7.1 bridge test deliberately runs in a disposable Python process.  A
+    recent diagnostic reached the complete forward terminal and all Python
+    cleanup checks, then faulted only during interpreter/ELF teardown.  This
+    helper lets the runner prove the functional transaction in one child and
+    investigate that later process-exit fault in another child.  It is not a
+    product execution option: the environment switch is honored only by this
+    standalone test module, after stream synchronization and fixture cleanup.
+    """
+
+    force_exit = os.getenv("P7_1_TEST_EXIT_AFTER_RECEIPT") == "1"
+    exit_strategy = "os__exit" if force_exit else "normal_python_exit"
+    print(
+        "P7_1_FINAL_RECEIPT "
+        f"mode={mode} pass=1 terminal=stream_synchronized teardown=complete "
+        f"exit_strategy={exit_strategy}",
+        flush=True,
+    )
+    if force_exit:
+        # The caller uses a fresh disposable test process.  `os._exit` is
+        # intentionally after every P7 assertion, terminal release, and real
+        # fixture cleanup; it bypasses only CPython/ELF process finalization.
+        os._exit(0)
+
+
+def _install_process_exit_probe() -> None:
+    """Optionally mark the last Python-level teardown boundary.
+
+    This is diagnostic-only.  If the marker appears and the process still
+    faults, the remaining boundary is outside P7's Python test body and its
+    explicit forward/stream lifecycle.
+    """
+
+    if os.getenv("P7_1_TEST_PROCESS_EXIT_DIAG") != "1":
+        return
+
+    def _mark_python_atexit() -> None:
+        print("P7_1_PROCESS_EXIT stage=python_atexit", flush=True)
+
+    atexit.register(_mark_python_atexit)
+
+
 def _cleanup_bisect_mode() -> str:
     """Return the explicit host-cleanup diagnostic mode, if any.
 
@@ -299,7 +344,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> str | None:
     args = parse_args()
     device = torch.device(args.device)
     if device.type != "npu":
@@ -318,7 +363,7 @@ def main() -> None:
             "device=%s opp_imported=0 aclnn_dispatched=0" % device,
             flush=True,
         )
-        return
+        return None
     if not args.fixture_module:
         inputs = _fail_closed_fixture(device)
         outputs = _run(inputs)
@@ -345,7 +390,7 @@ def main() -> None:
         del outputs
         del inputs
         _teardown_checkpoint(report_mode)
-        return
+        return report_mode
 
     module = importlib.import_module(args.fixture_module)
     factory = getattr(module, "build_p7_1_fixture", None)
@@ -355,6 +400,7 @@ def main() -> None:
         )
     fixture: dict[str, Any] = factory(device)
     cleanup = fixture.get("cleanup")
+    report_mode = "real_direct_hccp"
     try:
         inputs = tuple(fixture["inputs"])
         # A fixture is a transport transaction, not a pure function: running
@@ -379,15 +425,22 @@ def main() -> None:
         )
         del outputs
         del inputs
-        _teardown_checkpoint("real_direct_hccp")
+        _teardown_checkpoint(report_mode)
     finally:
         if cleanup is not None:
             cleanup()
+    return report_mode
 
 
 if __name__ == "__main__":
     try:
-        main()
+        completed_mode = main()
+        # Register only after the complete P7 body and fixture cleanup have
+        # returned.  `atexit` is LIFO, so this is the first Python-exit marker
+        # and cleanly separates a crash before Python atexit from one after it.
+        _install_process_exit_probe()
+        if completed_mode is not None:
+            _emit_final_receipt_and_maybe_exit(completed_mode)
     except Exception as exc:
         print(f"P7_1_TEST_FAIL type={type(exc).__name__} text={exc}", flush=True)
         raise

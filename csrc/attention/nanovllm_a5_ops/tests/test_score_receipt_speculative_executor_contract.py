@@ -287,6 +287,8 @@ def main() -> None:
         "LogConvertedDescriptorSet(#aclnn_api, converted)",
         "P7_1_DESCRIPTOR_LEDGER",
         "P7_1_DESCRIPTOR_LEDGER api=%s tuple_args=%zu acl_tensors=%zu unique_acl_tensors=%zu\\n",
+        "static auto *registry = new P7DirectLaunchLeaseRegistry();",
+        "process-lifetime instead",
     ):
         _require(op_api_common, token, op_api_common_path)
     _forbid(op_api_common, "aclDestroyAclOpExecutor(executor)", op_api_common_path)
@@ -367,6 +369,16 @@ def main() -> None:
         _require(runtime_package, token, runtime_package_path)
     for forbidden in ("p7_1_release_after_forward_terminal()",):
         _forbid(runtime_package, forbidden, runtime_package_path)
+    runtime_test = runtime_test_path.read_text(encoding="utf-8")
+    for token in (
+        "P7_1_TEST_EXIT_AFTER_RECEIPT",
+        "P7_1_TEST_PROCESS_EXIT_DIAG",
+        "P7_1_FINAL_RECEIPT",
+        "P7_1_PROCESS_EXIT stage=python_atexit",
+        "os._exit(0)",
+        "after every P7 assertion, terminal release, and real",
+    ):
+        _require(runtime_test, token, runtime_test_path)
     for token in (
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31'",
         "DESCRIPTOR_LEDGER",
@@ -374,10 +386,17 @@ def main() -> None:
         "direct_async_descriptor_release_done",
         "direct_async_tensor_keepalive_held",
         "run_direct_async_fail_closed_case()",
+        "run_direct_async_teardown_probe()",
+        "run_real_direct_hccp_case()",
+        "P7_1_TEST_EXIT_AFTER_RECEIPT=1",
         "P7_DIRECT_ASYNC_FAIL_CLOSED",
+        "P7_DIRECT_ASYNC_TEARDOWN_PROBE",
+        "P7_REAL_DIRECT_HCCP",
         "P7_1_TERMINAL_LEASE",
         "P7_1_BOUNDARY stage=torch_op_return",
         "P7_1_BOUNDARY stage=stream_terminal_done",
+        "P7_1_FINAL_RECEIPT",
+        "P7_1_TEST_PROCESS_EXIT_DIAG=1",
         "P7_REAL_FLOW_FINAL",
         "execution=direct_current_stream_then_real_hccp",
         "real_direct_hccp.log",
