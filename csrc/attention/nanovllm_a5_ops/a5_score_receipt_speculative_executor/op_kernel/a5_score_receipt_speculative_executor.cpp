@@ -6,6 +6,7 @@
 // dynamically lease any KVAF queue; no physical AIV is a permanent Get lane.
 
 #include "kernel_operator.h"
+#include "simt_api/asc_simt.h"
 
 #include "a5_score_receipt_speculative_executor_tiling.h"
 // build_nanovllm_ops.sh stages this exact helper from KVAF_FUSED_GET_SOURCE.
@@ -82,15 +83,18 @@ static_assert(sizeof(PrivateClaimResult) == 32U,
 // These are the matching L2-coherent SIMT loads used by KVAF's WQE
 // materializer.  Mapping identity is read through these helpers so a replayed
 // worker cannot observe a DCache-stale prior-forward tag.
-__simt_vf__ __aicore__ LAUNCH_BOUND(1)
-inline int32_t LoadGmInt32ForSimt(__gm__ const int32_t* address)
+// A VF service may call only SIMT callees.  These helpers are intentionally
+// SIMT callees (rather than nested VF launches): ClaimPrivateSlotSimt is the
+// one VF launch and uses them for coherent identity loads.
+__simt_callee__ inline int32_t LoadGmInt32ForSimt(
+    __gm__ const int32_t* address)
 {
     return static_cast<int32_t>(
         asc_ldcg(const_cast<__gm__ int32_t*>(address)));
 }
 
-__simt_vf__ __aicore__ LAUNCH_BOUND(1)
-inline int64_t LoadGmInt64ForSimt(__gm__ const int64_t* address)
+__simt_callee__ inline int64_t LoadGmInt64ForSimt(
+    __gm__ const int64_t* address)
 {
     return static_cast<int64_t>(static_cast<uint64_t>(
         asc_ldcg(const_cast<__gm__ int64_t*>(address))));
@@ -314,12 +318,10 @@ public:
         GM_ADDR private_ready_epoch, GM_ADDR private_ready_generation,
         GM_ADDR worker_stats, GM_ADDR rows_per_entry)
     {
-        // The executor owns only AIV/vector-side work plus its SIMT services.
-        // Do not construct TPipe/UB state on an unused AIC task if CANN
-        // invokes Init for both sides of a mixed launch.
-        if (!ASCEND_IS_AIV) {
-            return;
-        }
+        // The entry point declares KERNEL_TYPE_AIV_ONLY.  Keep this code free
+        // of ASCEND_IS_AIV conditionals: that macro expands to a constexpr
+        // statement (not a boolean expression), so negating it is invalid in
+        // AscendC.  More importantly, P7.1 has no AIC-side state to gate.
         candidateSeeds_ = reinterpret_cast<__gm__ int32_t*>(candidate_seeds);
         candidateCounts_ = reinterpret_cast<__gm__ int32_t*>(candidate_counts);
         candidateReadyEpoch_ = reinterpret_cast<__gm__ int64_t*>(candidate_ready_epoch);
@@ -358,11 +360,17 @@ public:
                                          kA5ScoreReceiptExecutorSeedWords * sizeof(int32_t));
         pipe_.InitBuffer(leaseBuffer_, sizeof(kvaf_fused_get::KvafStreamingBatchGetLeaseResult));
         pipe_.InitBuffer(claimBuffer_, sizeof(PrivateClaimResult));
-        localSeeds_[0] = seedBuffers_[0].Get<int32_t>();
-        localSeeds_[1] = seedBuffers_[1].Get<int32_t>();
-        leaseResult_ = reinterpret_cast<__ubuf__ kvaf_fused_get::KvafStreamingBatchGetLeaseResult*>(
-            leaseBuffer_.Get<uint8_t>());
-        claimResult_ = reinterpret_cast<__ubuf__ PrivateClaimResult*>(claimBuffer_.Get<uint8_t>());
+        // TBuf::Get returns LocalTensor, not an address.  Convert its physical
+        // UB address explicitly; direct LocalTensor-to-pointer conversion is
+        // rejected by the AscendC compiler and was the prior P7.1 build
+        // failure.  The two typed seed arrays remain exactly 2 x 64 x 4.
+        localSeeds_[0] = (__ubuf__ int32_t*)seedBuffers_[0].Get<int32_t>().GetPhyAddr();
+        localSeeds_[1] = (__ubuf__ int32_t*)seedBuffers_[1].Get<int32_t>().GetPhyAddr();
+        leaseResult_ =
+            (__ubuf__ kvaf_fused_get::KvafStreamingBatchGetLeaseResult*)
+                leaseBuffer_.Get<uint8_t>().GetPhyAddr();
+        claimResult_ = (__ubuf__ PrivateClaimResult*)
+            claimBuffer_.Get<uint8_t>().GetPhyAddr();
         for (uint32_t slot = 0U; slot < kA5ScoreReceiptExecutorMicrobatchSlots; ++slot) {
             batchState_[slot] = 0U;
             batchCount_[slot] = 0U;
@@ -416,7 +424,9 @@ public:
 
     __aicore__ inline void Process()
     {
-        if (!ASCEND_IS_AIV || !enabled_ || retainedQuarantinedWave_) {
+        // P7.1 is an AIV-only entry point; see Init for why no
+        // ASCEND_IS_AIV runtime/constexpr branch appears here.
+        if (!enabled_ || retainedQuarantinedWave_) {
             return;
         }
         for (uint32_t receipt = worker_; receipt < tiling_->receiptCount;

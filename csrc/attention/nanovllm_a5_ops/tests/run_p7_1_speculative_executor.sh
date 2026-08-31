@@ -252,7 +252,7 @@ if [[ "${P7_REAL_RC}" != "0" ]]; then
     fail "p7_1_real_direct_hccp_failed"
 fi
 
-grep -hE '^P7_1_(SOURCE|NPU|KVAF_BUILD|OPP|MANIFEST|BRIDGE|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|FINAL)' \
+grep -hE '^P7_1_(SOURCE|NPU|KVAF_BUILD|OPP|MANIFEST|BRIDGE|CONTROL|RECEIPTS|QUEUE|TRANSPORT|CANN_COMPILER|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|FINAL)' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 80
 printf 'P7_1_FINAL status=0 physical_npu=%s logical_npu=0 result=%s real_direct_hccp=1\n' \
     "${P7_PHYSICAL_NPU_ID}" "${P7_RESULT}"

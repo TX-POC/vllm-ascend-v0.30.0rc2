@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 REQUIRED_KERNEL = (
+    '#include "simt_api/asc_simt.h"',
     "TryAcquireKvafStreamingBatchGetQueueFromAicore",
     "LoadKvafStreamingBatchGetQueueTemplate",
     "PublishKvafStreamingBatchGetDescriptorScratch",
@@ -31,6 +32,11 @@ REQUIRED_KERNEL = (
     "ClearTerminalFailedMappingSimt",
     "LoadGmInt32ForSimt",
     "LoadGmInt64ForSimt",
+    "__simt_callee__ inline int32_t LoadGmInt32ForSimt",
+    "__simt_callee__ inline int64_t LoadGmInt64ForSimt",
+    "seedBuffers_[0].Get<int32_t>().GetPhyAddr()",
+    "leaseBuffer_.Get<uint8_t>().GetPhyAddr()",
+    "claimBuffer_.Get<uint8_t>().GetPhyAddr()",
 )
 FORBIDDEN_KERNEL = (
     "KERNEL_TYPE_MIX_AIC_1_2",
@@ -43,6 +49,11 @@ FORBIDDEN_KERNEL = (
     "ReadGmByPassDCache<int64_t>(private_ready_epoch",
     "ReadGmByPassDCache<int64_t>(private_ready_generation",
     "ReadGmByPassDCache<int32_t>(private_ready +",
+    "!ASCEND_IS_AIV",
+    "seedBuffers_[0].Get<int32_t>();",
+    "seedBuffers_[1].Get<int32_t>();",
+    "leaseBuffer_.Get<uint8_t>());",
+    "claimBuffer_.Get<uint8_t>());",
 )
 
 
@@ -158,6 +169,12 @@ def main() -> None:
         "P7_1_TRANSPORT_CONTRACT "
         "lease=real postonly=real try_retire=real finish=real release=real "
         "c8_dependency=0 fixed_get_core=0 task_type=aiv_only",
+        flush=True,
+    )
+    print(
+        "P7_1_CANN_COMPILER_CONTRACT "
+        "simt_callee=1 aiv_only_no_runtime_branch=1 "
+        "ub_physical_address_conversion=1",
         flush=True,
     )
     print(
