@@ -103,6 +103,7 @@ while IFS= read -r changed_path; do
     case "${changed_path}" in
         "${P7_OPS_REL}/tests/run_p7_1_speculative_executor.sh" | \
         "${P7_OPS_REL}/tests/run_p7_1_test_only_artifact_reuse.sh" | \
+        "${P7_OPS_REL}/tests/run_p7_1_fail_closed_dispatch_diag.sh" | \
         "${P7_OPS_REL}/tests/test_score_receipt_speculative_executor.py" | \
         "${P7_OPS_REL}/tests/test_score_receipt_speculative_executor_contract.py") ;;
         *) P7_UNEXPECTED_PATHS="${P7_UNEXPECTED_PATHS}${changed_path}," ;;
