@@ -15,7 +15,10 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <initializer_list>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <unordered_set>
@@ -335,6 +338,131 @@ template <typename Tuple>
 inline void ReleaseTuple(Tuple &args) {
   constexpr size_t kSize = std::tuple_size<Tuple>::value;
   ReleaseTuple(args, std::make_index_sequence<kSize>{});
+}
+
+// P7.1 is the only bridge that launches ACLNN directly on the caller's
+// current stream.  CANN's generated examples retain aclTensor descriptors
+// until the stream is terminal, so a direct bridge must not destroy its 31
+// descriptors merely because aclnn(...) has returned to the host.
+//
+// This small registry is deliberately *not* a second execution queue: the
+// kernel is already enqueued on the NPU stream.  It only owns host-side
+// descriptors and Tensor handles until the graph Runtime calls
+// ReleaseP7DirectLaunchLeasesAtForwardTerminal() after its final stream
+// terminal.  The bounded reservation fails closed if that terminal is not
+// being consumed, rather than allowing unbounded host-lifetime leakage.
+class P7DirectLaunchLeaseBase {
+ public:
+  explicit P7DirectLaunchLeaseBase(std::thread::id owner_thread)
+      : owner_thread_(owner_thread) {}
+  virtual ~P7DirectLaunchLeaseBase() = default;
+
+  std::thread::id owner_thread() const { return owner_thread_; }
+
+ private:
+  std::thread::id owner_thread_;
+};
+
+template <typename ConvertedTuple, typename TensorKeepaliveTuple>
+class P7DirectLaunchLease final : public P7DirectLaunchLeaseBase {
+ public:
+  P7DirectLaunchLease(ConvertedTuple converted,
+                      TensorKeepaliveTuple tensor_keepalive)
+      : P7DirectLaunchLeaseBase(std::this_thread::get_id()),
+        converted_(std::move(converted)),
+        tensor_keepalive_(std::move(tensor_keepalive)) {}
+
+  ~P7DirectLaunchLease() override { ReleaseTuple(converted_); }
+
+ private:
+  ConvertedTuple converted_;
+  // The tuple keeps every input, including the 13 read-only tensors that are
+  // not represented by a returned Ref alias, alive through stream terminal.
+  TensorKeepaliveTuple tensor_keepalive_;
+};
+
+class P7DirectLaunchLeaseRegistry {
+ public:
+  static constexpr size_t kMaxPendingLeases = 16;
+
+  P7DirectLaunchLeaseRegistry() { pending_.reserve(kMaxPendingLeases); }
+
+  bool Reserve() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (pending_.size() + reservations_ >= kMaxPendingLeases) {
+      return false;
+    }
+    ++reservations_;
+    return true;
+  }
+
+  void CancelReservation() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    TORCH_CHECK(reservations_ > 0,
+                "P7 direct launch lease reservation underflow");
+    --reservations_;
+  }
+
+  void Commit(std::shared_ptr<P7DirectLaunchLeaseBase> lease) {
+    TORCH_CHECK(lease != nullptr, "P7 direct launch lease is null");
+    std::lock_guard<std::mutex> guard(mutex_);
+    TORCH_CHECK(reservations_ > 0,
+                "P7 direct launch lease commit without reservation");
+    --reservations_;
+    pending_.push_back(std::move(lease));
+  }
+
+  int64_t ReleaseAtForwardTerminal() {
+    std::vector<std::shared_ptr<P7DirectLaunchLeaseBase>> completed;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      const std::thread::id caller = std::this_thread::get_id();
+      for (const auto &lease : pending_) {
+        TORCH_CHECK(
+            lease->owner_thread() == caller,
+            "P7 direct launch leases must be released by the same host "
+            "thread that enqueued them; call the graph forward terminal on "
+            "the owning runtime thread");
+      }
+      completed.swap(pending_);
+    }
+    const int64_t released = static_cast<int64_t>(completed.size());
+    // Destruction releases aclTensor descriptors and Tensor keepalives only
+    // after the caller has established the forward stream terminal.
+    completed.clear();
+    return released;
+  }
+
+  int64_t PendingCount() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return static_cast<int64_t>(pending_.size());
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  size_t reservations_ = 0;
+  std::vector<std::shared_ptr<P7DirectLaunchLeaseBase>> pending_;
+};
+
+inline P7DirectLaunchLeaseRegistry &GetP7DirectLaunchLeaseRegistry() {
+  static P7DirectLaunchLeaseRegistry registry;
+  return registry;
+}
+
+template <typename ConvertedTuple, typename TensorKeepaliveTuple>
+inline std::shared_ptr<P7DirectLaunchLeaseBase> MakeP7DirectLaunchLease(
+    ConvertedTuple converted, TensorKeepaliveTuple tensor_keepalive) {
+  return std::make_shared<
+      P7DirectLaunchLease<ConvertedTuple, TensorKeepaliveTuple>>(
+      std::move(converted), std::move(tensor_keepalive));
+}
+
+inline int64_t ReleaseP7DirectLaunchLeasesAtForwardTerminal() {
+  return GetP7DirectLaunchLeaseRegistry().ReleaseAtForwardTerminal();
+}
+
+inline int64_t PendingP7DirectLaunchLeases() {
+  return GetP7DirectLaunchLeaseRegistry().PendingCount();
 }
 
 inline void CollectAclTensorDescriptor(
@@ -820,9 +948,9 @@ inline void LogOrderedHostDso(
 // task queue, while P7.1's real asynchronous work already lives on the device
 // stream. A P7.1 fail-closed launch reached `submit_done` and then crashed in
 // that second hand-off. The direct path below matches the repository's direct
-// ACLNN baseline: create descriptors, query workspace, enqueue, then release
-// host-only descriptors. PTA/HugeMem setup remains a GetWorkspaceSize
-// precondition for this CANN release.
+// ACLNN baseline: create descriptors, query workspace, enqueue, then retain
+// host-only descriptors until the graph forward terminal. PTA/HugeMem setup
+// remains a GetWorkspaceSize precondition for this CANN release.
 //
 // This is P7-specific on purpose: existing operators retain their independently
 // validated EXEC_NPU_CMD_ORDERED contracts. P7's OpDef declares zero workspace;
@@ -841,6 +969,11 @@ inline void LogOrderedHostDso(
         #aclnn_api "GetWorkspaceSize is missing from repository-local ",        \
         "libcust_opapi.so");                                                   \
     LogResolvedOpApi(#aclnn_api, workspace_addr_fn, launch_addr_fn);             \
+    auto npu_stream = c10_npu::getCurrentNPUStream();                            \
+    const aclrtStream acl_stream = npu_stream.stream(false);                     \
+    /* Keep torch_npu core-control stream ownership in the direct path. */      \
+    UseStreamResIfNeeded(acl_stream, true);                                      \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_enqueue_ready");             \
                                                                                \
     const bool pta_cache_active = InitPtaCacheForWorkspace();                    \
     LogOpApiLifecycle(#aclnn_api,                                                \
@@ -865,44 +998,61 @@ inline void LogOrderedHostDso(
     auto converted = ConvertTypes(                                               \
         __VA_ARGS__, workspace_size_ptr, executor_ptr);                          \
     LogConvertedDescriptorSet(#aclnn_api, converted);                            \
+    auto direct_async_tls_cleanup = [&]() {                                     \
+      if (release_huge_mem != nullptr) {                                        \
+        release_huge_mem(nullptr, false);                                        \
+      }                                                                          \
+      if (uninit_huge_mem != nullptr) {                                         \
+        uninit_huge_mem(nullptr, false);                                         \
+      }                                                                          \
+      UnInitPtaCacheForWorkspace(pta_cache_active);                              \
+    };                                                                           \
     LogOpApiLifecycle(#aclnn_api, "direct_async_workspace_call_begin");       \
     auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);         \
     const int workspace_status = CallTuple(workspace_fn, converted);             \
-    TORCH_CHECK(                                                                 \
-        workspace_status == 0,                                                   \
-        "call " #aclnn_api "GetWorkspaceSize failed: ",                       \
-        RecentAclError());                                                       \
+    if (workspace_status != 0) {                                                 \
+      ReleaseTuple(converted);                                                   \
+      direct_async_tls_cleanup();                                                \
+      TORCH_CHECK(false,                                                         \
+                  "call " #aclnn_api "GetWorkspaceSize failed: ",             \
+                  RecentAclError());                                             \
+    }                                                                            \
     LogOpApiLifecycle(#aclnn_api, "direct_async_workspace_ready");           \
                                                                                \
-    TORCH_CHECK(                                                                 \
-        workspace_size == 0,                                                     \
-        "P7 direct async ABI requires zero CANN workspace; nonzero workspace ", \
-        "needs an explicit stream-owned lifetime contract");                  \
+    if (workspace_size != 0) {                                                   \
+      ReleaseTuple(converted);                                                   \
+      direct_async_tls_cleanup();                                                \
+      TORCH_CHECK(false,                                                         \
+                  "P7 direct async ABI requires zero CANN workspace; nonzero ", \
+                  "workspace needs an explicit stream-owned lifetime contract");\
+    }                                                                            \
     void *workspace_ptr = nullptr;                                               \
                                                                                \
-    auto npu_stream = c10_npu::getCurrentNPUStream();                            \
-    const aclrtStream acl_stream = npu_stream.stream(false);                     \
+    auto direct_async_lease = MakeP7DirectLaunchLease(                          \
+        std::move(converted), tensor_keepalive);                                 \
+    if (!GetP7DirectLaunchLeaseRegistry().Reserve()) {                           \
+      direct_async_tls_cleanup();                                                \
+      TORCH_CHECK(false,                                                         \
+                  "P7 direct launch lease capacity exhausted; forward terminal ",\
+                  "did not release prior P7 leases");                         \
+    }                                                                            \
     auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);            \
     LogOpApiLifecycle(#aclnn_api, "direct_async_launch_begin");               \
     const int launch_status =                                                     \
         launch_fn(workspace_ptr, workspace_size, executor, acl_stream);          \
-    TORCH_CHECK(                                                                 \
-        launch_status == 0,                                                      \
-        "call " #aclnn_api " failed: ", RecentAclError());                   \
+    if (launch_status != 0) {                                                    \
+      GetP7DirectLaunchLeaseRegistry().CancelReservation();                      \
+      direct_async_tls_cleanup();                                                \
+      TORCH_CHECK(false,                                                         \
+                  "call " #aclnn_api " failed: ", RecentAclError());          \
+    }                                                                            \
     LogOpApiLifecycle(#aclnn_api, "direct_async_launch_done");                \
                                                                                \
-    ReleaseTuple(converted);                                                     \
-    if (release_huge_mem != nullptr) {                                          \
-      release_huge_mem(nullptr, false);                                          \
-    }                                                                            \
-    LogOpApiLifecycle(#aclnn_api, "direct_async_descriptor_release_done");   \
-    if (uninit_huge_mem != nullptr) {                                            \
-      uninit_huge_mem(nullptr, false);                                           \
-    }                                                                            \
-    UnInitPtaCacheForWorkspace(pta_cache_active);                                \
+    GetP7DirectLaunchLeaseRegistry().Commit(std::move(direct_async_lease));     \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_descriptor_lease_held");     \
+    direct_async_tls_cleanup();                                                  \
     LogOpApiLifecycle(#aclnn_api,                                                \
                       pta_cache_active ? "direct_async_pta_cache_uninit"       \
                                        : "direct_async_pta_cache_not_active");  \
     LogOpApiLifecycle(#aclnn_api, "direct_async_submit_done");                \
-    (void)tensor_keepalive;                                                      \
   } while (false)

@@ -257,10 +257,13 @@ def main() -> None:
         "#define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC",
         "InitPtaCacheForWorkspace()",
         "UnInitPtaCacheForWorkspace(pta_cache_active)",
-        "workspace_size == 0",
+        "workspace_size != 0",
+        "UseStreamResIfNeeded(acl_stream, true)",
+        "MakeP7DirectLaunchLease",
+        "ReleaseP7DirectLaunchLeasesAtForwardTerminal",
         "direct_async_workspace_call_begin",
         "direct_async_launch_done",
-        "direct_async_descriptor_release_done",
+        "direct_async_descriptor_lease_held",
         "direct_async_submit_done",
         "RTLD_NOW | RTLD_LOCAL",
         "GetAclTensorApiPair()",
@@ -280,7 +283,6 @@ def main() -> None:
         raise AssertionError("missing P7 direct ACLNN macro")
     for forbidden in (
         "OpCommand::RunOpApi",
-        "UseStreamResIfNeeded",
         "ordered_acl_call",
         "aclrtSynchronizeStream",
     ):
@@ -311,6 +313,7 @@ def main() -> None:
         "direct_async_workspace_call_begin",
         "run_direct_async_fail_closed_case()",
         "P7_DIRECT_ASYNC_FAIL_CLOSED",
+        "P7_1_TERMINAL_LEASE",
         "P7_REAL_FLOW_FINAL",
         "execution=direct_current_stream_then_real_hccp",
         "real_direct_hccp.log",
@@ -323,6 +326,7 @@ def main() -> None:
         "MAPPED_OBJECT",
         "FREE -> FILLING -> POSTED -> CQ_TERMINAL",
         "直接 ACLNN 入流",
+        "forward stream terminal",
     ):
         _require(abi, token, abi_path)
 

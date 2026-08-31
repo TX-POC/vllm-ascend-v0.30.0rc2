@@ -169,6 +169,12 @@ if [[ -d "${P7_KVAF_BUILD_SOURCE}" && \
       -n "$(find "${P7_KVAF_BUILD}/python/kvaf" -maxdepth 1 -type f -name '_kvaf*.so' -print -quit 2>/dev/null)" ]]; then
     P7_KVAF_BUILD_VALID=1
 fi
+P7_KVAF_BUILD_STAMP="${P7_KVAF_BUILD}/.p7_kvaf_source_head"
+P7_KVAF_BUILD_HEAD="$(sed -n '1p' "${P7_KVAF_BUILD_STAMP}" 2>/dev/null | tr -d '[:space:]')"
+P7_KVAF_BUILD_HEAD_MATCH=0
+if [[ "${P7_KVAF_BUILD_HEAD}" == "${P7_KVAF_HEAD}" ]]; then
+    P7_KVAF_BUILD_HEAD_MATCH=1
+fi
 
 P7_REUSE_READY=0
 if [[ "${P7_MANIFEST_VALID}" == "1" && "${P7_ARTIFACT_COMMIT_VALID}" == "1" && \
@@ -179,18 +185,20 @@ if [[ "${P7_MANIFEST_VALID}" == "1" && "${P7_ARTIFACT_COMMIT_VALID}" == "1" && \
       "${P7_KVAF_SHA_MATCH}" == "1" && \
       "${P7_CLOSURE_UNCHANGED}" == "1" && -z "${P7_UNEXPECTED_PATHS}" && \
       "${P7_KVAF_BUILD_VALID}" == "1" && \
+      "${P7_KVAF_BUILD_HEAD_MATCH}" == "1" && \
       -f "${P7_BRIDGE_ROOT}/score_receipt_speculative_executor_setup.py" && \
       -f "${P7_REUSE_OPP_ROOT}/vendors/customize/bin/set_env.bash" ]]; then
     P7_REUSE_READY=1
 fi
 
-printf 'P7_REUSE_GATE ready=%s runtime_vllm=%s required_runtime=%s runtime_match=%s artifact_vllm=%s artifact_ancestor=%s runtime_kvaf=%s required_kvaf=%s kvaf_match=%s artifact_kvaf=%s manifest_valid=%s closure_unchanged=%s kvaf_build_valid=%s unexpected_paths=<%s>\n' \
+printf 'P7_REUSE_GATE ready=%s runtime_vllm=%s required_runtime=%s runtime_match=%s artifact_vllm=%s artifact_ancestor=%s runtime_kvaf=%s required_kvaf=%s kvaf_match=%s artifact_kvaf=%s manifest_valid=%s closure_unchanged=%s kvaf_build_valid=%s kvaf_build_head=%s kvaf_build_head_match=%s unexpected_paths=<%s>\n' \
     "${P7_REUSE_READY}" "${P7_VLLM_HEAD}" "${P7_REQUIRED_RUNTIME_SHA:-none}" \
     "${P7_RUNTIME_SHA_MATCH}" \
     "${P7_ARTIFACT_VLLM_SHA:-missing}" "${P7_ARTIFACT_ANCESTOR}" \
     "${P7_KVAF_HEAD}" "${P7_REQUIRED_KVAF_SHA:-none}" "${P7_KVAF_SHA_MATCH}" \
     "${P7_ARTIFACT_KVAF_SHA:-missing}" \
     "${P7_MANIFEST_VALID}" "${P7_CLOSURE_UNCHANGED}" "${P7_KVAF_BUILD_VALID}" \
+    "${P7_KVAF_BUILD_HEAD:-missing}" "${P7_KVAF_BUILD_HEAD_MATCH}" \
     "${P7_UNEXPECTED_PATHS:-none}"
 if [[ "${P7_REUSE_READY}" != "1" ]]; then
     fail "closure_or_provenance_gate_failed"
@@ -263,11 +271,12 @@ run_direct_async_fail_closed_case() {
     local descriptor_ledger=0
     local workspace=0
     local launch=0
-    local descriptor_release=0
+    local descriptor_lease=0
     local pta_ready=0
     local pta_uninit=0
     local submit=0
     local task_queue_handoff=0
+    local terminal_lease=0
     local test_pass=0
     local teardown=0
 
@@ -281,20 +290,22 @@ run_direct_async_fail_closed_case() {
     grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31' "${case_log}" && descriptor_ledger=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_workspace_call_begin' "${case_log}" && workspace=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_launch_done' "${case_log}" && launch=1
-    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_descriptor_release_done' "${case_log}" && descriptor_release=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_descriptor_lease_held' "${case_log}" && descriptor_lease=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_pta_cache_ready' "${case_log}" && pta_ready=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_pta_cache_uninit' "${case_log}" && pta_uninit=1
     grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=direct_async_submit_done' "${case_log}" && submit=1
     grep -Fq 'handoff_runopapi_by_value' "${case_log}" && task_queue_handoff=1
+    grep -Fq 'P7_1_TERMINAL_LEASE released=1 pending=0 terminal=stream_synchronized' "${case_log}" && terminal_lease=1
     grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
     grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
-    printf 'P7_DIRECT_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_release=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s real_hccp=scheduled_after_pass log=%s\n' \
+    printf 'P7_DIRECT_ASYNC_FAIL_CLOSED rc=%s descriptor_ledger=%s workspace=%s launch=%s descriptor_lease=%s terminal_lease=%s pta_ready=%s pta_uninit=%s submit=%s task_queue_handoff=%s test_pass=%s teardown=%s real_hccp=scheduled_after_pass log=%s\n' \
         "${case_rc}" "${descriptor_ledger}" "${workspace}" "${launch}" \
-        "${descriptor_release}" "${pta_ready}" "${pta_uninit}" "${submit}" \
+        "${descriptor_lease}" "${terminal_lease}" "${pta_ready}" "${pta_uninit}" "${submit}" \
         "${task_queue_handoff}" "${test_pass}" "${teardown}" "${case_log}"
     if [[ "${case_rc}" != "0" || "${descriptor_ledger}" != "1" || \
           "${workspace}" != "1" || "${launch}" != "1" || \
-          "${descriptor_release}" != "1" || "${pta_ready}" != "1" || \
+          "${descriptor_lease}" != "1" || "${terminal_lease}" != "1" || \
+          "${pta_ready}" != "1" || \
           "${pta_uninit}" != "1" || "${submit}" != "1" || \
           "${task_queue_handoff}" != "0" || "${test_pass}" != "1" || \
           "${teardown}" != "1" ]]; then
@@ -331,7 +342,7 @@ fi
 printf 'P7_DIRECT_CURRENT_STREAM observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
     "${P7_DIRECT_CURRENT_STREAM}"
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER)|P7_(DIRECT_ASYNC_FAIL_CLOSED|DIRECT_CURRENT_STREAM|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(direct_async_pta_cache_ready|direct_async_pta_cache_unavailable|direct_async_pta_cache_uninit|direct_async_pta_cache_not_active|direct_async_workspace_call_begin|direct_async_workspace_ready|direct_async_launch_begin|direct_async_launch_done|direct_async_descriptor_release_done|direct_async_submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER|TERMINAL_LEASE)|P7_(DIRECT_ASYNC_FAIL_CLOSED|DIRECT_CURRENT_STREAM|REAL_FLOW_FINAL|REAL_HCCP_SKIPPED)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(direct_async_enqueue_ready|direct_async_pta_cache_ready|direct_async_pta_cache_unavailable|direct_async_pta_cache_uninit|direct_async_pta_cache_not_active|direct_async_workspace_call_begin|direct_async_workspace_ready|direct_async_launch_begin|direct_async_launch_done|direct_async_descriptor_lease_held|direct_async_submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
         "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then

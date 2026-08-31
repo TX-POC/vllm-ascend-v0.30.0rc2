@@ -41,6 +41,17 @@ direct launch 没有一个在 host 返回后还要单独保活的临时 workspac
 stream terminal。未来若算子需要非零 workspace，必须先补上可验证的 stream-owned
 workspace 生命周期，不能悄悄复用这里的零 workspace 路径。
 
+但 `workspace=0` **不等于** host descriptor 可以在 `aclnn(...)` 返回后立即销毁。
+P7.1 因此把 31 个 `aclTensor` descriptor 与 31 个 Tensor handle 作为一个有上限的
+`direct-launch lease` 暂存；此 lease 不执行 DMA、也不轮询 CQ，它只保护 host-side
+ACLNN 输入。Graph runtime 在本 forward 的最终 stream terminal（`forward stream terminal`，
+实际产品中是 QSFA terminal）确认之后调用 `p7_1_release_after_forward_terminal()` 统一释放。若上一个
+forward 没有 terminal，lease 池会在固定上限前 fail-closed，而不是无限积压。
+
+这仍然没有重新引入 `OpCommand`、CPU/GIL 逐候选提交或固定 Get 核：设备端的
+`PostOnly -> DMA -> CQ` 从 P7.1 kernel 入流后持续异步执行；terminal hook 只处理已经
+不再被设备读取的 host descriptor 生命周期。
+
 ## 31 个 ACLNN 张量 / 18 个原地 Ref 输出
 
 Torch 侧 schema 仍是 `torch_schema=31in_18aliasout`，这样图能看到 18 个可变状态的

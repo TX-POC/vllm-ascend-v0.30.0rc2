@@ -181,6 +181,7 @@ if [[ "${P7_KVAF_BUILD_RC}" != "0" || ! -s "${P7_KVAF_GET}" || ! -s "${P7_KVAF_P
         "${P7_KVAF_PYEXT:-missing}"
     fail "kvaf_incremental_build_failed"
 fi
+printf '%s\n' "${P7_KVAF_HEAD}" > "${P7_KVAF_BUILD}/.p7_kvaf_source_head"
 printf 'P7_1_KVAF_BUILD status=0 source_head=%s get=1 put=1\n' "${P7_KVAF_HEAD}"
 
 # Fresh timestamped OPP/build roots prevent an old CANN package from being

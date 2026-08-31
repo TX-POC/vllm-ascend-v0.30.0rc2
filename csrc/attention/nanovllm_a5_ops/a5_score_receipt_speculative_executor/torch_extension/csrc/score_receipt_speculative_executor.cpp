@@ -358,4 +358,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         contract["fixed_get_core"] = false;
         return contract;
     });
+    m.def("p7_1_release_after_forward_terminal", [] {
+        const int64_t released =
+            nanovllm_a5_opapi::ReleaseP7DirectLaunchLeasesAtForwardTerminal();
+        if (DebugEnabled()) {
+            std::fprintf(stderr,
+                         "P7_1_TERMINAL_LEASE released=%lld pending=%lld "
+                         "terminal=caller_confirmed_stream_terminal\n",
+                         static_cast<long long>(released),
+                         static_cast<long long>(
+                             nanovllm_a5_opapi::PendingP7DirectLaunchLeases()));
+            std::fflush(stderr);
+        }
+        return released;
+    });
+    m.def("p7_1_pending_launch_leases", [] {
+        return nanovllm_a5_opapi::PendingP7DirectLaunchLeases();
+    });
 }
