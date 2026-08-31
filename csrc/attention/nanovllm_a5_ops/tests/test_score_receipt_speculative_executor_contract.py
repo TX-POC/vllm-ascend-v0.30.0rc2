@@ -233,6 +233,8 @@ def main() -> None:
         "OpCommand::RunOpApi(#aclnn_api, ordered_acl_call)",
         "UseStreamResIfNeeded(acl_stream, true)",
         "UseStreamResIfNeeded(acl_stream, false)",
+        "InitPtaCacheForWorkspace()",
+        "UnInitPtaCacheForWorkspace(pta_cache_active)",
         "ordered_tensor_keepalive",
         "handoff_runopapi_by_value",
         "descriptor_release_done",
@@ -281,7 +283,7 @@ def main() -> None:
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
-        "ordered_opapi_lifetime=1",
+        "ordered_opapi_lifetime=1 pta_cache_lifecycle=1",
         flush=True,
     )
     print(

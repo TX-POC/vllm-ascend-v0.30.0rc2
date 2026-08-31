@@ -270,7 +270,7 @@ else
     P7_REAL_RC=98
 fi
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|launch_begin|launch_done|descriptor_release_done|submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
       "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then

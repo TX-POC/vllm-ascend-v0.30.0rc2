@@ -8,12 +8,10 @@
 // runtime may consume the queued command after the caller has released the
 // associated host objects.  We therefore use the same narrowly scoped
 // OpCommand::RunOpApi hand-off while continuing to resolve the operator
-// symbols from the repository-local OPP.  The distinction is safety
-// critical: under the torch_npu task queue, RunOpApiV2 retains pointers to
-// its caller's std::string/callback instead of owning copies.  This launcher
-// deliberately creates the callback on the stack, so V2 would turn an
-// asynchronous kernel submission into a use-after-free after this macro
-// returns.  RunOpApi takes the callback by value and owns the queued copy.
+// symbols from the repository-local OPP.  The launcher creates its callback
+// on the stack, so it deliberately uses the by-value API rather than relying
+// on the implementation-specific copy timing of RunOpApiV2.  This keeps the
+// submission asynchronous while making the callback ownership explicit.
 
 #include <cstdlib>
 #include <cstdio>
@@ -77,6 +75,9 @@ using OpApiLaunchFn = int (*)(
 using InitHugeMemThreadLocalFn = int (*)(void *, bool);
 using UnInitHugeMemThreadLocalFn = void (*)(void *, bool);
 using ReleaseHugeMemFn = void (*)(void *, bool);
+using InitPtaCacheThreadLocalFn = void (*)();
+using SetPtaHashKeyFn = void (*)(uint64_t);
+using UnInitPtaCacheThreadLocalFn = void (*)();
 using AclUseStreamResFn = aclError (*)(aclrtStream);
 
 inline void *OpenLibraryOnce(const char *path) {
@@ -335,6 +336,36 @@ inline void LogOpApiLifecycle(const char *api, const char *stage) {
   std::fflush(stderr);
 }
 
+// This is the same host-side cache lifecycle used by the checked-in CANN
+// ACLNN adapter around GetWorkspaceSize.  Keep the three functions as a
+// complete optional triplet: calling only init/set or only uninit would make
+// an older libopapi's host allocator state less safe, not more safe.
+inline bool InitPtaCacheForWorkspace() {
+  static auto init = reinterpret_cast<InitPtaCacheThreadLocalFn>(
+      ResolveSymbol("InitPTACacheThreadLocal"));
+  static auto set_hash = reinterpret_cast<SetPtaHashKeyFn>(
+      ResolveSymbol("SetPTAHashKey"));
+  static auto uninit = reinterpret_cast<UnInitPtaCacheThreadLocalFn>(
+      ResolveSymbol("UnInitPTACacheThreadLocal"));
+  if (init == nullptr || set_hash == nullptr || uninit == nullptr) {
+    return false;
+  }
+  init();
+  set_hash(0);
+  return true;
+}
+
+inline void UnInitPtaCacheForWorkspace(bool active) {
+  if (!active) {
+    return;
+  }
+  static auto uninit = reinterpret_cast<UnInitPtaCacheThreadLocalFn>(
+      ResolveSymbol("UnInitPTACacheThreadLocal"));
+  if (uninit != nullptr) {
+    uninit();
+  }
+}
+
 // An ACLNN custom operator may have the same exported symbol name in several
 // local OPP packages.  When that happens, a stale ABI often fails later with a
 // generic "dtype or format" message.  This one compact line identifies the
@@ -384,6 +415,10 @@ inline void LogResolvedOpApi(
     aclrtStream acl_stream = npu_stream.stream(false);                         \
     UseStreamResIfNeeded(acl_stream, true);                                    \
     LogOpApiLifecycle(#aclnn_api, "enqueue_ready");                           \
+    const bool pta_cache_active = InitPtaCacheForWorkspace();                  \
+    LogOpApiLifecycle(#aclnn_api,                                              \
+                      pta_cache_active ? "pta_cache_ready"                    \
+                                       : "pta_cache_unavailable");             \
     auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(           \
         ResolveSymbol("InitHugeMemThreadLocal"));                             \
     auto uninit_huge_mem = reinterpret_cast<UnInitHugeMemThreadLocalFn>(       \
@@ -447,5 +482,9 @@ inline void LogResolvedOpApi(
     if (uninit_huge_mem != nullptr) {                                          \
       uninit_huge_mem(nullptr, false);                                         \
     }                                                                          \
+    UnInitPtaCacheForWorkspace(pta_cache_active);                              \
+    LogOpApiLifecycle(#aclnn_api,                                              \
+                      pta_cache_active ? "pta_cache_uninit"                  \
+                                       : "pta_cache_not_active");             \
     LogOpApiLifecycle(#aclnn_api, "submit_done");                            \
   } while (false)
