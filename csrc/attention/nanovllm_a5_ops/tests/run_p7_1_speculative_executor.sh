@@ -32,6 +32,7 @@ P7_PHYSICAL_NPU_ID="${P7_PHYSICAL_NPU_ID:-7}"
 P7_PYTHON="${P7_PYTHON:-$(command -v python3 2>/dev/null)}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-${ASCEND_CANN_PACKAGE_PATH:-/usr/local/Ascend/cann-9.1.0}}"
 P7_BUILD_JOBS="${P7_BUILD_JOBS:-16}"
+P7_RUNTIME_TIMEOUT="${P7_RUNTIME_TIMEOUT:-120s}"
 P7_STAMP="$(date +%Y%m%d_%H%M%S)"
 P7_RESULT="${P7_RESULT:-$(dirname "${P7_VLLM_ROOT}")/results/p7_1_executor_npu${P7_PHYSICAL_NPU_ID}_${P7_STAMP}}"
 P7_BUILD_ROOT="${P7_BUILD_ROOT:-${OPS_ROOT}/build/p7_1_executor_${P7_STAMP}}"
@@ -92,6 +93,10 @@ if [[ ! -x "${P7_PYTHON}" || ! -f "${P7_BUILD_SCRIPT}" || \
       ! -f "${P7_BRIDGE_ROOT}/score_receipt_speculative_executor_setup.py" ]]; then
     fail "missing_p7_1_source_or_python"
 fi
+if ! command -v timeout >/dev/null 2>&1; then
+    printf 'P7_1_SOURCE ready=0 reason=missing_timeout_command\n'
+    fail "missing_timeout_command"
+fi
 if [[ ! -f "${ASCEND_HOME_PATH}/bin/setenv.bash" || \
       ! -f "${ASCEND_HOME_PATH}/aarch64-linux/asc/include/simt_api/device_atomic_functions.h" ]]; then
     printf 'P7_1_SOURCE ready=0 reason=missing_cann asc=%s\n' "${ASCEND_HOME_PATH}"
@@ -132,6 +137,7 @@ export NPU_ID=0
 export DEVICE_ID=0
 printf 'P7_1_NPU physical=%s logical=0 runtime_visible=%s legacy_visible=unset\n' \
     "${P7_PHYSICAL_NPU_ID}" "${ASCEND_RT_VISIBLE_DEVICES}"
+printf 'P7_1_RUNTIME_GUARD timeout=%s kill_grace=15s\n' "${P7_RUNTIME_TIMEOUT}"
 
 "${P7_PYTHON}" -c 'import torch, torch_npu, pybind11; torch.npu.set_device(0); print("P7_1_PYTHON exe=%s torch=%s torch_npu=%s device=%s" % (__import__("sys").executable, torch.__version__, torch_npu.__version__, torch.npu.get_device_name(0)))' \
     2>&1 | tee "${P7_RESULT}/python_npu.log"
@@ -245,7 +251,7 @@ printf 'P7_1_BRIDGE status=0 artifact=%s aliases=18\n' "${P7_BRIDGE_SO}"
 
 # First prove invalid KVAF control fails before acquiring a queue.  It is a
 # guard only, never reported as real HCCP success.
-"${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+timeout -k 15s "${P7_RUNTIME_TIMEOUT}" "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
     2>&1 | tee "${P7_RESULT}/fail_closed.log"
 P7_FAIL_CLOSED_RC=${PIPESTATUS[0]}
 if [[ "${P7_FAIL_CLOSED_RC}" != "0" ]]; then
@@ -255,7 +261,7 @@ fi
 # Default final test is a real local KVAF transaction: cold bind -> dynamic
 # device lease -> descriptor publish/PostOnly -> CQ terminal Finish -> release.
 # It must not report PASS if the concrete fixture cannot initialize.
-"${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+timeout -k 15s "${P7_RUNTIME_TIMEOUT}" "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
     --fixture-module p7_1_real_direct_hccp_fixture \
     2>&1 | tee "${P7_RESULT}/real_direct_hccp.log"
 P7_REAL_RC=${PIPESTATUS[0]}

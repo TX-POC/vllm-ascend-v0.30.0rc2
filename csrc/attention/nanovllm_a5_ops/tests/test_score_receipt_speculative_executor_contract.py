@@ -36,6 +36,10 @@ REQUIRED_KERNEL = (
     "__simt_callee__ inline int32_t LoadGmInt32ForSimt",
     "__simt_callee__ inline int64_t LoadGmInt64ForSimt",
     "event_t simtEvent_ = static_cast<event_t>(EVENT_ID0);",
+    "TPipe* pipe_ = nullptr;",
+    "TPipe pipe;",
+    "A5ScoreReceiptSpeculativeExecutorKernel op(&pipe, &tilingData);",
+    "Fail-closed ordering is deliberate.",
     "seedBuffers_[0].Get<int32_t>().GetPhyAddr()",
     "leaseBuffer_.Get<uint8_t>().GetPhyAddr()",
     "claimBuffer_.Get<uint8_t>().GetPhyAddr()",
@@ -53,6 +57,8 @@ FORBIDDEN_KERNEL = (
     "ReadGmByPassDCache<int32_t>(private_ready +",
     "!ASCEND_IS_AIV",
     "static constexpr event_t kSimtEvent",
+    "TPipe pipe_;",
+    "pipe_.InitBuffer",
     "seedBuffers_[0].Get<int32_t>();",
     "seedBuffers_[1].Get<int32_t>();",
     "leaseBuffer_.Get<uint8_t>());",
@@ -190,6 +196,15 @@ def main() -> None:
         _require(kernel, token, kernel_path)
     for token in FORBIDDEN_KERNEL:
         _forbid(kernel, token, kernel_path)
+    control_validation = kernel.find(
+        "IsKvafStreamingBatchGetControlValidForAicore(control_)"
+    )
+    first_ub_allocation = kernel.find("pipe_->InitBuffer(seedBuffers_[0]")
+    if control_validation < 0 or first_ub_allocation < 0 or \
+       first_ub_allocation <= control_validation:
+        raise AssertionError(
+            "invalid KVAF control must be rejected before P7.1 initializes UB buffers"
+        )
     for token in (
         "kInputCount",
         "kOutputCount",
@@ -247,7 +262,8 @@ def main() -> None:
     print(
         "P7_1_CANN_COMPILER_CONTRACT "
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
-        "ub_physical_address_conversion=1 nonconst_event_t=1",
+        "ub_physical_address_conversion=1 nonconst_event_t=1 "
+        "entry_owned_tpipe=1 fail_closed_before_ub=1",
         flush=True,
     )
     print(

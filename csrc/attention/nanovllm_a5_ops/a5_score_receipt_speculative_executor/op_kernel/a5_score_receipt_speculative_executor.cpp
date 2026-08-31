@@ -296,8 +296,9 @@ inline void ClearTerminalFailedMappingSimt(
 class A5ScoreReceiptSpeculativeExecutorKernel {
 public:
     __aicore__ inline explicit A5ScoreReceiptSpeculativeExecutorKernel(
+        TPipe* pipe,
         const A5ScoreReceiptSpeculativeExecutorTilingData* tiling)
-        : tiling_(tiling)
+        : pipe_(pipe), tiling_(tiling)
     {}
 
     __aicore__ inline void Init(
@@ -354,23 +355,6 @@ public:
         workerStats_ = reinterpret_cast<__gm__ int64_t*>(worker_stats);
         rowsPerEntry_ = reinterpret_cast<__gm__ int32_t*>(rows_per_entry);
 
-        pipe_.InitBuffer(seedBuffers_[0], kA5ScoreReceiptExecutorMicrobatchCapacity *
-                                         kA5ScoreReceiptExecutorSeedWords * sizeof(int32_t));
-        pipe_.InitBuffer(seedBuffers_[1], kA5ScoreReceiptExecutorMicrobatchCapacity *
-                                         kA5ScoreReceiptExecutorSeedWords * sizeof(int32_t));
-        pipe_.InitBuffer(leaseBuffer_, sizeof(kvaf_fused_get::KvafStreamingBatchGetLeaseResult));
-        pipe_.InitBuffer(claimBuffer_, sizeof(PrivateClaimResult));
-        // TBuf::Get returns LocalTensor, not an address.  Convert its physical
-        // UB address explicitly; direct LocalTensor-to-pointer conversion is
-        // rejected by the AscendC compiler and was the prior P7.1 build
-        // failure.  The two typed seed arrays remain exactly 2 x 64 x 4.
-        localSeeds_[0] = (__ubuf__ int32_t*)seedBuffers_[0].Get<int32_t>().GetPhyAddr();
-        localSeeds_[1] = (__ubuf__ int32_t*)seedBuffers_[1].Get<int32_t>().GetPhyAddr();
-        leaseResult_ =
-            (__ubuf__ kvaf_fused_get::KvafStreamingBatchGetLeaseResult*)
-                leaseBuffer_.Get<uint8_t>().GetPhyAddr();
-        claimResult_ = (__ubuf__ PrivateClaimResult*)
-            claimBuffer_.Get<uint8_t>().GetPhyAddr();
         for (uint32_t slot = 0U; slot < kA5ScoreReceiptExecutorMicrobatchSlots; ++slot) {
             batchState_[slot] = 0U;
             batchCount_[slot] = 0U;
@@ -396,8 +380,7 @@ public:
             queueRequestSourceOffsets_ == nullptr || queueRequestObjectOffsets_ == nullptr ||
             queueRequestOutputIndices_ == nullptr || queueRequestCount_ == nullptr ||
             privateReadyEpoch_ == nullptr || privateReadyGeneration_ == nullptr ||
-            workerStats_ == nullptr || rowsPerEntry_ == nullptr || leaseResult_ == nullptr ||
-            claimResult_ == nullptr) {
+            workerStats_ == nullptr || rowsPerEntry_ == nullptr) {
             return;
         }
         epoch_ = static_cast<uint64_t>(ReadGmByPassDCache<int64_t>(streamingEpoch_));
@@ -416,6 +399,43 @@ public:
             control_.output_rows != tiling_->privatePackedRows ||
             control_.private_output_stride_bytes / kPackedKvRowBytes !=
                 tiling_->privateArenaCapacity) {
+            AddStat(kStatControlRejected, 1U);
+            return;
+        }
+
+        // Fail-closed ordering is deliberate.  A malformed control block is
+        // an ABI/ownership rejection, not a request to initialize UB or touch
+        // any SIMT/HCCP helper.  Keeping all four UB allocations below this
+        // return makes the invalid-control test a genuine no-transport path.
+        if (pipe_ == nullptr) {
+            // This cannot occur at the normal entry point, which owns a local
+            // TPipe and passes it explicitly.  Refuse the task rather than
+            // constructing a partially initialized executor.
+            AddStat(kStatControlRejected, 1U);
+            return;
+        }
+        pipe_->InitBuffer(seedBuffers_[0], kA5ScoreReceiptExecutorMicrobatchCapacity *
+                                          kA5ScoreReceiptExecutorSeedWords * sizeof(int32_t));
+        pipe_->InitBuffer(seedBuffers_[1], kA5ScoreReceiptExecutorMicrobatchCapacity *
+                                          kA5ScoreReceiptExecutorSeedWords * sizeof(int32_t));
+        pipe_->InitBuffer(leaseBuffer_, sizeof(kvaf_fused_get::KvafStreamingBatchGetLeaseResult));
+        pipe_->InitBuffer(claimBuffer_, sizeof(PrivateClaimResult));
+        // TBuf::Get returns LocalTensor, not an address.  Convert its physical
+        // UB address explicitly; direct LocalTensor-to-pointer conversion is
+        // rejected by the AscendC compiler and was the prior P7.1 build
+        // failure.  The two typed seed arrays remain exactly 2 x 64 x 4.
+        localSeeds_[0] = (__ubuf__ int32_t*)seedBuffers_[0].Get<int32_t>().GetPhyAddr();
+        localSeeds_[1] = (__ubuf__ int32_t*)seedBuffers_[1].Get<int32_t>().GetPhyAddr();
+        leaseResult_ =
+            (__ubuf__ kvaf_fused_get::KvafStreamingBatchGetLeaseResult*)
+                leaseBuffer_.Get<uint8_t>().GetPhyAddr();
+        claimResult_ = (__ubuf__ PrivateClaimResult*)
+            claimBuffer_.Get<uint8_t>().GetPhyAddr();
+        if (localSeeds_[0] == nullptr || localSeeds_[1] == nullptr ||
+            leaseResult_ == nullptr || claimResult_ == nullptr) {
+            // A valid transport control with no usable local state must
+            // degrade to exact Guaranteed Recall; it must never enter a
+            // partially materialized PostOnly transaction.
             AddStat(kStatControlRejected, 1U);
             return;
         }
@@ -1102,8 +1122,12 @@ private:
         }
     }
 
+    // Follow the standard AscendC ownership pattern: the entry point owns a
+    // stack-local TPipe for the invocation and the kernel object only borrows
+    // it.  A class-owned TPipe is nonstandard and can leave UB bookkeeping
+    // alive after a fail-closed early return.
+    TPipe* pipe_ = nullptr;
     const A5ScoreReceiptSpeculativeExecutorTilingData* tiling_;
-    TPipe pipe_;
     TBuf<TPosition::VECCALC> seedBuffers_[kA5ScoreReceiptExecutorMicrobatchSlots];
     TBuf<TPosition::VECCALC> leaseBuffer_;
     TBuf<TPosition::VECCALC> claimBuffer_;
@@ -1215,7 +1239,8 @@ extern "C" __global__ __aicore__ void a5_score_receipt_speculative_executor(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(A5ScoreReceiptSpeculativeExecutorTilingData);
     GET_TILING_DATA(tilingData, tiling);
-    A5ScoreReceiptSpeculativeExecutorKernel op(&tilingData);
+    TPipe pipe;
+    A5ScoreReceiptSpeculativeExecutorKernel op(&pipe, &tilingData);
     op.Init(candidate_seeds, candidate_counts, candidate_ready_epoch,
             candidate_status, streaming_epoch, source_lens,
             kv_object_address_domain, req_pool_entries, kv_object_map,
