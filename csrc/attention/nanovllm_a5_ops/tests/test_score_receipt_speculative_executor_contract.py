@@ -280,11 +280,12 @@ def main() -> None:
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
         "DESCRIPTOR_LEDGER",
         "workspace_call_begin",
-        "P7_CLEANUP_WORKSPACE_QUERY_NOT_STANDALONE",
-        "P7_CLEANUP_ALIAS_AB mode=phase2_noop",
         "run_normal_fail_closed_case()",
         "P7_CLEANUP_NORMAL_ASYNC",
-        "phase2_executor_autorelease",
+        "P7_DIRECT_BISECT_SKIPPED reason=direct_path_bypasses_task_queue_stream_resource_contract_and_is_not_a_product_gate",
+        "unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
+        "P7_REAL_FLOW_FINAL",
+        "execution=normal_task_queue_then_real_hccp",
         "real_direct_hccp.log",
     ):
         _require(reuse_runner, token, reuse_runner_path)
@@ -327,8 +328,8 @@ def main() -> None:
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
         "ordered_opapi_lifetime=1 pta_cache_lifecycle=1 "
-        "host_cleanup_bisect=1 loader_scope_local=1 descriptor_pairing=1 "
-        "descriptor_ledger=1 phase2_executor_autorelease=1",
+        "normal_async_gate=1 direct_bisect_not_gate=1 "
+        "loader_scope_local=1 descriptor_pairing=1 descriptor_ledger=1",
         flush=True,
     )
     print(
