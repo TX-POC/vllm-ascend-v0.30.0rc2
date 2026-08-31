@@ -303,6 +303,51 @@ run_fail_closed_case() {
     return 0
 }
 
+run_normal_fail_closed_case() {
+    local case_log="${P7_RESULT}/fail_closed_normal_async.log"
+    local case_rc=0
+    local descriptor_ledger=0
+    local handoff=0
+    local launch=0
+    local descriptor_release=0
+    local pta_ready=0
+    local pta_uninit=0
+    local test_pass=0
+    local teardown=0
+
+    # This final fresh interpreter is intentionally *not* the real-HCCP
+    # fixture.  It proves the normal OpCommand handoff/lifetime path after the
+    # direct cleanup matrix has passed, while the invalid P7 control still
+    # rejects before any queue lease, DMA PostOnly, or CQ operation.
+    env -u NANOVLLM_A5_OPAPI_CLEANUP_BISECT \
+        -u NANOVLLM_A5_OPAPI_CLEANUP_MODE \
+        -u NANOVLLM_A5_P7_OUTPUT_TOPOLOGY \
+        timeout 90s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
+        2>&1 | tee "${case_log}"
+    case_rc=${PIPESTATUS[0]}
+
+    grep -Fqx 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49' "${case_log}" && descriptor_ledger=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=handoff_runopapi_by_value' "${case_log}" && handoff=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=launch_done' "${case_log}" && launch=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=descriptor_release_done' "${case_log}" && descriptor_release=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_ready' "${case_log}" && pta_ready=1
+    grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=pta_cache_uninit' "${case_log}" && pta_uninit=1
+    grep -Fq 'P7_1_TEST mode=fail_closed pass=1' "${case_log}" && test_pass=1
+    grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
+    printf 'P7_CLEANUP_NORMAL_ASYNC rc=%s descriptor_ledger=%s handoff=%s launch=%s descriptor_release=%s pta_ready=%s pta_uninit=%s test_pass=%s teardown=%s real_hccp=not_run log=%s\n' \
+        "${case_rc}" "${descriptor_ledger}" "${handoff}" "${launch}" \
+        "${descriptor_release}" "${pta_ready}" "${pta_uninit}" \
+        "${test_pass}" "${teardown}" "${case_log}"
+    if [[ "${case_rc}" != "0" || "${descriptor_ledger}" != "1" || \
+          "${handoff}" != "1" || "${launch}" != "1" || \
+          "${descriptor_release}" != "1" || "${pta_ready}" != "1" || \
+          "${pta_uninit}" != "1" || "${test_pass}" != "1" || \
+          "${teardown}" != "1" ]]; then
+        return 1
+    fi
+    return 0
+}
+
 P7_OWNING_HANDOFF=0
 P7_REAL_RC=98
 P7_CLEANUP_BISECT_RC=98
@@ -313,6 +358,7 @@ P7_CLEANUP_LAUNCH_DISTINCT_RC=98
 P7_CLEANUP_RELEASE_CONVERTED_RC=98
 P7_CLEANUP_RELEASE_HUGE_RC=98
 P7_CLEANUP_UNINIT_HUGE_RC=98
+P7_CLEANUP_NORMAL_ASYNC_RC=98
 if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
     run_fail_closed_case workspace_only aliases
     P7_CLEANUP_WORKSPACE_RC=$?
@@ -363,15 +409,26 @@ if [[ "${P7_PREFLIGHT_RC}" == "0" && "${P7_CLEANUP_BISECT}" == "1" ]]; then
     else
         printf 'P7_CLEANUP_PTA_SKIPPED reason=pre_pta_boundary_failed\n'
     fi
+    if [[ "${P7_CLEANUP_BISECT_RC}" == "0" && \
+          "${P7_CLEANUP_PTA_RC}" == "0" ]]; then
+        run_normal_fail_closed_case
+        P7_CLEANUP_NORMAL_ASYNC_RC=$?
+    else
+        printf 'P7_CLEANUP_NORMAL_ASYNC_SKIPPED reason=direct_cleanup_boundary_failed\n'
+    fi
     P7_FAIL_CLOSED_RC="${P7_CLEANUP_BISECT_RC}"
     if [[ "${P7_CLEANUP_PTA_RC}" != "0" ]]; then
         P7_FAIL_CLOSED_RC=1
     fi
-    printf 'P7_CLEANUP_BISECT_FINAL status=%s workspace=%s launch_alias=%s launch_distinct=%s release_converted=%s release_huge=%s uninit_huge=%s pta_cache=%s real_hccp=not_run execution=direct_synchronized\n' \
+    if [[ "${P7_CLEANUP_NORMAL_ASYNC_RC}" != "0" ]]; then
+        P7_FAIL_CLOSED_RC=1
+    fi
+    printf 'P7_CLEANUP_BISECT_FINAL status=%s workspace=%s launch_alias=%s launch_distinct=%s release_converted=%s release_huge=%s uninit_huge=%s pta_cache=%s normal_async=%s real_hccp=not_run execution=direct_synchronized_then_normal_async\n' \
         "${P7_FAIL_CLOSED_RC}" "${P7_CLEANUP_WORKSPACE_RC}" \
         "${P7_CLEANUP_LAUNCH_ALIAS_RC}" "${P7_CLEANUP_LAUNCH_DISTINCT_RC}" \
         "${P7_CLEANUP_RELEASE_CONVERTED_RC}" "${P7_CLEANUP_RELEASE_HUGE_RC}" \
-        "${P7_CLEANUP_UNINIT_HUGE_RC}" "${P7_CLEANUP_PTA_RC}"
+        "${P7_CLEANUP_UNINIT_HUGE_RC}" "${P7_CLEANUP_PTA_RC}" \
+        "${P7_CLEANUP_NORMAL_ASYNC_RC}"
 elif [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
     timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         2>&1 | tee "${P7_RESULT}/fail_closed.log"
@@ -401,7 +458,7 @@ if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
     printf 'P7_CLEANUP_EXECUTION model=direct_synchronized_task_queue=not_used\n'
 fi
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|CLEANUP|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER)|P7_CLEANUP_(CASE|ALIAS_AB|PTA_SKIPPED|BISECT_FINAL)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|CLEANUP|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER)|P7_CLEANUP_(CASE|NORMAL_ASYNC|ALIAS_AB|PTA_SKIPPED|BISECT_FINAL)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
     if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \

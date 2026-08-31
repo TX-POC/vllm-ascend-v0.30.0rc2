@@ -269,6 +269,9 @@ def main() -> None:
     for token in (
         "grep -Fqx 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
         "DESCRIPTOR_LEDGER",
+        "run_normal_fail_closed_case()",
+        "P7_CLEANUP_NORMAL_ASYNC",
+        "real_hccp=not_run",
     ):
         _require(reuse_runner, token, reuse_runner_path)
     for token in (
