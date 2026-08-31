@@ -7,8 +7,13 @@
 // is unsafe when the current NPU stream is enqueued asynchronously: the
 // runtime may consume the queued command after the caller has released the
 // associated host objects.  We therefore use the same narrowly scoped
-// OpCommand::RunOpApiV2 hand-off as the checked-in torch_npu adapter while
-// continuing to resolve the operator symbols from the repository-local OPP.
+// OpCommand::RunOpApi hand-off while continuing to resolve the operator
+// symbols from the repository-local OPP.  The distinction is safety
+// critical: under the torch_npu task queue, RunOpApiV2 retains pointers to
+// its caller's std::string/callback instead of owning copies.  This launcher
+// deliberately creates the callback on the stack, so V2 would turn an
+// asynchronous kernel submission into a use-after-free after this macro
+// returns.  RunOpApi takes the callback by value and owns the queued copy.
 
 #include <cstdlib>
 #include <cstdio>
@@ -435,7 +440,10 @@ inline void LogResolvedOpApi(
       LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");              \
       return launch_status;                                                    \
     };                                                                         \
-    at_npu::native::OpCommand::RunOpApiV2(#aclnn_api, ordered_acl_call);      \
+    /* Keep an owning copy of the callback in the task queue.  Do not use     \
+     * RunOpApiV2 here: V2 queues non-owning pointers to stack state. */      \
+    LogOpApiLifecycle(#aclnn_api, "handoff_runopapi_by_value");             \
+    at_npu::native::OpCommand::RunOpApi(#aclnn_api, ordered_acl_call);        \
     if (uninit_huge_mem != nullptr) {                                          \
       uninit_huge_mem(nullptr, false);                                         \
     }                                                                          \

@@ -230,13 +230,19 @@ def main() -> None:
     ):
         _require(bridge, token, bridge_path)
     for token in (
-        "OpCommand::RunOpApiV2",
+        "OpCommand::RunOpApi(#aclnn_api, ordered_acl_call)",
         "UseStreamResIfNeeded(acl_stream, true)",
         "UseStreamResIfNeeded(acl_stream, false)",
         "ordered_tensor_keepalive",
+        "handoff_runopapi_by_value",
         "descriptor_release_done",
     ):
         _require(op_api_common, token, op_api_common_path)
+    if "OpCommand::RunOpApiV2(#aclnn_api, ordered_acl_call)" in op_api_common:
+        raise AssertionError(
+            "P7.1 must not use RunOpApiV2: task-queue V2 retains stack pointers "
+            "to the callback and operation name after this launcher returns"
+        )
     for token in (
         "31in_18aliasout",
         "AIV-only",

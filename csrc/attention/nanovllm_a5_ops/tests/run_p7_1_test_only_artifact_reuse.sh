@@ -207,6 +207,9 @@ export P7_EXPECTED_KVAF_SHA="${P7_ARTIFACT_KVAF_SHA}"
 export P7_KVAF_BATCH_GET_KERNEL="${P7_KVAF_BUILD}/bin/kvaf_execute_batch_get_kernels.o"
 export P7_KVAF_BATCH_PUT_KERNEL="${P7_KVAF_BUILD}/bin/kvaf_execute_batch_put_kernels.o"
 export PYTHONPATH="${P7_BRIDGE_ROOT}:${P7_KVAF_BUILD}/python${PYTHONPATH:+:${PYTHONPATH}}"
+# This is intentionally on for the scoped P7.1 retry.  The marker proves the
+# bridge used the owning RunOpApi hand-off before a result is interpreted.
+export NANOVLLM_A5_OPAPI_DEBUG=1
 
 "${P7_PYTHON}" -c 'import os, torch, torch_npu; torch.npu.set_device(0); print("P7_REUSE_NPU physical=%s logical=0 device=%s" % (os.environ.get("ASCEND_RT_VISIBLE_DEVICES"), torch.npu.get_device_name(0)))' \
     2>&1 | tee "${P7_RESULT}/npu.log"
@@ -245,6 +248,19 @@ if [[ "${P7_PREFLIGHT_RC}" == "0" ]]; then
 else
     P7_FAIL_CLOSED_RC=98
 fi
+P7_OWNING_HANDOFF=0
+if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]] && \
+   grep -Fq 'NANOVLLM_A5_OPAPI_LIFECYCLE api=aclnnA5ScoreReceiptSpeculativeExecutor stage=handoff_runopapi_by_value' \
+       "${P7_RESULT}/fail_closed.log"; then
+    P7_OWNING_HANDOFF=1
+fi
+printf 'P7_REUSE_OWNING_HANDOFF observed=%s api=A5ScoreReceiptSpeculativeExecutor\n' \
+    "${P7_OWNING_HANDOFF}"
+if [[ "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_OWNING_HANDOFF}" != "1" ]]; then
+    # A passing tensor result from another registered bridge is not evidence
+    # that the rebuilt bridge was dispatched.  Fail before attempting HCCP.
+    P7_FAIL_CLOSED_RC=97
+fi
 if [[ "${P7_FAIL_CLOSED_RC}" == "0" ]]; then
     timeout 180s "${P7_PYTHON}" "${P7_TEST}" --device npu:0 \
         --fixture-module p7_1_real_direct_hccp_fixture \
@@ -254,7 +270,7 @@ else
     P7_REAL_RC=98
 fi
 
-grep -hE '^P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS)' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|launch_begin|launch_done|descriptor_release_done|submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
       "${P7_FAIL_CLOSED_RC}" == "0" && "${P7_REAL_RC}" == "0" ]]; then
