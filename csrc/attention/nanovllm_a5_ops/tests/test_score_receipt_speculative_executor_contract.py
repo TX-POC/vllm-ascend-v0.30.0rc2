@@ -158,6 +158,7 @@ def main() -> None:
     )
     op_api_common_path = ops_root / "torch_extension" / "csrc" / "op_api_common.h"
     runtime_test_path = ops_root / "tests" / "test_score_receipt_speculative_executor.py"
+    reuse_runner_path = ops_root / "tests" / "run_p7_1_test_only_artifact_reuse.sh"
     real_fixture_path = p7_root / "torch_extension" / "p7_1_real_direct_hccp_fixture.py"
     abi_path = p7_root / "P7_1_ABI.md"
     for path in (
@@ -168,6 +169,7 @@ def main() -> None:
         bridge_path,
         op_api_common_path,
         runtime_test_path,
+        reuse_runner_path,
         real_fixture_path,
         abi_path,
     ):
@@ -194,6 +196,7 @@ def main() -> None:
     tiling = tiling_path.read_text(encoding="utf-8")
     bridge = bridge_path.read_text(encoding="utf-8")
     op_api_common = op_api_common_path.read_text(encoding="utf-8")
+    reuse_runner = reuse_runner_path.read_text(encoding="utf-8")
     abi = abi_path.read_text(encoding="utf-8")
     for token in REQUIRED_KERNEL:
         _require(kernel, token, kernel_path)
@@ -245,8 +248,29 @@ def main() -> None:
         "GetAclTensorApiPair()",
         "P7_1_ACL_DSO",
         "P7_1_HOST_DSO",
+        "LogConvertedDescriptorSet(#aclnn_api, converted)",
+        "P7_1_DESCRIPTOR_LEDGER",
+        "P7_1_DESCRIPTOR_LEDGER api=%s tuple_args=%zu acl_tensors=%zu unique_acl_tensors=%zu\\n",
     ):
         _require(op_api_common, token, op_api_common_path)
+    converted_offset = op_api_common.find("auto converted = ConvertTypes(")
+    ledger_offset = op_api_common.find(
+        "LogConvertedDescriptorSet(#aclnn_api, converted);", converted_offset
+    )
+    workspace_offset = op_api_common.find(
+        "auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);",
+        converted_offset,
+    )
+    if not (converted_offset >= 0 and converted_offset < ledger_offset < workspace_offset):
+        raise AssertionError(
+            "P7 descriptor ledger must run after ConvertTypes and before "
+            "GetWorkspaceSize"
+        )
+    for token in (
+        "grep -Fqx 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49'",
+        "DESCRIPTOR_LEDGER",
+    ):
+        _require(reuse_runner, token, reuse_runner_path)
     for token in (
         "31in_18aliasout",
         "AIV-only",
@@ -286,7 +310,13 @@ def main() -> None:
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
         "ordered_opapi_lifetime=1 pta_cache_lifecycle=1 "
-        "host_cleanup_bisect=1 loader_scope_local=1 descriptor_pairing=1",
+        "host_cleanup_bisect=1 loader_scope_local=1 descriptor_pairing=1 "
+        "descriptor_ledger=1",
+        flush=True,
+    )
+    print(
+        "P7_1_DESCRIPTOR_CONTRACT tuple_args=51 acl_tensors=49 "
+        "unique_acl_tensors=49 gate=before_workspace",
         flush=True,
     )
     print(

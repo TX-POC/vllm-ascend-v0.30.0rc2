@@ -22,6 +22,7 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -338,6 +339,48 @@ template <typename Tuple>
 inline void ReleaseTuple(Tuple &args) {
   constexpr size_t kSize = std::tuple_size<Tuple>::value;
   ReleaseTuple(args, std::make_index_sequence<kSize>{});
+}
+
+inline void CollectAclTensorDescriptor(
+    aclTensor *descriptor, std::vector<void *> *descriptors) {
+  if (descriptor != nullptr) {
+    descriptors->push_back(descriptor);
+  }
+}
+
+template <typename T>
+inline void CollectAclTensorDescriptor(T, std::vector<void *> *) {}
+
+template <typename Tuple, size_t... I>
+inline void LogConvertedDescriptorSetImpl(
+    const char *api, Tuple &args, std::index_sequence<I...>) {
+  if (!OpApiDebugEnabled()) {
+    return;
+  }
+  std::vector<void *> descriptors;
+  descriptors.reserve(sizeof...(I));
+  (void)std::initializer_list<int>{
+      (CollectAclTensorDescriptor(std::get<I>(args), &descriptors), 0)...};
+  std::unordered_set<void *> unique(descriptors.begin(), descriptors.end());
+  std::fprintf(
+      stderr,
+      "P7_1_DESCRIPTOR_LEDGER api=%s tuple_args=%zu acl_tensors=%zu unique_acl_tensors=%zu\n",
+      api,
+      sizeof...(I),
+      descriptors.size(),
+      unique.size());
+  std::fflush(stderr);
+}
+
+// The launcher also carries two non-descriptor trailing pointers (workspace
+// size and executor).  Keeping the full tuple count separate from the ACL
+// tensor count makes a malformed 31-in/18-out P7 bridge immediately visible
+// without dumping 49 host addresses into an uncopyable log.
+template <typename Tuple>
+inline void LogConvertedDescriptorSet(const char *api, Tuple &args) {
+  constexpr size_t kSize = std::tuple_size<Tuple>::value;
+  LogConvertedDescriptorSetImpl(
+      api, args, std::make_index_sequence<kSize>{});
 }
 
 template <typename Tuple, size_t... I>
@@ -658,6 +701,7 @@ inline void LogOrderedHostDso(
     aclOpExecutor **executor_ptr = &executor;                                  \
     auto converted = ConvertTypes(                                             \
         __VA_ARGS__, workspace_size_ptr, executor_ptr);                        \
+    LogConvertedDescriptorSet(#aclnn_api, converted);                          \
     auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);       \
     int workspace_status = CallTuple(workspace_fn, converted);                 \
     TORCH_CHECK(                                                               \

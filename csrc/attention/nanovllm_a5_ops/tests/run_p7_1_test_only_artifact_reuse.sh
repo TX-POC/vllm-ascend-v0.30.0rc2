@@ -265,6 +265,7 @@ run_fail_closed_case() {
     local completion=0
     local test_pass=0
     local teardown=0
+    local descriptor_ledger=0
 
     # Each mode gets a fresh interpreter and a fresh torch bridge load.  That
     # is essential: launch_only intentionally defers cleanup until process
@@ -277,6 +278,7 @@ run_fail_closed_case() {
     case_rc=${PIPESTATUS[0]}
 
     grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=config bisect=1" "${case_log}" && config=1
+    grep -Fqx 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=51 acl_tensors=49 unique_acl_tensors=49' "${case_log}" && descriptor_ledger=1
     if [[ "${mode}" == "workspace_only" ]]; then
         grep -Fq "P7_1_CLEANUP api=aclnnA5ScoreReceiptSpeculativeExecutor mode=${mode} stage=workspace_only_return bisect=1" "${case_log}" && completion=1
         grep -Fq 'P7_1_TEST mode=workspace_only pass=1' "${case_log}" && test_pass=1
@@ -287,12 +289,14 @@ run_fail_closed_case() {
         grep -Fq 'P7_1_TEARDOWN mode=fail_closed stage=python_refs_collected sync=1' "${case_log}" && teardown=1
     fi
 
-    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
-        "${mode}" "${topology}" "${case_rc}" "${config}" "${completion}" \
-        "${test_pass}" "${teardown}" "${case_log}"
+    printf 'P7_CLEANUP_CASE mode=%s topology=%s rc=%s config=%s descriptor_ledger=%s completion=%s test_pass=%s teardown=%s execution=direct_synchronized log=%s\n' \
+        "${mode}" "${topology}" "${case_rc}" "${config}" \
+        "${descriptor_ledger}" "${completion}" "${test_pass}" \
+        "${teardown}" "${case_log}"
 
     if [[ "${case_rc}" != "0" || "${config}" != "1" || \
-          "${completion}" != "1" || "${test_pass}" != "1" || \
+          "${descriptor_ledger}" != "1" || "${completion}" != "1" || \
+          "${test_pass}" != "1" || \
           "${teardown}" != "1" ]]; then
         return 1
     fi
@@ -397,7 +401,7 @@ if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
     printf 'P7_CLEANUP_EXECUTION model=direct_synchronized_task_queue=not_used\n'
 fi
 
-grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|CLEANUP|ACL_DSO|HOST_DSO)|P7_CLEANUP_(CASE|ALIAS_AB|PTA_SKIPPED|BISECT_FINAL)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
+grep -hE '^(P7_1_(FIXTURE|SOURCE_ABI|CONTROL|RECEIPTS|QUEUE|TRANSPORT|FAILURE|REAL_BIND|REAL_LIFECYCLE|TEST|TEST_FAIL|CONTRACT_PASS|CLEANUP|ACL_DSO|HOST_DSO|DESCRIPTOR_LEDGER)|P7_CLEANUP_(CASE|ALIAS_AB|PTA_SKIPPED|BISECT_FINAL)|NANOVLLM_A5_OPAPI_LIFECYCLE .*stage=(handoff_runopapi_by_value|pta_cache_ready|pta_cache_unavailable|pta_cache_uninit|pta_cache_not_active|launch_begin|launch_done|descriptor_release_done|submit_done))' \
     "${P7_RESULT}"/*.log 2>/dev/null | tail -n 120
 if [[ "${P7_CLEANUP_BISECT}" == "1" ]]; then
     if [[ "${P7_CONTRACT_RC}" == "0" && "${P7_PREFLIGHT_RC}" == "0" && \
