@@ -20,6 +20,12 @@
 #include "op_api_common.h"
 
 namespace {
+// P7's host-ordering and terminal-lease helpers deliberately live in the
+// common OpAPI namespace.  Keep the qualification explicit here: the launch
+// macro imports that namespace only inside its own expansion, while the
+// reservation / hand-off code below executes before and after that macro.
+namespace p7_opapi = nanovllm_a5_opapi;
+
 constexpr int64_t kInputCount = 31;
 constexpr int64_t kOutputCount = 18;
 constexpr int64_t kCandidateCapacity = 128;
@@ -247,9 +253,9 @@ Result RunNpu(
     // The P7 device executor remains asynchronous after that one ordered
     // launch. Its AIV workers own CandidateSeed -> PostOnly -> HCCP DMA -> CQ;
     // this bridge never waits for a queue, DMA, or CQ result.
-    ClearP7DirectLaunchTokenForCurrentThread();
-    const OrderedCleanupPlan p7_submission_plan =
-        OrderedCleanupPlanFromEnvironment();
+    p7_opapi::ClearP7DirectLaunchTokenForCurrentThread();
+    const p7_opapi::OrderedCleanupPlan p7_submission_plan =
+        p7_opapi::OrderedCleanupPlanFromEnvironment();
     TORCH_CHECK(!p7_submission_plan.bisect,
                 "P7.1 ordered async submission rejects cleanup-bisect mode; ",
                 "it would bypass the torch_npu task-queue ownership contract");
@@ -278,14 +284,16 @@ Result RunNpu(
     TORCH_CHECK(p7_terminal_acl_stream != nullptr,
                 "P7.1 has no current NPU stream for its terminal lease");
     const uint64_t p7_terminal_token =
-        GetP7DirectLaunchLeaseRegistry().ReserveEnqueued(
-            MakeP7DirectLaunchLease(keepalive), p7_terminal_acl_stream);
+        p7_opapi::GetP7DirectLaunchLeaseRegistry().ReserveEnqueued(
+            p7_opapi::MakeP7DirectLaunchLease(keepalive),
+            p7_terminal_acl_stream);
     // The observer is only host-side failure bookkeeping.  It is carried with
     // the ordered closure so a queue-consumer failure transitions this exact
     // pre-reserved token to HOST_FAILED before torch_npu propagates the
     // original exception.  It does not participate in the ACLNN ABI.
-    auto p7_failure_observer = MakeP7OrderedLaunchFailureObserver(
-        p7_terminal_token, p7_terminal_acl_stream);
+    auto p7_failure_observer =
+        p7_opapi::MakeP7OrderedLaunchFailureObserver(
+            p7_terminal_token, p7_terminal_acl_stream);
     auto p7_ordered_keepalive = std::tuple_cat(
         keepalive, std::make_tuple(p7_failure_observer));
     try {
@@ -311,22 +319,24 @@ Result RunNpu(
         // above makes a failed pre-publish state an invariant failure; normal
         // post-return asynchronous failures are published and terminal-owned.
         const auto p7_abort_action =
-            GetP7DirectLaunchLeaseRegistry().ResolvePrePublishAbortNoThrow(
-                p7_terminal_token, p7_terminal_acl_stream);
+            p7_opapi::GetP7DirectLaunchLeaseRegistry()
+                .ResolvePrePublishAbortNoThrow(
+                    p7_terminal_token, p7_terminal_acl_stream);
         std::fprintf(
             stderr,
             "P7_1_DISPATCH_ABORT token=%llu action=%s "
             "terminal_owner=none_before_publish failed_or_handoff=retained\n",
             static_cast<unsigned long long>(p7_terminal_token),
-            P7DirectLaunchLeaseRegistry::PrePublishAbortActionName(
+            p7_opapi::P7DirectLaunchLeaseRegistry::PrePublishAbortActionName(
                 p7_abort_action));
         std::fflush(stderr);
         throw;
     }
     const bool p7_handoff_accepted =
-        GetP7DirectLaunchLeaseRegistry().MarkHostHandoffAccepted(
-            p7_terminal_token, p7_terminal_acl_stream);
-    PublishP7DirectLaunchTokenForCurrentThread(p7_terminal_token);
+        p7_opapi::GetP7DirectLaunchLeaseRegistry()
+            .MarkHostHandoffAccepted(p7_terminal_token, p7_terminal_acl_stream);
+    p7_opapi::PublishP7DirectLaunchTokenForCurrentThread(
+        p7_terminal_token);
     if (DebugEnabled()) {
         std::fprintf(stderr,
                      "P7_1_ORDERED_SUBMISSION token=%llu host_handoff=%s "

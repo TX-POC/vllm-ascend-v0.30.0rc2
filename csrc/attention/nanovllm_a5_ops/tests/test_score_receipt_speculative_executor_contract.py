@@ -297,6 +297,10 @@ def main() -> None:
         "GetTaskQueueEnable()",
         "isSyncLaunchStream()",
         "p7_submission_plan.bisect",
+        "namespace p7_opapi = nanovllm_a5_opapi;",
+        "p7_opapi::ClearP7DirectLaunchTokenForCurrentThread()",
+        "p7_opapi::GetP7DirectLaunchLeaseRegistry()",
+        "p7_opapi::PublishP7DirectLaunchTokenForCurrentThread(",
         "P7_1_BOUNDARY stage=run_npu_after_submit",
         "P7_1_BOUNDARY stage=run_npu_result_ready",
     ):
