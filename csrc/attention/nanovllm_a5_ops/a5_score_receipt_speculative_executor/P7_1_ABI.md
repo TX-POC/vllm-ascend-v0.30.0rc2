@@ -21,6 +21,26 @@ host tiling 的 worker 数是 `min(available_AIV, receipt_count, queue_count)`�
 并按 stride 继续处理多个 receipt。该上限只是避免已压缩的候选只有 `Q` 个 in-flight
 queue 时仍启动几十个 worker 空转抢 lease，造成无收益的 CAS/queue-busy 抖动。
 
+## 宿主提交边界
+
+P7.1 的宿主侧只做一次**直接 ACLNN 入流**：创建 31 个 tensor descriptor，调用
+`GetWorkspaceSize`，随后在调用者当前 NPU stream 直接调用
+`aclnnA5ScoreReceiptSpeculativeExecutor`。这个调用只把 AIV-only kernel 排入当前
+stream，**不等待** DMA 或 CQ，也不通过 `torch_npu::OpCommand` 再包一层 host
+task queue。原因不是绕开异步，而是 P7.1 的真实异步工作已经在设备端：
+`PostOnly -> DMA -> CQ`。再添加一个私有 host callback 会增加资源所有权边界，且曾在
+kernel fail-closed 后造成 post-submit 进程崩溃。
+
+host 返回后，CANN stream 继续执行 P7.1 kernel；kernel 内部才动态租 queue、发布
+descriptor、PostOnly，并在后续 receipt 中非阻塞 drain CQ。因此这里没有回到 CPU/GIL
+逐候选提交，也没有把 Get 固定给某些 AIV。
+
+当前 P7.1 tiling 明确声明 `workspace=0`，bridge 也对此做 fail-closed 检查。因而
+direct launch 没有一个在 host 返回后还要单独保活的临时 workspace Tensor；31 个输入和
+18 个 Ref 状态本来就是 graph `RuntimeResources`，其生命周期至少覆盖本 forward 的
+stream terminal。未来若算子需要非零 workspace，必须先补上可验证的 stream-owned
+workspace 生命周期，不能悄悄复用这里的零 workspace 路径。
+
 ## 31 个 ACLNN 张量 / 18 个原地 Ref 输出
 
 Torch 侧 schema 仍是 `torch_schema=31in_18aliasout`，这样图能看到 18 个可变状态的

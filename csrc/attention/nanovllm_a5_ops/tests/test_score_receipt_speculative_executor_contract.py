@@ -245,6 +245,7 @@ def main() -> None:
         "P7_1_REF_ABI",
         "mutable_refs=18",
         "Tensor(r!) worker_stats",
+        "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(",
     ):
         _require(bridge, token, bridge_path)
     if "empty_like" in bridge:
@@ -253,17 +254,14 @@ def main() -> None:
             "independent output descriptors"
         )
     for token in (
-        "OpCommand::RunOpApi(#aclnn_api, ordered_acl_call)",
-        "UseStreamResIfNeeded(acl_stream, true)",
-        "UseStreamResIfNeeded(acl_stream, false)",
+        "#define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC",
         "InitPtaCacheForWorkspace()",
         "UnInitPtaCacheForWorkspace(pta_cache_active)",
-        "ordered_tensor_keepalive",
-        "handoff_runopapi_by_value",
-        "descriptor_release_done",
-        "OrderedCleanupPlanFromEnvironment()",
-        "NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
-        "P7_1_CLEANUP",
+        "workspace_size == 0",
+        "direct_async_workspace_call_begin",
+        "direct_async_launch_done",
+        "direct_async_descriptor_release_done",
+        "direct_async_submit_done",
         "RTLD_NOW | RTLD_LOCAL",
         "GetAclTensorApiPair()",
         "P7_1_ACL_DSO",
@@ -271,25 +269,36 @@ def main() -> None:
         "LogConvertedDescriptorSet(#aclnn_api, converted)",
         "P7_1_DESCRIPTOR_LEDGER",
         "P7_1_DESCRIPTOR_LEDGER api=%s tuple_args=%zu acl_tensors=%zu unique_acl_tensors=%zu\\n",
-        "return {OrderedCleanupMode::kPhase2Noop, true, false, false, false, false};",
-        "phase2_executor_autorelease_done",
-        "non-repeatable aclOpExecutor is",
     ):
         _require(op_api_common, token, op_api_common_path)
     _forbid(op_api_common, "aclDestroyAclOpExecutor(executor)", op_api_common_path)
-    converted_offset = op_api_common.find("auto converted = ConvertTypes(")
+    direct_macro_offset = op_api_common.find(
+        "#define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC"
+    )
+    direct_macro = op_api_common[direct_macro_offset:]
+    if direct_macro_offset < 0:
+        raise AssertionError("missing P7 direct ACLNN macro")
+    for forbidden in (
+        "OpCommand::RunOpApi",
+        "UseStreamResIfNeeded",
+        "ordered_acl_call",
+        "aclrtSynchronizeStream",
+    ):
+        _forbid(direct_macro, forbidden, op_api_common_path)
+    converted_offset = op_api_common.find(
+        "auto converted = ConvertTypes(", direct_macro_offset
+    )
     ledger_offset = op_api_common.find(
-        "LogConvertedDescriptorSet(#aclnn_api, converted);", converted_offset
+        "LogConvertedDescriptorSet(#aclnn_api, converted);", direct_macro_offset
     )
     workspace_boundary_offset = op_api_common.find(
-        '"workspace_call_begin"', ledger_offset
+        '"direct_async_workspace_call_begin"', ledger_offset
     )
     workspace_offset = op_api_common.find(
-        "auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);",
-        converted_offset,
+        "auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);", direct_macro_offset
     )
     if not (
-        converted_offset >= 0
+        direct_macro_offset >= 0 and converted_offset >= 0
         and converted_offset < ledger_offset < workspace_boundary_offset < workspace_offset
     ):
         raise AssertionError(
@@ -299,13 +308,11 @@ def main() -> None:
     for token in (
         "grep -Fq 'P7_1_DESCRIPTOR_LEDGER api=aclnnA5ScoreReceiptSpeculativeExecutor tuple_args=33 acl_tensors=31 unique_acl_tensors=31'",
         "DESCRIPTOR_LEDGER",
-        "workspace_call_begin",
-        "run_normal_fail_closed_case()",
-        "P7_CLEANUP_NORMAL_ASYNC",
-        "P7_DIRECT_BISECT_SKIPPED reason=direct_path_bypasses_task_queue_stream_resource_contract_and_is_not_a_product_gate",
-        "unset NANOVLLM_A5_OPAPI_CLEANUP_BISECT",
+        "direct_async_workspace_call_begin",
+        "run_direct_async_fail_closed_case()",
+        "P7_DIRECT_ASYNC_FAIL_CLOSED",
         "P7_REAL_FLOW_FINAL",
-        "execution=normal_task_queue_then_real_hccp",
+        "execution=direct_current_stream_then_real_hccp",
         "real_direct_hccp.log",
     ):
         _require(reuse_runner, token, reuse_runner_path)
@@ -315,6 +322,7 @@ def main() -> None:
         "AIV-only",
         "MAPPED_OBJECT",
         "FREE -> FILLING -> POSTED -> CQ_TERMINAL",
+        "直接 ACLNN 入流",
     ):
         _require(abi, token, abi_path)
 
@@ -348,8 +356,8 @@ def main() -> None:
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
-        "ordered_opapi_lifetime=1 pta_cache_lifecycle=1 "
-        "normal_async_gate=1 direct_bisect_not_gate=1 "
+        "direct_current_stream_enqueue=1 pta_cache_lifecycle=1 "
+        "host_task_queue=0 zero_workspace_gate=1 "
         "loader_scope_local=1 descriptor_pairing=1 descriptor_ledger=1",
         flush=True,
     )

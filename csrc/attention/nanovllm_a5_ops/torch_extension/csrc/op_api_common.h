@@ -2,17 +2,13 @@
 
 // Minimal, self-contained ACLNN launcher for nanovllm_dsa_a5.
 //
-// ACLNN descriptor/workspace ownership must follow torch_npu's task-queue
-// contract.  A direct aclnn launch followed by immediate descriptor release
-// is unsafe when the current NPU stream is enqueued asynchronously: the
-// runtime may consume the queued command after the caller has released the
-// associated host objects.  We therefore use the same narrowly scoped
-// OpCommand::RunOpApi hand-off while continuing to resolve the operator
-// symbols from the repository-local OPP.  We deliberately use the by-value
-// API because it makes the closure ownership boundary explicit in this
-// bridge.  This is an implementation choice, not a claim that RunOpApiV2 is
-// intrinsically unsafe; the P7 test-only bisect below independently removes
-// the task queue when it isolates host-lifetime failures.
+// Most bridges below use torch_npu's OpCommand task-queue contract.  That is
+// the existing contract for their independently validated launch paths.  P7.1
+// is deliberately different: its CANN ABI has zero workspace and its actual
+// PostOnly/CQ asynchronous work is already device-side, so it uses the same
+// direct-current-stream ACLNN form as the repository's original standalone
+// baseline.  Keep that exception local to P7.1 rather than changing the
+// ownership rule for every other bridge.
 
 #include <cstdlib>
 #include <cstdio>
@@ -810,4 +806,103 @@ inline void LogOrderedHostDso(
                                          : "pta_cache_not_active");           \
       LogOpApiLifecycle(#aclnn_api, "submit_done");                          \
     }                                                                          \
+  } while (false)
+
+// P7.1 is a standalone device-side PostOnly/CQ executor. Its host launch uses
+// the public ACLNN stream ABI directly: ACLNN enqueues work on the caller's
+// current NPU stream and returns without waiting for DMA or CQ. The 31 input
+// tensors and 18 mutable Ref tensors are graph RuntimeResources: their
+// lifetime is required to cover this forward's stream terminal. This macro
+// deliberately introduces no temporary workspace Tensor whose lifetime would
+// end at the host return boundary.
+//
+// Do not route P7.1 through torch_npu::OpCommand. OpCommand is a private host
+// task queue, while P7.1's real asynchronous work already lives on the device
+// stream. A P7.1 fail-closed launch reached `submit_done` and then crashed in
+// that second hand-off. The direct path below matches the repository's direct
+// ACLNN baseline: create descriptors, query workspace, enqueue, then release
+// host-only descriptors. PTA/HugeMem setup remains a GetWorkspaceSize
+// precondition for this CANN release.
+//
+// This is P7-specific on purpose: existing operators retain their independently
+// validated EXEC_NPU_CMD_ORDERED contracts. P7's OpDef declares zero workspace;
+// fail closed if that changes instead of silently introducing an untracked
+// temporary tensor lifetime into the asynchronous device path.
+#define EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(aclnn_api, tensor_keepalive, ...) \
+  do {                                                                           \
+    using namespace nanovllm_a5_opapi;                                           \
+    static void *workspace_addr_fn =                                             \
+        ResolveSymbol(#aclnn_api "GetWorkspaceSize");                          \
+    static void *launch_addr_fn = ResolveSymbol(#aclnn_api);                    \
+    TORCH_CHECK(                                                                 \
+        workspace_addr_fn != nullptr && launch_addr_fn != nullptr,               \
+        #aclnn_api,                                                              \
+        " or ",                                                                \
+        #aclnn_api "GetWorkspaceSize is missing from repository-local ",        \
+        "libcust_opapi.so");                                                   \
+    LogResolvedOpApi(#aclnn_api, workspace_addr_fn, launch_addr_fn);             \
+                                                                               \
+    const bool pta_cache_active = InitPtaCacheForWorkspace();                    \
+    LogOpApiLifecycle(#aclnn_api,                                                \
+                      pta_cache_active ? "direct_async_pta_cache_ready"        \
+                                       : "direct_async_pta_cache_unavailable"); \
+    auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(             \
+        ResolveSymbol("InitHugeMemThreadLocal"));                               \
+    auto uninit_huge_mem = reinterpret_cast<UnInitHugeMemThreadLocalFn>(         \
+        ResolveSymbol("UnInitHugeMemThreadLocal"));                             \
+    auto release_huge_mem = reinterpret_cast<ReleaseHugeMemFn>(                  \
+        ResolveSymbol("ReleaseHugeMem"));                                       \
+    LogOrderedHostDso(#aclnn_api, workspace_addr_fn, launch_addr_fn,             \
+                      init_huge_mem, release_huge_mem, uninit_huge_mem);         \
+    if (init_huge_mem != nullptr) {                                              \
+      (void)init_huge_mem(nullptr, false);                                       \
+    }                                                                            \
+                                                                               \
+    uint64_t workspace_size = 0;                                                 \
+    uint64_t *workspace_size_ptr = &workspace_size;                              \
+    aclOpExecutor *executor = nullptr;                                           \
+    aclOpExecutor **executor_ptr = &executor;                                    \
+    auto converted = ConvertTypes(                                               \
+        __VA_ARGS__, workspace_size_ptr, executor_ptr);                          \
+    LogConvertedDescriptorSet(#aclnn_api, converted);                            \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_workspace_call_begin");       \
+    auto workspace_fn = WorkspaceFunction(converted, workspace_addr_fn);         \
+    const int workspace_status = CallTuple(workspace_fn, converted);             \
+    TORCH_CHECK(                                                                 \
+        workspace_status == 0,                                                   \
+        "call " #aclnn_api "GetWorkspaceSize failed: ",                       \
+        RecentAclError());                                                       \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_workspace_ready");           \
+                                                                               \
+    TORCH_CHECK(                                                                 \
+        workspace_size == 0,                                                     \
+        "P7 direct async ABI requires zero CANN workspace; nonzero workspace ", \
+        "needs an explicit stream-owned lifetime contract");                  \
+    void *workspace_ptr = nullptr;                                               \
+                                                                               \
+    auto npu_stream = c10_npu::getCurrentNPUStream();                            \
+    const aclrtStream acl_stream = npu_stream.stream(false);                     \
+    auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);            \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_launch_begin");               \
+    const int launch_status =                                                     \
+        launch_fn(workspace_ptr, workspace_size, executor, acl_stream);          \
+    TORCH_CHECK(                                                                 \
+        launch_status == 0,                                                      \
+        "call " #aclnn_api " failed: ", RecentAclError());                   \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_launch_done");                \
+                                                                               \
+    ReleaseTuple(converted);                                                     \
+    if (release_huge_mem != nullptr) {                                          \
+      release_huge_mem(nullptr, false);                                          \
+    }                                                                            \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_descriptor_release_done");   \
+    if (uninit_huge_mem != nullptr) {                                            \
+      uninit_huge_mem(nullptr, false);                                           \
+    }                                                                            \
+    UnInitPtaCacheForWorkspace(pta_cache_active);                                \
+    LogOpApiLifecycle(#aclnn_api,                                                \
+                      pta_cache_active ? "direct_async_pta_cache_uninit"       \
+                                       : "direct_async_pta_cache_not_active");  \
+    LogOpApiLifecycle(#aclnn_api, "direct_async_submit_done");                \
+    (void)tensor_keepalive;                                                      \
   } while (false)

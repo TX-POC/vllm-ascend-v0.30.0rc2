@@ -238,7 +238,9 @@ Result RunNpu(
         queueRequestSourceOffsets, queueRequestObjectOffsets,
         queueRequestOutputIndices, queueRequestCount, privateReadyEpoch,
         privateReadyGeneration, workerStats, rowsPerEntry);
-    EXEC_NPU_CMD_ORDERED(
+    // P7.1 directly enqueues ACLNN on the caller's current stream. The device
+    // kernel, not a torch_npu-private host task queue, owns PostOnly/CQ work.
+    EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC(
         aclnnA5ScoreReceiptSpeculativeExecutor, keepalive,
         candidateSeeds, candidateCounts, candidateReadyEpoch, candidateStatus,
         streamingEpoch, sourceLens, kvObjectAddressDomain, reqPoolEntries,
