@@ -23,8 +23,6 @@ from typing import Any, Iterable
 import torch
 import torch_npu  # noqa: F401
 
-import nanovllm_score_receipt_speculative_executor  # noqa: F401
-
 
 INPUT_COUNT = 31
 OUTPUT_COUNT = 18
@@ -47,7 +45,11 @@ def _fail_closed_fixture(device: torch.device) -> tuple[torch.Tensor, ...]:
 
     receipts, rows, sources, pools, objects, queues, arena, workers = 1, 1, 128, 1, 128, 1, 64, 1
     npu = lambda tensor: tensor.to(device).contiguous()
-    return tuple(
+    # This is intentionally a tuple literal, not ``tuple(a, b, ...)``:
+    # Python's tuple constructor accepts exactly one iterable argument.  Keep
+    # the 31-input ABI visible here and assert it before ACLNN dispatch so a
+    # test-harness typo cannot be mistaken for an operator/transport failure.
+    inputs = (
         npu(torch.full((receipts, 128, 4), -1, dtype=torch.int32)),  # candidate_seeds
         npu(torch.zeros(receipts, dtype=torch.int32)),
         npu(torch.tensor([41], dtype=torch.int64)),
@@ -80,6 +82,11 @@ def _fail_closed_fixture(device: torch.device) -> tuple[torch.Tensor, ...]:
         npu(torch.zeros((workers, 16), dtype=torch.int64)),
         npu(torch.ones(1, dtype=torch.int32)),
     )
+    if len(inputs) != INPUT_COUNT:
+        raise AssertionError(
+            f"fail-closed fixture must provide {INPUT_COUNT} inputs, got {len(inputs)}"
+        )
+    return inputs
 
 
 def _stat_sum(stats: torch.Tensor, column: int) -> int:
@@ -109,6 +116,11 @@ def _check_aliases(inputs: tuple[torch.Tensor, ...], outputs: Iterable[torch.Ten
 def _run(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     if len(inputs) != INPUT_COUNT:
         raise ValueError(f"fixture must provide exactly {INPUT_COUNT} inputs")
+    # Keep the fail-closed fixture preflight independent of an OPP package.
+    # The runner executes that preflight before any expensive KVAF/OPP build;
+    # importing the bridge belongs only to the actual ACLNN dispatch path.
+    import nanovllm_score_receipt_speculative_executor  # noqa: F401
+
     outputs = torch.ops.a5_score_receipt_speculative_executor.score_receipt_speculative_executor(*inputs)
     torch.npu.synchronize()
     _check_aliases(inputs, outputs)
@@ -205,6 +217,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Python module exposing build_p7_1_fixture(device) for real Direct-HCCP mode",
     )
+    parser.add_argument(
+        "--fixture-only",
+        action="store_true",
+        help="construct and validate only the built-in fail-closed fixture; never import an OPP or dispatch ACLNN",
+    )
     return parser.parse_args()
 
 
@@ -214,6 +231,20 @@ def main() -> None:
     if device.type != "npu":
         raise ValueError("--device must be npu:<logical-id>")
     torch.npu.set_device(device)
+    if args.fixture_only:
+        if args.fixture_module:
+            raise ValueError("--fixture-only cannot be combined with --fixture-module")
+        inputs = _fail_closed_fixture(device)
+        if len(inputs) != INPUT_COUNT:
+            raise AssertionError(f"expected {INPUT_COUNT} fixture inputs, got {len(inputs)}")
+        if any(value.device != device for value in inputs):
+            raise AssertionError("fixture tensors must all be allocated on --device")
+        print(
+            "P7_1_FIXTURE_PREFLIGHT pass=1 inputs=31 "
+            "device=%s opp_imported=0 aclnn_dispatched=0" % device,
+            flush=True,
+        )
+        return
     if not args.fixture_module:
         inputs = _fail_closed_fixture(device)
         values = _report("fail_closed", inputs, _run(inputs))

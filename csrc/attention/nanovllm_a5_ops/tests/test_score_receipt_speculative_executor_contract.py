@@ -11,6 +11,7 @@ executes the bridge in fail-closed and, when supplied, real-control modes.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 from pathlib import Path
 
@@ -69,6 +70,60 @@ def _forbid(text: str, token: str, path: Path) -> None:
         raise AssertionError(f"forbidden token={token!r} file={path}")
 
 
+def _check_fixture_source(path: Path, *, require_fail_closed_shape: bool) -> int:
+    """Reject a Python fixture bug before an expensive OPP compilation."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    invalid_tuple_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "tuple"
+        and len(node.args) > 1
+    ]
+    if invalid_tuple_calls:
+        first = invalid_tuple_calls[0]
+        raise AssertionError(
+            f"builtin tuple() accepts one iterable, got {len(first.args)} positional "
+            f"arguments at {path}:{first.lineno}"
+        )
+    if not require_fail_closed_shape:
+        return 0
+
+    fixture = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_fail_closed_fixture"
+        ),
+        None,
+    )
+    if fixture is None:
+        raise AssertionError(f"missing _fail_closed_fixture in {path}")
+    tuple_assignments = [
+        node
+        for node in ast.walk(fixture)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "inputs" for target in node.targets)
+        and isinstance(node.value, ast.Tuple)
+    ]
+    if len(tuple_assignments) != 1 or len(tuple_assignments[0].value.elts) != 31:
+        count = len(tuple_assignments[0].value.elts) if tuple_assignments else -1
+        raise AssertionError(
+            f"_fail_closed_fixture must assign one 31-element tuple literal, got {count}"
+        )
+    returns_inputs = any(
+        isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "inputs"
+        for node in ast.walk(fixture)
+    )
+    if not returns_inputs:
+        raise AssertionError("_fail_closed_fixture must return its checked inputs tuple")
+    return len(tuple_assignments[0].value.elts)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -95,8 +150,19 @@ def main() -> None:
         / "csrc"
         / "score_receipt_speculative_executor.cpp"
     )
+    runtime_test_path = ops_root / "tests" / "test_score_receipt_speculative_executor.py"
+    real_fixture_path = p7_root / "torch_extension" / "p7_1_real_direct_hccp_fixture.py"
     abi_path = p7_root / "P7_1_ABI.md"
-    for path in (spec_path, host_path, kernel_path, tiling_path, bridge_path, abi_path):
+    for path in (
+        spec_path,
+        host_path,
+        kernel_path,
+        tiling_path,
+        bridge_path,
+        runtime_test_path,
+        real_fixture_path,
+        abi_path,
+    ):
         if not path.is_file():
             raise AssertionError(f"missing required P7.1 file={path}")
 
@@ -153,6 +219,11 @@ def main() -> None:
     ):
         _require(abi, token, abi_path)
 
+    fail_closed_inputs = _check_fixture_source(
+        runtime_test_path, require_fail_closed_shape=True
+    )
+    _check_fixture_source(real_fixture_path, require_fail_closed_shape=False)
+
     print(
         "P7_1_SOURCE_ABI "
         "op=A5ScoreReceiptSpeculativeExecutor inputs=31 outputs=18 "
@@ -177,6 +248,11 @@ def main() -> None:
         "P7_1_CANN_COMPILER_CONTRACT "
         "simt_callee=1 aiv_only_no_runtime_branch=1 "
         "ub_physical_address_conversion=1 nonconst_event_t=1",
+        flush=True,
+    )
+    print(
+        "P7_1_FIXTURE_SOURCE_CONTRACT "
+        f"fail_closed_inputs={fail_closed_inputs} tuple_multiarg=0 files=2",
         flush=True,
     )
     print(

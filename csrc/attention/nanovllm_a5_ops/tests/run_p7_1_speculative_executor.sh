@@ -147,6 +147,17 @@ if [[ "${P7_CONTRACT_RC}" != "0" ]]; then
     fail "p7_1_static_contract_failed"
 fi
 
+# This deliberately runs before rebuilding KVAF or compiling the OPP.  It
+# allocates the 31 fixture inputs on the selected NPU but does not import the
+# bridge or dispatch ACLNN, so harness/ABI mistakes fail in seconds rather
+# than after an expensive operator build.
+"${P7_PYTHON}" "${P7_TEST}" --device npu:0 --fixture-only \
+    2>&1 | tee "${P7_RESULT}/fixture_preflight.log"
+P7_FIXTURE_PREFLIGHT_RC=${PIPESTATUS[0]}
+if [[ "${P7_FIXTURE_PREFLIGHT_RC}" != "0" ]]; then
+    fail "p7_1_fixture_preflight_failed"
+fi
+
 # Rebuild the selected KVAF checkout before staging it into P7.1.  This is an
 # incremental KVAF build only; it never invokes the full vLLM-Ascend build.
 cmake --build "${P7_KVAF_BUILD}" -j "${P7_BUILD_JOBS}" \
