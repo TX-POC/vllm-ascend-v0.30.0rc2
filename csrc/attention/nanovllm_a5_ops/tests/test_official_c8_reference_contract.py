@@ -20,10 +20,12 @@ REFERENCE_BRIDGE = (
 )
 TARGET_ADAPTER = OPS_ROOT / "tests/streaming_quant_li_get_target_adapter.py"
 COMMON_OPAPI = OPS_ROOT / "torch_extension/csrc/op_api_common.h"
+UPSTREAM_BUILD_SCRIPT = OPS_ROOT.parents[1] / "build.sh"
 
 
 def require_source_matched_reference_contract() -> None:
     build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+    upstream_build_script = UPSTREAM_BUILD_SCRIPT.read_text(encoding="utf-8")
     reference_bridge = REFERENCE_BRIDGE.read_text(encoding="utf-8")
     adapter = TARGET_ADAPTER.read_text(encoding="utf-8")
     common_opapi = COMMON_OPAPI.read_text(encoding="utf-8")
@@ -40,6 +42,18 @@ def require_source_matched_reference_contract() -> None:
     assert "source_head=${SOURCE_HEAD}" in build_script
     assert "-newer \"${BUILD_MARKER}\"" in build_script
     assert '! -e "${SOURCE_ROOT}/.git"' in build_script
+    # A filtered two-op reference build must not reuse the normal product
+    # target graph.  The upstream builder supports independent sibling
+    # directories, and the reference cache is keyed by exact source revision
+    # so rebuilds of the same revision remain incremental.
+    assert "build_official_c8_reference_${SOURCE_HEAD_SHORT}" in build_script
+    assert 'VLLM_ASCEND_CMAKE_BUILD_DIR="${UPSTREAM_BUILD_DIR}"' in build_script
+    assert 'VLLM_ASCEND_CMAKE_OUTPUT_DIR="${UPSTREAM_OUTPUT_DIR}"' in build_script
+    assert 'VLLM_ASCEND_CMAKE_BUILD_OUT_DIR="${UPSTREAM_BUILD_OUT_DIR}"' in build_script
+    assert 'find "${UPSTREAM_BUILD_DIR}"' in build_script
+    assert 'BUILD_DIR=${VLLM_ASCEND_CMAKE_BUILD_DIR:-${CURRENT_DIR}/build}' in upstream_build_script
+    assert 'OUTPUT_DIR=${VLLM_ASCEND_CMAKE_OUTPUT_DIR:-${CURRENT_DIR}/output}' in upstream_build_script
+    assert 'BUILD_OUT_DIR=${VLLM_ASCEND_CMAKE_BUILD_OUT_DIR:-${CURRENT_DIR}/build_out}' in upstream_build_script
 
     # Both real ACLNN calls retain the canonical names from torch_binding.cpp.
     # The reference bridge gets a private resolver slot so changing the P3

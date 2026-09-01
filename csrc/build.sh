@@ -17,9 +17,15 @@ UT_TARGETS=()
 ########################################################################################################################
 
 CURRENT_DIR=$(dirname $(readlink -f ${BASH_SOURCE[0]}))
-BUILD_DIR=${CURRENT_DIR}/build
-OUTPUT_DIR=${CURRENT_DIR}/output
-BUILD_OUT_DIR=${CURRENT_DIR}/build_out
+# The normal product build retains the historical paths.  A caller that
+# builds a deliberately filtered operator set may select sibling directories
+# through these variables, so its CMake target graph cannot contaminate the
+# normal ``csrc/build`` cache.  The supplied directories must remain direct
+# children of ``CURRENT_DIR`` because the CMake invocation below uses ``..``
+# as its source directory.
+BUILD_DIR=${VLLM_ASCEND_CMAKE_BUILD_DIR:-${CURRENT_DIR}/build}
+OUTPUT_DIR=${VLLM_ASCEND_CMAKE_OUTPUT_DIR:-${CURRENT_DIR}/output}
+BUILD_OUT_DIR=${VLLM_ASCEND_CMAKE_BUILD_OUT_DIR:-${CURRENT_DIR}/build_out}
 USER_ID=$(id -u)
 PARENT_JOB="false"
 HOST_TILING="false"
@@ -325,7 +331,7 @@ export BASE_PATH=$(
     cd "$(dirname $0)"
     pwd
 )
-export BUILD_PATH="${BASE_PATH}/build"
+export BUILD_PATH="${VLLM_ASCEND_CMAKE_BUILD_DIR:-${BASE_PATH}/build}"
 function log() {
     local current_time=`date +"%Y-%m-%d %H:%M:%S"`
     echo "[$current_time] "$1
