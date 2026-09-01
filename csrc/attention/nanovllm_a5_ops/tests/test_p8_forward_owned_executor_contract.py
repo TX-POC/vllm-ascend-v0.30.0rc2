@@ -169,6 +169,27 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, self.kernel)
 
+    def test_stage_b_launch_is_capped_by_receipts_and_queues_not_arena_rows(
+        self,
+    ) -> None:
+        """Private-slot capacity must not manufacture empty AIV workers.
+
+        A worker strides all private rows in QSFA/terminal phases, so a
+        64-slot private arena with one Direct-HCCP queue still has exactly one
+        concurrent transport service task.  This is a dynamic workload cap,
+        not a permanent worker-to-queue or core assignment.
+        """
+        compact = re.sub(r"\s+", " ", self.host)
+        self.assertIn(
+            "uint32_t workers = available_aiv < receipts ? available_aiv : receipts;",
+            compact,
+        )
+        self.assertIn("workers = workers < queues ? workers : queues;", compact)
+        self.assertNotIn("private_rows > work_items", self.host)
+        for marker in ('LogP8Tiling("PREALLOC"', 'LogP8Tiling("READY"'):
+            self.assertIn(marker, self.host)
+        self.assertIn("const ge::graphStatus schedule_status = context->SetScheduleMode(1U);", self.host)
+
     def test_stage_b_simt_boundaries_match_cann_address_space_rules(self) -> None:
         """Catch front-end errors before an expensive staged OPP build.
 

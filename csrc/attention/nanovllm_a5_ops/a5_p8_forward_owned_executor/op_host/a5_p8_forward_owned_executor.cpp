@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <vector>
 
@@ -90,6 +91,24 @@ constexpr size_t kAliasInputs[kOutputCount] = {
     kQueueRequestCount, kCandidateCursor, kCandidateCursorIdentity,
     kWorkerStats, kCandidateReceiptIdentity, kCandidateStatus,
 };
+
+// P8's workers are dynamic *queue service tasks*, never a permanent Get-core
+// partition.  Keep the host-side launch geometry visible in one compact line:
+// this is the only place that can turn a bounded receipt/queue workload into
+// a many-AIV launch before the device kernel gets control.
+void LogP8Tiling(const char* stage, uint32_t aic, uint32_t aiv,
+                 uint32_t receipts, uint32_t queues, uint32_t private_rows,
+                 uint32_t stats_rows, uint32_t workers, uint32_t block_dim,
+                 ge::graphStatus schedule_status)
+{
+    std::fprintf(
+        stderr,
+        "P8_TILING_%s aic=%u aiv=%u receipts=%u queues=%u private_rows=%u "
+        "stats_rows=%u workers=%u block_dim=%u schedule_status=%d\n",
+        stage, aic, aiv, receipts, queues, private_rows, stats_rows,
+        workers, block_dim, static_cast<int>(schedule_status));
+    std::fflush(stderr);
+}
 
 bool IsPositiveVector(const gert::Shape& shape)
 {
@@ -269,27 +288,46 @@ static ge::graphStatus TilingA5P8ForwardOwnedExecutor(
         return ge::GRAPH_FAILED;
     }
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const uint32_t available_aic = platform.GetCoreNumAic();
     const uint32_t available_aiv = platform.GetCoreNumAiv();
-    uint32_t work_items = receipts;
-    if (queues > work_items) {
-        work_items = queues;
-    }
-    if (private_rows > work_items) {
-        work_items = private_rows;
-    }
-    const uint32_t workers = available_aiv < work_items ? available_aiv : work_items;
+    // A worker walks receipts, queues and private rows with a stride.  Thus
+    // private_rows is storage capacity, not a concurrency requirement.  A
+    // larger worker count than receipt/queue service capacity only creates
+    // empty AIV blocks that contend for the same graph launch resources.
+    // Cap by both real sources of concurrent transport work; any scheduled
+    // AIV can still lease any queue, so this is not a core-to-queue binding.
+    uint32_t workers = available_aiv < receipts ? available_aiv : receipts;
+    workers = workers < queues ? workers : queues;
     if (workers == 0U || stats_rows < workers) {
+        LogP8Tiling("FAIL", available_aic, available_aiv, receipts, queues,
+                    private_rows, stats_rows, workers, 0U,
+                    ge::GRAPH_FAILED);
         return ge::GRAPH_FAILED;
     }
     const uint32_t block_dim = platform.CalcTschBlockDim(
         workers, 0U, available_aiv);
     if (block_dim != workers) {
+        LogP8Tiling("FAIL", available_aic, available_aiv, receipts, queues,
+                    private_rows, stats_rows, workers, block_dim,
+                    ge::GRAPH_FAILED);
         return ge::GRAPH_FAILED;
     }
-    context->SetScheduleMode(1U);
+    const ge::graphStatus schedule_status = context->SetScheduleMode(1U);
+    if (schedule_status != ge::GRAPH_SUCCESS) {
+        LogP8Tiling("FAIL", available_aic, available_aiv, receipts, queues,
+                    private_rows, stats_rows, workers, block_dim,
+                    schedule_status);
+        return ge::GRAPH_FAILED;
+    }
     context->SetBlockDim(block_dim);
+    LogP8Tiling("PREALLOC", available_aic, available_aiv, receipts, queues,
+                private_rows, stats_rows, workers, block_dim,
+                schedule_status);
     auto* tiling = context->GetTilingData<A5P8ForwardOwnedExecutorTilingData>();
     if (tiling == nullptr) {
+        LogP8Tiling("FAIL", available_aic, available_aiv, receipts, queues,
+                    private_rows, stats_rows, workers, block_dim,
+                    schedule_status);
         return ge::GRAPH_FAILED;
     }
     tiling->workerCount = workers;
@@ -309,6 +347,9 @@ static ge::graphStatus TilingA5P8ForwardOwnedExecutor(
     if (context->GetWorkspaceSizes(1) != nullptr) {
         context->GetWorkspaceSizes(1)[0] = 0U;
     }
+    LogP8Tiling("READY", available_aic, available_aiv, receipts, queues,
+                private_rows, stats_rows, workers, block_dim,
+                schedule_status);
     return ge::GRAPH_SUCCESS;
 }
 }  // namespace optiling

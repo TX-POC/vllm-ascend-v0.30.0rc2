@@ -174,6 +174,40 @@ class P8StageABGraphContractTest(unittest.TestCase):
             [item["name"] for item in STAGE_B_SPEC["output_desc"]],
         )
 
+    def test_stage_b_same_name_outputs_remain_input_refs_not_extra_aclnn_args(
+        self,
+    ) -> None:
+        """Guard the CANN same-name mutable-ref ABI used by the working P7 path.
+
+        The returned tensors are graph aliases, but ACLNN receives exactly one
+        descriptor for each same-name input/ref.  Adding a second set of 19
+        output descriptors changes this op from its 28-tensor ABI to a known
+        invalid 49-tensor ABI before device tiling even begins.
+        """
+        schema = _schema(
+            STAGE_B_BRIDGE, "forward_owned_executor",
+            "advance_forward_control",
+        )
+        input_names, output_names = _tensor_names(schema)
+        expected_alias_inputs = [input_names.index(name) for name in output_names]
+        self.assertEqual(
+            expected_alias_inputs,
+            [4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+             24, 25, 27, 2, 3],
+        )
+        input_desc = {item["name"]: item for item in STAGE_B_SPEC["input_desc"]}
+        for output in STAGE_B_SPEC["output_desc"]:
+            self.assertEqual(output["type"], input_desc[output["name"]]["type"])
+
+        run_npu = STAGE_B_BRIDGE[
+            STAGE_B_BRIDGE.index("Result RunNpu("):
+            STAGE_B_BRIDGE.index("Result RunMeta(")
+        ]
+        self.assertIn("P8_FORWARD_OWNED_BRIDGE_ABI tensors=28 mutable_refs=19", run_npu)
+        self.assertIn("rows_per_entry, worker_stats);", run_npu)
+        self.assertNotIn("candidate_status_out", run_npu)
+        self.assertNotIn("forward_control_out", run_npu)
+
     def test_advance_schema_latches_arena_health_on_abort(self) -> None:
         """Control-transition failure must poison the shared arena as well.
 
