@@ -276,10 +276,16 @@ AdmissionResult ArenaAdmissionNpu(
         forward_control, p8_arena_health, fused_get_control, p8_wave_records,
         p8_private_records, expected_identity, admission_result);
     RequireP8DeferredHostContract();
+    // ACLNN has a C ABI, independent of the Torch alias schema below.  Even
+    // though these three returned tensors alias inputs in Torch, the generated
+    // custom-op API takes the output descriptors after its input descriptors.
+    // Omitting them shifts workspace/executor into the output slots at the
+    // C-ABI boundary.  Keep the order identical to ops.json::output_desc.
     EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
         aclnnA5P8ArenaAdmissionGate, keepalive, forward_control,
         p8_arena_health, fused_get_control, p8_wave_records,
-        p8_private_records, expected_identity, admission_result);
+        p8_private_records, expected_identity, admission_result,
+        forward_control, p8_arena_health, admission_result);
     return std::make_tuple(forward_control, p8_arena_health, admission_result);
 }
 
@@ -344,9 +350,12 @@ AdvanceResult AdvanceForwardControlNpu(
                                      expected_identity, transition_program,
                                      transition_result);
     RequireP8DeferredHostContract();
+    // See ArenaAdmissionNpu: Torch aliases remain explicit ACLNN output
+    // descriptors, in ops.json output order.
     EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
         aclnnA5P8ForwardControlAdvance, keepalive, forward_control,
         p8_arena_health, expected_identity, transition_program,
+        transition_result, forward_control, p8_arena_health,
         transition_result);
     return std::make_tuple(forward_control, p8_arena_health,
                            transition_result);
@@ -438,6 +447,12 @@ Result RunNpu(
         queue_request_count, candidate_cursor, candidate_cursor_identity,
         rows_per_entry, worker_stats);
     RequireP8DeferredHostContract();
+    // The 19 returned tensors are mutable aliases in the Torch schema, but
+    // they are still a separate output-descriptor suffix in the generated
+    // ACLNN ABI.  Do not shorten this call to the 28 input tensors: doing so
+    // makes the generated C function interpret workspace/executor pointers as
+    // its first output descriptors and corrupt the host heap at launch.
+    // Keep the suffix exactly in ops.json::output_desc order.
     EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
         aclnnA5P8ForwardOwnedExecutor, keepalive, candidate_seeds,
         candidate_counts, candidate_receipt_identity, candidate_status,
@@ -450,7 +465,14 @@ Result RunNpu(
         p8_private_records, queue_request_source_offsets,
         queue_request_object_offsets, queue_request_output_indices,
         queue_request_count, candidate_cursor, candidate_cursor_identity,
-        rows_per_entry, worker_stats);
+        rows_per_entry, worker_stats,
+        forward_control, p8_arena_health, private_source_to_slot,
+        private_object_to_slot, private_ready_table, private_slot_cursor,
+        private_packed_output, fused_get_control, p8_wave_records,
+        p8_private_records, queue_request_source_offsets,
+        queue_request_object_offsets, queue_request_output_indices,
+        queue_request_count, candidate_cursor, candidate_cursor_identity,
+        worker_stats, candidate_receipt_identity, candidate_status);
     return std::make_tuple(
         forward_control, p8_arena_health, private_source_to_slot,
         private_object_to_slot,
