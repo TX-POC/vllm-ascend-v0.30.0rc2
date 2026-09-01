@@ -255,6 +255,28 @@ def _assert_mutable_refs_unchanged(
     )
 
 
+def _assert_post_terminal_npu_health(device: torch.device) -> None:
+    """Prove the next ordinary NPU operation still works after P7.
+
+    A successful P7 terminal alone is insufficient: the old ordered launcher
+    destroyed thread-local ACLNN allocator state on the producer thread and
+    only exposed the corruption on the *next* NPU-side ``torch.equal``.  This
+    compact probe keeps that regression visible without moving the Ref checks
+    to CPU or hiding a damaged runtime behind process exit.
+    """
+
+    actual = torch.arange(8, dtype=torch.int32, device=device).add_(1)
+    expected = torch.arange(1, 9, dtype=torch.int32, device=device)
+    torch.npu.synchronize()
+    if not torch.equal(actual, expected):
+        raise AssertionError("post-terminal ordinary NPU probe returned a wrong value")
+    print(
+        "P7_1_POST_TERMINAL_NPU_PROBE pass=1 "
+        "op=arange_add_equal stream_terminal=1",
+        flush=True,
+    )
+
+
 def _run(
     inputs: tuple[torch.Tensor, ...], *, expect_no_mutation: bool = False
 ) -> tuple[torch.Tensor, ...]:
@@ -303,6 +325,7 @@ def _run(
     _check_ref_outputs(inputs, tuple(outputs))
     if expect_no_mutation:
         _assert_mutable_refs_unchanged(inputs, snapshots)
+    _assert_post_terminal_npu_health(inputs[0].device)
     return tuple(outputs)
 
 

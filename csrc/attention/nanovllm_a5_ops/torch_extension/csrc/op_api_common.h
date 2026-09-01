@@ -1222,3 +1222,156 @@ inline void LogOrderedHostDso(
       LogOpApiLifecycle(#aclnn_api, "submit_done");                          \
     }                                                                          \
   } while (false)
+
+// P7's ordered launch has a stricter host-lifetime requirement than the
+// historical generic launcher above.  `RunOpApi` hands a closure from the
+// Python submitter thread to a torch_npu task-queue consumer thread.  PTA and
+// HugeMem explicitly have ThreadLocal in their CANN ABI names, and aclTensor
+// descriptors / aclOpExecutor are allocated from that host-side lifecycle.
+//
+// Therefore this P7-only helper deliberately crosses the queue boundary with
+// *only* value-owned ATen tensors plus the graph-terminal keepalive tuple.  It
+// constructs and destroys all ACLNN host objects in the one consumer closure
+// that launches the operation.  Do not generalize this by blindly changing
+// EXEC_NPU_CMD_ORDERED: other callers may pass AclTensorArgument, which holds
+// a reference rather than a value.  P7 passes plain at::Tensor values only.
+//
+// Producer thread:
+//   framework enqueue hand-off -> RunOpApi
+// Consumer thread:
+//   PTA/HugeMem -> descriptors -> GetWorkspaceSize -> launch -> descriptor
+//   release -> HugeMem/PTA teardown
+//
+// The P7 kernel owns CandidateSeed -> PostOnly -> HCCP DMA -> CQ afterwards;
+// this helper only fixes the host ACLNN hand-off and never waits for DMA/CQ.
+#define EXEC_NPU_CMD_P7_ORDERED_DEFERRED(aclnn_api, tensor_keepalive, ...)    \
+  do {                                                                         \
+    using namespace nanovllm_a5_opapi;                                        \
+    static void *p7_workspace_addr_fn =                                       \
+        ResolveSymbol(#aclnn_api "GetWorkspaceSize");                        \
+    static void *p7_launch_addr_fn = ResolveSymbol(#aclnn_api);               \
+    TORCH_CHECK(                                                               \
+        p7_workspace_addr_fn != nullptr && p7_launch_addr_fn != nullptr,      \
+        #aclnn_api,                                                            \
+        " or ",                                                               \
+        #aclnn_api "GetWorkspaceSize is missing from repository-local ",     \
+        "libcust_opapi.so");                                                 \
+    LogResolvedOpApi(#aclnn_api, p7_workspace_addr_fn, p7_launch_addr_fn);    \
+    auto p7_npu_stream = c10_npu::getCurrentNPUStream();                       \
+    aclrtStream p7_acl_stream = p7_npu_stream.stream(false);                  \
+    /* This producer-side call is the torch_npu queue hand-off pair. */       \
+    UseStreamResIfNeeded(p7_acl_stream, true);                                \
+    LogOpApiLifecycle(#aclnn_api, "producer_enqueue_ready");                 \
+    /* std::make_tuple decays P7's at::Tensor arguments to value ownership. */\
+    auto p7_deferred_args = std::make_tuple(__VA_ARGS__);                      \
+    auto p7_ordered_tensor_keepalive = tensor_keepalive;                       \
+    auto p7_ordered_acl_call =                                                 \
+        [p7_deferred_args = std::move(p7_deferred_args),                       \
+         p7_ordered_tensor_keepalive = std::move(p7_ordered_tensor_keepalive),\
+         p7_acl_stream, p7_workspace_addr_fn, p7_launch_addr_fn]() mutable    \
+        -> int {                                                               \
+      bool p7_pta_cache_active = false;                                       \
+      bool p7_huge_mem_active = false;                                        \
+      auto p7_init_huge_mem =                                                  \
+          reinterpret_cast<InitHugeMemThreadLocalFn>(                         \
+              ResolveSymbol("InitHugeMemThreadLocal"));                      \
+      auto p7_uninit_huge_mem =                                                \
+          reinterpret_cast<UnInitHugeMemThreadLocalFn>(                       \
+              ResolveSymbol("UnInitHugeMemThreadLocal"));                    \
+      auto p7_release_huge_mem =                                               \
+          reinterpret_cast<ReleaseHugeMemFn>(ResolveSymbol("ReleaseHugeMem"));\
+      auto p7_cleanup_consumer_tls = [&]() noexcept {                          \
+        if (p7_huge_mem_active) {                                              \
+          if (p7_release_huge_mem != nullptr) {                               \
+            p7_release_huge_mem(nullptr, false);                              \
+          }                                                                    \
+          if (p7_uninit_huge_mem != nullptr) {                                \
+            p7_uninit_huge_mem(nullptr, false);                               \
+          }                                                                    \
+          p7_huge_mem_active = false;                                         \
+        }                                                                      \
+        if (p7_pta_cache_active) {                                            \
+          UnInitPtaCacheForWorkspace(true);                                   \
+          p7_pta_cache_active = false;                                        \
+        }                                                                      \
+        LogOpApiLifecycle(#aclnn_api, "consumer_tls_uninit");                \
+      };                                                                       \
+      try {                                                                    \
+        (void)p7_ordered_tensor_keepalive;                                    \
+        /* This is the consumer-side mate of producer_enqueue_ready. */       \
+        UseStreamResIfNeeded(p7_acl_stream, false);                           \
+        LogOpApiLifecycle(#aclnn_api, "consumer_stream_ready");              \
+        p7_pta_cache_active = InitPtaCacheForWorkspace();                     \
+        LogOpApiLifecycle(                                                    \
+            #aclnn_api,                                                        \
+            p7_pta_cache_active ? "consumer_pta_cache_ready"                 \
+                                : "consumer_pta_cache_unavailable");          \
+        LogOrderedHostDso(#aclnn_api, p7_workspace_addr_fn, p7_launch_addr_fn,\
+                          p7_init_huge_mem, p7_release_huge_mem,              \
+                          p7_uninit_huge_mem);                                \
+        if (p7_init_huge_mem != nullptr) {                                    \
+          (void)p7_init_huge_mem(nullptr, false);                             \
+          p7_huge_mem_active = true;                                          \
+          LogOpApiLifecycle(#aclnn_api, "consumer_huge_mem_ready");          \
+        }                                                                      \
+        uint64_t p7_workspace_size = 0;                                       \
+        uint64_t *p7_workspace_size_ptr = &p7_workspace_size;                 \
+        aclOpExecutor *p7_executor = nullptr;                                 \
+        aclOpExecutor **p7_executor_ptr = &p7_executor;                       \
+        auto p7_converted = std::apply(                                       \
+            [&](auto &...p7_args) {                                           \
+              return ConvertTypes(p7_args..., p7_workspace_size_ptr,          \
+                                  p7_executor_ptr);                            \
+            },                                                                 \
+            p7_deferred_args);                                                \
+        LogConvertedDescriptorSet(#aclnn_api, p7_converted);                  \
+        bool p7_converted_released = false;                                   \
+        try {                                                                  \
+          auto p7_workspace_fn =                                              \
+              WorkspaceFunction(p7_converted, p7_workspace_addr_fn);          \
+          const int p7_workspace_status =                                    \
+              CallTuple(p7_workspace_fn, p7_converted);                       \
+          TORCH_CHECK(                                                        \
+              p7_workspace_status == 0,                                      \
+              "call " #aclnn_api "GetWorkspaceSize failed: ",              \
+              RecentAclError());                                              \
+          /* P7's hand-written AIV-only kernel has no CANN workspace ABI. */  \
+          TORCH_CHECK(                                                        \
+              p7_workspace_size == 0,                                        \
+              "P7.1 requires zero ACLNN workspace; got ",                   \
+              p7_workspace_size);                                            \
+          LogOpApiLifecycle(#aclnn_api, "consumer_workspace_ready");         \
+          auto p7_launch_fn =                                                 \
+              reinterpret_cast<OpApiLaunchFn>(p7_launch_addr_fn);             \
+          LogOpApiLifecycle(#aclnn_api, "launch_begin");                     \
+          const int p7_launch_status =                                        \
+              p7_launch_fn(nullptr, p7_workspace_size, p7_executor,          \
+                           p7_acl_stream);                                    \
+          TORCH_CHECK(                                                        \
+              p7_launch_status == 0,                                         \
+              "call " #aclnn_api " failed: ", RecentAclError());           \
+          LogOpApiLifecycle(#aclnn_api, "launch_done");                      \
+          ReleaseTuple(p7_converted);                                        \
+          p7_converted_released = true;                                       \
+          LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");          \
+          p7_cleanup_consumer_tls();                                          \
+          return p7_launch_status;                                            \
+        } catch (...) {                                                        \
+          if (!p7_converted_released) {                                      \
+            ReleaseTuple(p7_converted);                                      \
+          }                                                                   \
+          throw;                                                              \
+        }                                                                      \
+      } catch (...) {                                                          \
+        p7_cleanup_consumer_tls();                                            \
+        /* Mark the exact forward lease before torch_npu propagates error. */ \
+        NotifyOrderedLaunchFailureTuple(p7_ordered_tensor_keepalive);         \
+        LogOpApiLifecycle(#aclnn_api, "consumer_failed_quarantined");        \
+        throw;                                                                 \
+      }                                                                        \
+    };                                                                         \
+    LogOpApiLifecycle(#aclnn_api, "handoff_runopapi_p7_deferred");           \
+    at_npu::native::OpCommand::RunOpApi(#aclnn_api, p7_ordered_acl_call);     \
+    /* Producer owns no ACLNN descriptor/PTA/HugeMem state after hand-off. */ \
+    LogOpApiLifecycle(#aclnn_api, "submit_done");                            \
+  } while (false)

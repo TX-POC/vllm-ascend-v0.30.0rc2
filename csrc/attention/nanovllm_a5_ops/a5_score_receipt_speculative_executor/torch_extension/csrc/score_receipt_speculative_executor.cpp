@@ -318,7 +318,13 @@ Result RunNpu(
     auto p7_ordered_keepalive = std::tuple_cat(
         keepalive, std::make_tuple(p7_failure_observer));
     try {
-        EXEC_NPU_CMD_ORDERED(
+        // The framework task queue preserves producer order, but its consumer
+        // can run on a different host thread.  P7 must therefore use the
+        // dedicated deferred helper: it transfers only value-owned ATen
+        // tensors across that boundary and creates/destructs every ACLNN
+        // descriptor, executor, PTA cache, and HugeMem state on the one
+        // consumer thread that launches the op.
+        EXEC_NPU_CMD_P7_ORDERED_DEFERRED(
             aclnnA5ScoreReceiptSpeculativeExecutor, p7_ordered_keepalive,
             candidateSeeds, candidateCounts, candidateReadyEpoch, candidateStatus,
             streamingEpoch, sourceLens, kvObjectAddressDomain, reqPoolEntries,

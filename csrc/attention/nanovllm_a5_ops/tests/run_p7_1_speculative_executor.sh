@@ -126,6 +126,7 @@ P7_OPP_ROOT="${P7_OPS_ROOT}/_custom_opp_p7_1_fresh_$(basename "$P7_RUN_ROOT")"
 P7_OPP_VENDOR="${P7_OPP_ROOT}/vendors/customize"
 P7_OPP_SET_ENV="${P7_OPP_VENDOR}/bin/set_env.bash"
 P7_OPAPI="${P7_OPP_VENDOR}/op_api/lib/libcust_opapi.so"
+P7_GENERATED_HEADER="${P7_OPP_VENDOR}/op_api/include/aclnn_a5_score_receipt_speculative_executor.h"
 P7_BRIDGE_PYTHON_ROOT="${P7_RUN_ROOT}/bridge/lib"
 P7_BRIDGE_TEMP="${P7_RUN_ROOT}/bridge/temp"
 P7_BRIDGE_SO="${P7_BRIDGE_PYTHON_ROOT}/nanovllm_score_receipt_speculative_executor/_C${P7_PYEXT_SUFFIX}"
@@ -212,6 +213,45 @@ if [[ "$P7_OPP_RC" != "0" || ! -f "$P7_OPP_SET_ENV" || ! -s "$P7_OPAPI" ]]; then
     fail "p7_opp_fresh_build_failed"
 fi
 
+# The bridge invokes the generated ACLNN API through the source-matched OPP.
+# Same-name input/output ports are supposed to produce 18 mutable Ref aliases,
+# not another 18 input descriptors.  Verify the *generated header* before we
+# compile or run the bridge: this is a direct ABI guard, not artifact discovery.
+if [[ ! -s "$P7_GENERATED_HEADER" ]]; then
+    fail "p7_generated_aclnn_header_missing"
+fi
+"$P7_PYTHON" - "$P7_GENERATED_HEADER" <<'PY' 2>&1 | tee "${P7_RUN_ROOT}/generated_abi.log"
+import re
+import sys
+from pathlib import Path
+
+header = Path(sys.argv[1])
+text = header.read_text(encoding="utf-8")
+match = re.search(
+    r"aclnnStatus\s+aclnnA5ScoreReceiptSpeculativeExecutorGetWorkspaceSize"
+    r"\s*\((.*?)\)\s*;",
+    text,
+    flags=re.S,
+)
+if match is None:
+    raise SystemExit("P7_1_GENERATED_ABI pass=0 reason=workspace_signature_missing")
+params = match.group(1)
+tensors = len(re.findall(r"\baclTensor\s*\*", params))
+has_workspace = bool(re.search(r"\buint64_t\s*\*\s*workspace", params))
+has_executor = bool(re.search(r"\baclOpExecutor\s*\*\s*\*\s*executor", params))
+passed = tensors == 31 and has_workspace and has_executor
+print(
+    "P7_1_GENERATED_ABI pass=%d tensors=%d workspace=%d executor=%d header=%s"
+    % (passed, tensors, has_workspace, has_executor, header),
+    flush=True,
+)
+raise SystemExit(0 if passed else 1)
+PY
+P7_GENERATED_ABI_RC=${PIPESTATUS[0]}
+if [[ "$P7_GENERATED_ABI_RC" != "0" ]]; then
+    fail "p7_generated_aclnn_abi_mismatch"
+fi
+
 # The bridge goes outside the source worktree, so neither a previous in-place
 # .so nor an editable install can be discovered by this run.
 (
@@ -239,7 +279,8 @@ P7_MANIFEST_TMP="${P7_MANIFEST}.tmp.$$"
     printf 'kvaf_root=%s\nkvaf_sha=%s\nkvaf_build=%s\n' \
         "$P7_KVAF_ROOT" "$P7_KVAF_SHA" "$P7_KVAF_BUILD"
     printf 'batch_get_kernel=%s\nbatch_put_kernel=%s\n' "$P7_KVAF_GET" "$P7_KVAF_PUT"
-    printf 'opp_vendor=%s\nopapi=%s\n' "$P7_OPP_VENDOR" "$P7_OPAPI"
+    printf 'opp_vendor=%s\nopapi=%s\ngenerated_header=%s\n' \
+        "$P7_OPP_VENDOR" "$P7_OPAPI" "$P7_GENERATED_HEADER"
     printf 'bridge_python_root=%s\nbridge_so=%s\n' "$P7_BRIDGE_PYTHON_ROOT" "$P7_BRIDGE_SO"
     printf 'p7_abi=31tensor_18refout\ntask_queue_enable=%s\nlaunch_blocking=%s\nready=1\n' \
         "$TASK_QUEUE_ENABLE" "$ASCEND_LAUNCH_BLOCKING"
@@ -283,14 +324,39 @@ P7_FAIL_CLOSED_RC=${PIPESTATUS[0]}
 P7_FAIL_CLOSED_NOOP=0
 P7_FAIL_CLOSED_ORDERED=0
 P7_FAIL_CLOSED_RECEIPT=0
+P7_FAIL_CLOSED_NEXT_NPU=0
 grep -Fq 'P7_1_FAIL_CLOSED_NOOP mutable_refs_unchanged=18 queue_or_private_write=0 control_stat_write=0' \
     "${P7_RUN_ROOT}/fail_closed.log" && P7_FAIL_CLOSED_NOOP=1
 grep -Fq 'P7_1_ORDERED_SUBMISSION token=' "${P7_RUN_ROOT}/fail_closed.log" && P7_FAIL_CLOSED_ORDERED=1
 grep -Fq 'P7_1_ORDERING_RECEIPT baseline_valid=1 predecessor_invalid_observed=1 control_rejected=0 mutable_refs_unchanged=18' \
     "${P7_RUN_ROOT}/fail_closed.log" && P7_FAIL_CLOSED_RECEIPT=1
+grep -Fq 'P7_1_POST_TERMINAL_NPU_PROBE pass=1 op=arange_add_equal stream_terminal=1' \
+    "${P7_RUN_ROOT}/fail_closed.log" && P7_FAIL_CLOSED_NEXT_NPU=1
 if [[ "$P7_FAIL_CLOSED_RC" != "0" || "$P7_FAIL_CLOSED_NOOP" != "1" || \
-      "$P7_FAIL_CLOSED_ORDERED" != "1" || "$P7_FAIL_CLOSED_RECEIPT" != "1" ]]; then
+      "$P7_FAIL_CLOSED_ORDERED" != "1" || "$P7_FAIL_CLOSED_RECEIPT" != "1" || \
+      "$P7_FAIL_CLOSED_NEXT_NPU" != "1" ]]; then
     fail "fail_closed_gate_failed"
+fi
+
+# The os._exit child above proves data-path and next-NPU-op safety without
+# mixing it with CPython/ELF shutdown.  Run the same completed transaction in
+# a second, ordinary Python process as an independent teardown gate.  A crash
+# here is reported explicitly; it cannot be silently hidden by the disposable
+# child strategy used for the first signal.
+P7_1_TEST_PROCESS_EXIT_DIAG=1 \
+timeout -k 15s "$P7_RUNTIME_TIMEOUT" "$P7_PYTHON" "$P7_TEST" --device npu:0 \
+    2>&1 | tee "${P7_RUN_ROOT}/fail_closed_normal_exit.log"
+P7_FAIL_CLOSED_NORMAL_EXIT_RC=${PIPESTATUS[0]}
+P7_FAIL_CLOSED_NORMAL_RECEIPT=0
+P7_FAIL_CLOSED_NORMAL_ATEXIT=0
+grep -Fq 'P7_1_FINAL_RECEIPT mode=fail_closed pass=1 terminal=stream_synchronized teardown=complete exit_strategy=normal_python_exit' \
+    "${P7_RUN_ROOT}/fail_closed_normal_exit.log" && P7_FAIL_CLOSED_NORMAL_RECEIPT=1
+grep -Fq 'P7_1_PROCESS_EXIT stage=python_atexit' \
+    "${P7_RUN_ROOT}/fail_closed_normal_exit.log" && P7_FAIL_CLOSED_NORMAL_ATEXIT=1
+if [[ "$P7_FAIL_CLOSED_NORMAL_EXIT_RC" != "0" || \
+      "$P7_FAIL_CLOSED_NORMAL_RECEIPT" != "1" || \
+      "$P7_FAIL_CLOSED_NORMAL_ATEXIT" != "1" ]]; then
+    fail "fail_closed_normal_process_teardown_failed"
 fi
 
 P7_1_TEST_EXIT_AFTER_RECEIPT=1 \

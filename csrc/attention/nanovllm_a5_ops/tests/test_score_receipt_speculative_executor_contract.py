@@ -312,7 +312,7 @@ def main() -> None:
         "P7_1_REF_ABI",
         "mutable_refs=18",
         "Tensor(r!) worker_stats",
-        "EXEC_NPU_CMD_ORDERED(",
+        "EXEC_NPU_CMD_P7_ORDERED_DEFERRED(",
         "ReserveEnqueued(",
         "MarkHostHandoffAccepted(",
         "P7_1_ORDERED_SUBMISSION",
@@ -338,8 +338,14 @@ def main() -> None:
             "P7.1 bridge must return the 18 mutable Torch aliases, not allocate "
             "independent output descriptors"
         )
+    if "EXEC_NPU_CMD_ORDERED(" in bridge:
+        raise AssertionError(
+            "P7.1 must not use the generic ordered launcher: it creates TLS "
+            "on the producer and consumes it on the task-queue thread"
+        )
     for token in (
         "#define EXEC_NPU_CMD_ORDERED",
+        "#define EXEC_NPU_CMD_P7_ORDERED_DEFERRED",
         "InitPtaCacheForWorkspace()",
         "UnInitPtaCacheForWorkspace(pta_cache_active)",
         "MakeP7DirectLaunchLease",
@@ -362,6 +368,12 @@ def main() -> None:
         "handoff_runopapi_by_value",
         "UseStreamResIfNeeded(acl_stream, true)",
         "UseStreamResIfNeeded(acl_stream, false)",
+        "producer_enqueue_ready",
+        "consumer_stream_ready",
+        "consumer_pta_cache_ready",
+        "consumer_huge_mem_ready",
+        "consumer_workspace_ready",
+        "consumer_tls_uninit",
         "RTLD_NOW | RTLD_LOCAL",
         "GetAclTensorApiPair()",
         "P7_1_ACL_DSO",
@@ -380,17 +392,45 @@ def main() -> None:
        "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC" in bridge:
         raise AssertionError(
             "P7 must not retain or invoke a raw-current-stream ACLNN macro; "
-            "the only allowed host path is EXEC_NPU_CMD_ORDERED"
+            "the only allowed host path is EXEC_NPU_CMD_P7_ORDERED_DEFERRED"
         )
     if "pending.token <= token" in op_api_common:
         raise AssertionError(
             "P7 terminal release must reclaim the exact token only; a later "
             "forward must never release an earlier queued callback's inputs"
         )
+    # P7 crosses torch_npu's host task queue.  All objects backed by CANN's
+    # ThreadLocal allocator must be created, used, and torn down in the
+    # consumer closure, not partly on the producer after RunOpApi accepts the
+    # closure.  This catches the exact lifetime inversion that made the next
+    # ordinary NPU op segfault after an apparently successful P7 dispatch.
+    p7_macro_pos = op_api_common.find("#define EXEC_NPU_CMD_P7_ORDERED_DEFERRED")
+    p7_macro = op_api_common[p7_macro_pos:]
+    p7_handoff_pos = p7_macro.find("at_npu::native::OpCommand::RunOpApi")
+    for token in (
+        "p7_deferred_args = std::make_tuple(__VA_ARGS__)",
+        "consumer_stream_ready",
+        "InitPtaCacheForWorkspace()",
+        "InitHugeMemThreadLocal",
+        "ConvertTypes(p7_args...",
+        "GetWorkspaceSize failed",
+        "ReleaseTuple(p7_converted)",
+        "consumer_tls_uninit",
+    ):
+        _require(p7_macro, token, op_api_common_path)
+    if p7_handoff_pos < 0:
+        raise AssertionError("P7 deferred macro must hand off through RunOpApi")
+    producer_tail = p7_macro[p7_handoff_pos:]
+    for forbidden in (
+        "UnInitPtaCacheForWorkspace(",
+        "p7_uninit_huge_mem(nullptr, false)",
+        "ReleaseTuple(p7_converted)",
+    ):
+        _forbid(producer_tail, forbidden, op_api_common_path)
     abort_pos = bridge.find("ResolvePrePublishAbortNoThrow(")
     abort_log_pos = bridge.find("P7_1_DISPATCH_ABORT", abort_pos)
     publish_pos = bridge.find("PublishP7DirectLaunchTokenForCurrentThread(")
-    ordered_submit_pos = bridge.find("EXEC_NPU_CMD_ORDERED(")
+    ordered_submit_pos = bridge.find("EXEC_NPU_CMD_P7_ORDERED_DEFERRED(")
     host_gate_pos = bridge.find("P7_1_ORDERED_HOST_GATE")
     reserve_pos = bridge.find("ReserveEnqueued(")
     if min(abort_pos, abort_log_pos, publish_pos, ordered_submit_pos,
@@ -440,6 +480,8 @@ def main() -> None:
         "_enqueue_invalid_control_predecessor",
         "P7_1_ORDERING_SENTINEL",
         "P7_1_ORDERING_RECEIPT",
+        "P7_1_POST_TERMINAL_NPU_PROBE",
+        "_assert_post_terminal_npu_health",
         "P7_1_ASSEMBLY_GATE stage=before_fixture_cold_bind",
         "predecessor=control_zero_queued",
         "required_consumer_observation=invalid_control",
@@ -498,7 +540,12 @@ def main() -> None:
         "P7_1_PACKAGE_IMPORT",
         "P7_1_TEST_EXIT_AFTER_RECEIPT=1",
         "P7_1_ORDERING_RECEIPT",
+        "P7_1_POST_TERMINAL_NPU_PROBE",
         "P7_1_FINAL_RECEIPT",
+        "P7_GENERATED_HEADER",
+        "P7_1_GENERATED_ABI",
+        "p7_generated_aclnn_abi_mismatch",
+        "fail_closed_normal_process_teardown_failed",
         "P7_PHYSICAL_NPU_ID",
         "P7_TASK_QUEUE_ENABLE",
         "TASK_QUEUE_ENABLE",
@@ -553,7 +600,7 @@ def main() -> None:
         "ub_physical_address_conversion=1 nonconst_event_t=1 "
         "entry_owned_tpipe=1 fail_closed_before_ub=1 "
         "fail_closed_control_only=1 pta_cache_lifecycle=1 "
-        "host_task_queue=ordered workspace_lifetime=framework_owned "
+        "host_task_queue=ordered workspace_lifetime=consumer_tls_owned "
         "loader_scope_local=1 descriptor_pairing=1 descriptor_ledger=1",
         flush=True,
     )
