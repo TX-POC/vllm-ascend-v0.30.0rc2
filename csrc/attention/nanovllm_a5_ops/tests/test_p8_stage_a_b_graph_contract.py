@@ -410,6 +410,29 @@ class P8StageABGraphContractTest(unittest.TestCase):
         ):
             self.assertIn(token, RUNTIME)
 
+    def test_runtime_defers_reference_c8_import_until_the_fixture_selects_opp(self) -> None:
+        """Provenance preflight must not initialize the C8 resolver itself.
+
+        The source-matched reference bridge binds its selected OPP at its
+        first import.  Stage-A/B can be imported at process start, but C8 must
+        remain deferred until the real fixture selects the exact reference
+        OPP; then the same run-root provenance is checked again while loaded.
+        """
+        preflight = RUNTIME.index(
+            "_assert_fresh_bridge_provenance(reference_must_be_loaded=False)"
+        )
+        prepare = RUNTIME.index("prepared, attach, real_mode = _prepare_fixture(")
+        loaded = RUNTIME.index(
+            "_assert_fresh_bridge_provenance(reference_must_be_loaded=real_mode)"
+        )
+        self.assertLess(preflight, prepare)
+        self.assertLess(prepare, loaded)
+        self.assertIn("reference_state = \"deferred\"", RUNTIME)
+        self.assertIn("reference_state = \"loaded\"", RUNTIME)
+        self.assertNotIn(
+            'importlib.import_module("nanovllm_official_c8_reference")', RUNTIME
+        )
+
     def test_fresh_bridge_builds_copy_init_from_their_own_source_roots(self) -> None:
         """Reject CWD-dependent `find_packages()` in the per-run bridges.
 

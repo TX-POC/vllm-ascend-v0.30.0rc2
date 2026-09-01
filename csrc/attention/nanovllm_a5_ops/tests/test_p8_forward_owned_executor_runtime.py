@@ -35,6 +35,7 @@ import argparse
 import importlib
 import os
 from pathlib import Path
+import sys
 from typing import Any, Callable, Mapping, Sequence
 
 import torch
@@ -414,7 +415,74 @@ def _require_under_root(label: str, path: str | os.PathLike[str], root: str) -> 
     return str(resolved)
 
 
-def _assert_fresh_bridge_provenance() -> None:
+_BRIDGE_PACKAGE_NAMES = {
+    "reference": "nanovllm_official_c8_reference",
+    "stage_a": "nanovllm_score_receipt_executor",
+    "stage_b": "nanovllm_p8_forward_owned_executor",
+}
+
+
+def _fresh_bridge_paths(label: str, root: str) -> tuple[str, str]:
+    """Validate exactly the package files staged by this runner invocation.
+
+    The source-matched C8 bridge must remain unimported until its resolver has
+    received the selected reference OPP.  Therefore preflight uses only its
+    unique run-root files; it never imports the reference Python package.
+    """
+
+    package_dir = Path(root).resolve() / _BRIDGE_PACKAGE_NAMES[label]
+    init_path = package_dir / "__init__.py"
+    if not init_path.is_file():
+        raise RuntimeError(f"P8 {label} bridge package init is missing: {init_path}")
+    native_paths = tuple(sorted(package_dir.glob("_C*.so")))
+    if len(native_paths) != 1:
+        raise RuntimeError(
+            f"P8 {label} bridge must contain exactly one native _C extension: "
+            f"root={package_dir} found={[str(path) for path in native_paths]}"
+        )
+    return (
+        _require_under_root(f"{label}_package", init_path, root),
+        _require_under_root(f"{label}_extension", native_paths[0], root),
+    )
+
+
+def _assert_loaded_bridge_provenance(
+    label: str, root: str, expected_package: str, expected_native: str
+) -> tuple[str, str]:
+    """Prove an already-imported bridge is the package staged for this run."""
+
+    module_name = _BRIDGE_PACKAGE_NAMES[label]
+    module = sys.modules.get(module_name)
+    if module is None:
+        raise RuntimeError(f"P8 {label} bridge was not imported when required")
+    package_path = getattr(module, "__file__", None)
+    if not package_path:
+        raise RuntimeError(f"P8 {label} bridge was imported as a namespace package")
+    loaded_package = _require_under_root(f"{label}_package", package_path, root)
+    extension = getattr(module, "_C", None)
+    extension_path = getattr(extension, "__file__", None)
+    if not extension_path:
+        raise RuntimeError(f"P8 {label} bridge has no loaded _C extension")
+    loaded_native = _require_under_root(f"{label}_extension", extension_path, root)
+    if loaded_package != expected_package or loaded_native != expected_native:
+        raise RuntimeError(
+            f"P8 {label} bridge import does not match its staged package: "
+            f"package={loaded_package} expected_package={expected_package} "
+            f"native={loaded_native} expected_native={expected_native}"
+        )
+    return loaded_package, loaded_native
+
+
+def _assert_fresh_bridge_provenance(*, reference_must_be_loaded: bool) -> None:
+    """Check all three fresh bridge roots without pre-initializing C8.
+
+    Stage A and Stage B are deliberately imported at module load to bind their
+    own OPP environments.  The reference C8 bridge is different: its resolver
+    must first receive the selected source-matched OPP inside the real fixture.
+    Importing it during generic provenance preflight would make that resolver
+    look stale before its first valid use.
+    """
+
     roots = {
         "reference": os.environ.get("P8_REFERENCE_BRIDGE_ROOT", ""),
         "stage_a": os.environ.get("P8_STAGE_A_BRIDGE_ROOT", ""),
@@ -423,24 +491,37 @@ def _assert_fresh_bridge_provenance() -> None:
     if any(not root for root in roots.values()):
         raise RuntimeError("P8 bridge provenance roots are missing from the runner")
 
-    modules = {
-        "reference": importlib.import_module("nanovllm_official_c8_reference"),
-        "stage_a": importlib.import_module("nanovllm_score_receipt_executor"),
-        "stage_b": importlib.import_module("nanovllm_p8_forward_owned_executor"),
+    staged = {
+        label: _fresh_bridge_paths(label, root)
+        for label, root in roots.items()
     }
     rendered: list[str] = []
-    for label, module in modules.items():
-        package_path = _require_under_root(
-            f"{label}_package", str(module.__file__), roots[label]
+    for label in ("stage_a", "stage_b"):
+        package_path, native_path = _assert_loaded_bridge_provenance(
+            label, roots[label], *staged[label]
         )
-        extension = getattr(module, "_C", None)
-        extension_path = getattr(extension, "__file__", None)
-        if not extension_path:
-            raise RuntimeError(f"P8 {label} bridge has no loaded _C extension")
-        native_path = _require_under_root(
-            f"{label}_extension", str(extension_path), roots[label]
+        rendered.append(
+            f"{label}_package={package_path} {label}_extension={native_path}"
         )
-        rendered.append(f"{label}_package={package_path} {label}_extension={native_path}")
+    reference_name = _BRIDGE_PACKAGE_NAMES["reference"]
+    if reference_must_be_loaded:
+        package_path, native_path = _assert_loaded_bridge_provenance(
+            "reference", roots["reference"], *staged["reference"]
+        )
+        reference_state = "loaded"
+    else:
+        if reference_name in sys.modules:
+            raise RuntimeError(
+                "P8 reference bridge was initialized before the real fixture "
+                "selected its source-matched OPP"
+            )
+        package_path, native_path = staged["reference"]
+        reference_state = "deferred"
+    rendered.insert(
+        0,
+        "reference_package=" + package_path + " reference_extension=" + native_path
+        + " reference_state=" + reference_state,
+    )
     print(
         "P8_ARTIFACT_PROVENANCE "
         f"vllm={os.environ.get('P8_VLLM_EXPECTED_SHA', 'missing')} "
@@ -743,7 +824,9 @@ def main() -> None:
         f"visible_mapping={__import__('os').environ.get('ASCEND_RT_VISIBLE_DEVICES', 'unset')!r}",
         flush=True,
     )
-    _assert_fresh_bridge_provenance()
+    # This is intentionally a no-import preflight for the reference C8
+    # bridge.  The fixture below selects the exact OPP then initializes it.
+    _assert_fresh_bridge_provenance(reference_must_be_loaded=False)
 
     # The forward's fixed queue/private arena exists before receipt
     # publication.  This is deliberately separate from Stage-A output
@@ -752,6 +835,10 @@ def main() -> None:
     prepared, attach, real_mode = _prepare_fixture(
         args.real_fixture_module or None, device, stage_a_fixture
     )
+    # The real fixture has now selected the C8 OPP and performed the first
+    # reference import.  Prove that resolver belongs to this same run root
+    # before any Stage-A receipt or P8 transport operation starts.
+    _assert_fresh_bridge_provenance(reference_must_be_loaded=real_mode)
     shell = _require_arena_shell(prepared)
     admission = _run_arena_admission_gate(shell, expect_admitted=real_mode)
     if admission[0] != 0:
