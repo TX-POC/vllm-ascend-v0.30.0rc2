@@ -293,8 +293,10 @@ fi
 export USE_NINJA=0
 export A5_OFFICIAL_C8_REFERENCE_BRIDGE_BUILD_JOBS="$P8_BUILD_JOBS"
 if ! run_logged reference_c8_bridge "$P8_RUN_ROOT/reference_c8_bridge.log" \
-    "$P8_PYTHON" "$P8_REFERENCE_SETUP" build_py build_ext --force \
-      --build-lib "$P8_REFERENCE_BRIDGE" --build-temp "$P8_REFERENCE_TEMP"; then
+    "$P8_PYTHON" "$P8_REFERENCE_SETUP" \
+      build_py --force --build-lib "$P8_REFERENCE_BRIDGE" \
+      build_ext --force --build-lib "$P8_REFERENCE_BRIDGE" \
+        --build-temp "$P8_REFERENCE_TEMP"; then
     printf 'P8_RUNNER_FAIL stage=reference_c8_bridge result=%s\n' "$P8_RUN_ROOT"
     exit 1
 fi
@@ -346,8 +348,10 @@ fi
 export USE_NINJA=0
 export NANOVLLM_A5_SCORE_RECEIPT_EXECUTOR_BUILD_JOBS="$P8_BUILD_JOBS"
 if ! run_logged stage_a_bridge "$P8_RUN_ROOT/stage_a_bridge.log" \
-    "$P8_PYTHON" "$P8_STAGE_A_SETUP" build_py build_ext --force \
-    --build-lib "$P8_STAGE_A_BRIDGE" --build-temp "$P8_STAGE_A_TEMP"; then
+    "$P8_PYTHON" "$P8_STAGE_A_SETUP" \
+      build_py --force --build-lib "$P8_STAGE_A_BRIDGE" \
+      build_ext --force --build-lib "$P8_STAGE_A_BRIDGE" \
+        --build-temp "$P8_STAGE_A_TEMP"; then
     printf 'P8_RUNNER_FAIL stage=stage_a_bridge result=%s\n' "$P8_RUN_ROOT"
     exit 1
 fi
@@ -362,8 +366,10 @@ fi
 
 export NANOVLLM_A5_P8_FORWARD_OWNED_EXECUTOR_BUILD_JOBS="$P8_BUILD_JOBS"
 if ! run_logged stage_b_bridge "$P8_RUN_ROOT/stage_b_bridge.log" \
-    "$P8_PYTHON" "$P8_STAGE_B_SETUP" build_py build_ext --force \
-    --build-lib "$P8_STAGE_B_BRIDGE" --build-temp "$P8_STAGE_B_TEMP"; then
+    "$P8_PYTHON" "$P8_STAGE_B_SETUP" \
+      build_py --force --build-lib "$P8_STAGE_B_BRIDGE" \
+      build_ext --force --build-lib "$P8_STAGE_B_BRIDGE" \
+        --build-temp "$P8_STAGE_B_TEMP"; then
     printf 'P8_RUNNER_FAIL stage=stage_b_bridge result=%s\n' "$P8_RUN_ROOT"
     exit 1
 fi
