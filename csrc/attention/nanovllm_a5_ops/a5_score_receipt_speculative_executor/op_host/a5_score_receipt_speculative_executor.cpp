@@ -5,7 +5,6 @@
 // consumer.  All mutable transport lifetime is supplied as graph-visible
 // tensors so graph replay cannot inherit a hidden process-local queue state.
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -116,8 +115,13 @@ void LogP7TilingInputs(const gert::TilingContext* context)
         std::fflush(stderr);
         return;
     }
-    for (size_t begin = 0; begin < kInputCount; begin += 8U) {
-        const size_t end = std::min(begin + 8U, kInputCount);
+    const size_t inputCount = static_cast<size_t>(kInputCount);
+    for (size_t begin = 0; begin < inputCount; begin += 8U) {
+        // Keep both operands explicitly size_t.  The CANN host project is
+        // compiled as C++11; std::min(size_t, InputIndex) cannot deduce a
+        // common template type even though InputIndex is numerically valid.
+        const size_t next = begin + 8U;
+        const size_t end = next < inputCount ? next : inputCount;
         std::fprintf(stderr, "P7_1_TILING_INPUTS range=%zu-%zu", begin,
                      end - 1U);
         for (size_t index = begin; index < end; ++index) {

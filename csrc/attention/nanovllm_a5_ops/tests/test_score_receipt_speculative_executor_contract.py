@@ -295,6 +295,11 @@ def main() -> None:
             "P7.1 must choose AIV-only schedule/blockDim before requesting "
             "the typed tiling POD on direct ACLNN"
         )
+    if "std::min(begin + 8U, kInputCount)" in host:
+        raise AssertionError(
+            "P7.1 host diagnostics must not pass mixed size_t/InputIndex "
+            "arguments to std::min; CANN builds host code as C++11"
+        )
     for token in (
         "kA5ScoreReceiptExecutorMicrobatchCapacity = 64U",
         "kA5ScoreReceiptExecutorMicrobatchSlots = 2U",
