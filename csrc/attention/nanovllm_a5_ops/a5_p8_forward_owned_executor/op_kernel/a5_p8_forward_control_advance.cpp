@@ -112,7 +112,7 @@ __simt_callee__ inline bool IsAbortToForwardTerminal(
 
 __simt_callee__ inline bool AtomicOrP8RuntimeFlags(
     __gm__ kvaf_fused_get::KvafP8ForwardControl* control,
-    uint32_t set_flags, P8TransitionServiceResult* result) {
+    uint32_t set_flags, __ubuf__ P8TransitionServiceResult* result) {
     if (control == nullptr || result == nullptr) {
         return false;
     }

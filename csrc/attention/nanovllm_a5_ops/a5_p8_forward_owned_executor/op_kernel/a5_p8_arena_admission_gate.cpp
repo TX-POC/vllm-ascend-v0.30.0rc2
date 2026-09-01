@@ -201,8 +201,11 @@ public:
                 return;
             }
         }
-        __gm__ const int32_t* const leases = reinterpret_cast<__gm__
-            const int32_t*>(control.queue_leases);
+        // ReadGmByPassDCache accepts a GM pointer, not a const-qualified GM
+        // pointer.  This node only reads the table; dropping the C++ const
+        // qualifier here does not grant a write path.
+        __gm__ int32_t* const leases = reinterpret_cast<__gm__ int32_t*>(
+            control.queue_leases);
         if (leases == nullptr) {
             WriteResult(0U, kP8AdmissionControlInvalid, -1, -1);
             return;

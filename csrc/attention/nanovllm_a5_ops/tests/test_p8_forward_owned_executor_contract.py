@@ -98,6 +98,25 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, self.kernel)
 
+    def test_stage_b_simt_boundaries_match_cann_address_space_rules(self) -> None:
+        """Catch front-end errors before an expensive staged OPP build.
+
+        CANN 9.1 requires the transition-result hand-off of the SIMT service
+        to be UB-addressed, while ``ReadGmByPassDCache`` takes a mutable GM
+        pointer even for read-only accesses.  Both declarations are semantic
+        ABI details, not stylistic constness.
+        """
+        self.assertIn(
+            "uint32_t set_flags, __ubuf__ P8TransitionServiceResult* result)",
+            self.advance,
+        )
+        self.assertNotIn(
+            "uint32_t set_flags, P8TransitionServiceResult* result)",
+            self.advance,
+        )
+        self.assertIn("__gm__ int32_t* const leases", self.admission)
+        self.assertNotIn("__gm__ const int32_t* const leases", self.admission)
+
     def test_post_is_durable_and_never_uses_post_intent_rollback(self) -> None:
         for token in (
             "BeginAndPublishKvafP8WaveFilling",
