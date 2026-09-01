@@ -496,6 +496,9 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             'cann_third_party_cache_incomplete',
             '--cann_3rd_lib_path="${CANN_3RD_LIB_PATH}"',
             'toolchain_cann_3rd_lib_path=${CANN_3RD_LIB_PATH}',
+            'STAGED_MAKESELF_DIR="${SOURCE_ROOT}/csrc/third_party/makeself"',
+            'P3_REFERENCE_TOOLCHAIN_MAKESELF_STAGED',
+            'reason=makeself_stage_failed',
         ):
             self.assertIn(token, self.reference_build)
         self.assertIn(
@@ -504,6 +507,15 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         )
         self.assertIn(
             '--cann_3rd_lib_path="${CANN_3RD_LIB_PATH}"', self.build
+        )
+        self.assertIn(
+            'STAGED_MAKESELF_DIR="${GENERATED}/third_party/makeself"',
+            self.build,
+        )
+        self.assertIn('CPack makeself staging failed', self.build)
+        self.assertLess(
+            self.build.index('STAGED_MAKESELF_DIR="${GENERATED}/third_party/makeself"'),
+            self.build.index('pushd "${GENERATED}"'),
         )
 
 

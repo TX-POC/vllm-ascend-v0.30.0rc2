@@ -92,7 +92,28 @@ if [[ ! -r "${MAKESELF_SH}" || ! -r "${MAKESELF_HEADER}" || \
 fi
 CANN_3RD_LIB_PATH="$(cd "${CANN_3RD_LIB_PATH}" && pwd -P)"
 printf 'P3_REFERENCE_TOOLCHAIN cann_3rd_lib_path=%s makeself=1 json=1 abseil=1 protobuf=1\n' \
-  "${CANN_3RD_LIB_PATH}"
+    "${CANN_3RD_LIB_PATH}"
+
+# Upstream CANN correctly uses CANN_3RD_LIB_PATH to find/download most
+# dependencies, but its External CPack script still hard-codes
+# ${SOURCE_ROOT}/csrc/third_party/makeself.  A clean linked worktree has no
+# such generated directory, so materialize only the two packaging scripts
+# there before configuring.  This is neither an OPP nor a CMake-cache reuse:
+# csrc/third_party is ignored/generated and the package sources remain in the
+# caller's explicit shared tool cache.
+STAGED_MAKESELF_DIR="${SOURCE_ROOT}/csrc/third_party/makeself"
+mkdir -p "${STAGED_MAKESELF_DIR}"
+install -m 0755 "${MAKESELF_SH}" "${STAGED_MAKESELF_DIR}/makeself.sh"
+install -m 0644 "${MAKESELF_HEADER}" \
+    "${STAGED_MAKESELF_DIR}/makeself-header.sh"
+if [[ ! -x "${STAGED_MAKESELF_DIR}/makeself.sh" || \
+      ! -r "${STAGED_MAKESELF_DIR}/makeself-header.sh" ]]; then
+    printf 'P3_REFERENCE_BUILD_FAIL reason=makeself_stage_failed target=%s\n' \
+        "${STAGED_MAKESELF_DIR}" >&2
+    exit 2
+fi
+printf 'P3_REFERENCE_TOOLCHAIN_MAKESELF_STAGED source=%s target=%s\n' \
+    "${CANN_3RD_LIB_PATH}/makeself" "${STAGED_MAKESELF_DIR}"
 
 SOURCE_HEAD="$(git -C "${SOURCE_ROOT}" rev-parse HEAD 2>/dev/null || true)"
 if [[ -z "${SOURCE_HEAD}" ]]; then

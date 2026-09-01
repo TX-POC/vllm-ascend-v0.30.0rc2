@@ -1705,6 +1705,27 @@ if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \
     exit 1
 fi
 
+# CANN's packaging fallback is inconsistent with its dependency option: it
+# receives CANN_3RD_LIB_PATH for FetchContent, then CPack later hard-codes
+# <generated-project>/third_party/makeself.  Stage just these two scripts in
+# the ignored generated project before build.sh runs.  Do not copy a build
+# directory, OPP, or bridge: all compiled outputs below remain unique to this
+# invocation.
+if [[ -n "${CANN_3RD_LIB_PATH}" ]]; then
+    STAGED_MAKESELF_DIR="${GENERATED}/third_party/makeself"
+    mkdir -p "${STAGED_MAKESELF_DIR}"
+    install -m 0755 "${CANN_3RD_LIB_PATH}/makeself/makeself.sh" \
+        "${STAGED_MAKESELF_DIR}/makeself.sh"
+    install -m 0644 "${CANN_3RD_LIB_PATH}/makeself/makeself-header.sh" \
+        "${STAGED_MAKESELF_DIR}/makeself-header.sh"
+    if [[ ! -x "${STAGED_MAKESELF_DIR}/makeself.sh" || \
+          ! -r "${STAGED_MAKESELF_DIR}/makeself-header.sh" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: CPack makeself staging failed: ${STAGED_MAKESELF_DIR}." >&2
+        exit 2
+    fi
+    echo "[nanovllm_a5_ops] staged CPack makeself: ${STAGED_MAKESELF_DIR}"
+fi
+
 pushd "${GENERATED}" >/dev/null
 if [[ -n "${CANN_3RD_LIB_PATH}" ]]; then
     OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh \
