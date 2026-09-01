@@ -21,11 +21,13 @@ REFERENCE_BRIDGE = (
 TARGET_ADAPTER = OPS_ROOT / "tests/streaming_quant_li_get_target_adapter.py"
 COMMON_OPAPI = OPS_ROOT / "torch_extension/csrc/op_api_common.h"
 UPSTREAM_BUILD_SCRIPT = OPS_ROOT.parents[1] / "build.sh"
+GITIGNORE = OPS_ROOT.parents[2] / ".gitignore"
 
 
 def require_source_matched_reference_contract() -> None:
     build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
     upstream_build_script = UPSTREAM_BUILD_SCRIPT.read_text(encoding="utf-8")
+    gitignore = GITIGNORE.read_text(encoding="utf-8")
     reference_bridge = REFERENCE_BRIDGE.read_text(encoding="utf-8")
     adapter = TARGET_ADAPTER.read_text(encoding="utf-8")
     common_opapi = COMMON_OPAPI.read_text(encoding="utf-8")
@@ -54,6 +56,13 @@ def require_source_matched_reference_contract() -> None:
     assert 'BUILD_DIR=${VLLM_ASCEND_CMAKE_BUILD_DIR:-${CURRENT_DIR}/build}' in upstream_build_script
     assert 'OUTPUT_DIR=${VLLM_ASCEND_CMAKE_OUTPUT_DIR:-${CURRENT_DIR}/output}' in upstream_build_script
     assert 'BUILD_OUT_DIR=${VLLM_ASCEND_CMAKE_BUILD_OUT_DIR:-${CURRENT_DIR}/build_out}' in upstream_build_script
+    # These revision-keyed CMake directories are deliberate generated output.
+    # Ignoring exactly these paths preserves the runner's strict check for any
+    # real source modification while avoiding a false "dirty" result after a
+    # successful source-matched reference build.
+    assert "/csrc/build_official_c8_reference_*/" in gitignore
+    assert "/csrc/output_official_c8_reference_*/" in gitignore
+    assert "/csrc/build_out_official_c8_reference_*/" in gitignore
 
     # Both real ACLNN calls retain the canonical names from torch_binding.cpp.
     # The reference bridge gets a private resolver slot so changing the P3
