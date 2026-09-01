@@ -81,21 +81,17 @@ static_assert(sizeof(P8PrivateClaimResult) == 32U,
 
 using P8ArenaLeaseResult = a5_p8_arena::ArenaResult;
 
-__simt_vf__ __aicore__ LAUNCH_BOUND(1)
-inline void ClaimP8GlobalPrivateSlotSimt(
-    __gm__ int32_t* source_to_slot, __gm__ int32_t* object_to_slot,
-    __gm__ int32_t* private_ready, __gm__ int32_t* private_slot_cursor,
+__simt_callee__ inline void ClaimP8GlobalPrivateSlotFromSimt(
+    __gm__ int32_t* private_slot_cursor,
     __gm__ kvaf_fused_get::KvafP8PrivateRecord* private_records,
-    uint32_t private_row_count, uint64_t source_offset,
-    uint64_t object_offset, uint64_t forward_epoch,
-    uint64_t replay_generation, uint32_t layer_control_index,
-    uint32_t queue_id, uint64_t queue_generation, uint64_t post_sequence,
-    int32_t owner_tag,
+    uint32_t private_row_count, uint64_t source_offset, uint64_t object_offset,
+    uint64_t forward_epoch, uint64_t replay_generation,
+    uint32_t layer_control_index, uint32_t queue_id,
+    uint64_t queue_generation, uint64_t post_sequence, int32_t owner_tag,
     __ubuf__ P8PrivateClaimResult* result)
 {
-    if (source_to_slot == nullptr || object_to_slot == nullptr ||
-        private_ready == nullptr || private_slot_cursor == nullptr ||
-        private_records == nullptr || result == nullptr ||
+    if (private_slot_cursor == nullptr || private_records == nullptr ||
+        result == nullptr ||
         private_row_count == 0U || forward_epoch == 0U ||
         queue_generation == 0U || post_sequence == 0U || owner_tag <= 0) {
         return;
@@ -116,8 +112,20 @@ inline void ClaimP8GlobalPrivateSlotSimt(
     for (uint32_t attempt = 0U; attempt < private_row_count; ++attempt) {
         const uint32_t cursor = asc_atomic_add(private_slot_cursor, 1U);
         const uint32_t slot = cursor % private_row_count;
-        if (kvaf_fused_get::TryClaimKvafP8PrivateAllocatingFromSimt(
-                private_records + slot)) {
+        __gm__ kvaf_fused_get::KvafP8PrivateRecord* const record =
+            private_records + slot;
+        kvaf_fused_get::KvafP8WaveIdentity identity{};
+        identity.forward_epoch = forward_epoch;
+        identity.graph_replay_generation = replay_generation;
+        identity.layer_control_index = layer_control_index;
+        identity.queue_id = queue_id;
+        identity.queue_generation = queue_generation;
+        identity.post_sequence = post_sequence;
+        identity.owner_tag = owner_tag;
+        identity.reserved0 = 0U;
+        if (kvaf_fused_get::BeginKvafP8PrivateAllocatingPayloadFromSimt(
+                record, identity, source_offset, object_offset,
+                static_cast<int32_t>(slot))) {
             selected = slot;
             break;
         }
@@ -126,36 +134,50 @@ inline void ClaimP8GlobalPrivateSlotSimt(
         return;
     }
 
-    __gm__ kvaf_fused_get::KvafP8PrivateRecord* const record =
-        private_records + selected;
-    // The state claim above makes this row exclusively ours.  The immutable
-    // identity is published while ALLOCATING, then maps are claimed, then the
-    // state CAS makes the fully mapped PENDING record descriptor-visible.
-    // There is deliberately no full-record Store after the state claim: it
-    // could revive a terminal worker's durable QUARANTINED transition.
-    kvaf_fused_get::KvafP8WaveIdentity identity{};
-    identity.forward_epoch = forward_epoch;
-    identity.graph_replay_generation = replay_generation;
-    identity.layer_control_index = layer_control_index;
-    identity.queue_id = queue_id;
-    identity.queue_generation = queue_generation;
-    identity.post_sequence = post_sequence;
-    identity.owner_tag = owner_tag;
-    identity.reserved0 = 0U;
-    kvaf_fused_get::KvafP8PrivateRecord prepared{};
-    if (!kvaf_fused_get::PrepareKvafP8PrivateRecord(
-            identity, source_offset, object_offset,
-            static_cast<int32_t>(selected), &prepared) ||
-        !kvaf_fused_get::PublishKvafP8PrivateAllocatingPayloadToGm(
-            record, prepared)) {
-        (void)kvaf_fused_get::TryQuarantineKvafP8PrivateAllocatingFromSimt(
-            record);
-        private_ready[selected] = static_cast<int32_t>(
-            kvaf_fused_get::kKvafP8PrivateQuarantined);
-        result->quarantined = 1;
+    // The immutable payload is durable in ALLOCATING.  ClaimGlobalPrivate
+    // executes its AICore DDR publication barrier before the map service
+    // below may expose either directory entry.
+    result->output_index = static_cast<int32_t>(selected);
+    result->success = 1;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void ClaimP8GlobalPrivateSlotSimt(
+    __gm__ int32_t* private_slot_cursor,
+    __gm__ kvaf_fused_get::KvafP8PrivateRecord* private_records,
+    uint32_t private_row_count, uint64_t source_offset, uint64_t object_offset,
+    uint64_t forward_epoch, uint64_t replay_generation,
+    uint32_t layer_control_index, uint32_t queue_id,
+    uint64_t queue_generation, uint64_t post_sequence, int32_t owner_tag,
+    __ubuf__ P8PrivateClaimResult* result)
+{
+    ClaimP8GlobalPrivateSlotFromSimt(
+        private_slot_cursor, private_records, private_row_count, source_offset,
+        object_offset, forward_epoch, replay_generation, layer_control_index,
+        queue_id, queue_generation, post_sequence, owner_tag, result);
+}
+
+__simt_callee__ inline void CommitP8GlobalPrivateSlotMapsFromSimt(
+    __gm__ int32_t* source_to_slot, __gm__ int32_t* object_to_slot,
+    __gm__ int32_t* private_ready,
+    __gm__ kvaf_fused_get::KvafP8PrivateRecord* private_records,
+    uint32_t private_row_count, uint64_t source_offset,
+    uint64_t object_offset, uint32_t selected,
+    __ubuf__ P8PrivateClaimResult* result)
+{
+    if (source_to_slot == nullptr || object_to_slot == nullptr ||
+        private_ready == nullptr || private_records == nullptr ||
+        result == nullptr || selected >= private_row_count) {
         return;
     }
-    AscendC::Simt::ThreadFence();
+    result->source_offset = source_offset;
+    result->object_offset = object_offset;
+    result->output_index = static_cast<int32_t>(selected);
+    result->success = 0;
+    result->quarantined = 0;
+    result->reserved0 = 0;
+    __gm__ kvaf_fused_get::KvafP8PrivateRecord* const record =
+        private_records + selected;
 
     // A transient `-2` is now paired with a durable ALLOCATING record.  If a
     // terminal races an interrupted producer it can quarantine the row and
@@ -203,8 +225,21 @@ inline void ClaimP8GlobalPrivateSlotSimt(
     private_ready[selected] = static_cast<int32_t>(
         kvaf_fused_get::kKvafP8PrivatePending);
     AscendC::Simt::ThreadFence();
-    result->output_index = static_cast<int32_t>(selected);
     result->success = 1;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void CommitP8GlobalPrivateSlotMapsSimt(
+    __gm__ int32_t* source_to_slot, __gm__ int32_t* object_to_slot,
+    __gm__ int32_t* private_ready,
+    __gm__ kvaf_fused_get::KvafP8PrivateRecord* private_records,
+    uint32_t private_row_count, uint64_t source_offset,
+    uint64_t object_offset, uint32_t selected,
+    __ubuf__ P8PrivateClaimResult* result)
+{
+    CommitP8GlobalPrivateSlotMapsFromSimt(
+        source_to_slot, object_to_slot, private_ready, private_records,
+        private_row_count, source_offset, object_offset, selected, result);
 }
 
 class A5P8ForwardOwnedExecutorKernel {
@@ -560,13 +595,32 @@ private:
         set_flag(PIPE_S, PIPE_V, simtEvent_);
         wait_flag(PIPE_S, PIPE_V, simtEvent_);
         AscendC::Simt::VF_CALL<ClaimP8GlobalPrivateSlotSimt>(
-            AscendC::Simt::Dim3{1U, 1U, 1U}, privateSourceToSlot_,
-            privateObjectToSlot_, privateReady_, privateSlotCursor_,
+            AscendC::Simt::Dim3{1U, 1U, 1U}, privateSlotCursor_,
             privateRecords_, tiling_->privateRowCount, source_offset,
             object_offset, identity.forward_epoch,
             identity.graph_replay_generation, identity.layer_control_index,
             identity.queue_id, identity.queue_generation,
             identity.post_sequence, identity.owner_tag, claimResult_);
+        set_flag(PIPE_V, PIPE_S, simtEvent_);
+        wait_flag(PIPE_V, PIPE_S, simtEvent_);
+        if (claimResult_->success == 0) {
+            return false;
+        }
+
+        // Cross the only mixed-domain publication edge here.  The SIMT
+        // reservation wrote immutable payload while state is ALLOCATING;
+        // DDR visibility is required before the next SIMT VF may expose
+        // either source/object directory entry or promote PENDING.
+        DataSyncBarrier<MemDsbT::DDR>();
+        const uint32_t selected = static_cast<uint32_t>(
+            claimResult_->output_index);
+        set_flag(PIPE_S, PIPE_V, simtEvent_);
+        wait_flag(PIPE_S, PIPE_V, simtEvent_);
+        AscendC::Simt::VF_CALL<CommitP8GlobalPrivateSlotMapsSimt>(
+            AscendC::Simt::Dim3{1U, 1U, 1U}, privateSourceToSlot_,
+            privateObjectToSlot_, privateReady_, privateRecords_,
+            tiling_->privateRowCount, source_offset, object_offset, selected,
+            claimResult_);
         set_flag(PIPE_V, PIPE_S, simtEvent_);
         wait_flag(PIPE_V, PIPE_S, simtEvent_);
         if (claimResult_->quarantined != 0) {

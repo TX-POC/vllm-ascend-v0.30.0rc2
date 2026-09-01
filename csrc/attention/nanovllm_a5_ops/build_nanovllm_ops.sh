@@ -899,6 +899,7 @@ if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
             'ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup' \
             'QuarantineKvafP8PrivateReleaseClaimedFromAicore' \
             'ReleaseKvafP8PrivateRecordAfterQsfaTerminal' \
+            'BeginKvafP8PrivateAllocatingPayloadFromSimt' \
             'QuarantineKvafP8WaveAtForwardTerminal' \
             'QuarantineKvafP8PrivateAtForwardTerminal' \
             'KvafP8ForwardTerminalResult'; do

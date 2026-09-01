@@ -60,6 +60,23 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
                         break
         return bodies
 
+    @staticmethod
+    def _function_body(source: str, signature: str) -> str:
+        start = source.index(signature)
+        opening = source.find("{", start)
+        if opening < 0:
+            raise AssertionError(f"missing body for {signature}")
+        depth = 0
+        for index in range(opening, len(source)):
+            char = source[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[opening + 1:index]
+        raise AssertionError(f"unterminated body for {signature}")
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.kernel = KERNEL.read_text(encoding="utf-8")
@@ -116,6 +133,50 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         )
         self.assertIn("__gm__ int32_t* const leases", self.admission)
         self.assertNotIn("__gm__ const int32_t* const leases", self.admission)
+
+        for vf_signature, callee in (
+            (
+                "inline void ClaimP8GlobalPrivateSlotSimt(",
+                "ClaimP8GlobalPrivateSlotFromSimt(",
+            ),
+            (
+                "inline void CommitP8GlobalPrivateSlotMapsSimt(",
+                "CommitP8GlobalPrivateSlotMapsFromSimt(",
+            ),
+        ):
+            vf_body = self._function_body(self.kernel, vf_signature)
+            self.assertIn(callee, vf_body)
+            self.assertNotIn("asc_atomic_", vf_body)
+            self.assertNotIn("PrepareKvafP8PrivateRecord(", vf_body)
+            self.assertNotIn("PublishKvafP8PrivateAllocatingPayloadToGm(", vf_body)
+            vf_without_comments = re.sub(
+                r"//[^\n]*|/\*.*?\*/", "", vf_body, flags=re.DOTALL
+            ).strip()
+            self.assertRegex(
+                vf_without_comments,
+                rf"(?s)^{re.escape(callee[:-1])}\(.*\);$",
+            )
+
+        for callee_signature in (
+            "inline void ClaimP8GlobalPrivateSlotFromSimt(",
+            "inline void CommitP8GlobalPrivateSlotMapsFromSimt(",
+        ):
+            callee_body = self._function_body(self.kernel, callee_signature)
+            self.assertNotIn("PrepareKvafP8PrivateRecord(", callee_body)
+            self.assertNotIn("PublishKvafP8PrivateAllocatingPayloadToGm(", callee_body)
+            self.assertNotIn("FromAicore(", callee_body)
+
+        claim_start = self.kernel.index("bool ClaimGlobalPrivate(")
+        claim_end = self.kernel.index("// Each graph phase reloads", claim_start)
+        claim = self.kernel[claim_start:claim_end]
+        self.assertLess(
+            claim.index("VF_CALL<ClaimP8GlobalPrivateSlotSimt>"),
+            claim.index("DataSyncBarrier<MemDsbT::DDR>();"),
+        )
+        self.assertLess(
+            claim.index("DataSyncBarrier<MemDsbT::DDR>();"),
+            claim.index("VF_CALL<CommitP8GlobalPrivateSlotMapsSimt>"),
+        )
 
     def test_post_is_durable_and_never_uses_post_intent_rollback(self) -> None:
         for token in (
