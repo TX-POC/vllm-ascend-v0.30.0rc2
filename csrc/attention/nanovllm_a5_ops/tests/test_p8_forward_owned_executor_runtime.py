@@ -790,6 +790,70 @@ def _validate_terminal_reuse_fence(
         )
 
 
+def _run_prepost_control_reject(
+    inputs: tuple[torch.Tensor, ...], real_fixture: Mapping[str, Any]
+) -> None:
+    """Exercise the complete pre-POST composition without a DMA submission.
+
+    This is a diagnostic cut, not an alternative execution model.  The real
+    fixture has already performed unchanged C8 capture, local KVAF cold setup,
+    Direct-HCCP binding, arena admission, and exact Stage-A receipt attachment.
+    Clearing the *bound tensor in place* makes the Stage-B Init validation
+    reject before a queue lease, descriptor write, PostOnly, or CQ poll.  It
+    therefore separates a pre-POST composition fault from the valid-control
+    transport path without replacing any graph-visible tensor or weakening the
+    large real-input ABI.
+    """
+
+    control = inputs[17]
+    control.zero_()
+    torch.npu.synchronize()
+    before = {
+        index: inputs[index].detach().clone()
+        for index in MUTABLE_INPUTS
+        if index != WORKER_STATS_INPUT
+    }
+    stats_before = inputs[WORKER_STATS_INPUT].detach().clone()
+    _run_executor(inputs, "prepost_control_reject")
+
+    for index, expected in before.items():
+        _assert_equal(f"P8_prepost_immutable_{index}", inputs[index], expected)
+    delta = (
+        inputs[WORKER_STATS_INPUT].detach().cpu().to(torch.int64)
+        - stats_before.detach().cpu().to(torch.int64)
+    )
+    allowed = torch.zeros_like(delta)
+    allowed[:, CONTROL_REJECTED_STAT_COLUMN] = delta[:, CONTROL_REJECTED_STAT_COLUMN]
+    if not torch.equal(delta, allowed):
+        raise AssertionError(
+            "P8 real-bound control reject changed non-diagnostic worker_stats "
+            f"delta_sha16={_digest(delta)}"
+        )
+    rejected = int(delta[:, CONTROL_REJECTED_STAT_COLUMN].sum().item())
+    if rejected <= 0:
+        raise AssertionError(
+            "P8 real-bound control reject did not publish control_rejected"
+        )
+
+    validator = real_fixture.get("validate_prepost_control_reject")
+    if not callable(validator):
+        raise RuntimeError(
+            "real P8 fixture must export validate_prepost_control_reject(inputs)"
+        )
+    validator(inputs)
+    c8_gate = _check_c8_baseline(real_fixture)
+    if c8_gate != "pass":
+        raise AssertionError(
+            "P8 real-bound control-reject requires unchanged official-C8 "
+            "sparse_indices and score_source_lens baselines"
+        )
+    print(
+        "P8_PREPOST_CONTROL_REJECT "
+        f"control_rejected={rejected} post=0 cq=0 c8_math_gate={c8_gate} result=pass",
+        flush=True,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
@@ -807,6 +871,16 @@ def parse_args() -> argparse.Namespace:
         "--require-real-hccp",
         action="store_true",
         help="Fail unless a real fixture validates terminal Direct-HCCP payload semantics.",
+    )
+    parser.add_argument(
+        "--case",
+        choices=("full", "prepost_control_reject"),
+        default="full",
+        help=(
+            "`full` validates POST->CQ->QSFA->terminal; "
+            "`prepost_control_reject` retains C8, Stage-A, KVAF cold bind, and "
+            "arena admission but rejects the bound control before any POST/CQ."
+        ),
     )
     return parser.parse_args()
 
@@ -870,6 +944,26 @@ def main() -> None:
     identity = identity.reshape(3).contiguous()
     if not torch.equal(identity.cpu(), derived_identity.cpu()):
         raise AssertionError("P8 expected_identity does not match forward_control")
+
+    if args.case == "prepost_control_reject":
+        if not real_mode:
+            raise RuntimeError(
+                "P8 prepost_control_reject requires the real Direct-HCCP fixture"
+            )
+        _run_prepost_control_reject(inputs, real_fixture)
+        print(
+            "P8_RUNTIME_PASS "
+            "stage_a_exact=1 phase_graph=prepost_control_reject real_hccp=bound "
+            "c8_math_gate=pass",
+            flush=True,
+        )
+        # The deliberate in-place control corruption means a bound runtime
+        # cannot be safely released by a normal terminal cleanup.  The fixture
+        # records process-exit quarantine, and this one-case process then exits.
+        cleanup = real_fixture.get("cleanup")
+        if callable(cleanup):
+            cleanup()
+        return
 
     mutable_before = {
         index: inputs[index].detach().clone()

@@ -44,6 +44,10 @@ P8_CANN_3RD_LIB_PATH="${P8_REFERENCE_VLLM_ROOT}/csrc/third_party"
 # source/ABI diagnosis; the default requires real payload + C8 equivalence.
 P8_REAL_FIXTURE_MODULE="${P8_REAL_FIXTURE_MODULE:-p8_real_direct_hccp_fixture}"
 P8_REQUIRE_REAL_HCCP="${P8_REQUIRE_REAL_HCCP:-1}"
+# `prepost_control_reject` preserves the full pre-POST graph composition but
+# intentionally corrupts the already-bound control in place.  It therefore
+# cannot claim a validated payload and must not inherit the full-mode gate.
+P8_RUNTIME_CASE="${P8_RUNTIME_CASE:-full}"
 
 runner_fail() {
     printf 'P8_RUNNER_BLOCKED reason=%s\n' "$1"
@@ -83,6 +87,11 @@ is_clean_exact_repo() {
 
 if [[ "$P8_RUNNER_MODE" != "static" && "$P8_RUNNER_MODE" != "npu" ]]; then
     runner_fail "invalid_mode:${P8_RUNNER_MODE}"
+    exit 2
+fi
+if [[ "$P8_RUNTIME_CASE" != "full" &&
+      "$P8_RUNTIME_CASE" != "prepost_control_reject" ]]; then
+    runner_fail "invalid_runtime_case:${P8_RUNTIME_CASE}"
     exit 2
 fi
 
@@ -408,9 +417,9 @@ if ! is_clean_exact_repo vllm_target "$P8_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
     runner_fail "source_changed_during_scoped_build"
     exit 1
 fi
-P8_RUNTIME_ARGS=("$P8_RUNTIME_TEST" --device npu:0)
+P8_RUNTIME_ARGS=("$P8_RUNTIME_TEST" --device npu:0 --case "$P8_RUNTIME_CASE")
 P8_RUNTIME_ARGS+=(--real-fixture-module "$P8_REAL_FIXTURE_MODULE")
-if [[ "$P8_REQUIRE_REAL_HCCP" == "1" ]]; then
+if [[ "$P8_RUNTIME_CASE" == "full" && "$P8_REQUIRE_REAL_HCCP" == "1" ]]; then
     P8_RUNTIME_ARGS+=(--require-real-hccp)
 fi
 if ! run_logged runtime "$P8_RUN_ROOT/runtime.log" \

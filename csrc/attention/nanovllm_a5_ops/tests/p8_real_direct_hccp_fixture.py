@@ -585,6 +585,45 @@ def build_p8_real_fixture(
             state["terminal_safe"] = True
 
         result["validate_terminal"] = validate_terminal
+
+        def validate_prepost_control_reject(inputs: tuple[torch.Tensor, ...]) -> None:
+            """Validate a deliberately rejected control without releasing it.
+
+            The caller cleared the already-bound control tensor in place after
+            arena admission.  There must be no queue lease, descriptor, private
+            readiness, or candidate cursor mutation.  We still repeat the
+            unchanged official C8 call so the diagnostic retains the same
+            mathematical gate as the full P8 path.
+            """
+
+            torch.npu.synchronize()
+            stats = inputs[27].detach().cpu().to(torch.int64)
+            non_control = stats.clone()
+            non_control[:, STAT_CONTROL_REJECTED] = 0
+            if int(torch.count_nonzero(non_control)) != 0:
+                raise AssertionError(
+                    "P8 bound control-reject mutated a transport stat: "
+                    f"stats={stats.tolist()}"
+                )
+            if int(torch.count_nonzero(queue_leases.detach().cpu())) != 0:
+                raise AssertionError("P8 bound control-reject acquired a queue lease")
+            if int(torch.count_nonzero(inputs[12].detach().cpu() >= 0)) != 0:
+                raise AssertionError("P8 bound control-reject mapped a private source slot")
+            if int(torch.count_nonzero(inputs[13].detach().cpu() >= 0)) != 0:
+                raise AssertionError("P8 bound control-reject mapped a private object slot")
+            if int(torch.count_nonzero(inputs[14].detach().cpu())) != 0:
+                raise AssertionError("P8 bound control-reject marked a private slot ready")
+            if int(torch.count_nonzero(inputs[23].detach().cpu())) != 0:
+                raise AssertionError("P8 bound control-reject wrote a request count")
+            result["c8_baseline_after"] = _repeat_official_c8(c8_context)
+            state["c8_after"] = result["c8_baseline_after"]
+            print(
+                "P8_REAL_PREPOST_REJECT "
+                "queue_leased=0 descriptor_count=0 private_ready=0 result=pass",
+                flush=True,
+            )
+
+        result["validate_prepost_control_reject"] = validate_prepost_control_reject
         return result
     except Exception:
         cleanup()
