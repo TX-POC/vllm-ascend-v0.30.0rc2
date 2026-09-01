@@ -82,6 +82,13 @@ is_clean_exact_repo() {
     head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
     printf 'P8_SOURCE label=%s head=%s expected=%s dirty=%s\n' \
         "$label" "$head" "$expected" "$([[ -n "$dirty" ]] && echo 1 || echo 0)"
+    # Fail closed on every non-ignored source-tree change, but print a bounded
+    # receipt once so a remote build never turns into a blind retry loop.
+    if [[ -n "$dirty" ]]; then
+        printf 'P8_SOURCE_DIRTY label=%s entries_begin\n' "$label"
+        printf '%s\n' "$dirty" | sed -n '1,80p'
+        printf 'P8_SOURCE_DIRTY label=%s entries_end\n' "$label"
+    fi
     [[ -z "$dirty" && "$head" == "$expected" ]]
 }
 
@@ -114,6 +121,7 @@ P8_STAGE_A_SETUP="$P8_OPS_ROOT/a5_score_receipt_candidate_executor/torch_extensi
 P8_STAGE_B_SETUP="$P8_OPS_ROOT/a5_p8_forward_owned_executor/torch_extension/p8_forward_owned_executor_setup.py"
 P8_REFERENCE_BUILD_SCRIPT="$P8_REFERENCE_OPS_ROOT/a5_official_c8_reference/build_reference_opp.sh"
 P8_REFERENCE_SETUP="$P8_REFERENCE_OPS_ROOT/a5_official_c8_reference/torch_extension/official_c8_reference_setup.py"
+P8_REFERENCE_CONTRACT_TEST="$P8_OPS_ROOT/tests/test_official_c8_reference_contract.py"
 # Both shell build helpers are deliberately invoked below as
 # ``bash "$script"``.  They therefore need to be regular readable files, not
 # executable files.  Requiring ``-x`` here rejects a normal Git checkout when
@@ -123,7 +131,8 @@ if [[ ! -f "$P8_BUILD_SCRIPT" || ! -r "$P8_BUILD_SCRIPT" ||
       ! -f "$P8_STAGE_A_SETUP" || ! -r "$P8_STAGE_A_SETUP" ||
       ! -f "$P8_STAGE_B_SETUP" || ! -r "$P8_STAGE_B_SETUP" ||
       ! -f "$P8_REFERENCE_BUILD_SCRIPT" || ! -r "$P8_REFERENCE_BUILD_SCRIPT" ||
-      ! -f "$P8_REFERENCE_SETUP" || ! -r "$P8_REFERENCE_SETUP" ]]; then
+      ! -f "$P8_REFERENCE_SETUP" || ! -r "$P8_REFERENCE_SETUP" ||
+      ! -f "$P8_REFERENCE_CONTRACT_TEST" || ! -r "$P8_REFERENCE_CONTRACT_TEST" ]]; then
     runner_fail "p8_sources_missing_or_unreadable"
     exit 2
 fi
@@ -134,8 +143,9 @@ if [[ "$P8_RUNNER_MODE" == "static" ]]; then
     if run_logged static_contracts "$P8_STATIC_LOG" \
         bash -c 'cd "$1" && "$2" -m unittest -v \
           csrc.attention.nanovllm_a5_ops.tests.test_p8_forward_owned_executor_contract \
-          csrc.attention.nanovllm_a5_ops.tests.test_p8_stage_a_b_graph_contract' \
-        _ "$P8_VLLM_ROOT" "$P8_PYTHON"; then
+          csrc.attention.nanovllm_a5_ops.tests.test_p8_stage_a_b_graph_contract && \
+          "$2" "$3"' \
+        _ "$P8_VLLM_ROOT" "$P8_PYTHON" "$P8_REFERENCE_CONTRACT_TEST"; then
         if bash -n "$P8_BUILD_SCRIPT"; then
             printf 'P8_STATIC_PASS vllm=%s kvaf=%s\n' \
                 "$P8_VLLM_EXPECTED_SHA" "$P8_KVAF_EXPECTED_SHA"
@@ -224,8 +234,9 @@ printf 'P8_RUNNER_CONFIG mode=npu physical=7 logical=0 run_root=%s vllm_target=%
 if ! run_logged p8_lifecycle_contracts "$P8_RUN_ROOT/p8_lifecycle_contracts.log" \
     bash -c 'cd "$1" && "$2" -m unittest -v \
       csrc.attention.nanovllm_a5_ops.tests.test_p8_forward_owned_executor_contract \
-      csrc.attention.nanovllm_a5_ops.tests.test_p8_stage_a_b_graph_contract' \
-    _ "$P8_VLLM_ROOT" "$P8_PYTHON"; then
+      csrc.attention.nanovllm_a5_ops.tests.test_p8_stage_a_b_graph_contract && \
+      "$2" "$3"' \
+    _ "$P8_VLLM_ROOT" "$P8_PYTHON" "$P8_REFERENCE_CONTRACT_TEST"; then
     printf 'P8_RUNNER_FAIL stage=p8_lifecycle_contracts result=%s\n' "$P8_RUN_ROOT"
     exit 1
 fi
