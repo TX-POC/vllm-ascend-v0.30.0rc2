@@ -275,8 +275,26 @@ def main() -> None:
         "source_lens",
         "kv_object_address_domain",
         "OP_ADD(A5ScoreReceiptSpeculativeExecutor)",
+        "P7_1_TILING_PREALLOC",
+        "P7_1_TILING_DIAG",
+        "CalcTschBlockDim(workerCount, 0U, availableAiv)",
     ):
         _require(host, token, host_path)
+    # A CANN 9.1 direct ACLNN launch allocates its typed tiling payload only
+    # after execution geometry is chosen.  Guard the proven order so a later
+    # refactor cannot silently reintroduce the opaque EZ1008 tiling failure.
+    schedule_pos = host.find("context->SetScheduleMode(1U)")
+    block_pos = host.find("context->SetBlockDim(blockDim)")
+    typed_tiling_pos = host.find(
+        "context->GetTilingData<A5ScoreReceiptSpeculativeExecutorTilingData>()"
+    )
+    if min(schedule_pos, block_pos, typed_tiling_pos) < 0 or not (
+        schedule_pos < block_pos < typed_tiling_pos
+    ):
+        raise AssertionError(
+            "P7.1 must choose AIV-only schedule/blockDim before requesting "
+            "the typed tiling POD on direct ACLNN"
+        )
     for token in (
         "kA5ScoreReceiptExecutorMicrobatchCapacity = 64U",
         "kA5ScoreReceiptExecutorMicrobatchSlots = 2U",

@@ -5,9 +5,12 @@
 // consumer.  All mutable transport lifetime is supplied as graph-visible
 // tensors so graph replay cannot inherit a hidden process-local queue state.
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "../op_kernel/a5_score_receipt_speculative_executor_tiling.h"
@@ -85,6 +88,75 @@ constexpr size_t kAliasInputs[kOutputCount] = {
 constexpr uint32_t kControlWords = 16U;
 constexpr uint32_t kPackedKvRowBytes = 656U;
 
+// Keep the host-side failure receipt self-contained.  CANN reports every
+// tiling callback failure to ACLNN as the same EZ1008 status, so returning
+// GRAPH_FAILED without this context turns one concrete contract failure into
+// a multi-round remote investigation.  The receipt is emitted only on an
+// error and groups all 31 inputs into four short, copyable lines.
+std::string ShapeDebugText(const gert::Shape* shape)
+{
+    if (shape == nullptr) {
+        return "<null>";
+    }
+    std::string text{"["};
+    for (int64_t dim = 0; dim < shape->GetDimNum(); ++dim) {
+        if (dim != 0) {
+            text += ",";
+        }
+        text += std::to_string(shape->GetDim(dim));
+    }
+    text += "]";
+    return text;
+}
+
+void LogP7TilingInputs(const gert::TilingContext* context)
+{
+    if (context == nullptr) {
+        std::fprintf(stderr, "P7_1_TILING_INPUTS context=<null>\n");
+        std::fflush(stderr);
+        return;
+    }
+    for (size_t begin = 0; begin < kInputCount; begin += 8U) {
+        const size_t end = std::min(begin + 8U, kInputCount);
+        std::fprintf(stderr, "P7_1_TILING_INPUTS range=%zu-%zu", begin,
+                     end - 1U);
+        for (size_t index = begin; index < end; ++index) {
+            const auto* inputShape = context->GetInputShape(index);
+            const auto* inputDesc = context->GetInputDesc(index);
+            const int dtype = inputDesc == nullptr
+                ? -1
+                : static_cast<int>(inputDesc->GetDataType());
+            const gert::Shape* storage = inputShape == nullptr
+                ? nullptr
+                : &inputShape->GetStorageShape();
+            const std::string shape = ShapeDebugText(storage);
+            std::fprintf(stderr, " i%zu=d%d:s%s", index, dtype,
+                         shape.c_str());
+        }
+        std::fprintf(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+
+void LogP7TilingFailure(const char* stage, const gert::TilingContext* context,
+                        size_t input, int expectedDtype, int actualDtype,
+                        uint32_t aicCount, uint32_t aivCount,
+                        uint32_t workerCount, uint32_t blockDim,
+                        ge::graphStatus scheduleStatus)
+{
+    const char* node = context != nullptr && context->GetNodeName() != nullptr
+        ? context->GetNodeName()
+        : "A5ScoreReceiptSpeculativeExecutor";
+    std::fprintf(
+        stderr,
+        "P7_1_TILING_DIAG stage=%s node=%s input=%zu expected_dtype=%d "
+        "actual_dtype=%d aic=%u aiv=%u workers=%u block_dim=%u "
+        "schedule_status=%d\n",
+        stage, node, input, expectedDtype, actualDtype, aicCount, aivCount,
+        workerCount, blockDim, static_cast<int>(scheduleStatus));
+    LogP7TilingInputs(context);
+}
+
 bool IsPositiveVector(const gert::Shape& shape)
 {
     return shape.GetDimNum() == 1 && shape.GetDim(0) > 0;
@@ -116,17 +188,27 @@ bool ValidateGeometry(const gert::Shape* const* inputs,
                       uint32_t* objectCapacity, uint32_t* queueCount,
                       uint32_t* privateArenaCapacity,
                       uint32_t* privatePackedRows,
-                      uint32_t* workerStatsRows)
+                      uint32_t* workerStatsRows,
+                      const char** failureStage)
 {
+    if (failureStage != nullptr) {
+        *failureStage = "unknown";
+    }
     if (inputs == nullptr || receiptCount == nullptr || rowCount == nullptr ||
         sourceCapacity == nullptr || poolSize == nullptr ||
         objectCapacity == nullptr || queueCount == nullptr ||
         privateArenaCapacity == nullptr || privatePackedRows == nullptr ||
         workerStatsRows == nullptr) {
+        if (failureStage != nullptr) {
+            *failureStage = "geometry_argument";
+        }
         return false;
     }
     for (size_t index = 0; index < kInputCount; ++index) {
         if (inputs[index] == nullptr) {
+            if (failureStage != nullptr) {
+                *failureStage = "geometry_missing_shape";
+            }
             return false;
         }
     }
@@ -187,6 +269,9 @@ bool ValidateGeometry(const gert::Shape* const* inputs,
         !IsPositiveVector(requestCount) || !IsPositiveMatrix(privateReadyEpoch) ||
         !IsPositiveMatrix(privateReadyGeneration) || !IsPositiveMatrix(workerStats) ||
         !IsPositiveVector(rowsPerEntry)) {
+        if (failureStage != nullptr) {
+            *failureStage = "geometry_rank_or_receipt";
+        }
         return false;
     }
 
@@ -226,6 +311,9 @@ bool ValidateGeometry(const gert::Shape* const* inputs,
         privateReadyGeneration.GetDim(1) != arena ||
         workerStats.GetDim(1) != kA5ScoreReceiptExecutorWorkerStatColumns ||
         rowsPerEntry.GetDim(0) != 1) {
+        if (failureStage != nullptr) {
+            *failureStage = "geometry_cross_tensor";
+        }
         return false;
     }
     *receiptCount = receipts;
@@ -246,6 +334,8 @@ static ge::graphStatus TilingA5ScoreReceiptSpeculativeExecutor(
     gert::TilingContext* context)
 {
     if (context == nullptr || context->GetPlatformInfo() == nullptr) {
+        LogP7TilingFailure("bootstrap_context_or_platform", context, kInputCount,
+                           -1, -1, 0U, 0U, 0U, 0U, ge::GRAPH_FAILED);
         return ge::GRAPH_FAILED;
     }
     const gert::Shape* inputShapes[kInputCount] = {};
@@ -262,8 +352,24 @@ static ge::graphStatus TilingA5ScoreReceiptSpeculativeExecutor(
     for (size_t index = 0; index < kInputCount; ++index) {
         inputShapes[index] = context->GetInputShape(index) == nullptr
             ? nullptr : &context->GetInputShape(index)->GetStorageShape();
-        if (inputShapes[index] == nullptr || context->GetInputDesc(index) == nullptr ||
-            context->GetInputDesc(index)->GetDataType() != expected[index]) {
+        if (inputShapes[index] == nullptr) {
+            LogP7TilingFailure("missing_input_shape", context, index,
+                               static_cast<int>(expected[index]), -1, 0U, 0U,
+                               0U, 0U, ge::GRAPH_FAILED);
+            return ge::GRAPH_FAILED;
+        }
+        if (context->GetInputDesc(index) == nullptr) {
+            LogP7TilingFailure("missing_input_desc", context, index,
+                               static_cast<int>(expected[index]), -1, 0U, 0U,
+                               0U, 0U, ge::GRAPH_FAILED);
+            return ge::GRAPH_FAILED;
+        }
+        const int actualDtype =
+            static_cast<int>(context->GetInputDesc(index)->GetDataType());
+        if (actualDtype != static_cast<int>(expected[index])) {
+            LogP7TilingFailure("input_dtype", context, index,
+                               static_cast<int>(expected[index]), actualDtype,
+                               0U, 0U, 0U, 0U, ge::GRAPH_FAILED);
             return ge::GRAPH_FAILED;
         }
     }
@@ -276,13 +382,17 @@ static ge::graphStatus TilingA5ScoreReceiptSpeculativeExecutor(
     uint32_t privateArenaCapacity = 0U;
     uint32_t privatePackedRows = 0U;
     uint32_t workerStatsRows = 0U;
+    const char* geometryFailure = "geometry_unknown";
     if (!ValidateGeometry(inputShapes, &receiptCount, &rowCount, &sourceCapacity,
                           &poolSize, &objectCapacity, &queueCount,
                           &privateArenaCapacity, &privatePackedRows,
-                          &workerStatsRows)) {
+                          &workerStatsRows, &geometryFailure)) {
+        LogP7TilingFailure(geometryFailure, context, kInputCount, -1, -1,
+                           0U, 0U, 0U, 0U, ge::GRAPH_FAILED);
         return ge::GRAPH_FAILED;
     }
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const uint32_t availableAic = platform.GetCoreNumAic();
     const uint32_t availableAiv = platform.GetCoreNumAiv();
     // Candidate receipts are already compact.  Launching every available AIV
     // just to race a smaller dynamic HCCP queue pool adds lease/CAS churn and
@@ -292,10 +402,40 @@ static ge::graphStatus TilingA5ScoreReceiptSpeculativeExecutor(
     uint32_t workerCount = availableAiv < receiptCount ? availableAiv : receiptCount;
     workerCount = workerCount < queueCount ? workerCount : queueCount;
     if (workerCount == 0U || workerStatsRows < workerCount) {
+        LogP7TilingFailure("worker_capacity", context, kInputCount, -1, -1,
+                           availableAic, availableAiv, workerCount, 0U,
+                           ge::GRAPH_FAILED);
         return ge::GRAPH_FAILED;
     }
+
+    // CANN 9.1 direct ACLNN requires the AIV-only execution geometry before
+    // it materializes a typed tiling POD.  Requesting GetTilingData first
+    // leaves the payload null and ACLNN reports only the opaque EZ1008
+    // "tiling function" error.  This follows the known-good P5 ordering;
+    // it is not a static Get-core partition.  `workerCount` is still the
+    // dynamic number of receipts/queues to service in this launch.
+    const uint32_t blockDim =
+        platform.CalcTschBlockDim(workerCount, 0U, availableAiv);
+    if (blockDim != workerCount) {
+        LogP7TilingFailure("aiv_only_block_dim", context, kInputCount, -1,
+                           -1, availableAic, availableAiv, workerCount,
+                           blockDim, ge::GRAPH_FAILED);
+        return ge::GRAPH_FAILED;
+    }
+    const ge::graphStatus scheduleStatus = context->SetScheduleMode(1U);
+    context->SetBlockDim(blockDim);
+    std::fprintf(
+        stderr,
+        "P7_1_TILING_PREALLOC aic=%u aiv=%u workers=%u block_dim=%u "
+        "schedule_request=batch schedule_status=%d\n",
+        availableAic, availableAiv, workerCount, blockDim,
+        static_cast<int>(scheduleStatus));
+    std::fflush(stderr);
     auto* tiling = context->GetTilingData<A5ScoreReceiptSpeculativeExecutorTilingData>();
     if (tiling == nullptr) {
+        LogP7TilingFailure("typed_tiling_null", context, kInputCount, -1,
+                           -1, availableAic, availableAiv, workerCount,
+                           blockDim, scheduleStatus);
         return ge::GRAPH_FAILED;
     }
     tiling->workerCount = workerCount;
@@ -314,7 +454,13 @@ static ge::graphStatus TilingA5ScoreReceiptSpeculativeExecutor(
     tiling->microbatchCapacity = kA5ScoreReceiptExecutorMicrobatchCapacity;
     tiling->microbatchSlots = kA5ScoreReceiptExecutorMicrobatchSlots;
     tiling->reserved = 0U;
-    context->SetBlockDim(workerCount);
+    std::fprintf(
+        stderr,
+        "P7_1_TILING_READY aic=%u aiv=%u workers=%u block_dim=%u "
+        "receipts=%u queues=%u rows=%u source=%u arena=%u\n",
+        availableAic, availableAiv, workerCount, blockDim, receiptCount,
+        queueCount, rowCount, sourceCapacity, privateArenaCapacity);
+    std::fflush(stderr);
     if (context->GetWorkspaceSizes(1) != nullptr) {
         context->GetWorkspaceSizes(1)[0] = 0U;
     }
