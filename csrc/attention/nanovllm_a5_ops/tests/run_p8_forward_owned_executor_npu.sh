@@ -31,10 +31,13 @@ P8_PYTHON="${P8_PYTHON:-$(command -v python3 2>/dev/null || true)}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.0}"
 P8_BUILD_JOBS="${P8_BUILD_JOBS:-16}"
 P8_TEST_TIMEOUT="${P8_TEST_TIMEOUT:-300s}"
-# This is intentionally an explicit tool-cache input, never an implicit
-# reuse of a prior CMake build directory.  It must hold CANN's downloaded
-# package helpers (at minimum makeself), not any vLLM/P8 source or output.
-P8_CANN_3RD_LIB_PATH="${P8_CANN_3RD_LIB_PATH:-}"
+# CANN's downloaded source dependencies belong to the stable, exact reference
+# checkout.  ``csrc/third_party`` is ignored by Git: it is neither a compiled
+# P8 artifact nor a CMake object cache.  Let upstream CANN populate it on the
+# first build and reuse it on later runs of this same source root.  This keeps
+# the source/artifact provenance rule simple without turning an absent local
+# download cache into a false P8 readiness failure.
+P8_CANN_3RD_LIB_PATH="${P8_REFERENCE_VLLM_ROOT}/csrc/third_party"
 # P8 is a real Direct-HCCP validation runner, not a stale-artifact smoke test.
 # The only permitted runtime fixture is built from this run root's fresh KVAF
 # output.  Set P8_REQUIRE_REAL_HCCP=0 only for a deliberately fail-closed
@@ -176,26 +179,13 @@ print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s" % (
     exit 1
 fi
 
-# Fail before the fresh KVAF build if the clean worktree cannot package the
-# source-matched official C8 reference offline.  The upstream CANN builder
-# only needs these generated tool files here; reusing csrc/build would embed
-# a different source root in CMakeCache.txt and is explicitly forbidden.
-P8_CACHE_MAKESELF="${P8_CANN_3RD_LIB_PATH}/makeself/makeself.sh"
-P8_CACHE_MAKESELF_HEADER="${P8_CANN_3RD_LIB_PATH}/makeself/makeself-header.sh"
-P8_CACHE_JSON_HEADER="${P8_CANN_3RD_LIB_PATH}/json/include/nlohmann/json.hpp"
-P8_CACHE_ABSEIL_ARCHIVE="${P8_CANN_3RD_LIB_PATH}/abseil-cpp/abseil-cpp-20230802.1.tar.gz"
-P8_CACHE_ABSEIL_PKG_ARCHIVE="${P8_CANN_3RD_LIB_PATH}/pkg/abseil-cpp-20230802.1.tar.gz"
-P8_CACHE_PROTOBUF_ARCHIVE="${P8_CANN_3RD_LIB_PATH}/protobuf/protobuf-all-25.1.tar.gz"
-P8_CACHE_PROTOBUF_PKG_ARCHIVE="${P8_CANN_3RD_LIB_PATH}/pkg/protobuf-25.1.tar.gz"
-if [[ -z "${P8_CANN_3RD_LIB_PATH}" || ! -r "$P8_CACHE_MAKESELF" || \
-      ! -r "$P8_CACHE_MAKESELF_HEADER" || ! -r "$P8_CACHE_JSON_HEADER" ]] || \
-   { [[ ! -r "$P8_CACHE_ABSEIL_ARCHIVE" ]] && [[ ! -r "$P8_CACHE_ABSEIL_PKG_ARCHIVE" ]]; } || \
-   { [[ ! -r "$P8_CACHE_PROTOBUF_ARCHIVE" ]] && [[ ! -r "$P8_CACHE_PROTOBUF_PKG_ARCHIVE" ]]; }; then
-    runner_fail "cann_third_party_cache_incomplete:${P8_CANN_3RD_LIB_PATH:-unset}"
-    exit 2
-fi
+# Do not preflight a four-package offline cache.  The first upstream CANN
+# build may download only the dependencies it actually needs; later builds
+# reuse this source-owned, Git-ignored directory.  The compiled OPPs, bridges
+# and KVAF build still remain freshly rooted under P8_RUN_ROOT below.
+mkdir -p "$P8_CANN_3RD_LIB_PATH"
 P8_CANN_3RD_LIB_PATH="$(cd "$P8_CANN_3RD_LIB_PATH" && pwd -P)"
-printf 'P8_TOOLCHAIN_CACHE cann_3rd_lib_path=%s makeself=1 json=1 abseil=1 protobuf=1\n' \
+printf 'P8_TOOLCHAIN_CACHE mode=source_owned_lazy_fetch root=%s\n' \
     "$P8_CANN_3RD_LIB_PATH"
 
 mkdir -p "$P8_OPS_ROOT/build"
@@ -290,7 +280,6 @@ export A5_OFFICIAL_C8_REFERENCE_ROOT="$P8_REFERENCE_OPP"
 export A5_OFFICIAL_C8_EXPECTED_SOURCE_HEAD="$P8_VLLM_EXPECTED_SHA"
 export A5_OFFICIAL_C8_REFERENCE_BUILD_JOBS="$P8_BUILD_JOBS"
 export A5_OFFICIAL_C8_CANN_3RD_LIB_PATH="$P8_CANN_3RD_LIB_PATH"
-export NANOVLLM_A5_CANN_3RD_LIB_PATH="$P8_CANN_3RD_LIB_PATH"
 if ! run_logged reference_c8_opp "$P8_RUN_ROOT/reference_c8_opp.log" \
     bash "$P8_REFERENCE_BUILD_SCRIPT"; then
     printf 'P8_RUNNER_FAIL stage=reference_c8_opp result=%s\n' "$P8_RUN_ROOT"
@@ -317,6 +306,10 @@ fi
 export NANOVLLM_A5_OPS_PYTHON="$P8_PYTHON"
 export NANOVLLM_A5_OPS_BUILD_JOBS="$P8_BUILD_JOBS"
 export NANOVLLM_A5_SKIP_TORCH_EXTENSION=1
+# Stage-A/B are fresh msopgen projects.  Do not impose the reference C8
+# dependency directory on them: their builder already handles its own CANN
+# dependency setup, and importing it here would recreate the old cache gate.
+unset NANOVLLM_A5_CANN_3RD_LIB_PATH
 export NANOVLLM_A5_OPS_ONLY=A5ScoreReceiptCandidateExecutor
 export NANOVLLM_A5_OPS_BUILD_ROOT="$P8_STAGE_A_BUILD"
 export NANOVLLM_A5_LOCAL_OPP="$P8_STAGE_A_OPP"

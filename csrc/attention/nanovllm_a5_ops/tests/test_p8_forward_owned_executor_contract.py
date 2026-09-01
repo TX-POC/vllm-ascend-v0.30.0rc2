@@ -526,49 +526,36 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             self.assertIn(readable_gate, self.runner)
         self.assertNotIn('! -x "$P8_BUILD_SCRIPT"', self.runner)
 
-    def test_clean_reference_build_uses_an_explicit_offline_tool_cache(self) -> None:
-        """Never reuse an old CMakeCache or silently fall back to network."""
+    def test_p8_uses_a_source_owned_lazy_cann_dependency_directory(self) -> None:
+        """Dependency downloads are reusable inputs, never stale build outputs."""
         for token in (
-            'P8_CANN_3RD_LIB_PATH',
-            'cann_third_party_cache_incomplete:',
-            'P8_TOOLCHAIN_CACHE cann_3rd_lib_path=%s makeself=1 json=1 abseil=1 protobuf=1',
+            'P8_CANN_3RD_LIB_PATH="${P8_REFERENCE_VLLM_ROOT}/csrc/third_party"',
+            'P8_TOOLCHAIN_CACHE mode=source_owned_lazy_fetch root=%s',
             'A5_OFFICIAL_C8_CANN_3RD_LIB_PATH="$P8_CANN_3RD_LIB_PATH"',
-            'NANOVLLM_A5_CANN_3RD_LIB_PATH="$P8_CANN_3RD_LIB_PATH"',
+            'unset NANOVLLM_A5_CANN_3RD_LIB_PATH',
         ):
             self.assertIn(token, self.runner)
-        self.assertLess(
-            self.runner.index('cann_third_party_cache_incomplete:'),
-            self.runner.index('P8_KVAF_BUILD="$P8_RUN_ROOT/kvaf_build"'),
+        self.assertNotIn('cann_third_party_cache_incomplete:', self.runner)
+        self.assertNotIn(
+            'NANOVLLM_A5_CANN_3RD_LIB_PATH="$P8_CANN_3RD_LIB_PATH"',
+            self.runner,
         )
         for token in (
-            'A5_OFFICIAL_C8_CANN_3RD_LIB_PATH',
-            'cann_third_party_cache_incomplete',
+            'mkdir -p "${CANN_3RD_LIB_PATH}"',
+            'P3_REFERENCE_TOOLCHAIN mode=source_owned_lazy_fetch',
             '--cann_3rd_lib_path="${CANN_3RD_LIB_PATH}"',
-            'toolchain_cann_3rd_lib_path=${CANN_3RD_LIB_PATH}',
-            'STAGED_MAKESELF_DIR="${SOURCE_ROOT}/csrc/third_party/makeself"',
-            'P3_REFERENCE_TOOLCHAIN_MAKESELF_STAGED',
-            'reason=makeself_stage_failed',
             'CMAKE_HOME_DIRECTORY:INTERNAL',
             'reason=foreign_cmake_cache',
             'P3_REFERENCE_INCREMENTAL',
         ):
             self.assertIn(token, self.reference_build)
-        self.assertIn(
-            'CANN_3RD_LIB_PATH="${NANOVLLM_A5_CANN_3RD_LIB_PATH:-}"',
-            self.build,
-        )
-        self.assertIn(
-            '--cann_3rd_lib_path="${CANN_3RD_LIB_PATH}"', self.build
-        )
-        self.assertIn(
-            'STAGED_MAKESELF_DIR="${GENERATED}/third_party/makeself"',
-            self.build,
-        )
-        self.assertIn('CPack makeself staging failed', self.build)
-        self.assertLess(
-            self.build.index('STAGED_MAKESELF_DIR="${GENERATED}/third_party/makeself"'),
-            self.build.index('pushd "${GENERATED}"'),
-        )
+        for forbidden in (
+            'cann_third_party_cache_incomplete',
+            'STAGED_MAKESELF_DIR="${SOURCE_ROOT}/csrc/third_party/makeself"',
+            'P3_REFERENCE_TOOLCHAIN_MAKESELF_STAGED',
+            'reason=makeself_stage_failed',
+        ):
+            self.assertNotIn(forbidden, self.reference_build)
 
 
 if __name__ == "__main__":

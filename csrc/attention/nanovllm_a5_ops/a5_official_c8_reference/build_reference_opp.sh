@@ -14,10 +14,9 @@ INSTALL_ROOT="${A5_OFFICIAL_C8_REFERENCE_ROOT:-${THIS_DIR}/build-reference-opp}"
 EXPECTED_HEAD="${A5_OFFICIAL_C8_EXPECTED_SOURCE_HEAD:-}"
 BUILD_JOBS="${A5_OFFICIAL_C8_REFERENCE_BUILD_JOBS:-4}"
 # A clean linked worktree deliberately has no generated CANN third-party
-# cache.  Reusing a previous *build* directory would contaminate CMake's
-# source-path closure, but the downloaded package tools below are not source
-# code and are safe to share explicitly.  The upstream builder otherwise
-# tries to fetch makeself from the network.
+# cache.  ``csrc/third_party`` is Git-ignored source-build input, not a
+# compiled OPP or CMake object cache.  Let upstream CANN lazily download the
+# small dependency set here and reuse it for the same exact source root.
 CANN_3RD_LIB_PATH="${A5_OFFICIAL_C8_CANN_3RD_LIB_PATH:-${SOURCE_ROOT}/csrc/third_party}"
 VENDOR_NAME="official_c8_reference"
 OP_LIST="vllm_quant_lightning_indexer,vllm_quant_lightning_indexer_metadata"
@@ -99,45 +98,14 @@ if [[ ! "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
   printf 'P3_REFERENCE_BUILD_FAIL reason=invalid_jobs value=%s\n' "${BUILD_JOBS}" >&2
   exit 2
 fi
-MAKESELF_SH="${CANN_3RD_LIB_PATH}/makeself/makeself.sh"
-MAKESELF_HEADER="${CANN_3RD_LIB_PATH}/makeself/makeself-header.sh"
-JSON_HEADER="${CANN_3RD_LIB_PATH}/json/include/nlohmann/json.hpp"
-ABSEIL_ARCHIVE="${CANN_3RD_LIB_PATH}/abseil-cpp/abseil-cpp-20230802.1.tar.gz"
-ABSEIL_PKG_ARCHIVE="${CANN_3RD_LIB_PATH}/pkg/abseil-cpp-20230802.1.tar.gz"
-PROTOBUF_ARCHIVE="${CANN_3RD_LIB_PATH}/protobuf/protobuf-all-25.1.tar.gz"
-PROTOBUF_PKG_ARCHIVE="${CANN_3RD_LIB_PATH}/pkg/protobuf-25.1.tar.gz"
-if [[ ! -r "${MAKESELF_SH}" || ! -r "${MAKESELF_HEADER}" || \
-      ! -r "${JSON_HEADER}" ]] || \
-   { [[ ! -r "${ABSEIL_ARCHIVE}" ]] && [[ ! -r "${ABSEIL_PKG_ARCHIVE}" ]]; } || \
-   { [[ ! -r "${PROTOBUF_ARCHIVE}" ]] && [[ ! -r "${PROTOBUF_PKG_ARCHIVE}" ]]; }; then
-  printf 'P3_REFERENCE_BUILD_FAIL reason=cann_third_party_cache_incomplete root=%s\n' \
+if ! mkdir -p "${CANN_3RD_LIB_PATH}"; then
+  printf 'P3_REFERENCE_BUILD_FAIL reason=cann_third_party_dir_unavailable root=%s\n' \
     "${CANN_3RD_LIB_PATH}" >&2
   exit 2
 fi
 CANN_3RD_LIB_PATH="$(cd "${CANN_3RD_LIB_PATH}" && pwd -P)"
-printf 'P3_REFERENCE_TOOLCHAIN cann_3rd_lib_path=%s makeself=1 json=1 abseil=1 protobuf=1\n' \
+printf 'P3_REFERENCE_TOOLCHAIN mode=source_owned_lazy_fetch cann_3rd_lib_path=%s\n' \
     "${CANN_3RD_LIB_PATH}"
-
-# Upstream CANN correctly uses CANN_3RD_LIB_PATH to find/download most
-# dependencies, but its External CPack script still hard-codes
-# ${SOURCE_ROOT}/csrc/third_party/makeself.  A clean linked worktree has no
-# such generated directory, so materialize only the two packaging scripts
-# there before configuring.  This is neither an OPP nor a CMake-cache reuse:
-# csrc/third_party is ignored/generated and the package sources remain in the
-# caller's explicit shared tool cache.
-STAGED_MAKESELF_DIR="${SOURCE_ROOT}/csrc/third_party/makeself"
-mkdir -p "${STAGED_MAKESELF_DIR}"
-install -m 0755 "${MAKESELF_SH}" "${STAGED_MAKESELF_DIR}/makeself.sh"
-install -m 0644 "${MAKESELF_HEADER}" \
-    "${STAGED_MAKESELF_DIR}/makeself-header.sh"
-if [[ ! -x "${STAGED_MAKESELF_DIR}/makeself.sh" || \
-      ! -r "${STAGED_MAKESELF_DIR}/makeself-header.sh" ]]; then
-    printf 'P3_REFERENCE_BUILD_FAIL reason=makeself_stage_failed target=%s\n' \
-        "${STAGED_MAKESELF_DIR}" >&2
-    exit 2
-fi
-printf 'P3_REFERENCE_TOOLCHAIN_MAKESELF_STAGED source=%s target=%s\n' \
-    "${CANN_3RD_LIB_PATH}/makeself" "${STAGED_MAKESELF_DIR}"
 
 SOURCE_HEAD="$(git -C "${SOURCE_ROOT}" rev-parse HEAD 2>/dev/null || true)"
 if [[ -z "${SOURCE_HEAD}" ]]; then
