@@ -21,6 +21,7 @@ revision at OPP build time.  This test does not copy or mutate that repository.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
 
@@ -39,6 +40,26 @@ REFERENCE_BUILD = OPS_ROOT / "a5_official_c8_reference" / "build_reference_opp.s
 
 
 class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
+    @staticmethod
+    def _simt_callee_bodies(source: str) -> list[str]:
+        """Return function bodies in AscendC's SIMT callable domain."""
+        bodies: list[str] = []
+        for match in re.finditer(r"__simt_callee__\s+inline\b", source):
+            opening = source.find("{", match.end())
+            if opening < 0:
+                continue
+            depth = 0
+            for index in range(opening, len(source)):
+                char = source[index]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        bodies.append(source[opening + 1:index])
+                        break
+        return bodies
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.kernel = KERNEL.read_text(encoding="utf-8")
@@ -313,14 +334,42 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         # from being substituted in the graph node.
         self.assertIn("PoisonActiveLeaseSimtService", self.advance)
 
-    def test_arena_tag_helpers_are_explicitly_aicore_callable(self) -> None:
-        """Prevent CANN from silently treating SIMT helper calls as host calls."""
+    def test_arena_tag_helpers_do_not_cross_aicore_simt_callable_domains(self) -> None:
+        """A SIMT callee cannot call an AICore helper, even if both inline."""
         for signature in (
             "__aicore__ inline uint32_t MakeTag",
             "__aicore__ inline ArenaState StateOf",
             "__aicore__ inline uint32_t GenerationOf",
+            "__simt_callee__ inline uint32_t SimtMakeTag",
+            "__simt_callee__ inline ArenaState SimtStateOf",
+            "__simt_callee__ inline uint32_t SimtGenerationOf",
         ):
             self.assertIn(signature, self.arena_tag)
+        # The named SIMT transitions must call only their SIMT siblings.  The
+        # CANN compiler rejects even a trivial call from `__simt_callee__` to
+        # `__aicore__`; this gate catches that specific regression before a
+        # costly isolated OPP build.
+        for signature in (
+            "SimtMakeTag(",
+            "SimtStateOf(",
+            "SimtGenerationOf(",
+        ):
+            self.assertGreaterEqual(self.arena_tag.count(signature), 2)
+        forbidden_call = re.compile(
+            r"(?<![A-Za-z0-9_])(?:MakeTag|StateOf|GenerationOf)\s*\("
+        )
+        simt_bodies = self._simt_callee_bodies(self.arena_tag)
+        self.assertGreaterEqual(len(simt_bodies), 9)
+        for body in simt_bodies:
+            body_without_comments = re.sub(
+                r"//[^\n]*|/\*.*?\*/", "", body, flags=re.DOTALL
+            )
+            self.assertIsNone(forbidden_call.search(body_without_comments))
+        # Keep the linter itself honest: a direct AICore helper call must be
+        # detected rather than merely relying on a source-token count.
+        self.assertIsNotNone(
+            forbidden_call.search("return MakeTag(1U, kArenaIdle);")
+        )
 
     def test_only_admission_writes_the_cached_lease_generation(self) -> None:
         """No generic forward-control store may erase the high-word ticket.

@@ -34,10 +34,11 @@ struct ArenaResult {
 static_assert(sizeof(ArenaResult) == 8U,
               "P8 tagged arena result ABI changed");
 
-// These helpers are reached through the SIMT services below.  AscendC does
-// not infer device linkage from `constexpr`: without the explicit AICore
-// qualifier it treats them as host functions and rejects every lifecycle CAS
-// caller during the kernel compile.
+// AICore graph nodes use these helpers directly.  They deliberately have a
+// separate SIMT sibling below: AscendC does not permit a __simt_callee__
+// function to call an __aicore__ helper, even when both bodies are trivially
+// inline.  Keeping the two three-instruction encoders explicit is smaller
+// and safer than relying on compiler-specific cross-domain inlining.
 __aicore__ inline uint32_t MakeTag(uint32_t generation, ArenaState state)
 {
     return (generation << kArenaStateBits) |
@@ -50,6 +51,27 @@ __aicore__ inline ArenaState StateOf(uint32_t tag)
 }
 
 __aicore__ inline uint32_t GenerationOf(uint32_t tag)
+{
+    return tag >> kArenaStateBits;
+}
+
+// SIMT services run in a different callable domain from the surrounding
+// AICore graph nodes.  These mirror the AICore helpers exactly; both families
+// encode the same [generation | state] control word and do not change the P8
+// arena state-machine semantics.
+__simt_callee__ inline uint32_t SimtMakeTag(
+    uint32_t generation, ArenaState state)
+{
+    return (generation << kArenaStateBits) |
+           static_cast<uint32_t>(state);
+}
+
+__simt_callee__ inline ArenaState SimtStateOf(uint32_t tag)
+{
+    return static_cast<ArenaState>(tag & kArenaStateMask);
+}
+
+__simt_callee__ inline uint32_t SimtGenerationOf(uint32_t tag)
 {
     return tag >> kArenaStateBits;
 }
@@ -67,12 +89,12 @@ __simt_callee__ inline bool TryClaimAdmissionFromSimt(
     result->success = 0U;
     result->observed_tag = static_cast<uint32_t>(*health);
     const uint32_t expected = result->observed_tag;
-    if (StateOf(expected) != kArenaIdle ||
-        GenerationOf(expected) >= kArenaGenerationMax) {
+    if (SimtStateOf(expected) != kArenaIdle ||
+        SimtGenerationOf(expected) >= kArenaGenerationMax) {
         return false;
     }
-    const uint32_t desired = MakeTag(GenerationOf(expected) + 1U,
-                                     kArenaClaiming);
+    const uint32_t desired = SimtMakeTag(SimtGenerationOf(expected) + 1U,
+                                         kArenaClaiming);
     const int32_t observed = asc_atomic_cas(
         health, static_cast<int32_t>(expected), static_cast<int32_t>(desired));
     result->observed_tag = static_cast<uint32_t>(observed);
@@ -100,14 +122,15 @@ __simt_callee__ inline bool FinishAdmissionFromSimt(
     __ubuf__ ArenaResult* result)
 {
     if (health == nullptr || result == nullptr ||
-        StateOf(claiming_tag) != kArenaClaiming ||
-        GenerationOf(claiming_tag) == 0U) {
+        SimtStateOf(claiming_tag) != kArenaClaiming ||
+        SimtGenerationOf(claiming_tag) == 0U) {
         return false;
     }
     result->success = 0U;
     result->observed_tag = static_cast<uint32_t>(*health);
-    const uint32_t desired = MakeTag(
-        GenerationOf(claiming_tag), healthy ? kArenaActive : kArenaUnhealthy);
+    const uint32_t desired = SimtMakeTag(
+        SimtGenerationOf(claiming_tag),
+        healthy ? kArenaActive : kArenaUnhealthy);
     const int32_t observed = asc_atomic_cas(
         health, static_cast<int32_t>(claiming_tag), static_cast<int32_t>(desired));
     result->observed_tag = static_cast<uint32_t>(observed);
@@ -133,14 +156,14 @@ __simt_callee__ inline bool PoisonActiveLeaseFromSimt(
     __ubuf__ ArenaResult* result)
 {
     if (health == nullptr || result == nullptr ||
-        StateOf(active_tag) != kArenaActive ||
-        GenerationOf(active_tag) == 0U) {
+        SimtStateOf(active_tag) != kArenaActive ||
+        SimtGenerationOf(active_tag) == 0U) {
         return false;
     }
     result->success = 0U;
     result->observed_tag = static_cast<uint32_t>(*health);
-    const uint32_t desired = MakeTag(
-        GenerationOf(active_tag), kArenaUnhealthy);
+    const uint32_t desired = SimtMakeTag(
+        SimtGenerationOf(active_tag), kArenaUnhealthy);
     const int32_t observed = asc_atomic_cas(
         health, static_cast<int32_t>(active_tag), static_cast<int32_t>(desired));
     result->observed_tag = static_cast<uint32_t>(observed);
@@ -166,13 +189,13 @@ __simt_callee__ inline bool CompleteTerminalFromSimt(
     __ubuf__ ArenaResult* result)
 {
     if (health == nullptr || result == nullptr ||
-        StateOf(terminal_tag) != kArenaTerminalClaimed ||
-        GenerationOf(terminal_tag) == 0U) {
+        SimtStateOf(terminal_tag) != kArenaTerminalClaimed ||
+        SimtGenerationOf(terminal_tag) == 0U) {
         return false;
     }
     result->success = 0U;
     result->observed_tag = static_cast<uint32_t>(*health);
-    const uint32_t desired = MakeTag(GenerationOf(terminal_tag),
+    const uint32_t desired = SimtMakeTag(SimtGenerationOf(terminal_tag),
         release_clean ? kArenaIdle : kArenaUnhealthy);
     const int32_t observed = asc_atomic_cas(
         health, static_cast<int32_t>(terminal_tag), static_cast<int32_t>(desired));
@@ -203,13 +226,14 @@ __simt_callee__ inline bool QuarantineGenerationWrapFromSimt(
     __ubuf__ ArenaResult* result)
 {
     if (health == nullptr || result == nullptr ||
-        StateOf(idle_max_tag) != kArenaIdle ||
-        GenerationOf(idle_max_tag) != kArenaGenerationMax) {
+        SimtStateOf(idle_max_tag) != kArenaIdle ||
+        SimtGenerationOf(idle_max_tag) != kArenaGenerationMax) {
         return false;
     }
     result->success = 0U;
     result->observed_tag = static_cast<uint32_t>(*health);
-    const uint32_t desired = MakeTag(kArenaGenerationMax, kArenaUnhealthy);
+    const uint32_t desired = SimtMakeTag(kArenaGenerationMax,
+                                         kArenaUnhealthy);
     const int32_t observed = asc_atomic_cas(
         health, static_cast<int32_t>(idle_max_tag), static_cast<int32_t>(desired));
     result->observed_tag = static_cast<uint32_t>(observed);
@@ -244,12 +268,13 @@ __simt_callee__ inline bool TryClaimTerminalFromSimt(
     result->success = 0U;
     result->observed_tag = static_cast<uint32_t>(*health);
     const uint32_t observed_tag = result->observed_tag;
-    const ArenaState state = StateOf(observed_tag);
-    if (GenerationOf(observed_tag) != generation ||
+    const ArenaState state = SimtStateOf(observed_tag);
+    if (SimtGenerationOf(observed_tag) != generation ||
         (state != kArenaActive && state != kArenaUnhealthy)) {
         return false;
     }
-    const uint32_t desired = MakeTag(generation, kArenaTerminalClaimed);
+    const uint32_t desired = SimtMakeTag(generation,
+                                         kArenaTerminalClaimed);
     const int32_t observed = asc_atomic_cas(
         health, static_cast<int32_t>(observed_tag), static_cast<int32_t>(desired));
     result->observed_tag = static_cast<uint32_t>(observed);
