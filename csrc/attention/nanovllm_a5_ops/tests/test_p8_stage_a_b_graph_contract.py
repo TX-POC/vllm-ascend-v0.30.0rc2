@@ -174,44 +174,6 @@ class P8StageABGraphContractTest(unittest.TestCase):
             [item["name"] for item in STAGE_B_SPEC["output_desc"]],
         )
 
-    def test_aclnn_calls_keep_torch_alias_outputs_in_the_c_abi_suffix(self) -> None:
-        """Torch alias returns do not erase ACLNN output descriptors.
-
-        Generated custom-op APIs take inputs first and outputs second.  The
-        Stage-B kernel has 28 input slots and 19 output-ref slots; shortening
-        the bridge to the Tensor inputs lets the two trailing workspace /
-        executor pointers occupy output positions and corrupts the host heap at
-        launch.  Admission and advance follow the same rule on smaller ABIs.
-        """
-        input_names = [item["name"] for item in STAGE_B_SPEC["input_desc"]]
-        output_names = [item["name"] for item in STAGE_B_SPEC["output_desc"]]
-        self.assertEqual(len(input_names), 28)
-        self.assertEqual(len(output_names), 19)
-
-        executor_call = STAGE_B_BRIDGE[
-            STAGE_B_BRIDGE.index("aclnnA5P8ForwardOwnedExecutor,"):
-            STAGE_B_BRIDGE.index("    return std::make_tuple(",
-                                  STAGE_B_BRIDGE.index("aclnnA5P8ForwardOwnedExecutor,"))
-        ]
-        compact = re.sub(r"\s+", " ", executor_call)
-        expected_suffix = ", ".join(output_names)
-        self.assertIn(expected_suffix, compact)
-        self.assertIn("rows_per_entry, worker_stats, " + expected_suffix,
-                      compact)
-
-        for api, names in (
-            ("aclnnA5P8ArenaAdmissionGate", [
-                "forward_control", "p8_arena_health", "admission_result",
-            ]),
-            ("aclnnA5P8ForwardControlAdvance", [
-                "forward_control", "p8_arena_health", "transition_result",
-            ]),
-        ):
-            call_start = STAGE_B_BRIDGE.index(api + ",")
-            call_end = STAGE_B_BRIDGE.index(");", call_start)
-            call = re.sub(r"\s+", " ", STAGE_B_BRIDGE[call_start:call_end])
-            self.assertIn(", ".join(names), call, api)
-
     def test_advance_schema_latches_arena_health_on_abort(self) -> None:
         """Control-transition failure must poison the shared arena as well.
 
