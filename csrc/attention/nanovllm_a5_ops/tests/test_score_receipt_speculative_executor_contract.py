@@ -380,6 +380,8 @@ def main() -> None:
         "def _load_assembly()",
         "direct artifact selection is disabled",
         "bridge package is not the one recorded by the assembly",
+        "import torch  # noqa: E402,F401",
+        "import torch_npu  # noqa: E402,F401",
         "class ForwardTerminalLease",
         "capture_forward_terminal_lease",
         "release_at_forward_terminal",
@@ -388,6 +390,13 @@ def main() -> None:
         "aclTensor`` descriptors have already been released immediately",
     ):
         _require(runtime_package, token, runtime_package_path)
+    torch_import_pos = runtime_package.find("import torch  # noqa: E402,F401")
+    bridge_import_pos = runtime_package.find("from . import _C")
+    if min(torch_import_pos, bridge_import_pos) < 0 or torch_import_pos > bridge_import_pos:
+        raise AssertionError(
+            "P7 bridge package must import torch before _C so a clean Python "
+            "child exposes libc10/libtorch to the dynamic loader"
+        )
     for forbidden in ("p7_1_release_after_forward_terminal()",):
         _forbid(runtime_package, forbidden, runtime_package_path)
     runtime_test = runtime_test_path.read_text(encoding="utf-8")

@@ -133,6 +133,14 @@ if os.getenv("NANOVLLM_A5_OPAPI_DEBUG") not in (None, "", "0"):
         flush=True,
     )
 
+# The bridge links against libc10/libtorch/torch_npu.  A normal vLLM process
+# already imports these modules, but the fresh-assembly runner deliberately
+# verifies this package in a clean Python child.  Import them before `_C` so
+# their loader-visible DSOs are present in both cases; do not encode a
+# machine-specific torch library path or silently fall back to another bridge.
+import torch  # noqa: E402,F401
+import torch_npu  # noqa: E402,F401
+
 from . import _C  # noqa: E402,F401
 
 
