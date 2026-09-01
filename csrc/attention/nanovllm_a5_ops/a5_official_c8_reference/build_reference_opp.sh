@@ -40,20 +40,22 @@ if [[ -n "${EXPECTED_HEAD}" && "${SOURCE_HEAD}" != "${EXPECTED_HEAD}" ]]; then
     "${SOURCE_HEAD}" "${EXPECTED_HEAD}" >&2
   exit 2
 fi
-SOURCE_HEAD_SHORT="${SOURCE_HEAD:0:12}"
-
 # The normal product build and this filtered two-operator C8 build have
 # different CMake target graphs.  They must never share ``csrc/build``:
 # CMake can otherwise retain object-target references from the product graph
-# which do not exist in the filtered graph.  Keep an incremental cache per
-# exact source revision instead.  It is a sibling of csrc so upstream
-# ``build.sh`` can still use ``cmake ..`` without copying source files.
-UPSTREAM_BUILD_DIR="${A5_OFFICIAL_C8_REFERENCE_CMAKE_BUILD_DIR:-${SOURCE_ROOT}/csrc/build_official_c8_reference_${SOURCE_HEAD_SHORT}}"
-UPSTREAM_OUTPUT_DIR="${A5_OFFICIAL_C8_REFERENCE_OUTPUT_DIR:-${SOURCE_ROOT}/csrc/output_official_c8_reference_${SOURCE_HEAD_SHORT}}"
-UPSTREAM_BUILD_OUT_DIR="${A5_OFFICIAL_C8_REFERENCE_BUILD_OUT_DIR:-${SOURCE_ROOT}/csrc/build_out_official_c8_reference_${SOURCE_HEAD_SHORT}}"
+# which do not exist in the filtered graph.  The cache identity is therefore
+# the *source worktree plus this fixed filtered graph*, not the repository
+# commit.  ``build.sh`` runs CMake configure on every invocation, so changed
+# C8/CMake inputs are rebuilt normally, while an unrelated P8 test, runner or
+# .gitignore commit does not cold-compile official C8 again.  Full SOURCE_HEAD
+# remains an exact precondition and is written into each output provenance.
+# These siblings keep ``cmake ..`` valid without copying source files.
+UPSTREAM_BUILD_DIR="${A5_OFFICIAL_C8_REFERENCE_CMAKE_BUILD_DIR:-${SOURCE_ROOT}/csrc/build_official_c8_reference}"
+UPSTREAM_OUTPUT_DIR="${A5_OFFICIAL_C8_REFERENCE_OUTPUT_DIR:-${SOURCE_ROOT}/csrc/output_official_c8_reference}"
+UPSTREAM_BUILD_OUT_DIR="${A5_OFFICIAL_C8_REFERENCE_BUILD_OUT_DIR:-${SOURCE_ROOT}/csrc/build_out_official_c8_reference}"
 # A cache is reusable only for its own source root and fixed filtered op list.
 # It is never deleted here: a foreign cache fails closed rather than silently
-# recompiling against unknown products.
+# compiling against an unknown source root.
 if [[ -f "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" ]]; then
   CACHED_CMAKE_HOME="$({
     sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' \
@@ -66,10 +68,10 @@ if [[ -f "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" ]]; then
       "${CACHED_CMAKE_HOME}" "${EXPECTED_CMAKE_HOME}" >&2
     exit 2
   fi
-  printf 'P3_REFERENCE_INCREMENTAL source_head=%s cache_source=%s build_dir=%s\n' \
+  printf 'P3_REFERENCE_INCREMENTAL source_head=%s cache_scope=source_root_filtered_graph cache_source=%s build_dir=%s\n' \
     "${SOURCE_HEAD}" "${EXPECTED_CMAKE_HOME}" "${UPSTREAM_BUILD_DIR}"
 else
-  printf 'P3_REFERENCE_INCREMENTAL source_head=%s cache_source=<cold> build_dir=%s\n' \
+  printf 'P3_REFERENCE_INCREMENTAL source_head=%s cache_scope=source_root_filtered_graph cache_source=<cold> build_dir=%s\n' \
     "${SOURCE_HEAD}" "${UPSTREAM_BUILD_DIR}"
 fi
 if [[ -z "${USE_NINJA+x}" && -f "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" ]]; then

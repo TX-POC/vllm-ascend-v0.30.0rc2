@@ -222,6 +222,11 @@ csrc/third_party/
 # The source-matched official-C8 reference uses its own CMake cache so it
 # cannot reuse the normal product build.  They are build outputs, not source:
 # keep them invisible to the exact-source guard after a successful build.
+/csrc/build_official_c8_reference/
+/csrc/output_official_c8_reference/
+/csrc/build_out_official_c8_reference/
+# Legacy revision-keyed caches from the earlier layout remain generated output
+# while existing worktrees naturally migrate to the stable reference graph.
 /csrc/build_official_c8_reference_*/
 /csrc/output_official_c8_reference_*/
 /csrc/build_out_official_c8_reference_*/

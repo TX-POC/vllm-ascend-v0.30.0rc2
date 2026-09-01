@@ -45,10 +45,15 @@ def require_source_matched_reference_contract() -> None:
     assert "-newer \"${BUILD_MARKER}\"" in build_script
     assert '! -e "${SOURCE_ROOT}/.git"' in build_script
     # A filtered two-op reference build must not reuse the normal product
-    # target graph.  The upstream builder supports independent sibling
-    # directories, and the reference cache is keyed by exact source revision
-    # so rebuilds of the same revision remain incremental.
-    assert "build_official_c8_reference_${SOURCE_HEAD_SHORT}" in build_script
+    # target graph.  The upstream builder uses independent sibling dirs that
+    # are stable for this source worktree + fixed two-op graph. CMake itself
+    # detects changed inputs, so unrelated P8 commits do not cold-build C8.
+    assert (
+        'UPSTREAM_BUILD_DIR="${A5_OFFICIAL_C8_REFERENCE_CMAKE_BUILD_DIR:-'
+        '${SOURCE_ROOT}/csrc/build_official_c8_reference}"'
+    ) in build_script
+    assert "SOURCE_HEAD_SHORT" not in build_script
+    assert "cache_scope=source_root_filtered_graph" in build_script
     assert 'VLLM_ASCEND_CMAKE_BUILD_DIR="${UPSTREAM_BUILD_DIR}"' in build_script
     assert 'VLLM_ASCEND_CMAKE_OUTPUT_DIR="${UPSTREAM_OUTPUT_DIR}"' in build_script
     assert 'VLLM_ASCEND_CMAKE_BUILD_OUT_DIR="${UPSTREAM_BUILD_OUT_DIR}"' in build_script
@@ -56,10 +61,14 @@ def require_source_matched_reference_contract() -> None:
     assert 'BUILD_DIR=${VLLM_ASCEND_CMAKE_BUILD_DIR:-${CURRENT_DIR}/build}' in upstream_build_script
     assert 'OUTPUT_DIR=${VLLM_ASCEND_CMAKE_OUTPUT_DIR:-${CURRENT_DIR}/output}' in upstream_build_script
     assert 'BUILD_OUT_DIR=${VLLM_ASCEND_CMAKE_BUILD_OUT_DIR:-${CURRENT_DIR}/build_out}' in upstream_build_script
-    # These revision-keyed CMake directories are deliberate generated output.
+    # These fixed reference graph dirs are deliberate generated output; the
+    # legacy revision-keyed form stays ignored during transparent migration.
     # Ignoring exactly these paths preserves the runner's strict check for any
     # real source modification while avoiding a false "dirty" result after a
     # successful source-matched reference build.
+    assert "/csrc/build_official_c8_reference/" in gitignore
+    assert "/csrc/output_official_c8_reference/" in gitignore
+    assert "/csrc/build_out_official_c8_reference/" in gitignore
     assert "/csrc/build_official_c8_reference_*/" in gitignore
     assert "/csrc/output_official_c8_reference_*/" in gitignore
     assert "/csrc/build_out_official_c8_reference_*/" in gitignore
