@@ -35,6 +35,7 @@ ADVANCE = P8_ROOT / "op_kernel" / "a5_p8_forward_control_advance.cpp"
 SPEC = P8_ROOT / "ops.json"
 BUILD = OPS_ROOT / "build_nanovllm_ops.sh"
 RUNNER = OPS_ROOT / "tests" / "run_p8_forward_owned_executor_npu.sh"
+REFERENCE_BUILD = OPS_ROOT / "a5_official_c8_reference" / "build_reference_opp.sh"
 
 
 class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
@@ -49,6 +50,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         cls.spec = SPEC.read_text(encoding="utf-8")
         cls.build = BUILD.read_text(encoding="utf-8")
         cls.runner = RUNNER.read_text(encoding="utf-8")
+        cls.reference_build = REFERENCE_BUILD.read_text(encoding="utf-8")
 
     def test_isolated_operator_identity(self) -> None:
         self.assertIn('"op": "A5P8ForwardOwnedExecutor"', self.spec)
@@ -465,6 +467,35 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         ):
             self.assertIn(readable_gate, self.runner)
         self.assertNotIn('! -x "$P8_BUILD_SCRIPT"', self.runner)
+
+    def test_clean_reference_build_uses_an_explicit_offline_tool_cache(self) -> None:
+        """Never reuse an old CMakeCache or silently fall back to network."""
+        for token in (
+            'P8_CANN_3RD_LIB_PATH',
+            'cann_third_party_cache_incomplete:',
+            'P8_TOOLCHAIN_CACHE cann_3rd_lib_path=%s makeself=1 json=1 abseil=1 protobuf=1',
+            'A5_OFFICIAL_C8_CANN_3RD_LIB_PATH="$P8_CANN_3RD_LIB_PATH"',
+            'NANOVLLM_A5_CANN_3RD_LIB_PATH="$P8_CANN_3RD_LIB_PATH"',
+        ):
+            self.assertIn(token, self.runner)
+        self.assertLess(
+            self.runner.index('cann_third_party_cache_incomplete:'),
+            self.runner.index('P8_KVAF_BUILD="$P8_RUN_ROOT/kvaf_build"'),
+        )
+        for token in (
+            'A5_OFFICIAL_C8_CANN_3RD_LIB_PATH',
+            'cann_third_party_cache_incomplete',
+            '--cann_3rd_lib_path="${CANN_3RD_LIB_PATH}"',
+            'toolchain_cann_3rd_lib_path=${CANN_3RD_LIB_PATH}',
+        ):
+            self.assertIn(token, self.reference_build)
+        self.assertIn(
+            'CANN_3RD_LIB_PATH="${NANOVLLM_A5_CANN_3RD_LIB_PATH:-}"',
+            self.build,
+        )
+        self.assertIn(
+            '--cann_3rd_lib_path="${CANN_3RD_LIB_PATH}"', self.build
+        )
 
 
 if __name__ == "__main__":

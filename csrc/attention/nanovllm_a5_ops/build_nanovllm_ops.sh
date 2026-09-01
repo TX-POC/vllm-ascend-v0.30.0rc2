@@ -11,6 +11,11 @@ TORCH_EXTENSION="${ROOT}/torch_extension"
 PYTHON_BIN="${NANOVLLM_A5_OPS_PYTHON:-python3}"
 BUILD_JOBS="${NANOVLLM_A5_OPS_BUILD_JOBS:-$(nproc)}"
 SKIP_TORCH_EXTENSION="${NANOVLLM_A5_SKIP_TORCH_EXTENSION:-0}"
+# An isolated P8 build may use a machine-local CANN dependency cache.  This
+# holds downloaded third-party packaging/build inputs only; it is not a reuse
+# of an older OPP, bridge, or CMakeCache.  Keep legacy callers unchanged when
+# the variable is unset.
+CANN_3RD_LIB_PATH="${NANOVLLM_A5_CANN_3RD_LIB_PATH:-}"
 # `SOC_VERSION` is a legacy/product-global setting and has repeatedly
 # selected the wrong CANN product in isolated A5 builds.  Do not silently
 # inherit it.  Callers must set only A5_SOC_VERSION (or accept ascend950).
@@ -68,6 +73,15 @@ if [[ "${A5_SOC_VERSION_RAW,,}" != "${A5_SOC_VERSION}" ]]; then
     echo "[nanovllm_a5_ops] normalized product name ${A5_SOC_VERSION_RAW} -> ${A5_SOC_VERSION}"
 fi
 echo "[nanovllm_a5_ops] jobs: ${BUILD_JOBS}"
+if [[ -n "${CANN_3RD_LIB_PATH}" ]]; then
+    if [[ ! -r "${CANN_3RD_LIB_PATH}/makeself/makeself.sh" || \
+          ! -r "${CANN_3RD_LIB_PATH}/makeself/makeself-header.sh" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_CANN_3RD_LIB_PATH lacks CANN makeself tools: ${CANN_3RD_LIB_PATH}." >&2
+        exit 2
+    fi
+    CANN_3RD_LIB_PATH="$(cd "${CANN_3RD_LIB_PATH}" && pwd -P)"
+    echo "[nanovllm_a5_ops] CANN third-party cache: ${CANN_3RD_LIB_PATH}"
+fi
 
 ALL_OP_NAMES=(
     LightningIndexerDecodeUpdateA5
@@ -1683,7 +1697,12 @@ if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \
 fi
 
 pushd "${GENERATED}" >/dev/null
-OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh
+if [[ -n "${CANN_3RD_LIB_PATH}" ]]; then
+    OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh \
+        --cann_3rd_lib_path="${CANN_3RD_LIB_PATH}"
+else
+    OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh
+fi
 popd >/dev/null
 
 RUN_PKG="$(find "${GENERATED}/build_out" -maxdepth 1 -type f -name '*.run' | head -n 1)"
