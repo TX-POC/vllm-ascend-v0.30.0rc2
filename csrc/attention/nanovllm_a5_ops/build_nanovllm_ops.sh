@@ -90,6 +90,8 @@ SUPPORTED_OP_NAMES=(
     A5ExactReconcilePrivateView
     A5ScoreReceiptCandidateExecutor
     A5ScoreReceiptSpeculativeExecutor
+    A5P8ForwardOwnedExecutor
+    A5P8ForwardControlAdvance
 )
 
 # A prototype operator must be buildable without replacing the normal custom
@@ -138,6 +140,11 @@ STAGE_SCORE_RECEIPT_CANDIDATE_EXECUTOR_ONLY=0
 # It deliberately consumes only explicit graph-visible CandidateSeed and
 # lifecycle tensors; C8 source must never enter this OPP closure.
 STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY=0
+# P8 is the forward-owned product-path executor.  It is an isolated OPP on
+# purpose: C8 remains a separately built score-receipt publisher, and this
+# package contains only P8's CandidateSeed/PostOnly/CQ/QSFA-terminal state
+# machine plus the exact KVAF Direct-HCCP helper closure.
+STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY=0
 # P3's source-derived C8 operator has two independent compile-time axes:
 # publication (score workspace/receipts) and inline KVAF.  Default values
 # are declared before staging because this script is nounset-safe and the
@@ -170,6 +177,11 @@ if [[ "${#OP_NAMES[@]}" == "1" && \
       "${OP_NAMES[0]}" == "A5ScoreReceiptSpeculativeExecutor" ]]; then
     STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY=1
 fi
+if [[ "${#OP_NAMES[@]}" == "2" && \
+      "${OP_NAMES[0]}" == "A5P8ForwardOwnedExecutor" && \
+      "${OP_NAMES[1]}" == "A5P8ForwardControlAdvance" ]]; then
+    STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY=1
+fi
 if [[ " ${OP_NAMES[*]} " == *" A5StreamingQuantLiGet "* && \
       "${STAGE_STREAMING_QUANT_LI_GET_ONLY}" != "1" ]]; then
     echo "[nanovllm_a5_ops] ERROR: A5StreamingQuantLiGet is intentionally buildable only as NANOVLLM_A5_OPS_ONLY=A5StreamingQuantLiGet." >&2
@@ -193,6 +205,14 @@ if [[ " ${OP_NAMES[*]} " == *" A5ScoreReceiptSpeculativeExecutor "* && \
     echo "[nanovllm_a5_ops] ERROR: A5ScoreReceiptSpeculativeExecutor is buildable only as NANOVLLM_A5_OPS_ONLY=A5ScoreReceiptSpeculativeExecutor." >&2
     echo "[nanovllm_a5_ops] It is a standalone P7.1 PostOnly/CQ executor; mixing it with C8 or legacy source would invalidate the closure gate." >&2
     exit 2
+fi
+if [[ " ${OP_NAMES[*]} " == *" A5P8ForwardOwnedExecutor "* || \
+      " ${OP_NAMES[*]} " == *" A5P8ForwardControlAdvance "* ]]; then
+    if [[ "${STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY}" != "1" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P8 is buildable only as NANOVLLM_A5_OPS_ONLY=A5P8ForwardOwnedExecutor,A5P8ForwardControlAdvance." >&2
+        echo "[nanovllm_a5_ops] Mixing P8 with C8, P7, or legacy operators would destroy the forward-owned source closure." >&2
+        exit 2
+    fi
 fi
 
 # The repository stores each operator in its own directory. Build a temporary
@@ -599,6 +619,33 @@ elif [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
     cp -a "${P7_1_DIR}/op_kernel/." "${OP_DEV}/op_kernel/"
     echo "[nanovllm_a5_ops] strict P7.1 staging: A5ScoreReceiptSpeculativeExecutor only"
     echo "[nanovllm_a5_ops] P7.1 contract: CandidateSeed -> dynamic queue lease -> Direct-HCCP PostOnly/CQ; C8 closure=absent"
+elif [[ "${STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY}" == "1" ]]; then
+    # P8 deliberately has a narrow, forward-owned closure.  Do not copy a
+    # whole neighbouring probe directory here: a stale P7/C8 source in this
+    # package would be a materially different execution model, not a harmless
+    # build dependency.
+    P8_DIR="${ROOT}/a5_p8_forward_owned_executor"
+    P8_SPEC="${P8_DIR}/ops.json"
+    P8_HOST="${P8_DIR}/op_host/a5_p8_forward_owned_executor.cpp"
+    P8_KERNEL="${P8_DIR}/op_kernel/a5_p8_forward_owned_executor.cpp"
+    P8_TILING="${P8_DIR}/op_kernel/a5_p8_forward_owned_executor_tiling.h"
+    P8_ADVANCE_HOST="${P8_DIR}/op_host/a5_p8_forward_control_advance.cpp"
+    P8_ADVANCE_KERNEL="${P8_DIR}/op_kernel/a5_p8_forward_control_advance.cpp"
+    P8_ADVANCE_TILING="${P8_DIR}/op_kernel/a5_p8_forward_control_advance_tiling.h"
+    for P8_REQUIRED_FILE in "${P8_SPEC}" "${P8_HOST}" "${P8_KERNEL}" \
+                            "${P8_TILING}" "${P8_ADVANCE_HOST}" \
+                            "${P8_ADVANCE_KERNEL}" "${P8_ADVANCE_TILING}"; do
+        if [[ ! -s "${P8_REQUIRED_FILE}" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: P8 forward-owned executor requires ${P8_REQUIRED_FILE}." >&2
+            exit 2
+        fi
+    done
+    cp "${P8_SPEC}" "${OP_DEV}/ops.json"
+    cp "${P8_HOST}" "${P8_ADVANCE_HOST}" "${OP_DEV}/op_host/"
+    cp "${P8_KERNEL}" "${P8_TILING}" "${P8_ADVANCE_KERNEL}" \
+       "${P8_ADVANCE_TILING}" "${OP_DEV}/op_kernel/"
+    echo "[nanovllm_a5_ops] strict P8 staging: forward-owned executor + graph-visible control advance only"
+    echo "[nanovllm_a5_ops] P8 contract: receipt -> dynamic queue lease -> durable PostOnly/CQ -> QSFA-terminal verified private release -> ForwardTerminal quarantine; captured POST->DRAIN->QSFA->FORWARD_TERMINAL advance; C8/P7 closure=absent"
 else
     cp "${ROOT}/ops.json" "${OP_DEV}/ops.json"
 
@@ -639,6 +686,7 @@ fi
 NEEDS_P1_DENSE_KVAF=0
 NEEDS_P3_POST_KVAF=0
 NEEDS_P7_1_STREAMING_KVAF=0
+NEEDS_P8_FORWARD_OWNED_KVAF=0
 # Never inherit an ambient shell's staging variables.  An audit-only build
 # must not accidentally validate or package a closure left by an earlier
 # post/P1 invocation in the same terminal.
@@ -658,9 +706,13 @@ fi
 if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
     NEEDS_P7_1_STREAMING_KVAF=1
 fi
+if [[ "${STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY}" == "1" ]]; then
+    NEEDS_P8_FORWARD_OWNED_KVAF=1
+fi
 if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
       "${NEEDS_P3_POST_KVAF}" == "1" || \
-      "${NEEDS_P7_1_STREAMING_KVAF}" == "1" ]]; then
+      "${NEEDS_P7_1_STREAMING_KVAF}" == "1" || \
+      "${NEEDS_P8_FORWARD_OWNED_KVAF}" == "1" ]]; then
     KVAF_CONSUMER_NAMES=()
     if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" ]]; then
         KVAF_CONSUMER_NAMES+=("A5ExactScanSpeculativeGet")
@@ -670,6 +722,9 @@ if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
     fi
     if [[ "${NEEDS_P7_1_STREAMING_KVAF}" == "1" ]]; then
         KVAF_CONSUMER_NAMES+=("A5ScoreReceiptSpeculativeExecutor")
+    fi
+    if [[ "${NEEDS_P8_FORWARD_OWNED_KVAF}" == "1" ]]; then
+        KVAF_CONSUMER_NAMES+=("A5P8ForwardOwnedExecutor")
     fi
     if [[ -z "${KVAF_FUSED_GET_SOURCE:-}" ]]; then
         echo "[nanovllm_a5_ops] ERROR: ${KVAF_CONSUMER_NAMES[*]} requires KVAF_FUSED_GET_SOURCE=<exact KVAF checkout>." >&2
@@ -759,6 +814,69 @@ if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
             if ! grep -Fq "${required_token}" "${KVAF_FUSED_HEADER}"; then
                 echo "[nanovllm_a5_ops] ERROR: streaming KVAF closure misses ${required_token}." >&2
                 echo "[nanovllm_a5_ops] kvaf_head=${KVAF_FUSED_HEAD} helper=${KVAF_FUSED_HEADER}" >&2
+                exit 2
+            fi
+        done
+    fi
+    # P8 must use the v2 forward-owned lifecycle—not the older P7.1
+    # queue-local callback protocol.  Check the exact KVAF helper and ABI
+    # before staging anything so an old checkout cannot spend minutes in CANN
+    # and then fail with a mismatched record layout or a missing drain claim.
+    if [[ "${NEEDS_P8_FORWARD_OWNED_KVAF}" == "1" ]]; then
+        # P8 has a durable graph ABI shared by Post, Drain, QSFA terminal,
+        # and ForwardTerminal.  A merely "new enough" helper is unsafe:
+        # staging a different checkout can compile while silently changing a
+        # graph-stable record protocol.  The small P8 runner supplies this
+        # exact SHA; require it here before CANN work begins.
+        P8_EXPECTED_KVAF_SHA="${NANOVLLM_A5_P8_KVAF_EXPECTED_SHA:-}"
+        if [[ -z "${P8_EXPECTED_KVAF_SHA}" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: P8 requires NANOVLLM_A5_P8_KVAF_EXPECTED_SHA=<exact clean KVAF HEAD>." >&2
+            echo "[nanovllm_a5_ops] selected_kvaf_head=${KVAF_FUSED_HEAD}" >&2
+            exit 2
+        fi
+        if [[ "${KVAF_FUSED_HEAD}" != "${P8_EXPECTED_KVAF_SHA}" ]]; then
+            echo "[nanovllm_a5_ops] ERROR: P8 refuses a KVAF source/provenance mismatch." >&2
+            echo "[nanovllm_a5_ops] expected_kvaf_head=${P8_EXPECTED_KVAF_SHA} actual_kvaf_head=${KVAF_FUSED_HEAD}" >&2
+            exit 2
+        fi
+        for required_token in \
+            'KvafP8ForwardControl' \
+            'LoadKvafP8ForwardControlFromGm' \
+            'StoreKvafP8ForwardControlToGm' \
+            'MarkKvafP8ForwardAbortFromAicore' \
+            'KvafP8ForwardAbortResult' \
+            'KvafP8PrivateRecord' \
+            'KvafP8PrivateReleaseResult' \
+            'LoadKvafP8WaveRecordFromGm' \
+            'StoreKvafP8WaveRecordToGm' \
+            'TryClaimKvafP8WaveDrainFromAicore' \
+            'TryClaimKvafP8UnpostedWaveDrainFromAicore' \
+            'PrepareKvafP8WavePostIntent' \
+            'PostKvafP8Wave' \
+            'TryRetireKvafP8Wave' \
+            'FinishKvafP8Wave' \
+            'PublishKvafP8PrivateTerminalRecords' \
+            'ReleaseKvafP8WaveAfterPrivateReady' \
+            'ReleaseKvafP8PendingPrivateRecordAfterNoPost' \
+            'ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup' \
+            'QuarantineKvafP8PrivateReleaseClaimedFromAicore' \
+            'ReleaseKvafP8PrivateRecordAfterQsfaTerminal' \
+            'QuarantineKvafP8WaveAtForwardTerminal' \
+            'QuarantineKvafP8PrivateAtForwardTerminal' \
+            'KvafP8ForwardTerminalResult'; do
+            if ! grep -Fq "${required_token}" "${KVAF_FUSED_HEADER}"; then
+                echo "[nanovllm_a5_ops] ERROR: P8 forward-owned KVAF v2 closure misses ${required_token}." >&2
+                echo "[nanovllm_a5_ops] kvaf_head=${KVAF_FUSED_HEAD} helper=${KVAF_FUSED_HEADER}" >&2
+                exit 2
+            fi
+        done
+        for required_token in \
+            'KVAF_P8_WAVE_RECORD_BYTES' \
+            'KVAF_P8_PRIVATE_RECORD_BYTES' \
+            'KVAF_P8_FORWARD_CONTROL_BYTES'; do
+            if ! grep -Fq "${required_token}" "${KVAF_ABI_HEADER}"; then
+                echo "[nanovllm_a5_ops] ERROR: P8 forward-owned KVAF v2 ABI misses ${required_token}." >&2
+                echo "[nanovllm_a5_ops] kvaf_head=${KVAF_FUSED_HEAD} abi=${KVAF_ABI_HEADER}" >&2
                 exit 2
             fi
         done
@@ -861,6 +979,9 @@ for index in "${!OP_NAMES[@]}"; do
         op_spec="${ROOT}/a5_score_receipt_candidate_executor/ops.json"
     elif [[ "${op_name}" == "A5ScoreReceiptSpeculativeExecutor" ]]; then
         op_spec="${ROOT}/a5_score_receipt_speculative_executor/ops.json"
+    elif [[ "${op_name}" == "A5P8ForwardOwnedExecutor" || \
+            "${op_name}" == "A5P8ForwardControlAdvance" ]]; then
+        op_spec="${ROOT}/a5_p8_forward_owned_executor/ops.json"
     fi
     echo "[nanovllm_a5_ops] generate operator: ${op_name}"
     msopgen_args=(
@@ -956,6 +1077,33 @@ if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
     echo "[nanovllm_a5_ops] P7.1 removed generated host OpDef stub: ${P7_1_GENERATED_OPDEF_STUBS[0]}"
 fi
 
+# P8 overlays two checked-in graph nodes: the forward-owned transport executor
+# and the graph-visible phase-control advance node.  Remove exactly the two
+# generated registration stubs while the project still holds msopgen output;
+# leaving either one would create duplicate OP_ADD registrations and same-name
+# CANN INI sections.  This is a source-closure failure, never an INI issue to
+# patch after packaging.
+if [[ "${STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY}" == "1" ]]; then
+    for P8_OVERLAY_OP in A5P8ForwardOwnedExecutor A5P8ForwardControlAdvance; do
+        P8_GENERATED_OPDEF_STUBS=()
+        while IFS= read -r -d '' P8_GENERATED_HOST_SOURCE; do
+            if grep -qE "OP_ADD[[:space:]]*\\([[:space:]]*${P8_OVERLAY_OP}[[:space:]]*\\)" \
+                    "${P8_GENERATED_HOST_SOURCE}"; then
+                P8_GENERATED_OPDEF_STUBS+=("${P8_GENERATED_HOST_SOURCE}")
+            fi
+        done < <(find "${GENERATED}/op_host" -type f \
+            \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+        if [[ "${#P8_GENERATED_OPDEF_STUBS[@]}" -ne 1 ]]; then
+            echo "[nanovllm_a5_ops] ERROR: expected exactly one msopgen ${P8_OVERLAY_OP} host stub; found ${#P8_GENERATED_OPDEF_STUBS[@]}." >&2
+            printf '[nanovllm_a5_ops] P8 generated OpDef stub: %s\n' \
+                "${P8_GENERATED_OPDEF_STUBS[@]}" >&2
+            exit 1
+        fi
+        rm -f "${P8_GENERATED_OPDEF_STUBS[0]}"
+        echo "[nanovllm_a5_ops] P8 removed generated ${P8_OVERLAY_OP} host stub: ${P8_GENERATED_OPDEF_STUBS[0]}"
+    done
+fi
+
 # msopgen owns the CMake scaffold. Checked-in Host/AscendC implementation
 # sources overwrite only generated source stubs; directory structure is kept.
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
@@ -968,7 +1116,8 @@ rm -f "${GENERATED}/op_host/lightning_indexer_decode_update_a5_def.cpp"
 # staging/order regression fail before CANN starts compiling kernels.
 if [[ "${NEEDS_P1_DENSE_KVAF}" == "1" || \
       "${NEEDS_P3_POST_KVAF}" == "1" || \
-      "${NEEDS_P7_1_STREAMING_KVAF}" == "1" ]]; then
+      "${NEEDS_P7_1_STREAMING_KVAF}" == "1" || \
+      "${NEEDS_P8_FORWARD_OWNED_KVAF}" == "1" ]]; then
     KVAF_GENERATED_STAGE_DIR="${GENERATED}/op_kernel/kvaf_device"
     for generated_pair in \
         "${KVAF_FUSED_HEADER}:${KVAF_GENERATED_STAGE_DIR}/kvaf_fused_full_get_device.h" \
@@ -1310,6 +1459,149 @@ if [[ "${STAGE_SCORE_RECEIPT_SPECULATIVE_EXECUTOR_ONLY}" == "1" ]]; then
     fi
     echo "[nanovllm_a5_ops] P7.1 host registration closure: ${P7_1_OPDEF_SOURCES[0]} verified=1"
     echo "[nanovllm_a5_ops] P7.1 source closure: c8=absent fixed_get_core=absent kvaf=staged simt=staged post_cq=present verified=1"
+fi
+
+# P8 is the forward-owned lifecycle executor, not a modification of C8 and
+# not a second P7.1 package.  The generated project is the compiler input, so
+# prove its exact host/kernel/tiling/KVAF closure here.  In particular, a
+# durable wave drain has to claim the GM record before rehydrating it; a build
+# that silently falls back to the old queue-local lifecycle is rejected before
+# any device compiler work begins.
+if [[ "${STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY}" == "1" ]]; then
+    P8_EXPECTED_OPDEF_SOURCE="${GENERATED}/op_host/a5_p8_forward_owned_executor.cpp"
+    P8_DEVICE_TILING_HEADER="${GENERATED}/op_kernel/a5_p8_forward_owned_executor_tiling.h"
+    P8_DEVICE_TILING_SOURCE="${GENERATED}/op_kernel/a5_p8_forward_owned_executor.cpp"
+    P8_ADVANCE_EXPECTED_OPDEF_SOURCE="${GENERATED}/op_host/a5_p8_forward_control_advance.cpp"
+    P8_ADVANCE_DEVICE_TILING_HEADER="${GENERATED}/op_kernel/a5_p8_forward_control_advance_tiling.h"
+    P8_ADVANCE_DEVICE_TILING_SOURCE="${GENERATED}/op_kernel/a5_p8_forward_control_advance.cpp"
+    if [[ ! -f "${P8_EXPECTED_OPDEF_SOURCE}" ]] || \
+       [[ ! -f "${P8_ADVANCE_EXPECTED_OPDEF_SOURCE}" ]] || \
+       ! cmp -s "${ROOT}/a5_p8_forward_owned_executor/op_host/a5_p8_forward_owned_executor.cpp" \
+                 "${P8_EXPECTED_OPDEF_SOURCE}" || \
+       ! cmp -s "${ROOT}/a5_p8_forward_owned_executor/op_kernel/a5_p8_forward_owned_executor.cpp" \
+                 "${P8_DEVICE_TILING_SOURCE}" || \
+       ! cmp -s "${ROOT}/a5_p8_forward_owned_executor/op_kernel/a5_p8_forward_owned_executor_tiling.h" \
+                 "${P8_DEVICE_TILING_HEADER}" || \
+       ! cmp -s "${ROOT}/a5_p8_forward_owned_executor/op_host/a5_p8_forward_control_advance.cpp" \
+                 "${P8_ADVANCE_EXPECTED_OPDEF_SOURCE}" || \
+       ! cmp -s "${ROOT}/a5_p8_forward_owned_executor/op_kernel/a5_p8_forward_control_advance.cpp" \
+                 "${P8_ADVANCE_DEVICE_TILING_SOURCE}" || \
+       ! cmp -s "${ROOT}/a5_p8_forward_owned_executor/op_kernel/a5_p8_forward_control_advance_tiling.h" \
+                 "${P8_ADVANCE_DEVICE_TILING_HEADER}"; then
+        echo "[nanovllm_a5_ops] ERROR: P8 checked-in forward-owned source did not survive the generated-project overlay." >&2
+        echo "[nanovllm_a5_ops] executor_host=${P8_EXPECTED_OPDEF_SOURCE} advance_host=${P8_ADVANCE_EXPECTED_OPDEF_SOURCE}" >&2
+        exit 1
+    fi
+
+    P8_OPDEF_SOURCES=()
+    while IFS= read -r -d '' P8_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5P8ForwardOwnedExecutor[[:space:]]*\)' \
+                "${P8_HOST_SOURCE}"; then
+            P8_OPDEF_SOURCES+=("${P8_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+    if [[ "${#P8_OPDEF_SOURCES[@]}" -ne 1 || \
+          "${P8_OPDEF_SOURCES[0]:-}" != "${P8_EXPECTED_OPDEF_SOURCE}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P8 requires exactly one A5P8ForwardOwnedExecutor OpDef from the checked-in host source; found ${#P8_OPDEF_SOURCES[@]}." >&2
+        printf '[nanovllm_a5_ops] P8 OpDef source: %s\n' \
+            "${P8_OPDEF_SOURCES[@]}" >&2
+        exit 1
+    fi
+    P8_ADVANCE_OPDEF_SOURCES=()
+    while IFS= read -r -d '' P8_ADVANCE_HOST_SOURCE; do
+        if grep -qE 'OP_ADD[[:space:]]*\([[:space:]]*A5P8ForwardControlAdvance[[:space:]]*\)' \
+                "${P8_ADVANCE_HOST_SOURCE}"; then
+            P8_ADVANCE_OPDEF_SOURCES+=("${P8_ADVANCE_HOST_SOURCE}")
+        fi
+    done < <(find "${GENERATED}/op_host" -type f \
+        \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print0)
+    if [[ "${#P8_ADVANCE_OPDEF_SOURCES[@]}" -ne 1 || \
+          "${P8_ADVANCE_OPDEF_SOURCES[0]:-}" != "${P8_ADVANCE_EXPECTED_OPDEF_SOURCE}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: P8 requires exactly one A5P8ForwardControlAdvance OpDef from the checked-in host source; found ${#P8_ADVANCE_OPDEF_SOURCES[@]}." >&2
+        printf '[nanovllm_a5_ops] P8 advance OpDef source: %s\n' \
+            "${P8_ADVANCE_OPDEF_SOURCES[@]}" >&2
+        exit 1
+    fi
+    if ! grep -q 'GetTilingData<' "${P8_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'A5P8ForwardOwnedExecutorTilingData' \
+               "${P8_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'struct A5P8ForwardOwnedExecutorTilingData' \
+               "${P8_DEVICE_TILING_HEADER}" || \
+       ! grep -q 'REGISTER_TILING_DEFAULT(A5P8ForwardOwnedExecutorTilingData)' \
+               "${P8_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P8 standard POD tiling closure did not survive the generated-project overlay." >&2
+        exit 1
+    fi
+    if ! grep -q 'GetTilingData<' "${P8_ADVANCE_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'A5P8ForwardControlAdvanceTilingData' \
+               "${P8_ADVANCE_EXPECTED_OPDEF_SOURCE}" || \
+       ! grep -q 'struct A5P8ForwardControlAdvanceTilingData' \
+               "${P8_ADVANCE_DEVICE_TILING_HEADER}" || \
+       ! grep -q 'REGISTER_TILING_DEFAULT(A5P8ForwardControlAdvanceTilingData)' \
+               "${P8_ADVANCE_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P8 graph-control advance tiling closure did not survive the generated-project overlay." >&2
+        exit 1
+    fi
+    for P8_REQUIRED_TOKEN in \
+        'LoadKvafP8ForwardControlFromGm' \
+        'TryAcquireKvafStreamingBatchGetQueueFromAicore' \
+        'PrepareKvafP8WavePostIntent' \
+        'PostKvafP8Wave' \
+        'TryClaimKvafP8WaveDrainFromAicore' \
+        'TryClaimKvafP8UnpostedWaveDrainFromAicore' \
+        'TryRetireKvafP8Wave' \
+        'FinishKvafP8Wave' \
+        'PublishKvafP8PrivateTerminalRecords' \
+        'ReleaseKvafP8WaveAfterPrivateReady' \
+        'ReleaseKvafP8PendingPrivateRecordAfterNoPost' \
+        'ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup' \
+        'ReleaseKvafP8PrivateRecordAfterQsfaTerminal' \
+        'MarkKvafP8ForwardAbortFromAicore' \
+        'QuarantineKvafP8WaveAtForwardTerminal' \
+        'QuarantineKvafP8PrivateAtForwardTerminal' \
+        'kA5P8PhaseForwardTerminal' \
+        'DataSyncBarrier<MemDsbT::DDR>' \
+        'KERNEL_TYPE_AIV_ONLY'; do
+        if ! grep -Fq "${P8_REQUIRED_TOKEN}" "${P8_DEVICE_TILING_SOURCE}"; then
+            echo "[nanovllm_a5_ops] ERROR: P8 generated forward-owned source closure misses ${P8_REQUIRED_TOKEN}." >&2
+            exit 1
+        fi
+    done
+    for P8_ADVANCE_REQUIRED_TOKEN in \
+        'P8ForwardControlAdvanceSimtService' \
+        'MarkKvafP8ForwardAbortFromAicore' \
+        'kKvafP8ForwardPhaseQsfaTerminal' \
+        'kKvafP8ForwardPhaseForwardTerminal' \
+        'KERNEL_TYPE_AIV_ONLY'; do
+        if ! grep -Fq "${P8_ADVANCE_REQUIRED_TOKEN}" "${P8_ADVANCE_DEVICE_TILING_SOURCE}"; then
+            echo "[nanovllm_a5_ops] ERROR: P8 graph-control advance source closure misses ${P8_ADVANCE_REQUIRED_TOKEN}." >&2
+            exit 1
+        fi
+    done
+    if grep -Fq 'ReleaseKvafP8UnpostedWave' "${P8_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P8 may not use the unposted-wave release path after durable PostOnly intent." >&2
+        exit 1
+    fi
+    if grep -Fq 'ClearP8PrivateMappingSimt' "${P8_DEVICE_TILING_SOURCE}" || \
+       grep -Fq 'MarkKvafP8ForwardAbort(' "${P8_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P8 generated source retained an unsafe local map-clear or non-atomic abort path." >&2
+        exit 1
+    fi
+    if grep -Fq 'KERNEL_TYPE_MIX_AIC_1_2' "${P8_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P8 must remain AIV_ONLY; MIX would reserve an unnecessary AIC lane." >&2
+        exit 1
+    fi
+    if grep -REn \
+        '#[[:space:]]*include[[:space:]]*[<"][^>"]*(quant_lightning|a5_streaming_quant|a5_official_c8|a5_score_receipt_speculative_executor)|\b(kGetLane|LI_CORE|GET_CORE|physical.*core)\b' \
+        "${P8_EXPECTED_OPDEF_SOURCE}" "${P8_DEVICE_TILING_HEADER}" \
+        "${P8_DEVICE_TILING_SOURCE}" "${P8_ADVANCE_EXPECTED_OPDEF_SOURCE}" \
+        "${P8_ADVANCE_DEVICE_TILING_HEADER}" "${P8_ADVANCE_DEVICE_TILING_SOURCE}"; then
+        echo "[nanovllm_a5_ops] ERROR: P8 generated source closure unexpectedly contains C8/P7 code or a fixed physical Get-core role." >&2
+        exit 1
+    fi
+    echo "[nanovllm_a5_ops] P8 host registration closure: executor=${P8_OPDEF_SOURCES[0]} advance=${P8_ADVANCE_EXPECTED_OPDEF_SOURCE} verified=1"
+    echo "[nanovllm_a5_ops] P8 source closure: c8=absent p7=absent fixed_get_core=absent kvaf_v2=staged atomic_abort=present qsfa_verified_release=present forward_terminal=present graph_phase_advance=present simt=staged dynamic_queue_lease=present verified=1"
 fi
 
 if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \

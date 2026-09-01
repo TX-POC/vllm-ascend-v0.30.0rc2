@@ -1,0 +1,69 @@
+[
+  {
+    "op": "A5P8ForwardOwnedExecutor",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "candidate_seeds", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_ready_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "candidate_status", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "forward_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "source_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_address_domain", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_source_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_object_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_ready_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_slot_cursor", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_packed_output", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+      {"name": "fused_get_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "p8_wave_records", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "p8_private_records", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "queue_request_source_offsets", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "queue_request_object_offsets", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "queue_request_output_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "queue_request_count", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_cursor", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_cursor_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "rows_per_entry", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "worker_stats", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+    ],
+    "output_desc": [
+      {"name": "forward_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "private_source_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_object_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_ready_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_slot_cursor", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "private_packed_output", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+      {"name": "fused_get_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "p8_wave_records", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "p8_private_records", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "queue_request_source_offsets", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "queue_request_object_offsets", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "queue_request_output_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "queue_request_count", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_cursor", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_cursor_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "worker_stats", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+    ],
+    "attr": []
+  },
+  {
+    "op": "A5P8ForwardControlAdvance",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "forward_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "expected_identity", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "transition_program", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "transition_result", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+    ],
+    "output_desc": [
+      {"name": "forward_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "transition_result", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+    ],
+    "attr": []
+  }
+]

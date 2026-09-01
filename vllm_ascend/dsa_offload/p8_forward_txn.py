@@ -14,7 +14,7 @@ There are two different lifetimes in the design:
   must stay stable while a graph is captured and replayed.
 * :class:`P8ForwardAsyncTxn` owns one forward's identity, host keepalive
   leases, and the legal transition through admission, DMA completion,
-  reconcile, QSFA reading, and release.
+  reconcile, QSFA reading, forward-terminal sweep, and release.
 
 The model is intentionally strict.  A stale CQ identity, timeout, or failed
 queue-release compare-and-swap is not treated as an ordinary retry.  The
@@ -47,9 +47,19 @@ class ForwardState(Enum):
     DRAINING = auto()
     RECONCILING = auto()
     QSFA_READING = auto()
+    FORWARD_TERMINAL = auto()
     RELEASED = auto()
     ABORTING = auto()
     FALLBACK_READY = auto()
+
+
+class ForwardPhase(Enum):
+    """Graph-visible control phase carried by the fixed P8 control row."""
+
+    ADMIT_POST = auto()
+    DRAIN = auto()
+    QSFA_TERMINAL = auto()
+    FORWARD_TERMINAL = auto()
 
 
 class QueueState(Enum):
@@ -59,10 +69,8 @@ class QueueState(Enum):
     FILLING = auto()
     POST_INTENT = auto()
     POSTED = auto()
-    CQ_OBSERVED = auto()
+    DRAIN_CLAIMED = auto()
     FINALIZED = auto()
-    PRIVATE_PUBLISHED = auto()
-    RELEASED = auto()
     QUARANTINED = auto()
 
 
@@ -84,6 +92,7 @@ class PrivateSlotState(Enum):
     READY = auto()
     FAILED = auto()
     QUARANTINED = auto()
+    RELEASE_CLAIMED = auto()
 
 
 @dataclass(frozen=True)
@@ -118,6 +127,11 @@ class CandidateRecord:
     producer: int | None = None
     owner: int | None = None
     private_slot: int | None = None
+    # These are the source/object-directory positions that point to the
+    # private output row.  They are installed while the row is PENDING and
+    # cleared by exact CAS only after QSFA's terminal reader.
+    source_offset: int | None = None
+    object_offset: int | None = None
     # A private slot comes from one global bounded arena, not from a queue's
     # fixed slice.  Its allocation generation prevents a stale candidate
     # record from being rebound merely because the same numerical slot was
@@ -147,6 +161,9 @@ class PrivateSlotRecord:
     queue_id: int | None = None
     queue_generation: int = 0
     post_sequence: int = 0
+    source_offset: int | None = None
+    object_offset: int | None = None
+    output_index: int = -1
 
 
 @dataclass
@@ -164,6 +181,14 @@ class P8WaveRecord:
     candidate_slots: tuple[int, ...] = ()
     private_slots: tuple[int, ...] = ()
     cq_success: bool | None = None
+    private_ready_published: bool = False
+    # A descriptor can leave POST_INTENT through exactly one durable outcome:
+    # either the doorbell was committed, or PostOnly proved that it was not.
+    # ``post_rejected`` is deliberately not inferred from ``cq_success``:
+    # a CQ result proves a committed post, while a rejected post has no CQ at
+    # all.  Keeping both facts makes the only safe early-cleanup path explicit.
+    post_committed: bool = False
+    post_rejected: bool = False
     quarantine_reason: str | None = None
 
 
@@ -186,6 +211,17 @@ class P8FixedResources:
     queues: list[P8WaveRecord] = field(init=False)
     candidates: list[CandidateRecord] = field(init=False)
     private_slots: list[PrivateSlotRecord] = field(init=False)
+    # The native executor owns two graph-stable int32 directories.  A model
+    # dictionary preserves the same crucial compare-and-swap contract without
+    # pretending that a Python object has device-memory concurrency.
+    private_source_to_slot: dict[int, int] = field(init=False, default_factory=dict)
+    private_object_to_slot: dict[int, int] = field(init=False, default_factory=dict)
+    private_ready: list[PrivateSlotState] = field(init=False)
+    # Forward-owned host/native handles are transferred here when a forward
+    # takes the quarantine/fallback exit.  Runtime teardown, not a detached
+    # transaction object, is then the explicit owner responsible for proving
+    # that it is safe to drop them.
+    quarantine_keepalives: set[str] = field(init=False, default_factory=set)
     _next_private_slot_hint: int = field(init=False, default=0, repr=False)
     active_txn: P8ForwardAsyncTxn | None = field(
         init=False,
@@ -208,6 +244,9 @@ class P8FixedResources:
         self.private_slots = [
             PrivateSlotRecord(slot_id=index)
             for index in range(self.private_slot_capacity)
+        ]
+        self.private_ready = [
+            PrivateSlotState.FREE for _ in range(self.private_slot_capacity)
         ]
 
     def claim_global_private_slot(
@@ -241,16 +280,20 @@ class P8FixedResources:
             private_slot.queue_id = None
             private_slot.queue_generation = 0
             private_slot.post_sequence = 0
+            private_slot.source_offset = None
+            private_slot.object_offset = None
+            private_slot.output_index = private_slot.slot_id
+            self.private_ready[slot_id] = PrivateSlotState.PENDING
             self._next_private_slot_hint = (slot_id + 1) % self.private_slot_capacity
             return private_slot
         return None
 
-    def release_global_private_slot(self, private_slot: PrivateSlotRecord) -> None:
-        """Return one proven-safe private slot to the global allocator.
+    def _commit_private_free(self, private_slot: PrivateSlotRecord) -> None:
+        """Commit an already-proven-safe private row back to ``FREE``.
 
-        Callers may use this only before PostOnly, after failed CQ handling,
-        or after the forward's QSFA terminal gate.  ``allocation_generation``
-        intentionally remains monotonic across reuse.
+        This is deliberately private to the fixed-resource owner.  Normal
+        callers must first pass through either the unposted rollback or the
+        QSFA-terminal ``RELEASE_CLAIMED -> map CAS clear -> FREE`` protocol.
         """
 
         if private_slot.state is PrivateSlotState.QUARANTINED:
@@ -265,6 +308,16 @@ class P8FixedResources:
         private_slot.queue_id = None
         private_slot.queue_generation = 0
         private_slot.post_sequence = 0
+        private_slot.source_offset = None
+        private_slot.object_offset = None
+        private_slot.output_index = -1
+        self.private_ready[private_slot.slot_id] = PrivateSlotState.FREE
+
+    def adopt_quarantine_keepalives(self, leases: set[str]) -> None:
+        """Transfer forward-owned keepalives to explicit teardown ownership."""
+
+        self.quarantine_keepalives.update(leases)
+        leases.clear()
 
     @property
     def has_quarantine(self) -> bool:
@@ -313,7 +366,7 @@ class P8FixedResources:
         """Reuse only records that were terminally released by a prior txn."""
 
         for queue in self.queues:
-            if queue.state not in {QueueState.FREE, QueueState.RELEASED}:
+            if queue.state is not QueueState.FREE:
                 raise P8LifecycleError(
                     "cannot reset non-terminal queue "
                     f"{queue.queue_id}: state={queue.state.name}"
@@ -326,6 +379,9 @@ class P8FixedResources:
             queue.candidate_slots = ()
             queue.private_slots = ()
             queue.cq_success = None
+            queue.private_ready_published = False
+            queue.post_committed = False
+            queue.post_rejected = False
             queue.quarantine_reason = None
 
         for candidate in self.candidates:
@@ -346,6 +402,8 @@ class P8FixedResources:
             candidate.owner = None
             candidate.private_slot = None
             candidate.private_allocation_generation = 0
+            candidate.source_offset = None
+            candidate.object_offset = None
 
         for private_slot in self.private_slots:
             if private_slot.state is not PrivateSlotState.FREE:
@@ -360,6 +418,16 @@ class P8FixedResources:
             private_slot.queue_id = None
             private_slot.queue_generation = 0
             private_slot.post_sequence = 0
+            private_slot.source_offset = None
+            private_slot.object_offset = None
+            private_slot.output_index = -1
+            self.private_ready[private_slot.slot_id] = PrivateSlotState.FREE
+
+        if self.private_source_to_slot or self.private_object_to_slot:
+            raise P8LifecycleError(
+                "cannot reset P8 resources while private directories still "
+                "point to a prior forward"
+            )
 
     def _detach(self, txn: P8ForwardAsyncTxn) -> None:
         if self.active_txn is not txn:
@@ -374,7 +442,8 @@ class P8ForwardAsyncTxn:
     A transaction never changes the persistent resident mapping.  It owns
     only speculative private slots and host keepalive leases.  The caller may
     release those leases only after all queue waves are terminal, all required
-    QSFA readers have passed, and the model-terminal operation was enqueued.
+    QSFA readers have passed, the model-terminal operation has been observed,
+    and the explicit forward-terminal sweep found no unresolved resource.
     """
 
     resources: P8FixedResources
@@ -382,9 +451,17 @@ class P8ForwardAsyncTxn:
     graph_generation: int
     expected_layers: int
     state: ForwardState = ForwardState.OPEN
+    phase: ForwardPhase = ForwardPhase.ADMIT_POST
     host_leases: set[str] = field(default_factory=set)
+    exact_winner_layers: set[int] = field(default_factory=set)
+    guaranteed_recall_layers: set[int] = field(default_factory=set)
     qsfa_terminal_layers: set[int] = field(default_factory=set)
     model_terminal_enqueued: bool = False
+    model_terminal_observed: bool = False
+    exact_input_ready: bool = False
+    qsfa_terminal_observed: bool = False
+    abort_latched: bool = False
+    forward_terminal_swept: bool = False
     abort_reason: str | None = None
 
     def retain_host_lease(self, lease_name: str) -> None:
@@ -406,6 +483,8 @@ class P8ForwardAsyncTxn:
         *,
         producer: int,
         layer_control_index: int,
+        source_offset: int | None = None,
+        object_offset: int | None = None,
     ) -> None:
         """Publish one already-compacted candidate into its fixed ring cell."""
 
@@ -421,6 +500,17 @@ class P8ForwardAsyncTxn:
         candidate.graph_generation = self.graph_generation
         candidate.layer_control_index = layer_control_index
         candidate.producer = producer
+        # The production CandidateSeed contains both offsets.  Keeping the
+        # default deterministic lets small lifecycle tests omit irrelevant
+        # score metadata while still exercising two independent directories.
+        candidate.source_offset = (
+            candidate_slot if source_offset is None else source_offset
+        )
+        candidate.object_offset = (
+            candidate_slot if object_offset is None else object_offset
+        )
+        if candidate.source_offset < 0 or candidate.object_offset < 0:
+            raise ValueError("CandidateSeed source/object offsets must be non-negative")
 
     def claim_candidate(self, candidate_slot: int, *, owner: int) -> None:
         """Claim a published seed before it can be put into a Get wave."""
@@ -545,6 +635,13 @@ class P8ForwardAsyncTxn:
             owner=owner,
         )
         if private_slot is not None:
+            if candidate.source_offset is None or candidate.object_offset is None:
+                raise P8LifecycleError(
+                    f"candidate {candidate_slot} has no source/object offsets"
+                )
+            private_slot.source_offset = candidate.source_offset
+            private_slot.object_offset = candidate.object_offset
+            self._publish_pending_private_mappings(private_slot)
             candidate.private_slot = private_slot.slot_id
             candidate.private_allocation_generation = private_slot.allocation_generation
             return private_slot.slot_id
@@ -569,7 +666,7 @@ class P8ForwardAsyncTxn:
         queue = self._queue(queue_id)
         if queue.state is QueueState.QUARANTINED:
             raise P8QuarantineError(f"queue {queue_id} is quarantined")
-        if queue.state not in {QueueState.FREE, QueueState.RELEASED}:
+        if queue.state is not QueueState.FREE:
             raise P8LifecycleError(
                 f"queue {queue_id} cannot be leased from {queue.state.name}"
             )
@@ -581,7 +678,16 @@ class P8ForwardAsyncTxn:
         queue.candidate_slots = ()
         queue.private_slots = ()
         queue.cq_success = None
+        queue.private_ready_published = False
+        queue.post_committed = False
+        queue.post_rejected = False
         queue.quarantine_reason = None
+        # Reserve a nonzero post sequence *before* descriptor/private-record
+        # binding.  PostOnly consumes this pre-reserved identity; it must not
+        # manufacture a new sequence after descriptor publication.
+        queue.post_sequence += 1
+        if queue.post_sequence <= 0:
+            raise P8LifecycleError("queue post sequence must be nonzero")
         queue.state = QueueState.FILLING
         return P8WaveIdentity(
             queue_id=queue_id,
@@ -589,9 +695,8 @@ class P8ForwardAsyncTxn:
             graph_generation=self.graph_generation,
             layer_control_index=layer_control_index,
             generation=queue.generation,
-            # ``post_sequence`` is monotonic for the physical queue.  A new
-            # lease starts from the prior value and PostOnly advances it,
-            # rather than resetting to zero when the queue is reused.
+            # ``post_sequence`` is monotonic for the physical queue and is
+            # reserved before private-record binding, not after the doorbell.
             post_sequence=queue.post_sequence,
             owner=owner,
         )
@@ -671,15 +776,17 @@ class P8ForwardAsyncTxn:
             private_record = self._private_slot(private_slot)
             private_record.queue_id = queue.queue_id
             private_record.queue_generation = queue.generation
+            private_record.post_sequence = lease.post_sequence
         queue.state = QueueState.POST_INTENT
 
     def post_only(self, lease: P8WaveIdentity) -> P8WaveIdentity:
         """Record the non-blocking doorbell transition and return CQ identity."""
 
         queue = self._validate_identity(lease, expected_state=QueueState.POST_INTENT)
-        queue.post_sequence += 1
-        for private_slot in queue.private_slots:
-            self._private_slot(private_slot).post_sequence = queue.post_sequence
+        if queue.post_sequence <= 0:
+            raise P8LifecycleError("PostOnly requires a reserved post sequence")
+        queue.post_committed = True
+        queue.post_rejected = False
         queue.state = QueueState.POSTED
         return P8WaveIdentity(
             queue_id=queue.queue_id,
@@ -691,14 +798,132 @@ class P8ForwardAsyncTxn:
             owner=lease.owner,
         )
 
+    def record_post_rejected(self, lease: P8WaveIdentity) -> P8WaveIdentity:
+        """Record a deterministic PostOnly rejection with no doorbell.
+
+        This is intentionally the *only* exception to the normal rule that a
+        queue-bound PENDING private row cannot be released before CQ.  The
+        native PostOnly implementation reaches this result only after it has
+        proved that the descriptor was rejected before a doorbell could be
+        issued.  ``POST_INTENT`` itself is still ambiguous and must use the
+        timeout/quarantine path.
+        """
+
+        queue = self._validate_identity(lease, expected_state=QueueState.POST_INTENT)
+        if queue.post_sequence <= 0:
+            raise P8LifecycleError("POST_REJECTED requires a reserved post sequence")
+        queue.post_committed = False
+        queue.post_rejected = True
+        # No CQ exists for this outcome.  FINALIZED stores the durable
+        # terminal outcome until a dynamic DRAIN worker claims exact cleanup.
+        queue.cq_success = None
+        queue.state = QueueState.FINALIZED
+        return P8WaveIdentity(
+            queue_id=queue.queue_id,
+            epoch=self.epoch,
+            graph_generation=self.graph_generation,
+            layer_control_index=queue.layer_control_index,
+            generation=queue.generation,
+            post_sequence=queue.post_sequence,
+            owner=lease.owner,
+        )
+
+    def try_claim_drain(self, wave: P8WaveIdentity) -> bool:
+        """Dynamically claim one durable POSTED wave without spinning.
+
+        This models the AIV CAS ``POSTED -> DRAIN_CLAIMED``.  A losing worker
+        simply returns ``False`` and continues score work; it must not probe,
+        finish or release a wave claimed by another worker.
+        """
+
+        queue = self._validate_identity(
+            wave,
+            expected_state=(QueueState.POSTED, QueueState.DRAIN_CLAIMED),
+        )
+        if not queue.post_committed or queue.post_rejected:
+            self._quarantine_queue(
+                queue,
+                "POSTED wave lacks an unambiguous committed-doorbell proof",
+            )
+            raise P8QuarantineError(
+                f"queue {queue.queue_id} quarantined after post-proof mismatch"
+            )
+        if queue.state is QueueState.DRAIN_CLAIMED:
+            return False
+        queue.state = QueueState.DRAIN_CLAIMED
+        return True
+
+    def try_claim_post_rejected_drain(self, wave: P8WaveIdentity) -> bool:
+        """CAS-claim a proved-no-doorbell wave for PENDING-private cleanup.
+
+        ``FINALIZED -> DRAIN_CLAIMED`` is a distinct dynamic DRAIN claim from
+        ``POSTED -> DRAIN_CLAIMED``: it never polls CQ.  It is legal only if
+        the durable record proves that no doorbell was committed.  Any stale
+        identity or contradictory record is fail-closed rather than guessed
+        free.
+        """
+
+        try:
+            queue = self._validate_identity(
+                wave,
+                expected_state=(QueueState.FINALIZED, QueueState.DRAIN_CLAIMED),
+            )
+            if (
+                not queue.post_rejected
+                or queue.post_committed
+                or queue.cq_success is not None
+                or queue.private_ready_published
+            ):
+                raise P8LifecycleError(
+                    "POST_REJECTED no-doorbell proof is missing or contradictory"
+                )
+        except P8LifecycleError as error:
+            queue = self._queue(wave.queue_id)
+            self._quarantine_queue(
+                queue,
+                f"POST_REJECTED drain proof/identity failure: {error}",
+            )
+            raise P8QuarantineError(
+                f"queue {wave.queue_id} quarantined after POST_REJECTED proof mismatch"
+            ) from error
+        if queue.state is QueueState.DRAIN_CLAIMED:
+            return False
+        queue.state = QueueState.DRAIN_CLAIMED
+        return True
+
+    def leave_drain_pending(self, wave: P8WaveIdentity) -> None:
+        """Return a claimed wave to POSTED when a nonblocking CQ poll is empty."""
+
+        queue = self._validate_identity(
+            wave,
+            expected_state=QueueState.DRAIN_CLAIMED,
+        )
+        if queue.cq_success is not None:
+            raise P8LifecycleError(
+                "cannot return a CQ-terminal wave to POSTED"
+            )
+        if not queue.post_committed or queue.post_rejected:
+            self._quarantine_queue(
+                queue,
+                "only a committed doorbell may return from DRAIN to POSTED",
+            )
+            raise P8QuarantineError(
+                f"queue {queue.queue_id} quarantined after invalid DRAIN return"
+            )
+        queue.state = QueueState.POSTED
+
     def observe_cq(self, wave: P8WaveIdentity, *, succeeded: bool) -> None:
         """Observe one terminal CQE without publishing the private view yet."""
 
         try:
             queue = self._validate_identity(
                 wave,
-                expected_state=QueueState.POSTED,
+                expected_state=QueueState.DRAIN_CLAIMED,
             )
+            if not queue.post_committed or queue.post_rejected:
+                raise P8LifecycleError(
+                    "CQ observation requires a committed PostOnly doorbell"
+                )
         except P8LifecycleError as error:
             queue = self._queue(wave.queue_id)
             self._quarantine_queue(queue, f"CQ identity failure: {error}")
@@ -706,20 +931,21 @@ class P8ForwardAsyncTxn:
                 f"queue {wave.queue_id} quarantined after CQ identity failure"
             ) from error
         queue.cq_success = bool(succeeded)
-        queue.state = QueueState.CQ_OBSERVED
 
     def finalize_wave(self, wave: P8WaveIdentity) -> None:
         """Finish CQ handling; success still needs explicit private publication."""
 
-        queue = self._validate_identity(wave, expected_state=QueueState.CQ_OBSERVED)
+        queue = self._validate_identity(wave, expected_state=QueueState.DRAIN_CLAIMED)
         if queue.cq_success is None:
-            raise P8LifecycleError("CQ_OBSERVED wave has no success result")
-        if not queue.cq_success:
-            for candidate_slot in queue.candidate_slots:
-                candidate = self._candidate(candidate_slot)
-                candidate.state = CandidateState.DEFERRED
-                self._free_candidate_private_slot(candidate, failed=True)
+            raise P8LifecycleError("DRAIN_CLAIMED wave has no CQ terminal result")
         queue.state = QueueState.FINALIZED
+
+        # ``PublishKvafP8PrivateTerminalRecords`` runs for both CQ success
+        # and observed CQ error.  A failed row remains mapped and marked
+        # FAILED until QSFA terminal clears both directories; exact recall,
+        # not early reuse, supplies the mathematical fallback.
+        if not queue.cq_success:
+            self._publish_private_terminal_records(queue, payload_ready=False)
 
     def publish_private(self, wave: P8WaveIdentity) -> None:
         """Make successful H2D payloads visible to private QSFA reconciliation."""
@@ -729,32 +955,16 @@ class P8ForwardAsyncTxn:
             raise P8LifecycleError(
                 "failed CQ cannot publish private payload; use exact recall"
             )
-        for candidate_slot in queue.candidate_slots:
-            candidate = self._candidate(candidate_slot)
-            private_slot = self._private_slot(candidate.private_slot)
-            if private_slot.state is not PrivateSlotState.PENDING:
-                raise P8LifecycleError(
-                    f"private slot {private_slot.slot_id} cannot publish from "
-                    f"{private_slot.state.name}"
-                )
-            try:
-                self._validate_private_slot_identity(
-                    candidate,
-                    private_slot,
-                    queue,
-                    wave,
-                )
-            except P8LifecycleError as error:
-                self._quarantine_queue(
-                    queue,
-                    f"private-slot identity failure: {error}",
-                )
-                raise P8QuarantineError(
-                    "private slot identity mismatch prevents publication"
-                ) from error
-            private_slot.state = PrivateSlotState.READY
-            candidate.state = CandidateState.CONSUMED
-        queue.state = QueueState.PRIVATE_PUBLISHED
+        try:
+            self._publish_private_terminal_records(queue, payload_ready=True)
+        except P8LifecycleError as error:
+            self._quarantine_queue(
+                queue,
+                f"private-slot identity failure: {error}",
+            )
+            raise P8QuarantineError(
+                "private slot identity mismatch prevents publication"
+            ) from error
 
     def release_queue(self, wave: P8WaveIdentity) -> None:
         """Release a terminal queue only if its epoch/generation CAS matches.
@@ -767,7 +977,7 @@ class P8ForwardAsyncTxn:
         try:
             queue = self._validate_identity(
                 wave,
-                expected_state=(QueueState.FINALIZED, QueueState.PRIVATE_PUBLISHED),
+                expected_state=QueueState.FINALIZED,
             )
         except P8LifecycleError as error:
             queue = self._queue(wave.queue_id)
@@ -775,15 +985,104 @@ class P8ForwardAsyncTxn:
             raise P8QuarantineError(
                 f"queue {wave.queue_id} quarantined after release failure"
             ) from error
-        if queue.state is QueueState.FINALIZED and queue.cq_success:
+        if not queue.post_committed or queue.post_rejected:
             self._quarantine_queue(
                 queue,
-                "successful CQ finalized without private READY publication",
+                "normal queue release received a non-committed PostOnly outcome",
             )
             raise P8QuarantineError(
-                f"queue {queue.queue_id} quarantined: successful CQ not published"
+                f"queue {queue.queue_id} quarantined: POST_REJECTED needs DRAIN cleanup"
             )
-        queue.state = QueueState.RELEASED
+        if not queue.private_ready_published:
+            self._quarantine_queue(
+                queue,
+                "CQ-finalized wave lacks private READY/FAILED publication",
+            )
+            raise P8QuarantineError(
+                f"queue {queue.queue_id} quarantined: private terminal not published"
+            )
+        queue.state = QueueState.FREE
+
+    def cleanup_post_rejected_wave(self, wave: P8WaveIdentity) -> None:
+        """Return a proved-unposted wave after exact PENDING-map cleanup.
+
+        The state sequence is ``FINALIZED -> DRAIN_CLAIMED -> FREE``.  Each
+        private row follows ``PENDING -> map CAS clear -> FREE``; it never
+        becomes QSFA-visible.  The first stale identity/mapping invalidates
+        the no-post proof for safe reuse, so the remaining durable resources
+        are quarantined and the forward aborts.
+        """
+
+        try:
+            queue = self._validate_identity(
+                wave,
+                expected_state=QueueState.DRAIN_CLAIMED,
+            )
+            if (
+                not queue.post_rejected
+                or queue.post_committed
+                or queue.cq_success is not None
+                or queue.private_ready_published
+            ):
+                raise P8LifecycleError(
+                    "POST_REJECTED cleanup lacks an exact no-doorbell proof"
+                )
+            if len(queue.candidate_slots) != len(queue.private_slots):
+                raise P8LifecycleError(
+                    "POST_REJECTED wave candidate/private cardinality mismatch"
+                )
+            for candidate_slot, private_slot_id in zip(
+                queue.candidate_slots,
+                queue.private_slots,
+            ):
+                candidate = self._candidate(candidate_slot)
+                private_slot = self._private_slot(private_slot_id)
+                self._require_candidate_identity(candidate)
+                self._validate_private_slot_identity(
+                    candidate,
+                    private_slot,
+                    queue,
+                    wave,
+                )
+                if candidate.state is not CandidateState.CLAIMED:
+                    raise P8LifecycleError(
+                        f"POST_REJECTED candidate {candidate.slot_id} is "
+                        f"{candidate.state.name}, not CLAIMED"
+                    )
+                if private_slot.state is not PrivateSlotState.PENDING:
+                    raise P8LifecycleError(
+                        f"POST_REJECTED private slot {private_slot.slot_id} is "
+                        f"{private_slot.state.name}, not PENDING"
+                    )
+                if (
+                    self.resources.private_ready[private_slot.slot_id]
+                    is not PrivateSlotState.PENDING
+                ):
+                    raise P8LifecycleError(
+                        "POST_REJECTED private slot "
+                        f"{private_slot.slot_id} readiness mismatch"
+                    )
+                if not self._clear_private_mappings_exact(private_slot):
+                    raise P8LifecycleError(
+                        f"POST_REJECTED private slot {private_slot.slot_id} "
+                        "mapping-clear mismatch"
+                    )
+                # The map clear is the ownership handoff.  Only after it
+                # succeeds is it safe to return the absolute private slot.
+                self.resources._commit_private_free(private_slot)
+                candidate.private_slot = None
+                candidate.private_allocation_generation = 0
+                candidate.state = CandidateState.DEFERRED
+            queue.state = QueueState.FREE
+        except P8LifecycleError as error:
+            queue = self._queue(wave.queue_id)
+            self._quarantine_queue(
+                queue,
+                f"POST_REJECTED pending-private cleanup failure: {error}",
+            )
+            raise P8QuarantineError(
+                f"queue {wave.queue_id} quarantined after POST_REJECTED cleanup failure"
+            ) from error
 
     def timeout_queue(self, wave: P8WaveIdentity, *, reason: str) -> None:
         """Fail closed when a PostOnly wave cannot prove terminal CQ state.
@@ -802,7 +1101,7 @@ class P8ForwardAsyncTxn:
                     QueueState.FILLING,
                     QueueState.POST_INTENT,
                     QueueState.POSTED,
-                    QueueState.CQ_OBSERVED,
+                    QueueState.DRAIN_CLAIMED,
                 ),
             )
         except P8LifecycleError as error:
@@ -824,6 +1123,7 @@ class P8ForwardAsyncTxn:
         """Drain all published/posted work without accepting new seeds."""
 
         self._transition(ForwardState.SEALED, ForwardState.DRAINING)
+        self.phase = ForwardPhase.DRAIN
 
     def begin_reconcile(self) -> None:
         """Enter exact Top-K reconcile only after every speculative wave ends."""
@@ -838,7 +1138,37 @@ class P8ForwardAsyncTxn:
     def begin_qsfa_reading(self) -> None:
         """Declare that QSFA may consume the reconciled private view."""
 
-        self._transition(ForwardState.RECONCILING, ForwardState.QSFA_READING)
+        self._require_state(ForwardState.RECONCILING)
+        missing_exact = self._missing_layers(self.exact_winner_layers)
+        missing_recall = self._missing_layers(self.guaranteed_recall_layers)
+        if missing_exact or missing_recall:
+            raise P8LifecycleError(
+                "cannot begin QSFA before exact winner and GuaranteedRecall "
+                f"are terminal: exact_missing={missing_exact} "
+                f"recall_missing={missing_recall}"
+            )
+        self.exact_input_ready = True
+        self.phase = ForwardPhase.QSFA_TERMINAL
+        self.state = ForwardState.QSFA_READING
+
+    def mark_exact_winners_confirmed(self, layer_id: int) -> None:
+        """Record exact Top-K completion for one layer after all score tiles."""
+
+        self._require_state(ForwardState.RECONCILING)
+        self._validate_layer_control_index(layer_id)
+        self.exact_winner_layers.add(layer_id)
+
+    def mark_guaranteed_recall_terminal(self, layer_id: int) -> None:
+        """Record the final exact miss-fill/readiness gate for one layer."""
+
+        self._require_state(ForwardState.RECONCILING)
+        self._validate_layer_control_index(layer_id)
+        if layer_id not in self.exact_winner_layers:
+            raise P8LifecycleError(
+                "GuaranteedRecall cannot be terminal before exact winner "
+                f"confirmation for layer {layer_id}"
+            )
+        self.guaranteed_recall_layers.add(layer_id)
 
     def mark_qsfa_terminal(self, layer_id: int) -> None:
         """Record one same-stream QSFA last-reader terminal operation."""
@@ -848,7 +1178,19 @@ class P8ForwardAsyncTxn:
             raise ValueError(
                 f"layer_id {layer_id} is outside [0,{self.expected_layers})"
             )
+        if layer_id in self.qsfa_terminal_layers:
+            raise P8LifecycleError(
+                f"QSFA terminal was already recorded for layer {layer_id}"
+            )
         self.qsfa_terminal_layers.add(layer_id)
+        self.qsfa_terminal_observed = True
+        # QSFA terminal is the last reader of this layer's private physical
+        # slots.  Release those slots now, rather than artificially holding
+        # the global private arena until an unrelated later layer/model event.
+        # The forward's model-terminal event still owns host/native handles
+        # and transaction destruction; it is not a substitute for a layer's
+        # payload-reader proof.
+        self._release_layer_private_slots_after_qsfa_terminal(layer_id)
 
     def mark_model_terminal_enqueued(self) -> None:
         """Record an event after all graph-side QSFA terminal ops were queued."""
@@ -861,31 +1203,101 @@ class P8ForwardAsyncTxn:
             )
         self.model_terminal_enqueued = True
 
-    def release(self) -> None:
-        """Release host leases and private slots after the forward terminal event."""
+    def mark_model_terminal_observed(self) -> None:
+        """Record completion of the model-terminal event before reuse/free."""
 
         self._require_state(ForwardState.QSFA_READING)
         if not self.model_terminal_enqueued:
             raise P8LifecycleError(
+                "model terminal cannot be observed before it is enqueued"
+            )
+        self.model_terminal_observed = True
+
+    def enter_forward_terminal(self) -> None:
+        """Close P8 admission and sweep unresolved durable resources.
+
+        This is a *fail-closed* phase, not a second drain loop.  A normal
+        forward may enter only after every QSFA reader and the model terminal
+        have completed.  An aborting forward may enter earlier, but every
+        non-free queue/private row belonging to the forward is quarantined;
+        it is never guessed free merely because a Python-side callback ended.
+        """
+
+        if self.state is ForwardState.QSFA_READING:
+            if len(self.qsfa_terminal_layers) != self.expected_layers:
+                raise P8LifecycleError(
+                    "forward terminal requires every QSFA last-reader terminal"
+                )
+            if not self.model_terminal_observed:
+                raise P8LifecycleError(
+                    "forward terminal requires observed model terminal"
+                )
+        elif self.state is not ForwardState.ABORTING:
+            raise P8LifecycleError(
+                "forward terminal is legal only after normal QSFA/model terminal "
+                "or from an aborting forward"
+            )
+
+        self.phase = ForwardPhase.FORWARD_TERMINAL
+        self._forward_terminal_sweep()
+        self.forward_terminal_swept = True
+        self.state = ForwardState.FORWARD_TERMINAL
+
+    def release(self) -> None:
+        """Release host/native ownership after the forward terminal event."""
+
+        self._require_state(ForwardState.FORWARD_TERMINAL)
+        if self.abort_latched:
+            raise P8LifecycleError(
+                "aborting forward must route to fallback, not normal release"
+            )
+        if not self.model_terminal_enqueued:
+            raise P8LifecycleError(
                 "cannot release P8 transaction before model terminal is enqueued"
+            )
+        if not self.model_terminal_observed:
+            raise P8LifecycleError(
+                "cannot release P8 transaction before model terminal is observed"
             )
         if len(self.qsfa_terminal_layers) != self.expected_layers:
             raise P8LifecycleError("cannot release before every QSFA reader is terminal")
+        if not self.forward_terminal_swept:
+            raise P8LifecycleError("cannot release before forward-terminal sweep")
         if not self._all_queues_released():
             raise P8LifecycleError("cannot release while a queue is still active")
-        for private_slot in self.resources.private_slots:
-            if private_slot.state in {PrivateSlotState.PENDING, PrivateSlotState.READY, PrivateSlotState.FAILED}:
-                self.resources.release_global_private_slot(private_slot)
+        unresolved_private = [
+            slot.slot_id
+            for slot in self.resources.private_slots
+            if slot.state in {
+                PrivateSlotState.PENDING,
+                PrivateSlotState.READY,
+                PrivateSlotState.FAILED,
+            }
+        ]
+        if unresolved_private:
+            raise P8LifecycleError(
+                "cannot release forward while a layer has not reported its "
+                f"QSFA terminal: private_slots={unresolved_private}"
+            )
         self.host_leases.clear()
         self.state = ForwardState.RELEASED
         self.resources._detach(self)
 
     def abort(self, reason: str) -> None:
-        """Enter fail-closed abort; callers must then drain or quarantine waves."""
+        """Latch a monotonic fail-closed abort bit for this forward.
+
+        Multiple dynamic workers may discover faults.  The first reason is
+        retained for diagnosis; later failures cannot clear, overwrite or
+        reopen the forward.  Resource recovery remains the explicit
+        forward-terminal sweep.
+        """
 
         self._require_not_terminal()
         if not reason:
             raise ValueError("abort reason must be non-empty")
+        if self.abort_latched:
+            return
+        self.abort_latched = True
         self.abort_reason = reason
         self.state = ForwardState.ABORTING
 
@@ -897,11 +1309,17 @@ class P8ForwardAsyncTxn:
         device writer has stopped.
         """
 
-        self._require_state(ForwardState.ABORTING)
+        self._require_state(ForwardState.FORWARD_TERMINAL)
+        if not self.abort_latched:
+            raise P8LifecycleError(
+                "normal forward must release instead of entering fallback"
+            )
+        if not self.forward_terminal_swept:
+            raise P8LifecycleError("fallback requires forward-terminal sweep")
         active = [
             queue.queue_id
             for queue in self.resources.queues
-            if queue.state not in {QueueState.FREE, QueueState.RELEASED, QueueState.QUARANTINED}
+            if queue.state not in {QueueState.FREE, QueueState.QUARANTINED}
         ]
         if active:
             raise P8LifecycleError(
@@ -932,6 +1350,7 @@ class P8ForwardAsyncTxn:
                 f"{unresolved_private}"
             )
         self.state = ForwardState.FALLBACK_READY
+        self.resources.adopt_quarantine_keepalives(self.host_leases)
         self.resources._detach(self)
 
     def _transition(self, expected: ForwardState, target: ForwardState) -> None:
@@ -1045,13 +1464,224 @@ class P8ForwardAsyncTxn:
         if private_slot.state is PrivateSlotState.PENDING:
             if failed:
                 private_slot.state = PrivateSlotState.FAILED
-                private_slot.queue_id = None
-                private_slot.queue_generation = 0
-                private_slot.post_sequence = 0
+                self.resources.private_ready[private_slot.slot_id] = (
+                    PrivateSlotState.FAILED
+                )
             else:
-                self.resources.release_global_private_slot(private_slot)
-        candidate.private_slot = None
-        candidate.private_allocation_generation = 0
+                self._rollback_unposted_private_claim(private_slot)
+        if not failed:
+            candidate.private_slot = None
+            candidate.private_allocation_generation = 0
+
+    def _publish_pending_private_mappings(
+        self, private_slot: PrivateSlotRecord
+    ) -> None:
+        """Publish both PENDING directory entries before descriptor creation.
+
+        The native claim does this with a ``-2`` transient marker and two
+        CASes.  In this deterministic model the all-or-nothing precondition
+        captures the same ownership rule: a candidate never adopts a stale
+        source/object entry, and a partial publication is quarantined.
+        """
+
+        if (
+            private_slot.state is not PrivateSlotState.PENDING
+            or private_slot.source_offset is None
+            or private_slot.object_offset is None
+            or private_slot.output_index < 0
+        ):
+            self._quarantine_private(
+                private_slot,
+                "invalid private row before source/object publication",
+            )
+            raise P8QuarantineError(
+                f"private slot {private_slot.slot_id} cannot publish mappings"
+            )
+        source = private_slot.source_offset
+        obj = private_slot.object_offset
+        if (
+            source in self.resources.private_source_to_slot
+            or obj in self.resources.private_object_to_slot
+        ):
+            self._quarantine_private(
+                private_slot,
+                "source/object mapping was already owned",
+            )
+            raise P8QuarantineError(
+                f"private slot {private_slot.slot_id} mapping claim failed"
+            )
+        self.resources.private_source_to_slot[source] = private_slot.output_index
+        self.resources.private_object_to_slot[obj] = private_slot.output_index
+
+    def _clear_private_mappings_exact(
+        self, private_slot: PrivateSlotRecord
+    ) -> bool:
+        """Model the ordered exact-CAS mapping clear used at QSFA terminal."""
+
+        source = private_slot.source_offset
+        obj = private_slot.object_offset
+        output_index = private_slot.output_index
+        if source is None or obj is None or output_index < 0:
+            return False
+        if self.resources.private_source_to_slot.get(source) != output_index:
+            return False
+        # Preserve the native failure semantics: if object CAS fails after a
+        # successful source CAS, do not try to compensate.  The row is later
+        # quarantined, never reused.
+        del self.resources.private_source_to_slot[source]
+        if self.resources.private_object_to_slot.get(obj) != output_index:
+            return False
+        del self.resources.private_object_to_slot[obj]
+        return True
+
+    def _rollback_unposted_private_claim(
+        self, private_slot: PrivateSlotRecord
+    ) -> None:
+        """Rollback only a PENDING row that never acquired a queue binding."""
+
+        if (
+            private_slot.state is not PrivateSlotState.PENDING
+            or private_slot.queue_id is not None
+        ):
+            raise P8LifecycleError(
+                "only an unposted PENDING private claim may be rolled back"
+            )
+        if not self._clear_private_mappings_exact(private_slot):
+            self._quarantine_private(
+                private_slot,
+                "unposted private mapping rollback CAS failed",
+            )
+            raise P8QuarantineError(
+                f"private slot {private_slot.slot_id} rollback mapping mismatch"
+            )
+        self.resources._commit_private_free(private_slot)
+
+    def _publish_private_terminal_records(
+        self,
+        queue: P8WaveRecord,
+        *,
+        payload_ready: bool,
+    ) -> None:
+        """Publish READY/FAILED for every CQ-terminal row of one wave."""
+
+        if queue.state is not QueueState.FINALIZED:
+            raise P8LifecycleError("private terminal publication requires FINALIZED")
+        if queue.private_ready_published:
+            raise P8LifecycleError("private terminal records were already published")
+        for candidate_slot in queue.candidate_slots:
+            candidate = self._candidate(candidate_slot)
+            private_slot = self._private_slot(candidate.private_slot)
+            self._validate_private_slot_identity(
+                candidate,
+                private_slot,
+                queue,
+                P8WaveIdentity(
+                    queue_id=queue.queue_id,
+                    epoch=self.epoch,
+                    graph_generation=self.graph_generation,
+                    layer_control_index=queue.layer_control_index,
+                    generation=queue.generation,
+                    post_sequence=queue.post_sequence,
+                    owner=queue.owner if queue.owner is not None else -1,
+                ),
+            )
+            if private_slot.state is not PrivateSlotState.PENDING:
+                raise P8LifecycleError(
+                    f"private slot {private_slot.slot_id} cannot publish from "
+                    f"{private_slot.state.name}"
+                )
+            private_slot.state = (
+                PrivateSlotState.READY if payload_ready else PrivateSlotState.FAILED
+            )
+            self.resources.private_ready[private_slot.slot_id] = private_slot.state
+            candidate.state = (
+                CandidateState.CONSUMED if payload_ready else CandidateState.DEFERRED
+            )
+        queue.private_ready_published = True
+
+    def _release_layer_private_slots_after_qsfa_terminal(
+        self, layer_id: int
+    ) -> None:
+        """Return only this layer's proven last-read private payloads.
+
+        Queue reuse is already allowed at CQ terminal.  This is the separate
+        global-private-arena reuse boundary: exactly the matching layer's
+        READY/FAILED rows become free after its QSFA terminal, while another
+        layer's payload remains protected.
+        """
+
+        private_slots = [
+            private_slot
+            for private_slot in self.resources.private_slots
+            if private_slot.epoch == self.epoch
+            and private_slot.graph_generation == self.graph_generation
+            and private_slot.layer_control_index == layer_id
+        ]
+        for private_slot in private_slots:
+            if private_slot.state in {
+                PrivateSlotState.PENDING,
+                PrivateSlotState.QUARANTINED,
+                PrivateSlotState.RELEASE_CLAIMED,
+            }:
+                raise P8LifecycleError(
+                    "QSFA terminal cannot release non-terminal private slot "
+                    f"{private_slot.slot_id}: state={private_slot.state.name}"
+                )
+            if private_slot.state in {
+                PrivateSlotState.READY,
+                PrivateSlotState.FAILED,
+            }:
+                self._release_private_after_qsfa_terminal(private_slot)
+
+        for candidate in self.resources.candidates:
+            if (
+                candidate.epoch == self.epoch
+                and candidate.graph_generation == self.graph_generation
+                and candidate.layer_control_index == layer_id
+            ):
+                candidate.private_slot = None
+                candidate.private_allocation_generation = 0
+
+    def _release_private_after_qsfa_terminal(
+        self, private_slot: PrivateSlotRecord
+    ) -> None:
+        """Perform ``READY/FAILED -> CLAIMED -> map clear -> FREE`` exactly."""
+
+        if (
+            self.phase is not ForwardPhase.QSFA_TERMINAL
+            or not self.exact_input_ready
+            or not self.qsfa_terminal_observed
+            or private_slot.state
+            not in {PrivateSlotState.READY, PrivateSlotState.FAILED}
+        ):
+            self._quarantine_private(
+                private_slot,
+                "QSFA terminal private-release control validation failed",
+            )
+            raise P8QuarantineError(
+                f"private slot {private_slot.slot_id} cannot enter release claim"
+            )
+        original_state = private_slot.state
+        if self.resources.private_ready[private_slot.slot_id] is not original_state:
+            self._quarantine_private(
+                private_slot,
+                "private-ready table differs from private record",
+            )
+            raise P8QuarantineError(
+                f"private slot {private_slot.slot_id} readiness mismatch"
+            )
+        private_slot.state = PrivateSlotState.RELEASE_CLAIMED
+        if not self._clear_private_mappings_exact(private_slot):
+            self._quarantine_private(
+                private_slot,
+                "private source/object mapping CAS clear failed",
+            )
+            raise P8QuarantineError(
+                f"private slot {private_slot.slot_id} mapping-clear mismatch"
+            )
+        # The mapping disappearance becomes visible before the final free.
+        self.resources.private_ready[private_slot.slot_id] = PrivateSlotState.FREE
+        self.resources._commit_private_free(private_slot)
 
     def _validate_private_slot_identity(
         self,
@@ -1097,9 +1727,85 @@ class P8ForwardAsyncTxn:
             candidate.state = CandidateState.DEFERRED
             if candidate.private_slot is not None:
                 private_slot = self._private_slot(candidate.private_slot)
-                private_slot.state = PrivateSlotState.QUARANTINED
-        self.abort_reason = reason
-        self.state = ForwardState.ABORTING
+                self._quarantine_private(private_slot, reason, latch_abort=False)
+        self._latch_abort(reason)
+        self.resources.adopt_quarantine_keepalives(self.host_leases)
+
+    def _quarantine_private(
+        self,
+        private_slot: PrivateSlotRecord,
+        reason: str,
+        *,
+        latch_abort: bool = True,
+    ) -> None:
+        """Make a private row permanently unavailable to this runtime arena."""
+
+        private_slot.state = PrivateSlotState.QUARANTINED
+        self.resources.private_ready[private_slot.slot_id] = (
+            PrivateSlotState.QUARANTINED
+        )
+        if latch_abort:
+            self._latch_abort(reason)
+
+    def _latch_abort(self, reason: str) -> None:
+        """Model the native sticky ABORT|PRIVATE_VIEW_DISABLED CAS."""
+
+        if not self.abort_latched:
+            self.abort_latched = True
+            self.abort_reason = reason
+        # A later worker may retain a more precise local diagnostic, but it
+        # must never re-open the forward or replace the first durable reason.
+        if self.state not in {
+            ForwardState.FORWARD_TERMINAL,
+            ForwardState.RELEASED,
+            ForwardState.FALLBACK_READY,
+        }:
+            self.state = ForwardState.ABORTING
+
+    def _forward_terminal_sweep(self) -> None:
+        """Quarantine unresolved records owned by this exact forward only."""
+
+        for queue in self.resources.queues:
+            if (
+                queue.epoch != self.epoch
+                or queue.graph_generation != self.graph_generation
+            ):
+                continue
+            if queue.state is not QueueState.FREE:
+                self._quarantine_queue(
+                    queue,
+                    "forward-terminal found an unresolved queue wave",
+                )
+
+        for private_slot in self.resources.private_slots:
+            if (
+                private_slot.epoch != self.epoch
+                or private_slot.graph_generation != self.graph_generation
+            ):
+                continue
+            if private_slot.state is not PrivateSlotState.FREE:
+                self._quarantine_private(
+                    private_slot,
+                    "forward-terminal found an unresolved private slot",
+                )
+
+        for candidate in self.resources.candidates:
+            if (
+                candidate.epoch == self.epoch
+                and candidate.graph_generation == self.graph_generation
+                and candidate.state in {CandidateState.PUBLISHED, CandidateState.CLAIMED}
+            ):
+                candidate.state = CandidateState.DEFERRED
+
+    def _all_queues_released(self) -> bool:
+        return all(queue.state is QueueState.FREE for queue in self.resources.queues)
+
+    def _missing_layers(self, completed_layers: set[int]) -> list[int]:
+        return [
+            layer_id
+            for layer_id in range(self.expected_layers)
+            if layer_id not in completed_layers
+        ]
 
     def _all_candidates_terminal(self) -> bool:
         return all(
@@ -1108,16 +1814,10 @@ class P8ForwardAsyncTxn:
             for candidate in self.resources.candidates
         )
 
-    def _all_queues_released(self) -> bool:
-        return all(
-            queue.state in {QueueState.FREE, QueueState.RELEASED}
-            for queue in self.resources.queues
-        )
-
-
 __all__ = [
     "CandidateRecord",
     "CandidateState",
+    "ForwardPhase",
     "ForwardState",
     "P8FixedResources",
     "P8ForwardAsyncTxn",

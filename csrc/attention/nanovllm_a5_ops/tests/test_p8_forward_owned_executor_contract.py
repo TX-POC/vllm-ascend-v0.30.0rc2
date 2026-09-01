@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Source-closure gate for the isolated P8 forward-owned executor.
+
+This test intentionally does not require Ascend hardware.  It proves the
+non-negotiable lifecycle wiring before an OPP build is attempted:
+
+* P8 is a standalone OPP and cannot import/compile C8 or P7 paths;
+* Post persists a durable intent.  A proved ``POST_REJECTED`` is reclaimed
+  only later by the DRAIN-owned no-post protocol, never in POST;
+* Drain atomically claims GM POSTED -> DRAIN_CLAIMED *before* it reloads the
+  record, then uses KVAF's nonblocking retire/Finish/private-publish/release
+  protocol;
+* QSFA terminal uses KVAF's CAS-verified private-slot release path;
+* ForwardTerminal quarantines unresolved resources without freeing DMA that
+  could still be in flight.
+
+The real KVAF helper is intentionally supplied only by the selected KVAF
+revision at OPP build time.  This test does not copy or mutate that repository.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import unittest
+
+
+OPS_ROOT = Path(__file__).resolve().parents[1]
+P8_ROOT = OPS_ROOT / "a5_p8_forward_owned_executor"
+KERNEL = P8_ROOT / "op_kernel" / "a5_p8_forward_owned_executor.cpp"
+HOST = P8_ROOT / "op_host" / "a5_p8_forward_owned_executor.cpp"
+TILING = P8_ROOT / "op_kernel" / "a5_p8_forward_owned_executor_tiling.h"
+SPEC = P8_ROOT / "ops.json"
+BUILD = OPS_ROOT / "build_nanovllm_ops.sh"
+
+
+class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.kernel = KERNEL.read_text(encoding="utf-8")
+        cls.host = HOST.read_text(encoding="utf-8")
+        cls.tiling = TILING.read_text(encoding="utf-8")
+        cls.spec = SPEC.read_text(encoding="utf-8")
+        cls.build = BUILD.read_text(encoding="utf-8")
+
+    def test_isolated_operator_identity(self) -> None:
+        self.assertIn('"op": "A5P8ForwardOwnedExecutor"', self.spec)
+        self.assertIn("OP_ADD(A5P8ForwardOwnedExecutor)", self.host)
+        self.assertIn("A5P8ForwardOwnedExecutorTilingData", self.tiling)
+        self.assertIn("KERNEL_TYPE_AIV_ONLY", self.kernel)
+        for legacy_name in (
+            "A5ScoreReceiptSpeculativeExecutor",
+            "A5StreamingQuantLiGet",
+            "A5OfficialC8",
+            "quant_lightning",
+            "a5_score_receipt_speculative_executor",
+        ):
+            self.assertNotIn(legacy_name, self.kernel)
+
+    def test_dynamic_resource_model_has_no_fixed_core_partition(self) -> None:
+        self.assertIn("TryAcquireKvafStreamingBatchGetQueueFromAicore", self.kernel)
+        self.assertIn("ClaimP8GlobalPrivateSlotSimt", self.kernel)
+        for forbidden in (
+            "kGetLane",
+            "LI_CORE",
+            "GET_CORE",
+            "physical_core",
+        ):
+            self.assertNotIn(forbidden, self.kernel)
+
+    def test_post_is_durable_and_never_uses_post_intent_rollback(self) -> None:
+        for token in (
+            "PrepareKvafP8WavePostIntent",
+            "PostKvafP8Wave",
+            "StoreKvafP8WaveRecordToGm",
+            "DataSyncBarrier<MemDsbT::DDR>",
+            "identity.post_sequence",
+            "ClaimGlobalPrivate",
+        ):
+            self.assertIn(token, self.kernel)
+        self.assertNotIn("ReleaseKvafP8UnpostedWave", self.kernel)
+        self.assertIn("ReloadForwardControlForPhase", self.kernel)
+        post = self.kernel[
+            self.kernel.index("bool PostReceipt"):self.kernel.index("void RunPostOnly")
+        ]
+        self.assertLess(
+            post.rindex("ReloadForwardControlForPhase"),
+            post.index("PostKvafP8Wave"),
+        )
+
+    def test_p8_descriptor_publish_uses_the_forward_owned_kvaf_abi_order(self) -> None:
+        """Keep a C++ signature drift out of the expensive remote OPP build.
+
+        KVAF deliberately puts the wave identity and private-record arena
+        before descriptor scratch in its P8-only overload.  The legacy
+        streaming helper has another ordering, so a token-only closure check
+        would not catch an accidental call to the wrong ABI.
+        """
+        post = self.kernel[
+            self.kernel.index("bool PostReceipt"):self.kernel.index("void RunPostOnly")
+        ]
+        expected = (
+            "PublishKvafP8BatchGetDescriptorScratch(\n"
+            "                control_, lease, identity, privateRecords_,\n"
+            "                tiling_->privateRowCount, descriptor)"
+        )
+        self.assertIn(expected, post)
+
+    def test_deterministic_no_post_is_cleaned_only_by_drain(self) -> None:
+        post = self.kernel[
+            self.kernel.index("bool PostReceipt"):self.kernel.index("void RunPostOnly")
+        ]
+        drain = self.kernel[
+            self.kernel.index("void DrainOneQueue"):
+            self.kernel.index("void RunDrain")
+        ]
+        no_post = self.kernel[
+            self.kernel.index("bool DrainDeterministicNoPostWave"):
+            self.kernel.index("void DrainOneQueue")
+        ]
+        self.assertIn("kKvafP8WaveOutcomePostRejected", post)
+        self.assertIn("wave.post_committed == 0U", post)
+        self.assertNotIn("ReleaseKvafP8PendingPrivateRecordAfterNoPost", post)
+        self.assertNotIn("ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup", post)
+        self.assertIn("TryClaimKvafP8UnpostedWaveDrainFromAicore", drain)
+        self.assertIn("DrainDeterministicNoPostWave", drain)
+        self.assertIn("ReleaseKvafP8PendingPrivateRecordAfterNoPost", no_post)
+        self.assertIn(
+            "ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup", no_post
+        )
+        self.assertLess(
+            no_post.index("ReleaseKvafP8PendingPrivateRecordAfterNoPost"),
+            no_post.index("ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup"),
+        )
+
+    def test_drain_claim_precedes_gm_reload(self) -> None:
+        drain_start = self.kernel.index("void DrainOneQueue")
+        drain_end = self.kernel.index("void RunDrain", drain_start)
+        drain = self.kernel[drain_start:drain_end]
+        self.assertLess(
+            drain.index("TryClaimKvafP8WaveDrainFromAicore"),
+            drain.index("LoadKvafP8WaveRecordFromGm"),
+        )
+        for token in (
+            "kKvafP8WaveDrainClaimed",
+            "TryRetireKvafP8Wave",
+            "FinishKvafP8Wave",
+            "PublishTerminalPrivateRows",
+            "ReleaseKvafP8WaveAfterPrivateReady",
+            "MarkForwardAbort",
+        ):
+            self.assertIn(token, drain)
+        self.assertIn("TryClaimKvafP8UnpostedWaveDrainFromAicore", drain)
+        self.assertIn("PublishKvafP8PrivateTerminalRecords", self.kernel)
+
+    def test_happy_post_cq_path_has_no_host_wait(self) -> None:
+        """The successful transport path is PostOnly then bounded drain.
+
+        This is intentionally a source-level integration contract until a
+        target machine supplies registered Direct-HCCP resources.  It rejects
+        the historical error of inserting a Python/host wait between the
+        descriptor publish and CQ terminal publication.
+        """
+        post = self.kernel[
+            self.kernel.index("bool PostReceipt"):self.kernel.index("void RunPostOnly")
+        ]
+        drain = self.kernel[
+            self.kernel.index("void DrainOneQueue"):
+            self.kernel.index("void RunDrain")
+        ]
+        self.assertLess(post.index("PrepareKvafP8WavePostIntent"),
+                        post.index("PostKvafP8Wave"))
+        self.assertIn("TryRetireKvafP8Wave", drain)
+        self.assertIn("FinishKvafP8Wave", drain)
+        self.assertIn("PublishTerminalPrivateRows", drain)
+        self.assertIn("ReleaseKvafP8WaveAfterPrivateReady", drain)
+        self.assertNotIn("Synchronize", post + drain)
+
+    def test_cq_pending_rehydrates_posted_record_for_later_drain(self) -> None:
+        drain = self.kernel[
+            self.kernel.index("void DrainOneQueue"):
+            self.kernel.index("void RunDrain")
+        ]
+        # `TryRetire` does not turn an in-flight CQ into a guessed terminal
+        # result.  The durable record must return to POSTED and be stored for
+        # another dynamic drain node to CAS-claim later.
+        self.assertIn("wave.state == kvaf_fused_get::kKvafP8WavePosted", drain)
+        self.assertLess(
+            drain.index("TryRetireKvafP8Wave"),
+            drain.index("StoreKvafP8WaveRecordToGm", drain.index("TryRetireKvafP8Wave")),
+        )
+
+    def test_forward_terminal_quarantines_post_intent_not_release_it(self) -> None:
+        terminal_start = self.kernel.index("void RunForwardTerminal")
+        terminal = self.kernel[terminal_start:]
+        # The KVAF terminal endpoint classifies every non-FREE durable wave,
+        # including POST_INTENT.  P8 deliberately does not call a normal
+        # release endpoint from this phase because an interrupted doorbell may
+        # still be visible to HCCP.
+        self.assertIn("QuarantineKvafP8WaveAtForwardTerminal", terminal)
+        self.assertNotIn("ReleaseKvafP8WaveAfterPrivateReady", terminal)
+        self.assertNotIn("ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup", terminal)
+
+    def test_failed_cq_is_terminal_private_miss_not_qsfa_ready(self) -> None:
+        publish = self.kernel[
+            self.kernel.index("bool PublishTerminalPrivateRows"):
+            self.kernel.index("bool IsDeterministicNoPostWave")
+        ]
+        qsfa = self.kernel[
+            self.kernel.index("void RunQsfaTerminalRelease"):
+            self.kernel.index("void RunForwardTerminal")
+        ]
+        # KVAF publishes READY or FAILED only after Finish validates every
+        # descriptor output.  FAILED remains a terminal record for exact /
+        # GuaranteedRecall fallback; it is never promoted to READY by P8.
+        self.assertIn("kKvafP8PrivateReady", publish)
+        self.assertIn("kKvafP8PrivateFailed", publish)
+        self.assertIn("privateReady_[output_index]", publish)
+        self.assertIn("kKvafP8PrivateFailed", qsfa)
+        self.assertNotIn("kKvafP8PrivateReady);", publish)
+
+    def test_qsfa_terminal_owns_private_release(self) -> None:
+        terminal_start = self.kernel.index("void RunQsfaTerminalRelease")
+        terminal_end = self.kernel.index("void RunForwardTerminal", terminal_start)
+        terminal = self.kernel[terminal_start:terminal_end]
+        self.assertIn("IsKvafP8PrivateViewReadyForQsfa", terminal)
+        self.assertIn("kKvafP8ForwardFlagQsfaTerminalObserved", terminal)
+        self.assertIn("ReleaseKvafP8PrivateRecordAfterQsfaTerminal", terminal)
+        self.assertIn("privateRecords_ + slot", terminal)
+        self.assertIn("privateReleaseResult_", terminal)
+        self.assertNotIn("ClearPrivateMapping", terminal)
+        self.assertIn("kKvafP8PrivateReady", terminal)
+        self.assertIn("kKvafP8PrivateFailed", terminal)
+
+    def test_abort_is_atomic_and_never_uses_the_legacy_local_helper(self) -> None:
+        self.assertIn("MarkKvafP8ForwardAbortFromAicore", self.kernel)
+        self.assertIn("KvafP8ForwardAbortResult", self.kernel)
+        self.assertNotIn("kvaf_fused_get::MarkKvafP8ForwardAbort(", self.kernel)
+
+    def test_forward_terminal_quarantines_without_queue_release(self) -> None:
+        terminal_start = self.kernel.index("void RunForwardTerminal")
+        terminal = self.kernel[terminal_start:]
+        for token in (
+            "kKvafP8ForwardPhaseForwardTerminal",
+            "QuarantineKvafP8WaveAtForwardTerminal",
+            "QuarantineKvafP8PrivateAtForwardTerminal",
+            "KvafP8ForwardTerminalResult",
+        ):
+            self.assertIn(token, terminal)
+        self.assertNotIn("ReleaseKvafP8WaveAfterPrivateReady", terminal)
+
+    def test_build_script_stages_only_the_isolated_p8_source(self) -> None:
+        self.assertIn("STAGE_P8_FORWARD_OWNED_EXECUTOR_ONLY", self.build)
+        self.assertIn("A5P8ForwardOwnedExecutor", self.build)
+        self.assertIn("A5P8ForwardControlAdvance", self.build)
+        self.assertIn("a5_p8_forward_owned_executor", self.build)
+        for token in (
+            "TryClaimKvafP8UnpostedWaveDrainFromAicore",
+            "ReleaseKvafP8PendingPrivateRecordAfterNoPost",
+            "ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup",
+        ):
+            self.assertIn(token, self.build)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -29,7 +29,15 @@ if len(_OPAPI_LIBS) != 1:
 
 _OPAPI = _OPAPI_LIBS[0].resolve()
 _VENDOR = _OPAPI.parents[2]
-os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(_VENDOR)
+# Several independently built P8 closures may coexist in one process
+# (unchanged C8 reference, Stage A, and Stage B).  CANN accepts a colon
+# separated vendor list.  Preserve vendors registered by earlier closures
+# instead of replacing the whole list, otherwise import order silently picks
+# a different op package at the first ACLNN execution.
+_existing_vendors = [item for item in os.getenv("ASCEND_CUSTOM_OPP_PATH", "").split(":") if item]
+os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join(
+    [str(_VENDOR), *(item for item in _existing_vendors if item != str(_VENDOR))]
+)
 os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(_OPAPI)
 
 if os.getenv("NANOVLLM_A5_OPAPI_DEBUG") not in (None, "", "0"):

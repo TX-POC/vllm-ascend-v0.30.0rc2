@@ -1,0 +1,419 @@
+// P8 host ABI: one forward-owned state machine, three graph phases.
+//
+// The P8 phase is graph-visible in a fixed KVAF forward-control record, not
+// an attribute or process-local switch.  Its four int64 words encode
+// [forward_epoch, graph_replay_generation, packed(layer_control_index, phase),
+// flags].  Device code always loads it through KVAF's field-wise ABI helper.
+// This lets Post, Drain, and QSFA-terminal launches validate the same durable
+// resource records across graph replay without changing C8's ABI.
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+#include "../op_kernel/a5_p8_forward_owned_executor_tiling.h"
+#include "register/op_def_registry.h"
+#include "register/op_impl_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+
+namespace {
+enum InputIndex : size_t {
+    kCandidateSeeds = 0,
+    kCandidateCounts,
+    kCandidateReadyEpoch,
+    kCandidateStatus,
+    kForwardControl,
+    kSourceLens,
+    kKvObjectAddressDomain,
+    kReqPoolEntries,
+    kKvObjectMap,
+    kKvObjectLens,
+    kKvObjectSlotsSnapshot,
+    kPrivateSourceToSlot,
+    kPrivateObjectToSlot,
+    kPrivateReadyTable,
+    kPrivateSlotCursor,
+    kPrivatePackedOutput,
+    kFusedGetControl,
+    kP8WaveRecords,
+    kP8PrivateRecords,
+    kQueueRequestSourceOffsets,
+    kQueueRequestObjectOffsets,
+    kQueueRequestOutputIndices,
+    kQueueRequestCount,
+    kCandidateCursor,
+    kCandidateCursorEpoch,
+    kRowsPerEntry,
+    kWorkerStats,
+    kInputCount,
+};
+
+enum OutputIndex : size_t {
+    // Forward-control is an output alias as well as an input.  P8 can set
+    // the shared fail-closed abort gate on a device failure, and graph users
+    // must observe that mutation rather than treating it as an invisible
+    // side effect.
+    kForwardControlOut = 0,
+    kPrivateSourceToSlotOut,
+    kPrivateObjectToSlotOut,
+    kPrivateReadyTableOut,
+    kPrivateSlotCursorOut,
+    kPrivatePackedOutputOut,
+    kFusedGetControlOut,
+    kP8WaveRecordsOut,
+    kP8PrivateRecordsOut,
+    kQueueRequestSourceOffsetsOut,
+    kQueueRequestObjectOffsetsOut,
+    kQueueRequestOutputIndicesOut,
+    kQueueRequestCountOut,
+    kCandidateCursorOut,
+    kCandidateCursorEpochOut,
+    kWorkerStatsOut,
+    kOutputCount,
+};
+
+constexpr size_t kAliasInputs[kOutputCount] = {
+    kForwardControl, kPrivateSourceToSlot, kPrivateObjectToSlot,
+    kPrivateReadyTable,
+    kPrivateSlotCursor, kPrivatePackedOutput, kFusedGetControl,
+    kP8WaveRecords, kP8PrivateRecords, kQueueRequestSourceOffsets,
+    kQueueRequestObjectOffsets, kQueueRequestOutputIndices,
+    kQueueRequestCount, kCandidateCursor, kCandidateCursorEpoch,
+    kWorkerStats,
+};
+
+bool IsPositiveVector(const gert::Shape& shape)
+{
+    return shape.GetDimNum() == 1 && shape.GetDim(0) > 0;
+}
+
+bool IsPositiveMatrix(const gert::Shape& shape)
+{
+    return shape.GetDimNum() == 2 && shape.GetDim(0) > 0 &&
+           shape.GetDim(1) > 0;
+}
+
+bool ValidateGeometry(const gert::Shape* const* shapes, uint32_t* receipts,
+                      uint32_t* rows, uint32_t* sources, uint32_t* pools,
+                      uint32_t* objects, uint32_t* queues,
+                      uint32_t* private_rows, uint32_t* worker_stat_rows)
+{
+    if (shapes == nullptr || receipts == nullptr || rows == nullptr ||
+        sources == nullptr || pools == nullptr || objects == nullptr ||
+        queues == nullptr || private_rows == nullptr ||
+        worker_stat_rows == nullptr) {
+        return false;
+    }
+    for (size_t index = 0U; index < kInputCount; ++index) {
+        if (shapes[index] == nullptr) {
+            return false;
+        }
+    }
+    const gert::Shape& seeds = *shapes[kCandidateSeeds];
+    const gert::Shape& counts = *shapes[kCandidateCounts];
+    const gert::Shape& ready_epoch = *shapes[kCandidateReadyEpoch];
+    const gert::Shape& status = *shapes[kCandidateStatus];
+    const gert::Shape& forward = *shapes[kForwardControl];
+    const gert::Shape& source_lens = *shapes[kSourceLens];
+    const gert::Shape& domain = *shapes[kKvObjectAddressDomain];
+    const gert::Shape& pool_entries = *shapes[kReqPoolEntries];
+    const gert::Shape& object_map = *shapes[kKvObjectMap];
+    const gert::Shape& object_lens = *shapes[kKvObjectLens];
+    const gert::Shape& snapshot = *shapes[kKvObjectSlotsSnapshot];
+    const gert::Shape& source_to_slot = *shapes[kPrivateSourceToSlot];
+    const gert::Shape& object_to_slot = *shapes[kPrivateObjectToSlot];
+    const gert::Shape& private_ready = *shapes[kPrivateReadyTable];
+    const gert::Shape& private_cursor = *shapes[kPrivateSlotCursor];
+    const gert::Shape& private_output = *shapes[kPrivatePackedOutput];
+    const gert::Shape& control = *shapes[kFusedGetControl];
+    const gert::Shape& waves = *shapes[kP8WaveRecords];
+    const gert::Shape& private_records = *shapes[kP8PrivateRecords];
+    const gert::Shape& request_source = *shapes[kQueueRequestSourceOffsets];
+    const gert::Shape& request_object = *shapes[kQueueRequestObjectOffsets];
+    const gert::Shape& request_output = *shapes[kQueueRequestOutputIndices];
+    const gert::Shape& request_count = *shapes[kQueueRequestCount];
+    const gert::Shape& candidate_cursor = *shapes[kCandidateCursor];
+    const gert::Shape& candidate_cursor_epoch = *shapes[kCandidateCursorEpoch];
+    const gert::Shape& rows_per_entry = *shapes[kRowsPerEntry];
+    const gert::Shape& stats = *shapes[kWorkerStats];
+
+    if (seeds.GetDimNum() != 3 || seeds.GetDim(0) <= 0 ||
+        seeds.GetDim(1) != kA5P8CandidateCapacity ||
+        seeds.GetDim(2) != kA5P8CandidateSeedWords ||
+        !IsPositiveVector(counts) || !IsPositiveVector(ready_epoch) ||
+        !IsPositiveVector(status) || !IsPositiveVector(forward) ||
+        forward.GetDim(0) != kA5P8ForwardControlWords ||
+        !IsPositiveVector(source_lens) || !IsPositiveVector(domain) ||
+        domain.GetDim(0) != 1 || !IsPositiveVector(pool_entries) ||
+        !IsPositiveMatrix(object_map) || !IsPositiveVector(object_lens) ||
+        !IsPositiveMatrix(snapshot) || !IsPositiveMatrix(source_to_slot) ||
+        !IsPositiveMatrix(object_to_slot) || !IsPositiveVector(private_ready) ||
+        !IsPositiveVector(private_cursor) || private_cursor.GetDim(0) != 1 ||
+        private_output.GetDimNum() != 2 ||
+        private_output.GetDim(1) != 656 || !IsPositiveVector(control) ||
+        !IsPositiveMatrix(waves) ||
+        waves.GetDim(1) != kA5P8WaveRecordWords ||
+        !IsPositiveMatrix(private_records) ||
+        private_records.GetDim(1) != kA5P8PrivateRecordWords ||
+        !IsPositiveMatrix(request_source) || !IsPositiveMatrix(request_object) ||
+        !IsPositiveMatrix(request_output) || !IsPositiveVector(request_count) ||
+        !IsPositiveVector(candidate_cursor) ||
+        !IsPositiveVector(candidate_cursor_epoch) ||
+        !IsPositiveVector(rows_per_entry) || rows_per_entry.GetDim(0) != 1 ||
+        !IsPositiveMatrix(stats) ||
+        stats.GetDim(1) != kA5P8WorkerStatColumns) {
+        return false;
+    }
+    const int64_t receipt_count = seeds.GetDim(0);
+    const int64_t row_count = source_lens.GetDim(0);
+    const int64_t source_capacity = object_map.GetDim(1);
+    const int64_t pool_count = object_map.GetDim(0);
+    const int64_t object_capacity = snapshot.GetDim(1);
+    const int64_t queue_count = waves.GetDim(0);
+    const int64_t private_count = private_records.GetDim(0);
+    const int64_t stat_rows = stats.GetDim(0);
+    if (receipt_count > std::numeric_limits<uint32_t>::max() ||
+        row_count <= 0 || source_capacity <= 0 || pool_count <= 0 ||
+        object_capacity <= 0 || queue_count <= 0 || private_count <= 0 ||
+        stat_rows <= 0 || row_count > std::numeric_limits<uint32_t>::max() ||
+        source_capacity > std::numeric_limits<uint32_t>::max() ||
+        pool_count > std::numeric_limits<uint32_t>::max() ||
+        object_capacity > std::numeric_limits<uint32_t>::max() ||
+        queue_count > std::numeric_limits<uint32_t>::max() ||
+        private_count > std::numeric_limits<uint32_t>::max() ||
+        stat_rows > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    if (counts.GetDim(0) != receipt_count || ready_epoch.GetDim(0) != receipt_count ||
+        status.GetDim(0) != receipt_count || candidate_cursor.GetDim(0) != receipt_count ||
+        candidate_cursor_epoch.GetDim(0) != receipt_count ||
+        pool_entries.GetDim(0) != row_count || object_lens.GetDim(0) != row_count ||
+        snapshot.GetDim(0) != pool_count || source_to_slot.GetDim(0) != row_count ||
+        source_to_slot.GetDim(1) != source_capacity ||
+        object_to_slot.GetDim(0) != pool_count ||
+        object_to_slot.GetDim(1) != object_capacity ||
+        private_ready.GetDim(0) != private_count ||
+        private_output.GetDim(0) != private_count ||
+        request_source.GetDim(0) != queue_count ||
+        request_object.GetDim(0) != queue_count ||
+        request_output.GetDim(0) != queue_count ||
+        request_source.GetDim(1) != kA5P8RequestCapacity ||
+        request_object.GetDim(1) != kA5P8RequestCapacity ||
+        request_output.GetDim(1) != kA5P8RequestCapacity ||
+        request_count.GetDim(0) != queue_count) {
+        return false;
+    }
+    *receipts = static_cast<uint32_t>(receipt_count);
+    *rows = static_cast<uint32_t>(row_count);
+    *sources = static_cast<uint32_t>(source_capacity);
+    *pools = static_cast<uint32_t>(pool_count);
+    *objects = static_cast<uint32_t>(object_capacity);
+    *queues = static_cast<uint32_t>(queue_count);
+    *private_rows = static_cast<uint32_t>(private_count);
+    *worker_stat_rows = static_cast<uint32_t>(stat_rows);
+    return true;
+}
+}  // namespace
+
+namespace optiling {
+static ge::graphStatus TilingA5P8ForwardOwnedExecutor(
+    gert::TilingContext* context)
+{
+    if (context == nullptr || context->GetPlatformInfo() == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    const ge::DataType expected[kInputCount] = {
+        ge::DT_INT32, ge::DT_INT32, ge::DT_INT64, ge::DT_INT32,
+        ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+        ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+        ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_UINT8,
+        ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+        ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+        ge::DT_INT64, ge::DT_INT32, ge::DT_INT64};
+    const gert::Shape* shapes[kInputCount] = {};
+    for (size_t index = 0U; index < kInputCount; ++index) {
+        if (context->GetInputShape(index) == nullptr ||
+            context->GetInputDesc(index) == nullptr ||
+            context->GetInputDesc(index)->GetDataType() != expected[index]) {
+            return ge::GRAPH_FAILED;
+        }
+        shapes[index] = &context->GetInputShape(index)->GetStorageShape();
+    }
+    uint32_t receipts = 0U;
+    uint32_t rows = 0U;
+    uint32_t sources = 0U;
+    uint32_t pools = 0U;
+    uint32_t objects = 0U;
+    uint32_t queues = 0U;
+    uint32_t private_rows = 0U;
+    uint32_t stats_rows = 0U;
+    if (!ValidateGeometry(shapes, &receipts, &rows, &sources, &pools,
+                          &objects, &queues, &private_rows, &stats_rows)) {
+        return ge::GRAPH_FAILED;
+    }
+    platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const uint32_t available_aiv = platform.GetCoreNumAiv();
+    uint32_t work_items = receipts;
+    if (queues > work_items) {
+        work_items = queues;
+    }
+    if (private_rows > work_items) {
+        work_items = private_rows;
+    }
+    const uint32_t workers = available_aiv < work_items ? available_aiv : work_items;
+    if (workers == 0U || stats_rows < workers) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint32_t block_dim = platform.CalcTschBlockDim(
+        workers, 0U, available_aiv);
+    if (block_dim != workers) {
+        return ge::GRAPH_FAILED;
+    }
+    context->SetScheduleMode(1U);
+    context->SetBlockDim(block_dim);
+    auto* tiling = context->GetTilingData<A5P8ForwardOwnedExecutorTilingData>();
+    if (tiling == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    tiling->workerCount = workers;
+    tiling->receiptCount = receipts;
+    tiling->rowCount = rows;
+    tiling->sourceCapacity = sources;
+    tiling->poolSize = pools;
+    tiling->kvObjectCapacity = objects;
+    tiling->queueCount = queues;
+    tiling->privateRowCount = private_rows;
+    tiling->workerStatsRows = stats_rows;
+    tiling->phase = 0U;
+    tiling->candidateCapacity = kA5P8CandidateCapacity;
+    tiling->requestCapacity = kA5P8RequestCapacity;
+    tiling->reserved0 = 0U;
+    tiling->reserved1 = 0U;
+    if (context->GetWorkspaceSizes(1) != nullptr) {
+        context->GetWorkspaceSizes(1)[0] = 0U;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+}  // namespace optiling
+
+namespace ops {
+static ge::graphStatus InferA5P8ForwardOwnedExecutorShape(
+    gert::InferShapeContext* context)
+{
+    if (context == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    for (size_t output = 0U; output < kOutputCount; ++output) {
+        const size_t input = kAliasInputs[output];
+        if (context->GetInputShape(input) == nullptr ||
+            context->GetOutputShape(output) == nullptr) {
+            return ge::GRAPH_FAILED;
+        }
+        *context->GetOutputShape(output) = *context->GetInputShape(input);
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferA5P8ForwardOwnedExecutorDataType(
+    gert::InferDataTypeContext* context)
+{
+    if (context == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    const ge::DataType output_types[kOutputCount] = {
+        ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+        ge::DT_INT32,
+        ge::DT_UINT8, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+        ge::DT_INT64, ge::DT_INT64, ge::DT_INT32, ge::DT_INT32,
+        ge::DT_INT32, ge::DT_INT64, ge::DT_INT64};
+    for (size_t output = 0U; output < kOutputCount; ++output) {
+        context->SetOutputDataType(output, output_types[output]);
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+class A5P8ForwardOwnedExecutor : public OpDef {
+public:
+    explicit A5P8ForwardOwnedExecutor(const char* name) : OpDef(name)
+    {
+        const std::vector<ge::Format> formats = {ge::FORMAT_ND};
+        const std::vector<ge::DataType> int32_types = {ge::DT_INT32};
+        const std::vector<ge::DataType> int64_types = {ge::DT_INT64};
+        const std::vector<ge::DataType> uint8_types = {ge::DT_UINT8};
+        const ge::DataType input_types[kInputCount] = {
+            ge::DT_INT32, ge::DT_INT32, ge::DT_INT64, ge::DT_INT32,
+            ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+            ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+            ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_UINT8,
+            ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+            ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+            ge::DT_INT64, ge::DT_INT32, ge::DT_INT64};
+        const char* input_names[kInputCount] = {
+            "candidate_seeds", "candidate_counts", "candidate_ready_epoch",
+            "candidate_status", "forward_control", "source_lens",
+            "kv_object_address_domain", "req_pool_entries", "kv_object_map",
+            "kv_object_lens", "kv_object_slots_snapshot",
+            "private_source_to_slot", "private_object_to_slot",
+            "private_ready_table", "private_slot_cursor",
+            "private_packed_output", "fused_get_control", "p8_wave_records",
+            "p8_private_records", "queue_request_source_offsets",
+            "queue_request_object_offsets", "queue_request_output_indices",
+            "queue_request_count", "candidate_cursor",
+            "candidate_cursor_epoch", "rows_per_entry", "worker_stats"};
+        for (size_t input = 0U; input < kInputCount; ++input) {
+            const std::vector<ge::DataType>* types = &int32_types;
+            if (input_types[input] == ge::DT_INT64) {
+                types = &int64_types;
+            } else if (input_types[input] == ge::DT_UINT8) {
+                types = &uint8_types;
+            }
+            this->Input(input_names[input]).ParamType(REQUIRED)
+                .DataType(*types).Format(formats);
+        }
+        const ge::DataType output_types[kOutputCount] = {
+            ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+            ge::DT_INT32,
+            ge::DT_UINT8, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+            ge::DT_INT64, ge::DT_INT64, ge::DT_INT32, ge::DT_INT32,
+            ge::DT_INT32, ge::DT_INT64, ge::DT_INT64};
+        const char* output_names[kOutputCount] = {
+            "forward_control", "private_source_to_slot",
+            "private_object_to_slot",
+            "private_ready_table", "private_slot_cursor",
+            "private_packed_output", "fused_get_control", "p8_wave_records",
+            "p8_private_records", "queue_request_source_offsets",
+            "queue_request_object_offsets", "queue_request_output_indices",
+            "queue_request_count", "candidate_cursor",
+            "candidate_cursor_epoch", "worker_stats"};
+        for (size_t output = 0U; output < kOutputCount; ++output) {
+            const std::vector<ge::DataType>* types = &int32_types;
+            if (output_types[output] == ge::DT_INT64) {
+                types = &int64_types;
+            } else if (output_types[output] == ge::DT_UINT8) {
+                types = &uint8_types;
+            }
+            this->Output(output_names[output]).ParamType(REQUIRED)
+                .DataType(*types).Format(formats);
+        }
+        OpAICoreConfig config;
+        config.DynamicCompileStaticFlag(true)
+            .DynamicFormatFlag(true)
+            .DynamicRankSupportFlag(true)
+            .DynamicShapeSupportFlag(true)
+            .NeedCheckSupportFlag(false)
+            .PrecisionReduceFlag(true)
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn")
+            .ExtendCfgInfo("opFile.value", "a5_p8_forward_owned_executor")
+            .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
+        this->AICore()
+            .SetTiling(optiling::TilingA5P8ForwardOwnedExecutor)
+            .AddConfig("ascend950", config);
+    }
+};
+OP_ADD(A5P8ForwardOwnedExecutor);
+
+IMPL_OP_INFERSHAPE(A5P8ForwardOwnedExecutor)
+    .InferShape(InferA5P8ForwardOwnedExecutorShape)
+    .InferDataType(InferA5P8ForwardOwnedExecutorDataType);
+}  // namespace ops
