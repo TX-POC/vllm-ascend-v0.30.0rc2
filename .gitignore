@@ -29,6 +29,8 @@ __pycache__/
 .Python
 build/
 csrc/attention/nanovllm_a5_ops/_custom_opp*/
+# Generated isolated P4 custom-op staging; never source input for a P8 run.
+csrc/attention/nanovllm_a5_ops/a5_c8_resident_seed/build-isolated/
 build_out/
 !csrc/cmake/third_party/build/
 !csrc/cmake/third_party/build/modules/

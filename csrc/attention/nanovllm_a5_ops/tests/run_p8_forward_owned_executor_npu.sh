@@ -92,10 +92,17 @@ P8_STAGE_A_SETUP="$P8_OPS_ROOT/a5_score_receipt_candidate_executor/torch_extensi
 P8_STAGE_B_SETUP="$P8_OPS_ROOT/a5_p8_forward_owned_executor/torch_extension/p8_forward_owned_executor_setup.py"
 P8_REFERENCE_BUILD_SCRIPT="$P8_OPS_ROOT/a5_official_c8_reference/build_reference_opp.sh"
 P8_REFERENCE_SETUP="$P8_OPS_ROOT/a5_official_c8_reference/torch_extension/official_c8_reference_setup.py"
-if [[ ! -x "$P8_BUILD_SCRIPT" || ! -f "$P8_RUNTIME_TEST" ||
-      ! -f "$P8_STAGE_A_SETUP" || ! -f "$P8_STAGE_B_SETUP" ||
-      ! -x "$P8_REFERENCE_BUILD_SCRIPT" || ! -f "$P8_REFERENCE_SETUP" ]]; then
-    runner_fail "p8_sources_missing_or_not_executable"
+# Both shell build helpers are deliberately invoked below as
+# ``bash "$script"``.  They therefore need to be regular readable files, not
+# executable files.  Requiring ``-x`` here rejects a normal Git checkout when
+# a helper is tracked as mode 100644, before P8 gets a chance to build.
+if [[ ! -f "$P8_BUILD_SCRIPT" || ! -r "$P8_BUILD_SCRIPT" ||
+      ! -f "$P8_RUNTIME_TEST" || ! -r "$P8_RUNTIME_TEST" ||
+      ! -f "$P8_STAGE_A_SETUP" || ! -r "$P8_STAGE_A_SETUP" ||
+      ! -f "$P8_STAGE_B_SETUP" || ! -r "$P8_STAGE_B_SETUP" ||
+      ! -f "$P8_REFERENCE_BUILD_SCRIPT" || ! -r "$P8_REFERENCE_BUILD_SCRIPT" ||
+      ! -f "$P8_REFERENCE_SETUP" || ! -r "$P8_REFERENCE_SETUP" ]]; then
+    runner_fail "p8_sources_missing_or_unreadable"
     exit 2
 fi
 

@@ -34,6 +34,7 @@ ADMISSION = P8_ROOT / "op_kernel" / "a5_p8_arena_admission_gate.cpp"
 ADVANCE = P8_ROOT / "op_kernel" / "a5_p8_forward_control_advance.cpp"
 SPEC = P8_ROOT / "ops.json"
 BUILD = OPS_ROOT / "build_nanovllm_ops.sh"
+RUNNER = OPS_ROOT / "tests" / "run_p8_forward_owned_executor_npu.sh"
 
 
 class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
@@ -47,6 +48,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         cls.advance = ADVANCE.read_text(encoding="utf-8")
         cls.spec = SPEC.read_text(encoding="utf-8")
         cls.build = BUILD.read_text(encoding="utf-8")
+        cls.runner = RUNNER.read_text(encoding="utf-8")
 
     def test_isolated_operator_identity(self) -> None:
         self.assertIn('"op": "A5P8ForwardOwnedExecutor"', self.spec)
@@ -449,6 +451,20 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup",
         ):
             self.assertIn(token, self.build)
+
+    def test_runner_accepts_bash_invoked_non_executable_build_helpers(self) -> None:
+        """A normal Git mode-100644 shell helper is valid when invoked by Bash."""
+        for invocation in (
+            'bash "$P8_BUILD_SCRIPT"',
+            'bash "$P8_REFERENCE_BUILD_SCRIPT"',
+        ):
+            self.assertIn(invocation, self.runner)
+        for readable_gate in (
+            '! -f "$P8_BUILD_SCRIPT" || ! -r "$P8_BUILD_SCRIPT"',
+            '! -f "$P8_REFERENCE_BUILD_SCRIPT" || ! -r "$P8_REFERENCE_BUILD_SCRIPT"',
+        ):
+            self.assertIn(readable_gate, self.runner)
+        self.assertNotIn('! -x "$P8_BUILD_SCRIPT"', self.runner)
 
 
 if __name__ == "__main__":
