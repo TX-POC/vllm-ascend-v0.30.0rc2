@@ -132,7 +132,10 @@ Result RunNpu(
         residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
         reqPoolEntries, kvObjectMap, kvObjectLens, candidateSeeds,
         candidateCounts, candidateReceiptIdentity, receiptStatus, receiptOwner);
-    EXEC_NPU_CMD_ORDERED(
+    // Stage-A is part of the same P8 graph closure.  It has a zero-workspace
+    // ABI and only Tensor arguments, so keep its ACLNN descriptors/executor
+    // on the torch_npu consumer thread just like Stage-B.
+    EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
         aclnnA5ScoreReceiptCandidateExecutor, keepalive, scoreWorkspace,
         tileReceipts, receiptIdentity, scoreSourceLens, residentThreshold,
         residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,

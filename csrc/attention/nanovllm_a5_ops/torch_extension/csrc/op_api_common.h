@@ -1375,3 +1375,152 @@ inline void LogOrderedHostDso(
     /* Producer owns no ACLNN descriptor/PTA/HugeMem state after hand-off. */ \
     LogOpApiLifecycle(#aclnn_api, "submit_done");                            \
   } while (false)
+
+// This is the narrow reusable form of P7's deferred host-lifetime contract.
+// It is intentionally *not* a replacement for EXEC_NPU_CMD_ORDERED: callers
+// may use it only when every ACLNN argument is a value-ownable at::Tensor and
+// the operator has a zero-workspace ABI.  Those two restrictions mean that
+// the producer may hand only Tensor values to the torch_npu queue consumer;
+// the consumer then owns the complete TLS -> descriptor -> executor -> launch
+// -> descriptor/TLS teardown interval.  In particular, no aclTensor or
+// aclOpExecutor constructed on the producer thread can outlive that thread's
+// HugeMem/PTA state.
+//
+// This retains framework ordering but never waits for device work.  It is
+// suitable for P8's Admission, Advance and executor graph nodes because their
+// generated host tilers explicitly declare zero workspace.  Do not relax the
+// workspace check without first defining an explicit stream-lifetime owner
+// for a consumer-created workspace Tensor.
+#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(                    \
+    aclnn_api, tensor_keepalive, ...)                                         \
+  do {                                                                         \
+    using namespace nanovllm_a5_opapi;                                        \
+    static void *deferred_workspace_addr_fn =                                 \
+        ResolveSymbol(#aclnn_api "GetWorkspaceSize");                        \
+    static void *deferred_launch_addr_fn = ResolveSymbol(#aclnn_api);         \
+    TORCH_CHECK(                                                               \
+        deferred_workspace_addr_fn != nullptr &&                              \
+            deferred_launch_addr_fn != nullptr,                               \
+        #aclnn_api,                                                            \
+        " or ",                                                               \
+        #aclnn_api "GetWorkspaceSize is missing from repository-local ",     \
+        "libcust_opapi.so");                                                 \
+    LogResolvedOpApi(#aclnn_api, deferred_workspace_addr_fn,                  \
+                     deferred_launch_addr_fn);                                \
+    auto deferred_npu_stream = c10_npu::getCurrentNPUStream();                \
+    aclrtStream deferred_acl_stream = deferred_npu_stream.stream(false);     \
+    /* Producer-side stream ownership is the framework queue hand-off. */    \
+    UseStreamResIfNeeded(deferred_acl_stream, true);                          \
+    LogOpApiLifecycle(#aclnn_api, "producer_enqueue_ready");                \
+    /* std::make_tuple decays every at::Tensor argument to value ownership. */\
+    auto deferred_args = std::make_tuple(__VA_ARGS__);                        \
+    auto deferred_tensor_keepalive = tensor_keepalive;                        \
+    auto deferred_acl_call =                                                  \
+        [deferred_args = std::move(deferred_args),                            \
+         deferred_tensor_keepalive = std::move(deferred_tensor_keepalive),   \
+         deferred_acl_stream, deferred_workspace_addr_fn,                     \
+         deferred_launch_addr_fn]() mutable -> int {                          \
+      bool deferred_pta_cache_active = false;                                 \
+      bool deferred_huge_mem_active = false;                                  \
+      auto deferred_init_huge_mem =                                           \
+          reinterpret_cast<InitHugeMemThreadLocalFn>(                         \
+              ResolveSymbol("InitHugeMemThreadLocal"));                      \
+      auto deferred_uninit_huge_mem =                                         \
+          reinterpret_cast<UnInitHugeMemThreadLocalFn>(                       \
+              ResolveSymbol("UnInitHugeMemThreadLocal"));                    \
+      auto deferred_release_huge_mem =                                        \
+          reinterpret_cast<ReleaseHugeMemFn>(ResolveSymbol("ReleaseHugeMem"));\
+      auto deferred_cleanup_consumer_tls = [&]() noexcept {                   \
+        if (deferred_huge_mem_active) {                                       \
+          if (deferred_release_huge_mem != nullptr) {                         \
+            deferred_release_huge_mem(nullptr, false);                        \
+          }                                                                    \
+          if (deferred_uninit_huge_mem != nullptr) {                          \
+            deferred_uninit_huge_mem(nullptr, false);                         \
+          }                                                                    \
+          deferred_huge_mem_active = false;                                   \
+        }                                                                      \
+        if (deferred_pta_cache_active) {                                      \
+          UnInitPtaCacheForWorkspace(true);                                    \
+          deferred_pta_cache_active = false;                                  \
+        }                                                                      \
+        LogOpApiLifecycle(#aclnn_api, "consumer_tls_uninit");               \
+      };                                                                       \
+      try {                                                                    \
+        (void)deferred_tensor_keepalive;                                      \
+        UseStreamResIfNeeded(deferred_acl_stream, false);                     \
+        LogOpApiLifecycle(#aclnn_api, "consumer_stream_ready");             \
+        deferred_pta_cache_active = InitPtaCacheForWorkspace();               \
+        LogOpApiLifecycle(                                                     \
+            #aclnn_api,                                                        \
+            deferred_pta_cache_active ? "consumer_pta_cache_ready"          \
+                                      : "consumer_pta_cache_unavailable");   \
+        LogOrderedHostDso(#aclnn_api, deferred_workspace_addr_fn,             \
+                          deferred_launch_addr_fn, deferred_init_huge_mem,    \
+                          deferred_release_huge_mem,                           \
+                          deferred_uninit_huge_mem);                          \
+        if (deferred_init_huge_mem != nullptr) {                              \
+          (void)deferred_init_huge_mem(nullptr, false);                       \
+          deferred_huge_mem_active = true;                                    \
+          LogOpApiLifecycle(#aclnn_api, "consumer_huge_mem_ready");         \
+        }                                                                      \
+        uint64_t deferred_workspace_size = 0;                                 \
+        uint64_t *deferred_workspace_size_ptr = &deferred_workspace_size;    \
+        aclOpExecutor *deferred_executor = nullptr;                           \
+        aclOpExecutor **deferred_executor_ptr = &deferred_executor;           \
+        auto deferred_converted = std::apply(                                 \
+            [&](auto &...deferred_args_ref) {                                 \
+              return ConvertTypes(deferred_args_ref...,                       \
+                                  deferred_workspace_size_ptr,                 \
+                                  deferred_executor_ptr);                      \
+            },                                                                 \
+            deferred_args);                                                    \
+        LogConvertedDescriptorSet(#aclnn_api, deferred_converted);            \
+        bool deferred_converted_released = false;                             \
+        try {                                                                  \
+          auto deferred_workspace_fn =                                        \
+              WorkspaceFunction(deferred_converted, deferred_workspace_addr_fn);\
+          const int deferred_workspace_status =                               \
+              CallTuple(deferred_workspace_fn, deferred_converted);          \
+          TORCH_CHECK(                                                        \
+              deferred_workspace_status == 0,                                 \
+              "call " #aclnn_api "GetWorkspaceSize failed: ",              \
+              RecentAclError());                                              \
+          TORCH_CHECK(                                                        \
+              deferred_workspace_size == 0,                                   \
+              #aclnn_api " requires zero ACLNN workspace for the deferred ",\
+              "tensor-owned launch path; got ", deferred_workspace_size);  \
+          LogOpApiLifecycle(#aclnn_api, "consumer_workspace_ready");        \
+          auto deferred_launch_fn =                                           \
+              reinterpret_cast<OpApiLaunchFn>(deferred_launch_addr_fn);      \
+          LogOpApiLifecycle(#aclnn_api, "launch_begin");                    \
+          const int deferred_launch_status =                                  \
+              deferred_launch_fn(nullptr, deferred_workspace_size,            \
+                                 deferred_executor, deferred_acl_stream);     \
+          TORCH_CHECK(                                                        \
+              deferred_launch_status == 0,                                    \
+              "call " #aclnn_api " failed: ", RecentAclError());           \
+          LogOpApiLifecycle(#aclnn_api, "launch_done");                     \
+          ReleaseTuple(deferred_converted);                                   \
+          deferred_converted_released = true;                                 \
+          LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");         \
+          deferred_cleanup_consumer_tls();                                    \
+          return deferred_launch_status;                                      \
+        } catch (...) {                                                        \
+          if (!deferred_converted_released) {                                 \
+            ReleaseTuple(deferred_converted);                                 \
+          }                                                                    \
+          throw;                                                               \
+        }                                                                      \
+      } catch (...) {                                                          \
+        deferred_cleanup_consumer_tls();                                      \
+        NotifyOrderedLaunchFailureTuple(deferred_tensor_keepalive);           \
+        LogOpApiLifecycle(#aclnn_api, "consumer_failed_quarantined");       \
+        throw;                                                                 \
+      }                                                                        \
+    };                                                                         \
+    LogOpApiLifecycle(#aclnn_api, "handoff_runopapi_tensor_owned_deferred");\
+    at_npu::native::OpCommand::RunOpApi(#aclnn_api, deferred_acl_call);       \
+    /* The producer never owns ACLNN TLS or descriptors on this path. */     \
+    LogOpApiLifecycle(#aclnn_api, "submit_done");                            \
+  } while (false)

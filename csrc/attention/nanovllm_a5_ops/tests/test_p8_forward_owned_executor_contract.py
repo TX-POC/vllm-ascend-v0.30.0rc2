@@ -29,6 +29,8 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 P8_ROOT = OPS_ROOT / "a5_p8_forward_owned_executor"
 KERNEL = P8_ROOT / "op_kernel" / "a5_p8_forward_owned_executor.cpp"
 HOST = P8_ROOT / "op_host" / "a5_p8_forward_owned_executor.cpp"
+ADMISSION_HOST = P8_ROOT / "op_host" / "a5_p8_arena_admission_gate.cpp"
+ADVANCE_HOST = P8_ROOT / "op_host" / "a5_p8_forward_control_advance.cpp"
 TILING = P8_ROOT / "op_kernel" / "a5_p8_forward_owned_executor_tiling.h"
 ARENA_TAG = P8_ROOT / "op_kernel" / "a5_p8_arena_tag.h"
 ADMISSION = P8_ROOT / "op_kernel" / "a5_p8_arena_admission_gate.cpp"
@@ -37,6 +39,17 @@ SPEC = P8_ROOT / "ops.json"
 BUILD = OPS_ROOT / "build_nanovllm_ops.sh"
 RUNNER = OPS_ROOT / "tests" / "run_p8_forward_owned_executor_npu.sh"
 REFERENCE_BUILD = OPS_ROOT / "a5_official_c8_reference" / "build_reference_opp.sh"
+BRIDGE = (
+    P8_ROOT / "torch_extension" / "csrc" / "p8_forward_owned_executor.cpp"
+)
+STAGE_A_BRIDGE = (
+    OPS_ROOT
+    / "a5_score_receipt_candidate_executor"
+    / "torch_extension"
+    / "csrc"
+    / "score_receipt_candidate_executor.cpp"
+)
+OP_API_COMMON = OPS_ROOT / "torch_extension" / "csrc" / "op_api_common.h"
 
 
 class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
@@ -89,6 +102,47 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         cls.build = BUILD.read_text(encoding="utf-8")
         cls.runner = RUNNER.read_text(encoding="utf-8")
         cls.reference_build = REFERENCE_BUILD.read_text(encoding="utf-8")
+        cls.bridge = BRIDGE.read_text(encoding="utf-8")
+        cls.stage_a_bridge = STAGE_A_BRIDGE.read_text(encoding="utf-8")
+        cls.op_api_common = OP_API_COMMON.read_text(encoding="utf-8")
+
+    def test_p8_acl_host_lifetime_is_tensor_owned_and_deferred(self) -> None:
+        """P8 must not recreate P7's producer-TLS descriptor lifetime bug."""
+        deferred = "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE("
+        self.assertEqual(self.bridge.count(deferred), 3)
+        self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.bridge)
+        self.assertEqual(self.stage_a_bridge.count(deferred), 1)
+        self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.stage_a_bridge)
+        self.assertEqual(
+            self.bridge.count("RequireP8DeferredHostContract();"), 3
+        )
+        self.assertIn("#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE", self.op_api_common)
+        generic = self.op_api_common[
+            self.op_api_common.index(
+                "#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE"
+            ):
+        ]
+        for token in (
+            "std::make_tuple(__VA_ARGS__)",
+            "UseStreamResIfNeeded(deferred_acl_stream, false)",
+            "InitPtaCacheForWorkspace()",
+            "ResolveSymbol(\"InitHugeMemThreadLocal\")",
+            "ConvertTypes(deferred_args_ref...",
+            "deferred_workspace_size == 0",
+            "ReleaseTuple(deferred_converted)",
+            "UnInitPtaCacheForWorkspace(true)",
+            "handoff_runopapi_tensor_owned_deferred",
+        ):
+            self.assertIn(token, generic)
+        stage_a_host = (
+            OPS_ROOT
+            / "a5_score_receipt_candidate_executor"
+            / "op_host"
+            / "a5_score_receipt_candidate_executor.cpp"
+        )
+        for host in (HOST, ADMISSION_HOST, ADVANCE_HOST, stage_a_host):
+            source = host.read_text(encoding="utf-8")
+            self.assertIn("GetWorkspaceSizes(1)[0] = 0U", source)
 
     def test_isolated_operator_identity(self) -> None:
         self.assertIn('"op": "A5P8ForwardOwnedExecutor"', self.spec)

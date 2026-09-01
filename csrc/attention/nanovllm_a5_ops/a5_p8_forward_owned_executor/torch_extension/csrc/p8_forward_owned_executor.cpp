@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <tuple>
 
@@ -189,6 +190,32 @@ using Result = std::tuple<
 using AdvanceResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 using AdmissionResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 
+// P8 passes only value-owned ATen tensors to its three zero-workspace ACLNN
+// nodes.  They must use the consumer-owned deferred launcher: torch_npu may
+// run RunOpApi on a task-queue thread after this Python caller returns, so
+// producer-thread aclTensor/executor/PTA/HugeMem state is invalid there.
+void RequireP8DeferredHostContract()
+{
+    const char* task_queue = std::getenv("TASK_QUEUE_ENABLE");
+    const char* launch_blocking = std::getenv("ASCEND_LAUNCH_BLOCKING");
+    const auto stream = c10_npu::getCurrentNPUStream();
+    TORCH_CHECK(!stream.isSyncLaunchStream(),
+                "P8 requires a non-sync launch stream for deferred ACLNN ",
+                "submission; refusing an inline producer-owned launch.");
+    if (const char* debug = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
+        debug != nullptr && debug[0] != '\0' &&
+        !(debug[0] == '0' && debug[1] == '\0')) {
+        std::fprintf(
+            stderr,
+            "P8_DEFERRED_HOST_GATE task_queue_enable=%s "
+            "launch_blocking=%s sync_launch_stream=0 "
+            "host_lifetime=consumer_owned\n",
+            task_queue == nullptr ? "<unset>" : task_queue,
+            launch_blocking == nullptr ? "<unset>" : launch_blocking);
+        std::fflush(stderr);
+    }
+}
+
 void ValidateArenaAdmissionInputs(
     const at::Tensor& forward_control, const at::Tensor& p8_arena_health,
     const at::Tensor& fused_get_control, const at::Tensor& p8_wave_records,
@@ -248,7 +275,8 @@ AdmissionResult ArenaAdmissionNpu(
     auto keepalive = std::make_tuple(
         forward_control, p8_arena_health, fused_get_control, p8_wave_records,
         p8_private_records, expected_identity, admission_result);
-    EXEC_NPU_CMD_ORDERED(
+    RequireP8DeferredHostContract();
+    EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
         aclnnA5P8ArenaAdmissionGate, keepalive, forward_control,
         p8_arena_health, fused_get_control, p8_wave_records,
         p8_private_records, expected_identity, admission_result);
@@ -315,7 +343,8 @@ AdvanceResult AdvanceForwardControlNpu(
     auto keepalive = std::make_tuple(forward_control, p8_arena_health,
                                      expected_identity, transition_program,
                                      transition_result);
-    EXEC_NPU_CMD_ORDERED(
+    RequireP8DeferredHostContract();
+    EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
         aclnnA5P8ForwardControlAdvance, keepalive, forward_control,
         p8_arena_health, expected_identity, transition_program,
         transition_result);
@@ -408,7 +437,8 @@ Result RunNpu(
         queue_request_object_offsets, queue_request_output_indices,
         queue_request_count, candidate_cursor, candidate_cursor_identity,
         rows_per_entry, worker_stats);
-    EXEC_NPU_CMD_ORDERED(
+    RequireP8DeferredHostContract();
+    EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
         aclnnA5P8ForwardOwnedExecutor, keepalive, candidate_seeds,
         candidate_counts, candidate_receipt_identity, candidate_status,
         forward_control, p8_arena_health, source_lens,
