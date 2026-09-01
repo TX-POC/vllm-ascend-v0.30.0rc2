@@ -34,18 +34,22 @@ struct ArenaResult {
 static_assert(sizeof(ArenaResult) == 8U,
               "P8 tagged arena result ABI changed");
 
-constexpr uint32_t MakeTag(uint32_t generation, ArenaState state)
+// These helpers are reached through the SIMT services below.  AscendC does
+// not infer device linkage from `constexpr`: without the explicit AICore
+// qualifier it treats them as host functions and rejects every lifecycle CAS
+// caller during the kernel compile.
+__aicore__ inline uint32_t MakeTag(uint32_t generation, ArenaState state)
 {
     return (generation << kArenaStateBits) |
            static_cast<uint32_t>(state);
 }
 
-constexpr ArenaState StateOf(uint32_t tag)
+__aicore__ inline ArenaState StateOf(uint32_t tag)
 {
     return static_cast<ArenaState>(tag & kArenaStateMask);
 }
 
-constexpr uint32_t GenerationOf(uint32_t tag)
+__aicore__ inline uint32_t GenerationOf(uint32_t tag)
 {
     return tag >> kArenaStateBits;
 }

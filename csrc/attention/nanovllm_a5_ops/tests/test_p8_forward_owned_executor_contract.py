@@ -313,6 +313,15 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         # from being substituted in the graph node.
         self.assertIn("PoisonActiveLeaseSimtService", self.advance)
 
+    def test_arena_tag_helpers_are_explicitly_aicore_callable(self) -> None:
+        """Prevent CANN from silently treating SIMT helper calls as host calls."""
+        for signature in (
+            "__aicore__ inline uint32_t MakeTag",
+            "__aicore__ inline ArenaState StateOf",
+            "__aicore__ inline uint32_t GenerationOf",
+        ):
+            self.assertIn(signature, self.arena_tag)
+
     def test_only_admission_writes_the_cached_lease_generation(self) -> None:
         """No generic forward-control store may erase the high-word ticket.
 
