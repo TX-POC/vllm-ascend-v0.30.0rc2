@@ -4,6 +4,7 @@
 # Required environment (the caller must have already fetched these exact,
 # clean revisions from the canonical repositories):
 #   P8_VLLM_ROOT=/path/to/vLLM-DSA-kip_demo_cs
+#   P8_REFERENCE_VLLM_ROOT=/path/to/stable-vllm-reference-worktree (optional)
 #   P8_KVAF_ROOT=/path/to/KVAF-kip_demo_cs_native_enqueue
 #   P8_VLLM_EXPECTED_SHA=<exact HEAD>
 #   P8_KVAF_EXPECTED_SHA=<exact HEAD, currently b1209279...>
@@ -11,14 +12,17 @@
 # Default mode is `npu`, designed for the 179 Docker environment with physical
 # NPU 7 exposed as logical NPU 0.  `P8_RUNNER_MODE=static` is a useful host
 # check: it validates the source/ABI contracts without loading CANN or NPU.
-# No git fetch/worktree/artifact discovery occurs here: a clean exact checkout
-# and fresh explicit per-SHA build directories are required instead.
+# No git fetch/worktree/artifact discovery occurs here.  P8 target artifacts
+# are fresh per invocation.  The optional reference root may persist only its
+# CMake object cache, and is accepted only when it is clean and at the same
+# exact source SHA as the target.
 
 set +u
 set -o pipefail
 
 P8_RUNNER_MODE="${P8_RUNNER_MODE:-npu}"
 P8_VLLM_ROOT="${P8_VLLM_ROOT:-}"
+P8_REFERENCE_VLLM_ROOT="${P8_REFERENCE_VLLM_ROOT:-$P8_VLLM_ROOT}"
 P8_KVAF_ROOT="${P8_KVAF_ROOT:-}"
 P8_VLLM_EXPECTED_SHA="${P8_VLLM_EXPECTED_SHA:-}"
 P8_KVAF_EXPECTED_SHA="${P8_KVAF_EXPECTED_SHA:-}"
@@ -83,19 +87,21 @@ if [[ -z "$P8_PYTHON" || ! -x "$P8_PYTHON" ]]; then
     runner_fail "python_missing"
     exit 2
 fi
-if ! is_clean_exact_repo vllm "$P8_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
+if ! is_clean_exact_repo vllm_target "$P8_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
+   ! is_clean_exact_repo vllm_reference "$P8_REFERENCE_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
    ! is_clean_exact_repo kvaf "$P8_KVAF_ROOT" "$P8_KVAF_EXPECTED_SHA"; then
     runner_fail "source_not_clean_or_exact"
     exit 2
 fi
 
 P8_OPS_ROOT="$P8_VLLM_ROOT/csrc/attention/nanovllm_a5_ops"
+P8_REFERENCE_OPS_ROOT="$P8_REFERENCE_VLLM_ROOT/csrc/attention/nanovllm_a5_ops"
 P8_BUILD_SCRIPT="$P8_OPS_ROOT/build_nanovllm_ops.sh"
 P8_RUNTIME_TEST="$P8_OPS_ROOT/tests/test_p8_forward_owned_executor_runtime.py"
 P8_STAGE_A_SETUP="$P8_OPS_ROOT/a5_score_receipt_candidate_executor/torch_extension/score_receipt_candidate_executor_setup.py"
 P8_STAGE_B_SETUP="$P8_OPS_ROOT/a5_p8_forward_owned_executor/torch_extension/p8_forward_owned_executor_setup.py"
-P8_REFERENCE_BUILD_SCRIPT="$P8_OPS_ROOT/a5_official_c8_reference/build_reference_opp.sh"
-P8_REFERENCE_SETUP="$P8_OPS_ROOT/a5_official_c8_reference/torch_extension/official_c8_reference_setup.py"
+P8_REFERENCE_BUILD_SCRIPT="$P8_REFERENCE_OPS_ROOT/a5_official_c8_reference/build_reference_opp.sh"
+P8_REFERENCE_SETUP="$P8_REFERENCE_OPS_ROOT/a5_official_c8_reference/torch_extension/official_c8_reference_setup.py"
 # Both shell build helpers are deliberately invoked below as
 # ``bash "$script"``.  They therefore need to be regular readable files, not
 # executable files.  Requiring ``-x`` here rejects a normal Git checkout when
@@ -208,8 +214,8 @@ P8_REFERENCE_BRIDGE="$P8_RUN_ROOT/reference_c8_bridge"
 P8_REFERENCE_TEMP="$P8_RUN_ROOT/reference_c8_temp"
 P8_SUFFIX="$($P8_PYTHON -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or ".so")')"
 
-printf 'P8_RUNNER_CONFIG mode=npu physical=7 logical=0 run_root=%s vllm=%s kvaf=%s\n' \
-    "$P8_RUN_ROOT" "$P8_VLLM_EXPECTED_SHA" "$P8_KVAF_EXPECTED_SHA"
+printf 'P8_RUNNER_CONFIG mode=npu physical=7 logical=0 run_root=%s vllm_target=%s vllm_reference=%s kvaf=%s\n' \
+    "$P8_RUN_ROOT" "$P8_VLLM_ROOT" "$P8_REFERENCE_VLLM_ROOT" "$P8_KVAF_ROOT"
 
 # Run the small source-level lifecycle suite once per real run.  The happy
 # Direct-HCCP fixture below validates the only hardware transaction it can
@@ -274,10 +280,12 @@ if not str(loaded).startswith(str(root)):
     exit 1
 fi
 
-# C8 itself remains unmodified.  Build the two official source-matched ACLNN
-# operators and their standalone bridge from this same clean VLLM revision;
-# the real fixture captures it before/after P8 as the strict math gate.
-export A5_OFFICIAL_C8_SOURCE_ROOT="$P8_VLLM_ROOT"
+# C8 itself remains unmodified.  Its reference root is source-matched to the
+# target root, while its CMake objects may remain at this one stable path.
+# CMake therefore recompiles the official tiling source only when it or one
+# of its declared dependencies changed; the packaged OPP remains fresh below
+# P8_RUN_ROOT on every invocation.
+export A5_OFFICIAL_C8_SOURCE_ROOT="$P8_REFERENCE_VLLM_ROOT"
 export A5_OFFICIAL_C8_REFERENCE_ROOT="$P8_REFERENCE_OPP"
 export A5_OFFICIAL_C8_EXPECTED_SOURCE_HEAD="$P8_VLLM_EXPECTED_SHA"
 export A5_OFFICIAL_C8_REFERENCE_BUILD_JOBS="$P8_BUILD_JOBS"
@@ -383,7 +391,8 @@ export PYTHONPATH="$P8_KVAF_BUILD/python:$P8_REFERENCE_BRIDGE:$P8_STAGE_A_BRIDGE
 # Building never authorizes a stale source revision to run.  This second
 # cheap check catches an accidental edit or revision change during the scoped
 # builds without reintroducing a global artifact-fingerprint framework.
-if ! is_clean_exact_repo vllm "$P8_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
+if ! is_clean_exact_repo vllm_target "$P8_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
+   ! is_clean_exact_repo vllm_reference "$P8_REFERENCE_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
    ! is_clean_exact_repo kvaf "$P8_KVAF_ROOT" "$P8_KVAF_EXPECTED_SHA"; then
     runner_fail "source_changed_during_scoped_build"
     exit 1

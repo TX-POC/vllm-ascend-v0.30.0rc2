@@ -30,6 +30,30 @@ OP_LIST="vllm_quant_lightning_indexer,vllm_quant_lightning_indexer_metadata"
 # keeps the reference-only package build isolated from unrelated build
 # artifacts without deleting the shared CMake directory.
 UPSTREAM_BUILD_DIR="${SOURCE_ROOT}/csrc/build"
+# The reference source root is intentionally allowed to retain its *own*
+# CMake/Ninja objects between P8 runs.  That is the expensive part of the
+# official C8 build, notably the large tiling translation unit.  It is safe
+# only when this cache was configured for this exact source-root path.  Do
+# not delete a foreign cache here: fail closed instead, so a caller can never
+# accidentally mix objects from two linked worktrees.
+if [[ -f "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" ]]; then
+  CACHED_CMAKE_HOME="$({
+    sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' \
+      "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" | head -n 1
+  } || true)"
+  EXPECTED_CMAKE_HOME="$(cd "${SOURCE_ROOT}/csrc" && pwd -P)"
+  if [[ -n "${CACHED_CMAKE_HOME}" && \
+        "${CACHED_CMAKE_HOME}" != "${EXPECTED_CMAKE_HOME}" ]]; then
+    printf 'P3_REFERENCE_BUILD_FAIL reason=foreign_cmake_cache cached=%s expected=%s\n' \
+      "${CACHED_CMAKE_HOME}" "${EXPECTED_CMAKE_HOME}" >&2
+    exit 2
+  fi
+  printf 'P3_REFERENCE_INCREMENTAL cache_source=%s build_dir=%s\n' \
+    "${EXPECTED_CMAKE_HOME}" "${UPSTREAM_BUILD_DIR}"
+else
+  printf 'P3_REFERENCE_INCREMENTAL cache_source=<cold> build_dir=%s\n' \
+    "${UPSTREAM_BUILD_DIR}"
+fi
 if [[ -z "${USE_NINJA+x}" && -f "${UPSTREAM_BUILD_DIR}/CMakeCache.txt" ]]; then
   CACHED_CMAKE_GENERATOR="$({
     sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' \

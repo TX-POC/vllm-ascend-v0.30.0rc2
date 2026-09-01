@@ -279,6 +279,7 @@ class P8StageABGraphContractTest(unittest.TestCase):
         for token in (
             "P8_VLLM_EXPECTED_SHA",
             "P8_KVAF_EXPECTED_SHA",
+            "P8_REFERENCE_VLLM_ROOT",
             "! -e \"$repo/.git\"",
             "rev-parse --is-inside-work-tree",
             "git -C \"$repo\" status --porcelain --untracked-files=all",
@@ -296,6 +297,13 @@ class P8StageABGraphContractTest(unittest.TestCase):
             "unset ASCEND_CUSTOM_OPP_PATH NANOVLLM_CUST_OPAPI_LIB",
             "PYTHONNOUSERSITE=1",
             "test_p8_forward_owned_executor_runtime.py",
+        ):
+            self.assertIn(token, RUNNER)
+        for token in (
+            'is_clean_exact_repo vllm_target "$P8_VLLM_ROOT"',
+            'is_clean_exact_repo vllm_reference "$P8_REFERENCE_VLLM_ROOT"',
+            'A5_OFFICIAL_C8_SOURCE_ROOT="$P8_REFERENCE_VLLM_ROOT"',
+            "vllm_target=%s vllm_reference=%s",
         ):
             self.assertIn(token, RUNNER)
         self.assertNotIn("git -C \"$repo\" fetch", RUNNER)

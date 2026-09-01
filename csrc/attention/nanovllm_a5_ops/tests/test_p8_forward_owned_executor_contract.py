@@ -499,6 +499,9 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             'STAGED_MAKESELF_DIR="${SOURCE_ROOT}/csrc/third_party/makeself"',
             'P3_REFERENCE_TOOLCHAIN_MAKESELF_STAGED',
             'reason=makeself_stage_failed',
+            'CMAKE_HOME_DIRECTORY:INTERNAL',
+            'reason=foreign_cmake_cache',
+            'P3_REFERENCE_INCREMENTAL',
         ):
             self.assertIn(token, self.reference_build)
         self.assertIn(
