@@ -298,6 +298,10 @@ if ! run_logged reference_c8_bridge "$P8_RUN_ROOT/reference_c8_bridge.log" \
     printf 'P8_RUNNER_FAIL stage=reference_c8_bridge result=%s\n' "$P8_RUN_ROOT"
     exit 1
 fi
+if [[ ! -f "$P8_REFERENCE_BRIDGE/nanovllm_official_c8_reference/__init__.py" ]]; then
+    runner_fail "reference_c8_bridge_package_missing"
+    exit 1
+fi
 if [[ ! -s "$P8_REFERENCE_BRIDGE/nanovllm_official_c8_reference/_C$P8_SUFFIX" ]]; then
     runner_fail "reference_c8_bridge_missing"
     exit 1
@@ -347,6 +351,10 @@ if ! run_logged stage_a_bridge "$P8_RUN_ROOT/stage_a_bridge.log" \
     printf 'P8_RUNNER_FAIL stage=stage_a_bridge result=%s\n' "$P8_RUN_ROOT"
     exit 1
 fi
+if [[ ! -f "$P8_STAGE_A_BRIDGE/nanovllm_score_receipt_executor/__init__.py" ]]; then
+    runner_fail "stage_a_bridge_package_missing"
+    exit 1
+fi
 if [[ ! -s "$P8_STAGE_A_BRIDGE/nanovllm_score_receipt_executor/_C$P8_SUFFIX" ]]; then
     runner_fail "stage_a_bridge_missing"
     exit 1
@@ -357,6 +365,10 @@ if ! run_logged stage_b_bridge "$P8_RUN_ROOT/stage_b_bridge.log" \
     "$P8_PYTHON" "$P8_STAGE_B_SETUP" build_py build_ext --force \
     --build-lib "$P8_STAGE_B_BRIDGE" --build-temp "$P8_STAGE_B_TEMP"; then
     printf 'P8_RUNNER_FAIL stage=stage_b_bridge result=%s\n' "$P8_RUN_ROOT"
+    exit 1
+fi
+if [[ ! -f "$P8_STAGE_B_BRIDGE/nanovllm_p8_forward_owned_executor/__init__.py" ]]; then
+    runner_fail "stage_b_bridge_package_missing"
     exit 1
 fi
 if [[ ! -s "$P8_STAGE_B_BRIDGE/nanovllm_p8_forward_owned_executor/_C$P8_SUFFIX" ]]; then
