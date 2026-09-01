@@ -51,6 +51,16 @@ STAGE_A_INIT = (
 STAGE_B_INIT = (
     STAGE_B / "torch_extension" / "nanovllm_p8_forward_owned_executor" / "__init__.py"
 ).read_text(encoding="utf-8")
+REFERENCE_BRIDGE_SETUP = (
+    OPS_ROOT / "a5_official_c8_reference" / "torch_extension" /
+    "official_c8_reference_setup.py"
+).read_text(encoding="utf-8")
+STAGE_A_BRIDGE_SETUP = (
+    STAGE_A / "torch_extension" / "score_receipt_candidate_executor_setup.py"
+).read_text(encoding="utf-8")
+STAGE_B_BRIDGE_SETUP = (
+    STAGE_B / "torch_extension" / "p8_forward_owned_executor_setup.py"
+).read_text(encoding="utf-8")
 
 
 def _schema(bridge: str, opname: str, next_opname: str | None = None) -> str:
@@ -390,6 +400,25 @@ class P8StageABGraphContractTest(unittest.TestCase):
             "exact=1",
         ):
             self.assertIn(token, RUNTIME)
+
+    def test_fresh_bridge_builds_copy_init_from_their_own_source_roots(self) -> None:
+        """Reject CWD-dependent `find_packages()` in the per-run bridges.
+
+        Each bridge is invoked by an absolute setup-script path while the P8
+        runner remains in another directory.  A bare ``find_packages()`` then
+        builds only ``_C.so`` in the run root; Python sees its package as a
+        namespace package and provenance loses ``module.__file__``.  This
+        exact source mapping keeps the package init, OPP binding, and native
+        extension together in every fresh P8 run.
+        """
+        for setup_source in (
+            REFERENCE_BRIDGE_SETUP,
+            STAGE_A_BRIDGE_SETUP,
+            STAGE_B_BRIDGE_SETUP,
+        ):
+            self.assertIn("find_packages(where=str(ROOT))", setup_source)
+            self.assertIn('package_dir={"": str(ROOT)}', setup_source)
+            self.assertNotIn("packages=find_packages(),", setup_source)
 
     def test_real_hccp_acceptance_requires_an_unchanged_c8_math_gate(self) -> None:
         """Do not mislabel a transport-only fixture as P8 correctness proof."""

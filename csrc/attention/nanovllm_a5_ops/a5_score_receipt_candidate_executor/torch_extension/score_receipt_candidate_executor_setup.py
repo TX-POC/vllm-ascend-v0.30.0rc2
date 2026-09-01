@@ -35,7 +35,12 @@ MAX_JOBS = int(
 setup(
     name="nanovllm_score_receipt_executor",
     version="0.1.0",
-    packages=find_packages(),
+    # P8 builds into a per-run ``--build-lib`` directory while this script is
+    # called from the runner's CWD.  Bind package discovery to ROOT so the
+    # bridge's __init__.py is copied with its native extension rather than
+    # being imported later as an ambiguous namespace package.
+    packages=find_packages(where=str(ROOT)),
+    package_dir={"": str(ROOT)},
     ext_modules=[
         NpuExtension(
             name="nanovllm_score_receipt_executor._C",

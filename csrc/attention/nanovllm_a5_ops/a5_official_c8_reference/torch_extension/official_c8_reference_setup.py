@@ -36,7 +36,13 @@ MAX_JOBS = int(
 setup(
     name="nanovllm_official_c8_reference",
     version="0.1.0",
-    packages=find_packages(),
+    # The P8 runner invokes this setup script from its own work directory and
+    # places the result under a unique ``--build-lib`` path.  Discovering
+    # packages from the caller's CWD silently omits ``__init__.py`` there,
+    # turning this bridge into a namespace package (``__file__ is None``).
+    # Anchor both discovery and source mapping at this setup file instead.
+    packages=find_packages(where=str(ROOT)),
+    package_dir={"": str(ROOT)},
     ext_modules=[
         NpuExtension(
             name="nanovllm_official_c8_reference._C",

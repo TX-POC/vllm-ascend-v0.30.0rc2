@@ -34,7 +34,12 @@ MAX_JOBS = int(
 setup(
     name="nanovllm_p8_forward_owned_executor",
     version="0.1.0",
-    packages=find_packages(),
+    # The source root must not depend on the shell CWD.  The P8 runner uses a
+    # new --build-lib for every attempt; explicitly copy this package's
+    # __init__.py beside _C so provenance and OPP environment binding cannot
+    # be bypassed by namespace-package resolution.
+    packages=find_packages(where=str(ROOT)),
+    package_dir={"": str(ROOT)},
     ext_modules=[
         NpuExtension(
             name="nanovllm_p8_forward_owned_executor._C",
