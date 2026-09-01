@@ -74,13 +74,22 @@ if [[ "${A5_SOC_VERSION_RAW,,}" != "${A5_SOC_VERSION}" ]]; then
 fi
 echo "[nanovllm_a5_ops] jobs: ${BUILD_JOBS}"
 if [[ -n "${CANN_3RD_LIB_PATH}" ]]; then
-    if [[ ! -r "${CANN_3RD_LIB_PATH}/makeself/makeself.sh" || \
-          ! -r "${CANN_3RD_LIB_PATH}/makeself/makeself-header.sh" ]]; then
-        echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_CANN_3RD_LIB_PATH lacks CANN makeself tools: ${CANN_3RD_LIB_PATH}." >&2
+    CACHE_MAKESELF="${CANN_3RD_LIB_PATH}/makeself/makeself.sh"
+    CACHE_MAKESELF_HEADER="${CANN_3RD_LIB_PATH}/makeself/makeself-header.sh"
+    CACHE_JSON_HEADER="${CANN_3RD_LIB_PATH}/json/include/nlohmann/json.hpp"
+    CACHE_ABSEIL_ARCHIVE="${CANN_3RD_LIB_PATH}/abseil-cpp/abseil-cpp-20230802.1.tar.gz"
+    CACHE_ABSEIL_PKG_ARCHIVE="${CANN_3RD_LIB_PATH}/pkg/abseil-cpp-20230802.1.tar.gz"
+    CACHE_PROTOBUF_ARCHIVE="${CANN_3RD_LIB_PATH}/protobuf/protobuf-all-25.1.tar.gz"
+    CACHE_PROTOBUF_PKG_ARCHIVE="${CANN_3RD_LIB_PATH}/pkg/protobuf-25.1.tar.gz"
+    if [[ ! -r "${CACHE_MAKESELF}" || ! -r "${CACHE_MAKESELF_HEADER}" || \
+          ! -r "${CACHE_JSON_HEADER}" ]] || \
+       { [[ ! -r "${CACHE_ABSEIL_ARCHIVE}" ]] && [[ ! -r "${CACHE_ABSEIL_PKG_ARCHIVE}" ]]; } || \
+       { [[ ! -r "${CACHE_PROTOBUF_ARCHIVE}" ]] && [[ ! -r "${CACHE_PROTOBUF_PKG_ARCHIVE}" ]]; }; then
+        echo "[nanovllm_a5_ops] ERROR: NANOVLLM_A5_CANN_3RD_LIB_PATH is incomplete: ${CANN_3RD_LIB_PATH}." >&2
         exit 2
     fi
     CANN_3RD_LIB_PATH="$(cd "${CANN_3RD_LIB_PATH}" && pwd -P)"
-    echo "[nanovllm_a5_ops] CANN third-party cache: ${CANN_3RD_LIB_PATH}"
+    echo "[nanovllm_a5_ops] CANN third-party cache: ${CANN_3RD_LIB_PATH} (makeself/json/abseil/protobuf ready)"
 fi
 
 ALL_OP_NAMES=(
