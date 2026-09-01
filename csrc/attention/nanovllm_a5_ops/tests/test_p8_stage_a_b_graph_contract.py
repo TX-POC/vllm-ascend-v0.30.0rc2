@@ -23,6 +23,7 @@ STAGE_A_SPEC = json.loads((STAGE_A / "ops.json").read_text(encoding="utf-8"))[0]
 STAGE_B_SPECS = json.loads((STAGE_B / "ops.json").read_text(encoding="utf-8"))
 STAGE_B_SPEC = STAGE_B_SPECS[0]
 STAGE_B_ADVANCE_SPEC = STAGE_B_SPECS[1]
+STAGE_B_ADMISSION_SPEC = STAGE_B_SPECS[2]
 STAGE_A_KERNEL = (
     STAGE_A / "op_kernel" / "a5_score_receipt_candidate_executor.cpp"
 ).read_text(encoding="utf-8")
@@ -81,7 +82,7 @@ class P8StageABGraphContractTest(unittest.TestCase):
             [
                 "score_workspace",
                 "tile_receipts",
-                "streaming_epoch",
+                "receipt_identity",
                 "score_source_lens",
                 "resident_threshold",
                 "resident_threshold_valid",
@@ -91,7 +92,13 @@ class P8StageABGraphContractTest(unittest.TestCase):
         self.assertIn("score < threshold", STAGE_A_KERNEL)
         self.assertIn("kvObjectSlotsSnapshot_", STAGE_A_KERNEL)
         self.assertIn("DataSyncBarrier<MemDsbT::DDR>()", STAGE_A_KERNEL)
-        self.assertIn("candidateReadyEpoch_", STAGE_A_KERNEL)
+        for token in (
+            "kCandidateReceiptIdentityWords = 4U",
+            "LoadStableInputIdentity",
+            "TombstoneOutputIdentity",
+            "PublishOutputIdentity",
+        ):
+            self.assertIn(token, STAGE_A_KERNEL)
 
     def test_candidate_seed_abi_is_exactly_reused_by_stage_b(self) -> None:
         stage_a_outputs = [item["name"] for item in STAGE_A_SPEC["output_desc"]]
@@ -101,7 +108,7 @@ class P8StageABGraphContractTest(unittest.TestCase):
             [
                 "candidate_seeds",
                 "candidate_counts",
-                "candidate_ready_epoch",
+                "candidate_receipt_identity",
                 "receipt_status",
             ],
         )
@@ -110,7 +117,7 @@ class P8StageABGraphContractTest(unittest.TestCase):
             [
                 "candidate_seeds",
                 "candidate_counts",
-                "candidate_ready_epoch",
+                "candidate_receipt_identity",
                 "candidate_status",
             ],
         )
@@ -118,7 +125,10 @@ class P8StageABGraphContractTest(unittest.TestCase):
         stage_b_types = [item["type"] for item in STAGE_B_SPEC["input_desc"][:4]]
         self.assertEqual(stage_a_types, stage_b_types)
         self.assertIn("kA5P8CandidateSeedWords = 4U", STAGE_B_TILING)
-        self.assertIn("candidateReadyEpoch_", STAGE_B_KERNEL)
+        self.assertIn("kA5P8CandidateReceiptIdentityWords = 4U", STAGE_B_TILING)
+        self.assertIn("LoadCurrentCandidateReceipt", STAGE_B_KERNEL)
+        self.assertIn("candidateReceiptIdentity_", STAGE_B_KERNEL)
+        self.assertIn("candidateCursorIdentity_", STAGE_B_KERNEL)
         self.assertIn("candidateStatus_", STAGE_B_KERNEL)
 
     def test_forward_control_is_a_graph_visible_mutable_alias(self) -> None:
@@ -128,7 +138,7 @@ class P8StageABGraphContractTest(unittest.TestCase):
                                                    "a5_p8_forward_owned_executor.cpp").read_text(encoding="utf-8"))
         self.assertIn("Tensor(a!) forward_control,", STAGE_B_BRIDGE)
 
-    def test_bridge_schema_is_exactly_27_inputs_and_16_alias_outputs(self) -> None:
+    def test_bridge_schema_is_exactly_28_inputs_and_19_alias_outputs(self) -> None:
         """Reject input/return alias drift before a CANN build.
 
         In particular, `forward_control` has one input occurrence and one
@@ -140,13 +150,13 @@ class P8StageABGraphContractTest(unittest.TestCase):
             "advance_forward_control",
         )
         input_names, output_names = _tensor_names(schema)
-        self.assertEqual(len(input_names), 27, input_names)
-        self.assertEqual(len(output_names), 16, output_names)
+        self.assertEqual(len(input_names), 28, input_names)
+        self.assertEqual(len(output_names), 19, output_names)
         self.assertEqual(input_names.count("forward_control"), 1)
         self.assertEqual(output_names.count("forward_control"), 1)
-        self.assertEqual(input_names[:5], [
-            "candidate_seeds", "candidate_counts", "candidate_ready_epoch",
-            "candidate_status", "forward_control",
+        self.assertEqual(input_names[:6], [
+            "candidate_seeds", "candidate_counts", "candidate_receipt_identity",
+            "candidate_status", "forward_control", "p8_arena_health",
         ])
         self.assertEqual(output_names[0], "forward_control")
         self.assertEqual(
@@ -154,19 +164,28 @@ class P8StageABGraphContractTest(unittest.TestCase):
             [item["name"] for item in STAGE_B_SPEC["output_desc"]],
         )
 
-    def test_advance_schema_is_exactly_four_inputs_and_two_alias_outputs(self) -> None:
+    def test_advance_schema_latches_arena_health_on_abort(self) -> None:
+        """Control-transition failure must poison the shared arena as well.
+
+        A forward abort without a sticky health latch would leave later graph
+        replays free to lease records whose previous owner failed mid-phase.
+        """
         schema = _schema(STAGE_B_BRIDGE, "advance_forward_control")
         input_names, output_names = _tensor_names(schema)
         self.assertEqual(
             input_names,
             [
                 "forward_control",
+                "p8_arena_health",
                 "expected_identity",
                 "transition_program",
                 "transition_result",
             ],
         )
-        self.assertEqual(output_names, ["forward_control", "transition_result"])
+        self.assertEqual(
+            output_names,
+            ["forward_control", "p8_arena_health", "transition_result"],
+        )
         self.assertEqual(
             [item["name"] for item in STAGE_B_ADVANCE_SPEC["input_desc"]],
             input_names,
@@ -177,15 +196,71 @@ class P8StageABGraphContractTest(unittest.TestCase):
         )
         self.assertIn("aclnnA5P8ForwardControlAdvance", STAGE_B_BRIDGE)
 
+    def test_admission_gate_is_a_one_time_graph_node_with_three_aliases(self) -> None:
+        """Admission protects the fixed arena; it is not a fixed Get core."""
+        schema = _schema(STAGE_B_BRIDGE, "arena_admission_gate")
+        input_names, output_names = _tensor_names(schema)
+        self.assertEqual(
+            input_names,
+            [
+                "forward_control",
+                "p8_arena_health",
+                "fused_get_control",
+                "p8_wave_records",
+                "p8_private_records",
+                "expected_identity",
+                "admission_result",
+            ],
+        )
+        self.assertEqual(
+            output_names,
+            ["forward_control", "p8_arena_health", "admission_result"],
+        )
+        self.assertEqual(
+            [item["name"] for item in STAGE_B_ADMISSION_SPEC["input_desc"]],
+            input_names,
+        )
+        self.assertEqual(
+            [item["name"] for item in STAGE_B_ADMISSION_SPEC["output_desc"]],
+            output_names,
+        )
+        self.assertIn("aclnnA5P8ArenaAdmissionGate", STAGE_B_BRIDGE)
+
     def test_stage_a_release_marker_precedes_stage_b_consumption(self) -> None:
-        publish = STAGE_A_KERNEL.index("candidate_ready_epoch is the sole release marker")
-        barrier = STAGE_A_KERNEL.index("DataSyncBarrier<MemDsbT::DDR>()", publish)
-        ready_store = STAGE_A_KERNEL.index("candidateReadyEpoch_ + receipt", barrier)
-        self.assertLess(publish, barrier)
-        self.assertLess(barrier, ready_store)
-        consume = STAGE_B_KERNEL.index("candidateReadyEpoch_ + receipt")
-        status = STAGE_B_KERNEL.index("candidateStatus_ + receipt", consume)
-        self.assertLess(consume, status)
+        # Stage A writes candidate payload/status, publishes identity lanes
+        # [epoch,replay,layer], barriers, and writes generation last.  Stage B
+        # samples the release generation twice around status consumption.
+        publish_start = STAGE_A_KERNEL.index("void PublishOutputIdentity")
+        publish_end = STAGE_A_KERNEL.index("void ClearSeeds", publish_start)
+        publish = STAGE_A_KERNEL[publish_start:publish_end]
+        prefix = publish.index("output + 0U")
+        barrier = publish.index("DataSyncBarrier<MemDsbT::DDR>()", prefix)
+        generation = publish.index("output + 3U", barrier)
+        self.assertLess(prefix, barrier)
+        self.assertLess(barrier, generation)
+        consume_start = STAGE_B_KERNEL.index("bool LoadCurrentCandidateReceipt")
+        consume_end = STAGE_B_KERNEL.index("void TombstoneReceiptIdentity", consume_start)
+        consume = STAGE_B_KERNEL[consume_start:consume_end]
+        self.assertLess(
+            consume.index("LoadStableReceiptIdentity(CandidateReceiptIdentity(receipt)"),
+            consume.index("candidateStatus_ + receipt"),
+        )
+        self.assertGreaterEqual(
+            consume.count("LoadStableReceiptIdentity(CandidateReceiptIdentity(receipt)"), 2,
+        )
+
+    def test_terminal_tombstones_both_receipt_and_cursor_identity(self) -> None:
+        terminal_start = STAGE_B_KERNEL.index("void TombstoneCurrentCandidateReceipt")
+        terminal_end = STAGE_B_KERNEL.index("void RunForwardTerminal", terminal_start)
+        terminal = STAGE_B_KERNEL[terminal_start:terminal_end]
+        for token in (
+            "TombstoneReceiptIdentity(CandidateReceiptIdentity(receipt))",
+            "candidateStatus_ + receipt",
+            "TombstoneReceiptIdentity(CandidateCursorIdentity(receipt))",
+            "candidateCursor_ + receipt",
+            "kCandidateStatusTombstoned",
+        ):
+            self.assertIn(token, terminal)
 
     def test_p8_stage_b_has_its_own_bridge_and_no_c8_or_p7_transport(self) -> None:
         self.assertIn("aclnnA5P8ForwardOwnedExecutor", STAGE_B_BRIDGE)
@@ -209,8 +284,12 @@ class P8StageABGraphContractTest(unittest.TestCase):
             "git -C \"$repo\" status --porcelain --untracked-files=all",
             "mktemp -d \"$P8_OPS_ROOT/build/p8_npu7_",
             "NANOVLLM_A5_OPS_ONLY=A5ScoreReceiptCandidateExecutor",
-            "NANOVLLM_A5_OPS_ONLY=A5P8ForwardOwnedExecutor,A5P8ForwardControlAdvance",
+            "NANOVLLM_A5_OPS_ONLY=A5P8ForwardOwnedExecutor,A5P8ForwardControlAdvance,A5P8ArenaAdmissionGate",
             "NANOVLLM_A5_P8_KVAF_EXPECTED_SHA",
+            "P8_REFERENCE_BRIDGE_ROOT",
+            "P8_STAGE_A_BRIDGE_ROOT",
+            "P8_STAGE_B_BRIDGE_ROOT",
+            "source_changed_during_scoped_build",
             "P8_PHYSICAL_NPU_ID",
             "ASCEND_RT_VISIBLE_DEVICES",
             "A5_SOC_VERSION=ascend950",
@@ -227,10 +306,80 @@ class P8StageABGraphContractTest(unittest.TestCase):
         """Invalid Direct-HCCP control must not look like a no-op or a Post."""
         for token in (
             "FAIL_CLOSED_TRANSPORT_INPUTS",
-            "WORKER_STATS_INPUT = 26",
+            "WORKER_STATS_INPUT = 27",
+            "receipt_tombstone=1 cursor_tombstone=1",
             "CONTROL_REJECTED_STAT_COLUMN = 10",
             "P8_FAIL_CLOSED_DIAGNOSTIC",
             "non_transport_mutation=0",
+        ):
+            self.assertIn(token, RUNTIME)
+
+    def test_runtime_orders_prepare_admission_receipt_attach_then_post(self) -> None:
+        """No Stage-A publication may race an unadmitted/reset arena.
+
+        The fixture deliberately has a two-step API.  It cold-binds the
+        graph-stable arena, admission leases that exact storage, and only then
+        does Stage A publish CandidateSeed GM.  Attachment must preserve the
+        admitted pointers before Stage B can POST.
+        """
+        prepare = RUNTIME.index("prepared, attach, real_mode = _prepare_fixture(")
+        invoke = RUNTIME.index("admission = _run_arena_admission_gate(shell")
+        stage_a = RUNTIME.index("stage_a = _run_stage_a(device, stage_a_fixture)")
+        attach = RUNTIME.index("inputs, identity, real_fixture = _attach_stage_a_receipts(")
+        post = RUNTIME.index('_run_executor(inputs, "post")')
+        self.assertLess(prepare, invoke)
+        self.assertLess(invoke, stage_a)
+        self.assertLess(stage_a, attach)
+        self.assertLess(attach, post)
+        for token in (
+            "P8_ARENA_ADMISSION",
+            "P8_ARENA_ATTACHMENT",
+            "admitted_shell_alias=1",
+            "stage_a_after_admission=1",
+            "dynamic_get_workers=1",
+            "ADMISSION_CONTROL_INVALID",
+            "arena_admission_gate",
+            "prepare_p8_real_fixture",
+            "attach_p8_stage_a_receipts",
+        ):
+            self.assertIn(token, RUNTIME)
+
+    def test_runtime_releases_only_after_qsfa_terminal_and_before_reuse(self) -> None:
+        """The single-layer harness is the terminal layer of one forward."""
+        qsfa = RUNTIME.index('_run_executor(inputs, "qsfa_terminal")')
+        forward = RUNTIME.index('_run_executor(inputs, "forward_terminal")')
+        reuse = RUNTIME.rindex("_validate_terminal_reuse_fence(")
+        self.assertLess(qsfa, forward)
+        self.assertLess(forward, reuse)
+        for token in (
+            "P8_LAYER_REUSE_CONTRACT",
+            "not once per layer",
+            "bounded CQ drain *and* QSFA terminal",
+            "P8_REUSE_FENCE",
+            "next_forward_reset_before_fence=0",
+        ):
+            self.assertIn(token, RUNTIME)
+        for token in (
+            "prepare_p8_real_fixture",
+            "attach_p8_stage_a_receipts",
+            "P8_REAL_ADMISSION",
+            "P8_REAL_RECEIPT_ATTACH",
+            "P8_REAL_REUSE_FENCE",
+            "reuse_fence_validated",
+        ):
+            self.assertIn(token, REAL_FIXTURE)
+
+    def test_runtime_proves_all_three_imported_bridges_are_fresh(self) -> None:
+        for token in (
+            "P8_ARTIFACT_PROVENANCE",
+            "P8 stale",
+            "nanovllm_official_c8_reference",
+            "nanovllm_score_receipt_executor",
+            "nanovllm_p8_forward_owned_executor",
+            "P8_REFERENCE_BRIDGE_ROOT",
+            "P8_STAGE_A_BRIDGE_ROOT",
+            "P8_STAGE_B_BRIDGE_ROOT",
+            "exact=1",
         ):
             self.assertIn(token, RUNTIME)
 

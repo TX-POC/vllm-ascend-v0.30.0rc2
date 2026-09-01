@@ -99,6 +99,31 @@ for required in (
 ):
     if required not in oracle_text:
         fail(f"oracle_gate_missing={required}")
+
+# The Stage-A candidate receipt is not an epoch-only ready bit.  This source
+# closure deliberately proves the four-word identity ABI and its release
+# ordering without pretending this host-only test can observe a device race.
+for required, text, label in (
+    ('"receipt_identity"', ops_text, "ops_json"),
+    ('"candidate_receipt_identity"', ops_text, "ops_json"),
+    ("kCandidateReceiptIdentityWords = 4U", kernel_text, "kernel"),
+    ("LoadStableInputIdentity", kernel_text, "kernel"),
+    ("TombstoneOutputIdentity", kernel_text, "kernel"),
+    ("PublishOutputIdentity", kernel_text, "kernel"),
+    ("RECEIPT_IDENTITY_WORDS = 4", oracle_text, "oracle"),
+):
+    if required not in text:
+        fail(f"receipt_identity_missing={label}:{required}")
+publish_start = kernel_text.find("void PublishOutputIdentity")
+publish_end = kernel_text.find("void ClearSeeds", publish_start)
+if publish_start < 0 or publish_end < 0:
+    fail("receipt_identity_publish_function_missing")
+publish = kernel_text[publish_start:publish_end]
+prefix = publish.find("output + 0U")
+barrier = publish.find("DataSyncBarrier<MemDsbT::DDR>()", prefix)
+generation = publish.find("output + 3U", barrier)
+if min(prefix, barrier, generation) < 0 or not prefix < barrier < generation:
+    fail("receipt_identity_generation_not_published_last")
 for forbidden in (
     r"^\s*(?:from|import)\s+.*a5_streaming_quant_li_get",
     r"^\s*(?:from|import)\s+.*kvaf",

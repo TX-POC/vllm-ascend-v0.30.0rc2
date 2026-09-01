@@ -11,6 +11,10 @@
 #include <cstdint>
 
 constexpr uint32_t kA5P8CandidateSeedWords = 4U;
+// [forward_epoch, graph_replay_generation, layer_control_index,
+//  receipt_generation].  Generation is the release word and is always
+// written/read last by the Stage-A -> Stage-B receipt seam.
+constexpr uint32_t kA5P8CandidateReceiptIdentityWords = 4U;
 constexpr uint32_t kA5P8CandidateCapacity = 128U;
 constexpr uint32_t kA5P8WaveRecordWords = 32U;
 constexpr uint32_t kA5P8PrivateRecordWords = 10U;

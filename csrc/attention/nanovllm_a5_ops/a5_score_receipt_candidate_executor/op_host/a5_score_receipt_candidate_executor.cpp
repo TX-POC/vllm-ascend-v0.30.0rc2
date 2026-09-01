@@ -21,7 +21,7 @@
 namespace {
 constexpr size_t kScoreWorkspace = 0;
 constexpr size_t kTileReceipts = 1;
-constexpr size_t kStreamingEpoch = 2;
+constexpr size_t kReceiptIdentity = 2;
 constexpr size_t kScoreSourceLens = 3;
 constexpr size_t kResidentThreshold = 4;
 constexpr size_t kResidentThresholdValid = 5;
@@ -33,13 +33,14 @@ constexpr size_t kInputCount = 10;
 
 constexpr size_t kCandidateSeeds = 0;
 constexpr size_t kCandidateCounts = 1;
-constexpr size_t kCandidateReadyEpoch = 2;
+constexpr size_t kCandidateReceiptIdentity = 2;
 constexpr size_t kReceiptStatus = 3;
 constexpr size_t kReceiptOwner = 4;
 
 constexpr uint32_t kReceiptWords = 16U;
 constexpr uint32_t kScoreTileWidth = 128U;
 constexpr uint32_t kCandidateSeedWords = 4U;
+constexpr uint32_t kCandidateReceiptIdentityWords = 4U;
 
 bool IsPositiveVector(const gert::Shape& shape)
 {
@@ -54,7 +55,7 @@ bool IsPositiveMatrix(const gert::Shape& shape)
 
 bool GetGeometry(const gert::Shape& scoreWorkspace,
                  const gert::Shape& tileReceipts,
-                 const gert::Shape& streamingEpoch,
+                 const gert::Shape& receiptIdentity,
                  const gert::Shape& scoreSourceLens,
                  const gert::Shape& residentThreshold,
                  const gert::Shape& residentThresholdValid,
@@ -70,8 +71,8 @@ bool GetGeometry(const gert::Shape& scoreWorkspace,
     if (rowCount == nullptr || sourceCapacity == nullptr || poolSize == nullptr ||
         kvObjectCapacity == nullptr || tilesPerRow == nullptr ||
         tileReceiptCount == nullptr || scoreWorkspaceWords == nullptr ||
-        !IsPositiveVector(scoreWorkspace) || !IsPositiveVector(streamingEpoch) ||
-        streamingEpoch.GetDim(0) != 1 || !IsPositiveVector(scoreSourceLens) ||
+        !IsPositiveVector(scoreWorkspace) || !IsPositiveMatrix(receiptIdentity) ||
+        !IsPositiveVector(scoreSourceLens) ||
         !IsPositiveVector(residentThreshold) ||
         !IsPositiveVector(residentThresholdValid) ||
         !IsPositiveVector(reqPoolEntries) || !IsPositiveVector(kvObjectLens) ||
@@ -110,6 +111,8 @@ bool GetGeometry(const gert::Shape& scoreWorkspace,
         tileCount > std::numeric_limits<uint32_t>::max() ||
         receiptCount > std::numeric_limits<uint32_t>::max() ||
         tileReceipts.GetDim(0) != static_cast<int64_t>(receiptCount) ||
+        receiptIdentity.GetDim(0) != static_cast<int64_t>(receiptCount) ||
+        receiptIdentity.GetDim(1) != kCandidateReceiptIdentityWords ||
         static_cast<uint64_t>(workspaceWords) < minimumWords) {
         return false;
     }
@@ -150,8 +153,8 @@ static ge::graphStatus TilingA5ScoreReceiptCandidateExecutor(
         context->GetInputShape(kScoreWorkspace)->GetStorageShape();
     const gert::Shape tileReceipts =
         context->GetInputShape(kTileReceipts)->GetStorageShape();
-    const gert::Shape streamingEpoch =
-        context->GetInputShape(kStreamingEpoch)->GetStorageShape();
+    const gert::Shape receiptIdentity =
+        context->GetInputShape(kReceiptIdentity)->GetStorageShape();
     const gert::Shape scoreSourceLens =
         context->GetInputShape(kScoreSourceLens)->GetStorageShape();
     const gert::Shape residentThreshold =
@@ -174,7 +177,7 @@ static ge::graphStatus TilingA5ScoreReceiptCandidateExecutor(
     uint32_t tilesPerRow = 0U;
     uint32_t tileReceiptCount = 0U;
     uint32_t scoreWorkspaceWords = 0U;
-    if (!GetGeometry(scoreWorkspace, tileReceipts, streamingEpoch,
+    if (!GetGeometry(scoreWorkspace, tileReceipts, receiptIdentity,
                      scoreSourceLens, residentThreshold,
                      residentThresholdValid, kvObjectSlotsSnapshot,
                      reqPoolEntries, kvObjectMap, kvObjectLens, &rowCount,
@@ -225,8 +228,8 @@ static ge::graphStatus InferA5ScoreReceiptCandidateExecutorShape(
     const gert::Shape scoreWorkspace =
         *context->GetInputShape(kScoreWorkspace);
     const gert::Shape tileReceipts = *context->GetInputShape(kTileReceipts);
-    const gert::Shape streamingEpoch =
-        *context->GetInputShape(kStreamingEpoch);
+    const gert::Shape receiptIdentity =
+        *context->GetInputShape(kReceiptIdentity);
     const gert::Shape scoreSourceLens =
         *context->GetInputShape(kScoreSourceLens);
     const gert::Shape residentThreshold =
@@ -246,7 +249,7 @@ static ge::graphStatus InferA5ScoreReceiptCandidateExecutorShape(
     uint32_t tilesPerRow = 0U;
     uint32_t receiptCount = 0U;
     uint32_t scoreWorkspaceWords = 0U;
-    if (!GetGeometry(scoreWorkspace, tileReceipts, streamingEpoch,
+    if (!GetGeometry(scoreWorkspace, tileReceipts, receiptIdentity,
                      scoreSourceLens, residentThreshold,
                      residentThresholdValid, kvObjectSlotsSnapshot,
                      reqPoolEntries, kvObjectMap, kvObjectLens, &rowCount,
@@ -256,7 +259,7 @@ static ge::graphStatus InferA5ScoreReceiptCandidateExecutorShape(
     }
     if (context->GetOutputShape(kCandidateSeeds) == nullptr ||
         context->GetOutputShape(kCandidateCounts) == nullptr ||
-        context->GetOutputShape(kCandidateReadyEpoch) == nullptr ||
+        context->GetOutputShape(kCandidateReceiptIdentity) == nullptr ||
         context->GetOutputShape(kReceiptStatus) == nullptr ||
         context->GetOutputShape(kReceiptOwner) == nullptr) {
         return ge::GRAPH_FAILED;
@@ -265,8 +268,11 @@ static ge::graphStatus InferA5ScoreReceiptCandidateExecutorShape(
     context->GetOutputShape(kCandidateSeeds)->SetDim(0, receiptCount);
     context->GetOutputShape(kCandidateSeeds)->SetDim(1, kScoreTileWidth);
     context->GetOutputShape(kCandidateSeeds)->SetDim(2, kCandidateSeedWords);
-    for (size_t index : {kCandidateCounts, kCandidateReadyEpoch,
-                         kReceiptStatus, kReceiptOwner}) {
+    context->GetOutputShape(kCandidateReceiptIdentity)->SetDimNum(2);
+    context->GetOutputShape(kCandidateReceiptIdentity)->SetDim(0, receiptCount);
+    context->GetOutputShape(kCandidateReceiptIdentity)->SetDim(
+        1, kCandidateReceiptIdentityWords);
+    for (size_t index : {kCandidateCounts, kReceiptStatus, kReceiptOwner}) {
         context->GetOutputShape(index)->SetDimNum(1);
         context->GetOutputShape(index)->SetDim(0, receiptCount);
     }
@@ -281,7 +287,7 @@ static ge::graphStatus InferA5ScoreReceiptCandidateExecutorDataType(
     }
     context->SetOutputDataType(kCandidateSeeds, ge::DT_INT32);
     context->SetOutputDataType(kCandidateCounts, ge::DT_INT32);
-    context->SetOutputDataType(kCandidateReadyEpoch, ge::DT_INT64);
+    context->SetOutputDataType(kCandidateReceiptIdentity, ge::DT_INT64);
     context->SetOutputDataType(kReceiptStatus, ge::DT_INT32);
     context->SetOutputDataType(kReceiptOwner, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
@@ -298,7 +304,7 @@ public:
             .DataType(int32Types).Format(formats);
         this->Input("tile_receipts").ParamType(REQUIRED)
             .DataType(int64Types).Format(formats);
-        this->Input("streaming_epoch").ParamType(REQUIRED)
+        this->Input("receipt_identity").ParamType(REQUIRED)
             .DataType(int64Types).Format(formats);
         for (const char* input : {"score_source_lens", "resident_threshold",
                                   "resident_threshold_valid",
@@ -312,7 +318,7 @@ public:
             .DataType(int32Types).Format(formats);
         this->Output("candidate_counts").ParamType(REQUIRED)
             .DataType(int32Types).Format(formats);
-        this->Output("candidate_ready_epoch").ParamType(REQUIRED)
+        this->Output("candidate_receipt_identity").ParamType(REQUIRED)
             .DataType(int64Types).Format(formats);
         this->Output("receipt_status").ParamType(REQUIRED)
             .DataType(int32Types).Format(formats);

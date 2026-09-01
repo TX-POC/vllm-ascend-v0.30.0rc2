@@ -286,7 +286,10 @@ if [[ ! -s "$P8_STAGE_A_OPP/vendors/customize/op_api/lib/libcust_opapi.so" ]]; t
     exit 1
 fi
 
-export NANOVLLM_A5_OPS_ONLY=A5P8ForwardOwnedExecutor,A5P8ForwardControlAdvance
+# P8 is one source-closed graph closure: admission validates a clean shared
+# arena once, then dynamic workers own POST/DRAIN/QSFA/FORWARD-terminal.  It
+# is deliberately not a ``31+1`` core partition.
+export NANOVLLM_A5_OPS_ONLY=A5P8ForwardOwnedExecutor,A5P8ForwardControlAdvance,A5P8ArenaAdmissionGate
 export NANOVLLM_A5_OPS_BUILD_ROOT="$P8_STAGE_B_BUILD"
 export NANOVLLM_A5_LOCAL_OPP="$P8_STAGE_B_OPP"
 export KVAF_FUSED_GET_SOURCE="$P8_KVAF_ROOT"
@@ -329,6 +332,12 @@ export NANOVLLM_A5_SCORE_RECEIPT_EXECUTOR_OPP="$P8_STAGE_A_OPP"
 export NANOVLLM_A5_P8_FORWARD_OWNED_OPP="$P8_STAGE_B_OPP"
 export NANOVLLM_A5_REFERENCE_C8_OPP="$P8_REFERENCE_OPP"
 export NANOVLLM_A5_REFERENCE_C8_OPAPI_LIB="$P8_REFERENCE_OPAPI"
+# The runtime verifies these exact paths after import.  Existence of a .so is
+# not provenance: all three packages must come from this runner's unique root.
+export P8_REFERENCE_BRIDGE_ROOT="$P8_REFERENCE_BRIDGE"
+export P8_STAGE_A_BRIDGE_ROOT="$P8_STAGE_A_BRIDGE"
+export P8_STAGE_B_BRIDGE_ROOT="$P8_STAGE_B_BRIDGE"
+export P8_VLLM_EXPECTED_SHA P8_KVAF_EXPECTED_SHA
 export P3_REFERENCE_EXPECTED_OPP_SOURCE_HEAD="$P8_VLLM_EXPECTED_SHA"
 export P3_RUNNER_EXPECTED_HEAD="$P8_VLLM_EXPECTED_SHA"
 export P3_NPU_ID=0
@@ -336,6 +345,14 @@ export P3_PHYSICAL_NPU_ID="$P8_PHYSICAL_NPU_ID"
 # The test module is deliberately first after the freshly built KVAF package,
 # so Python cannot discover an editable/installed historical bridge or KVAF.
 export PYTHONPATH="$P8_KVAF_BUILD/python:$P8_REFERENCE_BRIDGE:$P8_STAGE_A_BRIDGE:$P8_STAGE_B_BRIDGE:$P8_OPS_ROOT/tests${PYTHONPATH:+:$PYTHONPATH}"
+# Building never authorizes a stale source revision to run.  This second
+# cheap check catches an accidental edit or revision change during the scoped
+# builds without reintroducing a global artifact-fingerprint framework.
+if ! is_clean_exact_repo vllm "$P8_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
+   ! is_clean_exact_repo kvaf "$P8_KVAF_ROOT" "$P8_KVAF_EXPECTED_SHA"; then
+    runner_fail "source_changed_during_scoped_build"
+    exit 1
+fi
 P8_RUNTIME_ARGS=("$P8_RUNTIME_TEST" --device npu:0)
 P8_RUNTIME_ARGS+=(--real-fixture-module "$P8_REAL_FIXTURE_MODULE")
 if [[ "$P8_REQUIRE_REAL_HCCP" == "1" ]]; then

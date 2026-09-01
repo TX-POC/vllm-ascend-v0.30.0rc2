@@ -1,4 +1,4 @@
-// P8 host ABI: one forward-owned state machine, three graph phases.
+// P8 host ABI: one forward-owned state machine, four graph phases.
 //
 // The P8 phase is graph-visible in a fixed KVAF forward-control record, not
 // an attribute or process-local switch.  Its four int64 words encode
@@ -21,9 +21,14 @@ namespace {
 enum InputIndex : size_t {
     kCandidateSeeds = 0,
     kCandidateCounts,
-    kCandidateReadyEpoch,
+    kCandidateReceiptIdentity,
     kCandidateStatus,
     kForwardControl,
+    // Graph-stable, arena-wide sticky health bit.  This is intentionally
+    // independent of the per-layer four-word forward-control record: an
+    // in-flight resource quarantine must reject P8 admission for later
+    // layer/forward invocations using the same fixed arena.
+    kP8ArenaHealth,
     kSourceLens,
     kKvObjectAddressDomain,
     kReqPoolEntries,
@@ -43,7 +48,7 @@ enum InputIndex : size_t {
     kQueueRequestOutputIndices,
     kQueueRequestCount,
     kCandidateCursor,
-    kCandidateCursorEpoch,
+    kCandidateCursorIdentity,
     kRowsPerEntry,
     kWorkerStats,
     kInputCount,
@@ -55,6 +60,7 @@ enum OutputIndex : size_t {
     // must observe that mutation rather than treating it as an invisible
     // side effect.
     kForwardControlOut = 0,
+    kP8ArenaHealthOut,
     kPrivateSourceToSlotOut,
     kPrivateObjectToSlotOut,
     kPrivateReadyTableOut,
@@ -68,19 +74,21 @@ enum OutputIndex : size_t {
     kQueueRequestOutputIndicesOut,
     kQueueRequestCountOut,
     kCandidateCursorOut,
-    kCandidateCursorEpochOut,
+    kCandidateCursorIdentityOut,
     kWorkerStatsOut,
+    kCandidateReceiptIdentityOut,
+    kCandidateStatusOut,
     kOutputCount,
 };
 
 constexpr size_t kAliasInputs[kOutputCount] = {
-    kForwardControl, kPrivateSourceToSlot, kPrivateObjectToSlot,
+    kForwardControl, kP8ArenaHealth, kPrivateSourceToSlot, kPrivateObjectToSlot,
     kPrivateReadyTable,
     kPrivateSlotCursor, kPrivatePackedOutput, kFusedGetControl,
     kP8WaveRecords, kP8PrivateRecords, kQueueRequestSourceOffsets,
     kQueueRequestObjectOffsets, kQueueRequestOutputIndices,
-    kQueueRequestCount, kCandidateCursor, kCandidateCursorEpoch,
-    kWorkerStats,
+    kQueueRequestCount, kCandidateCursor, kCandidateCursorIdentity,
+    kWorkerStats, kCandidateReceiptIdentity, kCandidateStatus,
 };
 
 bool IsPositiveVector(const gert::Shape& shape)
@@ -112,9 +120,11 @@ bool ValidateGeometry(const gert::Shape* const* shapes, uint32_t* receipts,
     }
     const gert::Shape& seeds = *shapes[kCandidateSeeds];
     const gert::Shape& counts = *shapes[kCandidateCounts];
-    const gert::Shape& ready_epoch = *shapes[kCandidateReadyEpoch];
+    const gert::Shape& receipt_identity =
+        *shapes[kCandidateReceiptIdentity];
     const gert::Shape& status = *shapes[kCandidateStatus];
     const gert::Shape& forward = *shapes[kForwardControl];
+    const gert::Shape& arena_health = *shapes[kP8ArenaHealth];
     const gert::Shape& source_lens = *shapes[kSourceLens];
     const gert::Shape& domain = *shapes[kKvObjectAddressDomain];
     const gert::Shape& pool_entries = *shapes[kReqPoolEntries];
@@ -134,16 +144,18 @@ bool ValidateGeometry(const gert::Shape* const* shapes, uint32_t* receipts,
     const gert::Shape& request_output = *shapes[kQueueRequestOutputIndices];
     const gert::Shape& request_count = *shapes[kQueueRequestCount];
     const gert::Shape& candidate_cursor = *shapes[kCandidateCursor];
-    const gert::Shape& candidate_cursor_epoch = *shapes[kCandidateCursorEpoch];
+    const gert::Shape& candidate_cursor_identity =
+        *shapes[kCandidateCursorIdentity];
     const gert::Shape& rows_per_entry = *shapes[kRowsPerEntry];
     const gert::Shape& stats = *shapes[kWorkerStats];
 
     if (seeds.GetDimNum() != 3 || seeds.GetDim(0) <= 0 ||
         seeds.GetDim(1) != kA5P8CandidateCapacity ||
         seeds.GetDim(2) != kA5P8CandidateSeedWords ||
-        !IsPositiveVector(counts) || !IsPositiveVector(ready_epoch) ||
+        !IsPositiveVector(counts) || !IsPositiveMatrix(receipt_identity) ||
         !IsPositiveVector(status) || !IsPositiveVector(forward) ||
         forward.GetDim(0) != kA5P8ForwardControlWords ||
+        !IsPositiveVector(arena_health) || arena_health.GetDim(0) != 1 ||
         !IsPositiveVector(source_lens) || !IsPositiveVector(domain) ||
         domain.GetDim(0) != 1 || !IsPositiveVector(pool_entries) ||
         !IsPositiveMatrix(object_map) || !IsPositiveVector(object_lens) ||
@@ -159,7 +171,7 @@ bool ValidateGeometry(const gert::Shape* const* shapes, uint32_t* receipts,
         !IsPositiveMatrix(request_source) || !IsPositiveMatrix(request_object) ||
         !IsPositiveMatrix(request_output) || !IsPositiveVector(request_count) ||
         !IsPositiveVector(candidate_cursor) ||
-        !IsPositiveVector(candidate_cursor_epoch) ||
+        !IsPositiveMatrix(candidate_cursor_identity) ||
         !IsPositiveVector(rows_per_entry) || rows_per_entry.GetDim(0) != 1 ||
         !IsPositiveMatrix(stats) ||
         stats.GetDim(1) != kA5P8WorkerStatColumns) {
@@ -185,9 +197,13 @@ bool ValidateGeometry(const gert::Shape* const* shapes, uint32_t* receipts,
         stat_rows > std::numeric_limits<uint32_t>::max()) {
         return false;
     }
-    if (counts.GetDim(0) != receipt_count || ready_epoch.GetDim(0) != receipt_count ||
+    if (counts.GetDim(0) != receipt_count ||
+        receipt_identity.GetDim(0) != receipt_count ||
+        receipt_identity.GetDim(1) != kA5P8CandidateReceiptIdentityWords ||
         status.GetDim(0) != receipt_count || candidate_cursor.GetDim(0) != receipt_count ||
-        candidate_cursor_epoch.GetDim(0) != receipt_count ||
+        candidate_cursor_identity.GetDim(0) != receipt_count ||
+        candidate_cursor_identity.GetDim(1) !=
+            kA5P8CandidateReceiptIdentityWords ||
         pool_entries.GetDim(0) != row_count || object_lens.GetDim(0) != row_count ||
         snapshot.GetDim(0) != pool_count || source_to_slot.GetDim(0) != row_count ||
         source_to_slot.GetDim(1) != source_capacity ||
@@ -227,10 +243,10 @@ static ge::graphStatus TilingA5P8ForwardOwnedExecutor(
         ge::DT_INT32, ge::DT_INT32, ge::DT_INT64, ge::DT_INT32,
         ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
         ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-        ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_UINT8,
-        ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
-        ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-        ge::DT_INT64, ge::DT_INT32, ge::DT_INT64};
+        ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+        ge::DT_UINT8, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+        ge::DT_INT64, ge::DT_INT64, ge::DT_INT32, ge::DT_INT32,
+        ge::DT_INT32, ge::DT_INT64, ge::DT_INT32, ge::DT_INT64};
     const gert::Shape* shapes[kInputCount] = {};
     for (size_t index = 0U; index < kInputCount; ++index) {
         if (context->GetInputShape(index) == nullptr ||
@@ -323,10 +339,10 @@ static ge::graphStatus InferA5P8ForwardOwnedExecutorDataType(
     }
     const ge::DataType output_types[kOutputCount] = {
         ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-        ge::DT_INT32,
-        ge::DT_UINT8, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
-        ge::DT_INT64, ge::DT_INT64, ge::DT_INT32, ge::DT_INT32,
-        ge::DT_INT32, ge::DT_INT64, ge::DT_INT64};
+        ge::DT_INT32, ge::DT_INT32, ge::DT_UINT8, ge::DT_INT64,
+        ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+        ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT64,
+        ge::DT_INT64, ge::DT_INT64, ge::DT_INT32};
     for (size_t output = 0U; output < kOutputCount; ++output) {
         context->SetOutputDataType(output, output_types[output]);
     }
@@ -345,13 +361,14 @@ public:
             ge::DT_INT32, ge::DT_INT32, ge::DT_INT64, ge::DT_INT32,
             ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
             ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-            ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_UINT8,
-            ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
-            ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-            ge::DT_INT64, ge::DT_INT32, ge::DT_INT64};
+            ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
+            ge::DT_UINT8, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+            ge::DT_INT64, ge::DT_INT64, ge::DT_INT32, ge::DT_INT32,
+            ge::DT_INT32, ge::DT_INT64, ge::DT_INT32, ge::DT_INT64};
         const char* input_names[kInputCount] = {
-            "candidate_seeds", "candidate_counts", "candidate_ready_epoch",
-            "candidate_status", "forward_control", "source_lens",
+            "candidate_seeds", "candidate_counts", "candidate_receipt_identity",
+            "candidate_status", "forward_control", "p8_arena_health",
+            "source_lens",
             "kv_object_address_domain", "req_pool_entries", "kv_object_map",
             "kv_object_lens", "kv_object_slots_snapshot",
             "private_source_to_slot", "private_object_to_slot",
@@ -360,7 +377,7 @@ public:
             "p8_private_records", "queue_request_source_offsets",
             "queue_request_object_offsets", "queue_request_output_indices",
             "queue_request_count", "candidate_cursor",
-            "candidate_cursor_epoch", "rows_per_entry", "worker_stats"};
+            "candidate_cursor_identity", "rows_per_entry", "worker_stats"};
         for (size_t input = 0U; input < kInputCount; ++input) {
             const std::vector<ge::DataType>* types = &int32_types;
             if (input_types[input] == ge::DT_INT64) {
@@ -373,19 +390,20 @@ public:
         }
         const ge::DataType output_types[kOutputCount] = {
             ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-            ge::DT_INT32,
-            ge::DT_UINT8, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
-            ge::DT_INT64, ge::DT_INT64, ge::DT_INT32, ge::DT_INT32,
-            ge::DT_INT32, ge::DT_INT64, ge::DT_INT64};
+            ge::DT_INT32, ge::DT_INT32, ge::DT_UINT8, ge::DT_INT64,
+            ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64,
+            ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT64,
+            ge::DT_INT64, ge::DT_INT64, ge::DT_INT32};
         const char* output_names[kOutputCount] = {
-            "forward_control", "private_source_to_slot",
+            "forward_control", "p8_arena_health", "private_source_to_slot",
             "private_object_to_slot",
             "private_ready_table", "private_slot_cursor",
             "private_packed_output", "fused_get_control", "p8_wave_records",
             "p8_private_records", "queue_request_source_offsets",
             "queue_request_object_offsets", "queue_request_output_indices",
             "queue_request_count", "candidate_cursor",
-            "candidate_cursor_epoch", "worker_stats"};
+            "candidate_cursor_identity", "worker_stats",
+            "candidate_receipt_identity", "candidate_status"};
         for (size_t output = 0U; output < kOutputCount; ++output) {
             const std::vector<ge::DataType>* types = &int32_types;
             if (output_types[output] == ge::DT_INT64) {

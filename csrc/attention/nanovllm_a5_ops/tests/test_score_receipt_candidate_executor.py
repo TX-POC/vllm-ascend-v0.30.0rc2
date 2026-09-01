@@ -32,6 +32,7 @@ import nanovllm_score_receipt_executor  # noqa: F401
 TILE_WIDTH = 128
 RECEIPT_WORDS = 16
 RECEIPT_VERSION = 1
+RECEIPT_IDENTITY_WORDS = 4
 STATUS_OK = 1
 STATUS_INACTIVE = 2
 STATUS_EPOCH_MISMATCH = -1
@@ -147,14 +148,36 @@ def _fixture() -> Fixture:
     )
 
 
-def _reference(fixture: Fixture) -> tuple[torch.Tensor, ...]:
+def _receipt_identity(
+    fixture: Fixture, *, graph_replay_generation: int = 11,
+    layer_control_index: int = 3,
+) -> torch.Tensor:
+    """Graph-static full receipt identity with a nonzero per-receipt generation.
+
+    Generation is deliberately distinct across receipt slots so a cursor from
+    an earlier replay cannot be adopted merely because it has the same epoch.
+    """
+
+    tiles = (fixture.source_capacity + TILE_WIDTH - 1) // TILE_WIDTH
+    receipts = fixture.rows * tiles
+    identity = torch.empty((receipts, RECEIPT_IDENTITY_WORDS), dtype=torch.int64)
+    identity[:, 0] = fixture.epoch
+    identity[:, 1] = graph_replay_generation
+    identity[:, 2] = layer_control_index
+    identity[:, 3] = torch.arange(1, receipts + 1, dtype=torch.int64)
+    return identity
+
+
+def _reference(
+    fixture: Fixture, receipt_identity: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
     """CPU equivalent of the P7.0 device predicate and terminal statuses."""
 
     tiles = (fixture.source_capacity + TILE_WIDTH - 1) // TILE_WIDTH
     receipts = fixture.rows * tiles
     seeds = torch.full((receipts, TILE_WIDTH, 4), -1, dtype=torch.int32)
     counts = torch.zeros((receipts,), dtype=torch.int32)
-    ready_epoch = torch.full((receipts,), fixture.epoch, dtype=torch.int64)
+    candidate_receipt_identity = receipt_identity.clone()
     status = torch.empty((receipts,), dtype=torch.int32)
 
     for receipt in range(receipts):
@@ -216,7 +239,7 @@ def _reference(fixture: Fixture) -> tuple[torch.Tensor, ...]:
             compact += 1
         counts[receipt] = compact
         status[receipt] = STATUS_OK
-    return seeds, counts, ready_epoch, status
+    return seeds, counts, candidate_receipt_identity, status
 
 
 def _digest(tensor: torch.Tensor) -> str:
@@ -255,11 +278,12 @@ def main() -> None:
         raise ValueError("--device must select an NPU")
     torch.npu.set_device(device)
     fixture = _fixture()
-    expected = _reference(fixture)
+    receipt_identity = _receipt_identity(fixture)
+    expected = _reference(fixture, receipt_identity)
     tensors: list[Any] = [
         fixture.score_workspace,
         fixture.tile_receipts,
-        torch.tensor([fixture.epoch], dtype=torch.int64),
+        receipt_identity,
         fixture.score_source_lens,
         fixture.resident_threshold,
         fixture.resident_threshold_valid,
@@ -280,10 +304,10 @@ def main() -> None:
         *inputs
     )
     torch.npu.synchronize()
-    candidate_seeds, candidate_counts, candidate_ready_epoch, receipt_status, _owners = outputs
+    candidate_seeds, candidate_counts, candidate_receipt_identity, receipt_status, _owners = outputs
     for name, actual, wanted in zip(
-        ("candidate_seeds", "candidate_counts", "candidate_ready_epoch", "receipt_status"),
-        (candidate_seeds, candidate_counts, candidate_ready_epoch, receipt_status),
+        ("candidate_seeds", "candidate_counts", "candidate_receipt_identity", "receipt_status"),
+        (candidate_seeds, candidate_counts, candidate_receipt_identity, receipt_status),
         expected,
         strict=True,
     ):
@@ -303,7 +327,7 @@ def main() -> None:
     )
     print(
         "P7_ORACLE_PASS "
-        "candidate_seeds=1 counts=1 ready_epoch=1 status=1 "
+        "candidate_seeds=1 counts=1 receipt_identity=1 status=1 "
         "c8_dependency=0 kvaf_dependency=0",
         flush=True,
     )

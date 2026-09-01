@@ -62,11 +62,39 @@ class ForwardPhase(Enum):
     FORWARD_TERMINAL = auto()
 
 
+class ArenaLeaseState(Enum):
+    """The one forward-owned lease over P8's shared fixed arena.
+
+    This deliberately stays smaller than a forward identity.  Strict P8 does
+    not allow a queue/private arena to cross a forward boundary: all posted
+    work must reach CQ terminal (or quarantine), and every private reader
+    must finish, before the arena can become reusable.  ``generation`` is
+    therefore only a defensive lease token that makes a delayed terminal
+    harmless if a future bug were to violate that rule.
+    """
+
+    IDLE = auto()
+    LEASED = auto()
+    # Exactly one terminal worker owns the final LEASED -> IDLE decision.
+    # It is a short state-machine edge, not a new data buffer or scheduler.
+    TERMINAL_CLAIMED = auto()
+    QUARANTINED = auto()
+
+
 class QueueState(Enum):
     """State of one fixed Direct-HCCP queue/wave record."""
 
     FREE = auto()
+    # Queue owner-table acquisition succeeded, but a durable full wave
+    # identity has not been published yet.  This non-consumable edge prevents
+    # a terminal sweep from mistaking an interrupted admission for FREE.
+    FILLING_CLAIMED = auto()
     FILLING = auto()
+    # A proved-empty FILLING wave has one owner that is performing the final
+    # owner-table release.  ForwardTerminal must quarantine this transient
+    # state if it races the second CAS; it may never guess that the release
+    # completed just because the original worker returned.
+    FILLING_RELEASE_CLAIMED = auto()
     POST_INTENT = auto()
     POSTED = auto()
     DRAIN_CLAIMED = auto()
@@ -88,6 +116,9 @@ class PrivateSlotState(Enum):
     """Readiness state of a fixed private HBM staging slot."""
 
     FREE = auto()
+    # The physical row is exclusive and carries an owner identity, but its
+    # source/object maps are not yet visible.  It is never QSFA-readable.
+    ALLOCATING = auto()
     PENDING = auto()
     READY = auto()
     FAILED = auto()
@@ -222,6 +253,19 @@ class P8FixedResources:
     # transaction object, is then the explicit owner responsible for proving
     # that it is safe to drop them.
     quarantine_keepalives: set[str] = field(init=False, default_factory=set)
+    # P8 has one fixed arena for queues, candidate records and private slots.
+    # Under the strict no-cross-forward contract it needs only one atomically
+    # comparable lease token: ``(state, generation)``.  Do not turn
+    # epoch/replay/layer into arena ownership fields: those remain useful
+    # diagnostics on individual wave/private records, but do not make the
+    # arena safer than terminal-before-reuse already does.
+    _arena_lease_state: ArenaLeaseState = field(
+        init=False,
+        default=ArenaLeaseState.IDLE,
+        repr=False,
+    )
+    _arena_lease_generation: int = field(init=False, default=0, repr=False)
+    _arena_fault_reason: str | None = field(init=False, default=None, repr=False)
     _next_private_slot_hint: int = field(init=False, default=0, repr=False)
     active_txn: P8ForwardAsyncTxn | None = field(
         init=False,
@@ -271,7 +315,10 @@ class P8FixedResources:
             private_slot = self.private_slots[slot_id]
             if private_slot.state is not PrivateSlotState.FREE:
                 continue
-            private_slot.state = PrivateSlotState.PENDING
+            # Model the native `FREE -> ALLOCATING` reservation.  The record
+            # exists before either directory gets its short `-2` claim, so a
+            # forward-terminal sweep always has an owner to quarantine.
+            private_slot.state = PrivateSlotState.ALLOCATING
             private_slot.epoch = epoch
             private_slot.graph_generation = graph_generation
             private_slot.layer_control_index = layer_control_index
@@ -283,7 +330,7 @@ class P8FixedResources:
             private_slot.source_offset = None
             private_slot.object_offset = None
             private_slot.output_index = private_slot.slot_id
-            self.private_ready[slot_id] = PrivateSlotState.PENDING
+            self.private_ready[slot_id] = PrivateSlotState.FREE
             self._next_private_slot_hint = (slot_id + 1) % self.private_slot_capacity
             return private_slot
         return None
@@ -320,10 +367,130 @@ class P8FixedResources:
         leases.clear()
 
     @property
+    def arena_lease_state(self) -> ArenaLeaseState:
+        """Current shared-arena state, exposed for lifecycle diagnostics."""
+
+        return self._arena_lease_state
+
+    @property
+    def arena_lease_generation(self) -> int:
+        """Monotonic token of the currently held or last released lease."""
+
+        return self._arena_lease_generation
+
+    @property
+    def arena_healthy(self) -> bool:
+        """Compatibility view: only a quarantined arena is unhealthy."""
+
+        return self._arena_lease_state is not ArenaLeaseState.QUARANTINED
+
+    @property
+    def arena_fault_reason(self) -> str | None:
+        """First sticky quarantine reason, retained for runtime teardown."""
+
+        return self._arena_fault_reason
+
+    def _acquire_arena_lease(self) -> int:
+        """Model the one atomic ``IDLE(g) -> LEASED(g + 1)`` transition.
+
+        The caller has already proved every fixed queue/private row clean.
+        This token is intentionally unrelated to forward epoch/replay/layer:
+        it identifies only this physical-arena acquisition.
+        """
+
+        if self._arena_lease_state is ArenaLeaseState.QUARANTINED:
+            raise P8QuarantineError(
+                "P8 fixed arena is unhealthy/quarantined; recreate runtime "
+                f"resources before reuse: {self._arena_fault_reason}"
+            )
+        if self._arena_lease_state is not ArenaLeaseState.IDLE:
+            raise P8LifecycleError("P8 fixed arena is still leased by a prior forward")
+        self._arena_lease_generation += 1
+        if self._arena_lease_generation <= 0:
+            raise P8LifecycleError("P8 arena lease generation must be nonzero")
+        self._arena_lease_state = ArenaLeaseState.LEASED
+        return self._arena_lease_generation
+
+    def claim_arena_terminal(self, lease_generation: int) -> bool:
+        """Conditionally perform ``LEASED(g) -> TERMINAL_CLAIMED(g)``.
+
+        The normal transaction invokes this only after its forward-terminal
+        checks prove that no Post/CQ/private reader remains.  A second or
+        stale terminal loses this one-owner claim and must not touch the
+        current arena lease.
+        """
+
+        if (
+            self._arena_lease_state is not ArenaLeaseState.LEASED
+            or self._arena_lease_generation != lease_generation
+        ):
+            return False
+        self._arena_lease_state = ArenaLeaseState.TERMINAL_CLAIMED
+        return True
+
+    def complete_arena_terminal(self, lease_generation: int) -> bool:
+        """Conditionally perform ``TERMINAL_CLAIMED(g) -> IDLE(g)``.
+
+        Keeping this second, exact transition makes the terminal leader
+        explicit.  It prevents a duplicate terminal path from silently
+        releasing a lease after a different worker already owns the terminal
+        protocol.
+        """
+
+        if (
+            self._arena_lease_state is not ArenaLeaseState.TERMINAL_CLAIMED
+            or self._arena_lease_generation != lease_generation
+        ):
+            return False
+        self._arena_lease_state = ArenaLeaseState.IDLE
+        return True
+
+    def quarantine_arena_lease(self, lease_generation: int, reason: str) -> bool:
+        """Conditionally perform ``LEASED(g) -> QUARANTINED(g)``.
+
+        A delayed fault from an older lease returns ``False`` instead of
+        poisoning a newly acquired forward.  This is a defense-in-depth
+        guard; the primary rule remains terminal/quarantine before reuse.
+        """
+
+        if not reason:
+            raise ValueError("arena unhealthy reason must be non-empty")
+        if (
+            self._arena_lease_state
+            not in {ArenaLeaseState.LEASED, ArenaLeaseState.TERMINAL_CLAIMED}
+            or self._arena_lease_generation != lease_generation
+        ):
+            return False
+        self._arena_lease_state = ArenaLeaseState.QUARANTINED
+        if self._arena_fault_reason is None:
+            self._arena_fault_reason = reason
+        return True
+
+    def mark_arena_unhealthy(
+        self,
+        reason: str,
+        *,
+        lease_generation: int | None = None,
+    ) -> bool:
+        """Latch the *matching* current arena lease unavailable.
+
+        The optional argument preserves a narrow compatibility path for
+        model-internal callers, but it never falls back to a non-atomic
+        "mark whatever is current unhealthy" operation.  If no active
+        transaction owns a lease, there is no safe arena target to mutate.
+        """
+
+        if lease_generation is None:
+            if self.active_txn is None:
+                return False
+            lease_generation = self.active_txn.arena_lease_generation
+        return self.quarantine_arena_lease(lease_generation, reason)
+
+    @property
     def has_quarantine(self) -> bool:
         """Whether any fixed resource is unsafe to reuse."""
 
-        return any(
+        return (self._arena_lease_state is ArenaLeaseState.QUARANTINED) or any(
             queue.state is QueueState.QUARANTINED for queue in self.queues
         ) or any(
             slot.state is PrivateSlotState.QUARANTINED
@@ -347,17 +514,26 @@ class P8FixedResources:
             raise ValueError("expected_layers must be positive")
         if self.active_txn is not None:
             raise P8LifecycleError("previous P8 forward is still active")
+        if self._arena_lease_state is ArenaLeaseState.QUARANTINED:
+            raise P8QuarantineError(
+                "P8 fixed arena is unhealthy/quarantined; recreate runtime "
+                f"resources before reuse: {self.arena_fault_reason}"
+            )
+        if self._arena_lease_state is not ArenaLeaseState.IDLE:
+            raise P8LifecycleError("previous P8 arena lease is still active")
         if self.has_quarantine:
             raise P8QuarantineError(
                 "P8 fixed resources contain quarantined queue/private slots; "
                 "route this forward to the exact fallback until teardown"
             )
         self._reset_clean_records()
+        arena_lease_generation = self._acquire_arena_lease()
         txn = P8ForwardAsyncTxn(
             resources=self,
             epoch=epoch,
             graph_generation=graph_generation,
             expected_layers=expected_layers,
+            arena_lease_generation=arena_lease_generation,
         )
         self.active_txn = txn
         return txn
@@ -432,6 +608,14 @@ class P8FixedResources:
     def _detach(self, txn: P8ForwardAsyncTxn) -> None:
         if self.active_txn is not txn:
             raise P8LifecycleError("transaction is not this resource owner's active txn")
+        if (
+            self._arena_lease_state
+            in {ArenaLeaseState.LEASED, ArenaLeaseState.TERMINAL_CLAIMED}
+            and self._arena_lease_generation == txn.arena_lease_generation
+        ):
+            raise P8LifecycleError(
+                "cannot detach forward while its arena lease is still active"
+            )
         self.active_txn = None
 
 
@@ -444,12 +628,24 @@ class P8ForwardAsyncTxn:
     release those leases only after all queue waves are terminal, all required
     QSFA readers have passed, the model-terminal operation has been observed,
     and the explicit forward-terminal sweep found no unresolved resource.
+
+    P8 uses one sticky abort domain for a whole forward even though each
+    native graph invocation carries a layer-local control row.  When any
+    layer cannot prove queue/private ownership, it latches the shared arena
+    unhealthy and disables speculative admission for the remaining layers;
+    forward terminal then quarantines every unresolved record with the same
+    ``(epoch, graph_generation)``.  This deliberately conservative rule
+    prevents a layer-local failure from being hidden by another layer leasing
+    the same global queue/private arena.
     """
 
     resources: P8FixedResources
     epoch: int
     graph_generation: int
     expected_layers: int
+    # The only arena-ownership identity.  Forward epoch/replay/layer remain
+    # wave/private diagnostics, not conditions for arena reuse.
+    arena_lease_generation: int
     state: ForwardState = ForwardState.OPEN
     phase: ForwardPhase = ForwardPhase.ADMIT_POST
     host_leases: set[str] = field(default_factory=set)
@@ -663,6 +859,19 @@ class P8ForwardAsyncTxn:
             ForwardState.DRAINING,
         )
         self._validate_layer_control_index(layer_control_index)
+        if not self.resources.arena_healthy:
+            raise P8QuarantineError(
+                "P8 fixed arena is unhealthy; speculative admission is closed "
+                "until runtime teardown recreates it"
+            )
+        if (
+            self.resources.arena_lease_state is not ArenaLeaseState.LEASED
+            or self.resources.arena_lease_generation
+            != self.arena_lease_generation
+        ):
+            raise P8LifecycleError(
+                "P8 forward no longer owns the shared arena lease"
+            )
         queue = self._queue(queue_id)
         if queue.state is QueueState.QUARANTINED:
             raise P8QuarantineError(f"queue {queue_id} is quarantined")
@@ -688,7 +897,10 @@ class P8ForwardAsyncTxn:
         queue.post_sequence += 1
         if queue.post_sequence <= 0:
             raise P8LifecycleError("queue post sequence must be nonzero")
-        queue.state = QueueState.FILLING
+        # The native record first reaches a non-consumable claimed state;
+        # identity/payload publication then commits it to FILLING.  Keeping
+        # this separate lets tests model a terminal race in that gap.
+        queue.state = QueueState.FILLING_CLAIMED
         return P8WaveIdentity(
             queue_id=queue_id,
             epoch=self.epoch,
@@ -700,6 +912,112 @@ class P8ForwardAsyncTxn:
             post_sequence=queue.post_sequence,
             owner=owner,
         )
+
+    def _publish_filling_identity(self, lease: P8WaveIdentity) -> P8WaveRecord:
+        """Commit ``FILLING_CLAIMED -> FILLING`` after identity publication.
+
+        In native code the identity fields are written and DDR-published
+        before the expected-state CAS.  A ForwardTerminal winner remains
+        quarantined; this helper never writes a state back over it.
+        """
+
+        queue = self._validate_identity(
+            lease, expected_state=QueueState.FILLING_CLAIMED
+        )
+        queue.state = QueueState.FILLING
+        return queue
+
+    def claim_unposted_filling_release(self, lease: P8WaveIdentity) -> None:
+        """CAS-claim a proved-empty ``FILLING`` wave for its final release.
+
+        ``FILLING`` is a durable ownership record immediately after queue
+        acquisition.  Its owner cannot jump straight to ``FREE``: the native
+        implementation first CASes to ``FILLING_RELEASE_CLAIMED`` so a racing
+        ForwardTerminal can turn the lease into ``QUARANTINED`` instead of
+        allowing a late full-record write to resurrect it.
+
+        The split is public in this small model solely to test the real
+        terminal race.  Production P8 performs both CAS operations in the
+        same dynamic task; it does not introduce a host callback.
+        """
+
+        try:
+            # The explicit test-facing release claim starts after the same
+            # identity publication that a native no-work task performs.  It
+            # is still impossible to jump directly from FILLING_CLAIMED to
+            # FREE, and a forged identity is quarantined by this same guard.
+            if self._queue(lease.queue_id).state is QueueState.FILLING_CLAIMED:
+                self._publish_filling_identity(lease)
+            queue = self._validate_identity(
+                lease,
+                expected_state=QueueState.FILLING,
+            )
+            if (
+                queue.candidate_slots
+                or queue.private_slots
+                or queue.post_committed
+                or queue.post_rejected
+                or queue.cq_success is not None
+            ):
+                raise P8LifecycleError(
+                    "unposted lease has descriptor/CQ state and cannot be "
+                    "safely released"
+                )
+        except P8LifecycleError as error:
+            queue = self._queue(lease.queue_id)
+            self._quarantine_queue(
+                queue,
+                f"unposted lease release proof/identity failure: {error}",
+            )
+            raise P8QuarantineError(
+                f"queue {lease.queue_id} quarantined after unposted lease release failure"
+            ) from error
+        queue.state = QueueState.FILLING_RELEASE_CLAIMED
+
+    def finalize_unposted_filling_release(self, lease: P8WaveIdentity) -> None:
+        """Commit the release-owner CAS only after exact identity revalidation."""
+
+        try:
+            queue = self._validate_identity(
+                lease,
+                expected_state=QueueState.FILLING_RELEASE_CLAIMED,
+            )
+            if (
+                queue.candidate_slots
+                or queue.private_slots
+                or queue.post_committed
+                or queue.post_rejected
+                or queue.cq_success is not None
+            ):
+                raise P8LifecycleError(
+                    "filling-release claimant has descriptor/CQ state"
+                )
+        except P8LifecycleError as error:
+            queue = self._queue(lease.queue_id)
+            self._quarantine_queue(
+                queue,
+                f"filling release final-CAS/identity failure: {error}",
+            )
+            raise P8QuarantineError(
+                f"queue {lease.queue_id} quarantined after filling release final-CAS failure"
+            ) from error
+        queue.state = QueueState.FREE
+
+    def release_unposted_lease(self, lease: P8WaveIdentity) -> None:
+        """Return a lease only while it is provably before descriptor binding.
+
+        This convenience endpoint is the ordinary no-work path.  It preserves
+        both native state-machine edges (``FILLING`` →
+        ``FILLING_RELEASE_CLAIMED`` → ``FREE``), rather than modelling them
+        as a misleading direct assignment.
+
+        This is the model counterpart of native P8's pre-doorbell release
+        CAS.  It prevents an error path from silently dropping a queue lease
+        merely because a PostOnly call was never reached.
+        """
+
+        self.claim_unposted_filling_release(lease)
+        self.finalize_unposted_filling_release(lease)
 
     def prepare_post(
         self,
@@ -714,6 +1032,8 @@ class P8ForwardAsyncTxn:
             ForwardState.SEALED,
             ForwardState.DRAINING,
         )
+        if self._queue(lease.queue_id).state is QueueState.FILLING_CLAIMED:
+            self._publish_filling_identity(lease)
         queue = self._validate_identity(lease, expected_state=QueueState.FILLING)
         slots = tuple(candidate_slots)
         if not slots:
@@ -782,7 +1102,11 @@ class P8ForwardAsyncTxn:
     def post_only(self, lease: P8WaveIdentity) -> P8WaveIdentity:
         """Record the non-blocking doorbell transition and return CQ identity."""
 
-        queue = self._validate_identity(lease, expected_state=QueueState.POST_INTENT)
+        queue = self._validate_wave_or_quarantine(
+            lease,
+            expected_state=QueueState.POST_INTENT,
+            operation="PostOnly",
+        )
         if queue.post_sequence <= 0:
             raise P8LifecycleError("PostOnly requires a reserved post sequence")
         queue.post_committed = True
@@ -809,7 +1133,11 @@ class P8ForwardAsyncTxn:
         timeout/quarantine path.
         """
 
-        queue = self._validate_identity(lease, expected_state=QueueState.POST_INTENT)
+        queue = self._validate_wave_or_quarantine(
+            lease,
+            expected_state=QueueState.POST_INTENT,
+            operation="POST_REJECTED recording",
+        )
         if queue.post_sequence <= 0:
             raise P8LifecycleError("POST_REJECTED requires a reserved post sequence")
         queue.post_committed = False
@@ -836,9 +1164,10 @@ class P8ForwardAsyncTxn:
         finish or release a wave claimed by another worker.
         """
 
-        queue = self._validate_identity(
+        queue = self._validate_wave_or_quarantine(
             wave,
             expected_state=(QueueState.POSTED, QueueState.DRAIN_CLAIMED),
+            operation="DRAIN claim",
         )
         if not queue.post_committed or queue.post_rejected:
             self._quarantine_queue(
@@ -894,9 +1223,10 @@ class P8ForwardAsyncTxn:
     def leave_drain_pending(self, wave: P8WaveIdentity) -> None:
         """Return a claimed wave to POSTED when a nonblocking CQ poll is empty."""
 
-        queue = self._validate_identity(
+        queue = self._validate_wave_or_quarantine(
             wave,
             expected_state=QueueState.DRAIN_CLAIMED,
+            operation="DRAIN pending return",
         )
         if queue.cq_success is not None:
             raise P8LifecycleError(
@@ -935,7 +1265,11 @@ class P8ForwardAsyncTxn:
     def finalize_wave(self, wave: P8WaveIdentity) -> None:
         """Finish CQ handling; success still needs explicit private publication."""
 
-        queue = self._validate_identity(wave, expected_state=QueueState.DRAIN_CLAIMED)
+        queue = self._validate_wave_or_quarantine(
+            wave,
+            expected_state=QueueState.DRAIN_CLAIMED,
+            operation="CQ finalization",
+        )
         if queue.cq_success is None:
             raise P8LifecycleError("DRAIN_CLAIMED wave has no CQ terminal result")
         queue.state = QueueState.FINALIZED
@@ -950,7 +1284,11 @@ class P8ForwardAsyncTxn:
     def publish_private(self, wave: P8WaveIdentity) -> None:
         """Make successful H2D payloads visible to private QSFA reconciliation."""
 
-        queue = self._validate_identity(wave, expected_state=QueueState.FINALIZED)
+        queue = self._validate_wave_or_quarantine(
+            wave,
+            expected_state=QueueState.FINALIZED,
+            operation="private terminal publication",
+        )
         if not queue.cq_success:
             raise P8LifecycleError(
                 "failed CQ cannot publish private payload; use exact recall"
@@ -1098,7 +1436,9 @@ class P8ForwardAsyncTxn:
             self._validate_identity(
                 wave,
                 expected_state=(
+                    QueueState.FILLING_CLAIMED,
                     QueueState.FILLING,
+                    QueueState.FILLING_RELEASE_CLAIMED,
                     QueueState.POST_INTENT,
                     QueueState.POSTED,
                     QueueState.DRAIN_CLAIMED,
@@ -1279,6 +1619,18 @@ class P8ForwardAsyncTxn:
                 "cannot release forward while a layer has not reported its "
                 f"QSFA terminal: private_slots={unresolved_private}"
             )
+        if not self.resources.claim_arena_terminal(self.arena_lease_generation):
+            raise P8LifecycleError(
+                "cannot claim P8 terminal after arena-lease generation mismatch"
+            )
+        if not self.resources.complete_arena_terminal(self.arena_lease_generation):
+            self.resources.quarantine_arena_lease(
+                self.arena_lease_generation,
+                "arena terminal completion failed after unique terminal claim",
+            )
+            raise P8QuarantineError(
+                "cannot release P8 transaction after arena-terminal completion failure"
+            )
         self.host_leases.clear()
         self.state = ForwardState.RELEASED
         self.resources._detach(self)
@@ -1348,6 +1700,29 @@ class P8ForwardAsyncTxn:
                 "unresolved: "
                 f"candidates={unresolved_candidates} private_slots="
                 f"{unresolved_private}"
+            )
+        # An early exact-fallback that proved every P8 resource clean may
+        # return the arena normally.  Any actual ambiguity has already
+        # transitioned the matching lease to QUARANTINED, which intentionally
+        # remains unavailable until runtime teardown.
+        if self.resources.arena_lease_state is ArenaLeaseState.LEASED:
+            if not self.resources.claim_arena_terminal(self.arena_lease_generation):
+                raise P8LifecycleError(
+                    "cannot claim fallback terminal after arena-lease generation mismatch"
+                )
+            if not self.resources.complete_arena_terminal(
+                self.arena_lease_generation
+            ):
+                self.resources.quarantine_arena_lease(
+                    self.arena_lease_generation,
+                    "fallback arena terminal completion failed after unique claim",
+                )
+                raise P8QuarantineError(
+                    "cannot enter fallback after arena-terminal completion failure"
+                )
+        elif self.resources.arena_lease_state is not ArenaLeaseState.QUARANTINED:
+            raise P8LifecycleError(
+                "cannot enter fallback after arena lease was released by another owner"
             )
         self.state = ForwardState.FALLBACK_READY
         self.resources.adopt_quarantine_keepalives(self.host_leases)
@@ -1433,6 +1808,7 @@ class P8ForwardAsyncTxn:
             )
         if (
             wave.epoch != self.epoch
+            or wave.epoch != queue.epoch
             or wave.graph_generation != self.graph_generation
             or wave.graph_generation != queue.graph_generation
             or wave.layer_control_index != queue.layer_control_index
@@ -1451,6 +1827,33 @@ class P8ForwardAsyncTxn:
                 f"post={wave.post_sequence}, owner={wave.owner})"
             )
         return queue
+
+    def _validate_wave_or_quarantine(
+        self,
+        wave: P8WaveIdentity,
+        *,
+        expected_state: QueueState | tuple[QueueState, ...],
+        operation: str,
+    ) -> P8WaveRecord:
+        """Validate a potentially device-visible wave or fail closed.
+
+        Every transition after ``POST_INTENT`` operates on a descriptor that
+        may be observed by a device-side writer.  Therefore an epoch,
+        generation, owner or state mismatch is not a recoverable Python
+        control-flow error: the queue/private rows are quarantined and the
+        shared arena admission gate is latched unhealthy.  Keeping this rule
+        in one helper prevents individual lifecycle methods from accidentally
+        reintroducing a raw, non-durable identity failure.
+        """
+
+        try:
+            return self._validate_identity(wave, expected_state=expected_state)
+        except P8LifecycleError as error:
+            queue = self._queue(wave.queue_id)
+            self._quarantine_queue(queue, f"{operation} identity failure: {error}")
+            raise P8QuarantineError(
+                f"queue {wave.queue_id} quarantined after {operation} identity failure"
+            ) from error
 
     def _free_candidate_private_slot(
         self,
@@ -1485,14 +1888,14 @@ class P8ForwardAsyncTxn:
         """
 
         if (
-            private_slot.state is not PrivateSlotState.PENDING
+            private_slot.state is not PrivateSlotState.ALLOCATING
             or private_slot.source_offset is None
             or private_slot.object_offset is None
             or private_slot.output_index < 0
         ):
             self._quarantine_private(
                 private_slot,
-                "invalid private row before source/object publication",
+                "invalid allocating private row before source/object publication",
             )
             raise P8QuarantineError(
                 f"private slot {private_slot.slot_id} cannot publish mappings"
@@ -1512,6 +1915,12 @@ class P8ForwardAsyncTxn:
             )
         self.resources.private_source_to_slot[source] = private_slot.output_index
         self.resources.private_object_to_slot[obj] = private_slot.output_index
+        # Publication is state-last: no downstream consumer may observe a
+        # PENDING private row until both maps name this exact output slot.
+        private_slot.state = PrivateSlotState.PENDING
+        self.resources.private_ready[private_slot.slot_id] = (
+            PrivateSlotState.PENDING
+        )
 
     def _clear_private_mappings_exact(
         self, private_slot: PrivateSlotRecord
@@ -1722,6 +2131,10 @@ class P8ForwardAsyncTxn:
     def _quarantine_queue(self, queue: P8WaveRecord, reason: str) -> None:
         queue.state = QueueState.QUARANTINED
         queue.quarantine_reason = reason
+        self.resources.mark_arena_unhealthy(
+            reason,
+            lease_generation=self.arena_lease_generation,
+        )
         for candidate_slot in queue.candidate_slots:
             candidate = self._candidate(candidate_slot)
             candidate.state = CandidateState.DEFERRED
@@ -1743,6 +2156,10 @@ class P8ForwardAsyncTxn:
         private_slot.state = PrivateSlotState.QUARANTINED
         self.resources.private_ready[private_slot.slot_id] = (
             PrivateSlotState.QUARANTINED
+        )
+        self.resources.mark_arena_unhealthy(
+            reason,
+            lease_generation=self.arena_lease_generation,
         )
         if latch_abort:
             self._latch_abort(reason)
@@ -1815,6 +2232,7 @@ class P8ForwardAsyncTxn:
         )
 
 __all__ = [
+    "ArenaLeaseState",
     "CandidateRecord",
     "CandidateState",
     "ForwardPhase",

@@ -13,6 +13,7 @@ namespace {
 constexpr int64_t kReceiptWords = 16;
 constexpr int64_t kTileWidth = 128;
 constexpr int64_t kSeedWords = 4;
+constexpr int64_t kReceiptIdentityWords = 4;
 
 struct Geometry {
     int64_t rows;
@@ -40,7 +41,7 @@ void CheckNpuTensor(const at::Tensor& tensor, at::ScalarType type,
 
 Geometry Validate(
     const at::Tensor& scoreWorkspace, const at::Tensor& tileReceipts,
-    const at::Tensor& streamingEpoch, const at::Tensor& scoreSourceLens,
+    const at::Tensor& receiptIdentity, const at::Tensor& scoreSourceLens,
     const at::Tensor& residentThreshold,
     const at::Tensor& residentThresholdValid,
     const at::Tensor& kvObjectSlotsSnapshot,
@@ -69,7 +70,9 @@ Geometry Validate(
     TORCH_CHECK(tileReceipts.dim() == 2 && tileReceipts.size(0) == receipts &&
                     tileReceipts.size(1) == kReceiptWords,
                 "tile_receipts must be int64[R*ceil(S/128),16].");
-    TORCH_CHECK(streamingEpoch.dim() == 1 && streamingEpoch.numel() == 1 &&
+    TORCH_CHECK(receiptIdentity.dim() == 2 &&
+                    receiptIdentity.size(0) == receipts &&
+                    receiptIdentity.size(1) == kReceiptIdentityWords &&
                     residentThreshold.dim() == 1 &&
                     residentThreshold.numel() == rows &&
                     residentThresholdValid.dim() == 1 &&
@@ -85,7 +88,7 @@ Geometry Validate(
         const at::Device device = scoreWorkspace.device();
         CheckNpuTensor(scoreWorkspace, at::kInt, device, "score_workspace");
         CheckNpuTensor(tileReceipts, at::kLong, device, "tile_receipts");
-        CheckNpuTensor(streamingEpoch, at::kLong, device, "streaming_epoch");
+        CheckNpuTensor(receiptIdentity, at::kLong, device, "receipt_identity");
         CheckNpuTensor(scoreSourceLens, at::kInt, device, "score_source_lens");
         CheckNpuTensor(residentThreshold, at::kInt, device, "resident_threshold");
         CheckNpuTensor(residentThresholdValid, at::kInt, device,
@@ -104,7 +107,7 @@ using Result = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
 
 Result RunNpu(
     const at::Tensor& scoreWorkspace, const at::Tensor& tileReceipts,
-    const at::Tensor& streamingEpoch, const at::Tensor& scoreSourceLens,
+    const at::Tensor& receiptIdentity, const at::Tensor& scoreSourceLens,
     const at::Tensor& residentThreshold,
     const at::Tensor& residentThresholdValid,
     const at::Tensor& kvObjectSlotsSnapshot,
@@ -112,7 +115,7 @@ Result RunNpu(
     const at::Tensor& kvObjectLens)
 {
     const Geometry geometry = Validate(
-        scoreWorkspace, tileReceipts, streamingEpoch, scoreSourceLens,
+        scoreWorkspace, tileReceipts, receiptIdentity, scoreSourceLens,
         residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
         reqPoolEntries, kvObjectMap, kvObjectLens, true);
     const auto int32Options = scoreWorkspace.options().dtype(at::kInt);
@@ -120,27 +123,28 @@ Result RunNpu(
     auto candidateSeeds = at::empty({geometry.receipts, kTileWidth, kSeedWords},
                                     int32Options);
     auto candidateCounts = at::empty({geometry.receipts}, int32Options);
-    auto candidateReadyEpoch = at::empty({geometry.receipts}, int64Options);
+    auto candidateReceiptIdentity = at::empty(
+        {geometry.receipts, kReceiptIdentityWords}, int64Options);
     auto receiptStatus = at::empty({geometry.receipts}, int32Options);
     auto receiptOwner = at::empty({geometry.receipts}, int32Options);
     auto keepalive = std::make_tuple(
-        scoreWorkspace, tileReceipts, streamingEpoch, scoreSourceLens,
+        scoreWorkspace, tileReceipts, receiptIdentity, scoreSourceLens,
         residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
         reqPoolEntries, kvObjectMap, kvObjectLens, candidateSeeds,
-        candidateCounts, candidateReadyEpoch, receiptStatus, receiptOwner);
+        candidateCounts, candidateReceiptIdentity, receiptStatus, receiptOwner);
     EXEC_NPU_CMD_ORDERED(
         aclnnA5ScoreReceiptCandidateExecutor, keepalive, scoreWorkspace,
-        tileReceipts, streamingEpoch, scoreSourceLens, residentThreshold,
+        tileReceipts, receiptIdentity, scoreSourceLens, residentThreshold,
         residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,
         kvObjectMap, kvObjectLens, candidateSeeds, candidateCounts,
-        candidateReadyEpoch, receiptStatus, receiptOwner);
+        candidateReceiptIdentity, receiptStatus, receiptOwner);
     return std::make_tuple(candidateSeeds, candidateCounts,
-                           candidateReadyEpoch, receiptStatus, receiptOwner);
+                           candidateReceiptIdentity, receiptStatus, receiptOwner);
 }
 
 Result RunMeta(
     const at::Tensor& scoreWorkspace, const at::Tensor& tileReceipts,
-    const at::Tensor& streamingEpoch, const at::Tensor& scoreSourceLens,
+    const at::Tensor& receiptIdentity, const at::Tensor& scoreSourceLens,
     const at::Tensor& residentThreshold,
     const at::Tensor& residentThresholdValid,
     const at::Tensor& kvObjectSlotsSnapshot,
@@ -148,7 +152,7 @@ Result RunMeta(
     const at::Tensor& kvObjectLens)
 {
     const Geometry geometry = Validate(
-        scoreWorkspace, tileReceipts, streamingEpoch, scoreSourceLens,
+        scoreWorkspace, tileReceipts, receiptIdentity, scoreSourceLens,
         residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
         reqPoolEntries, kvObjectMap, kvObjectLens, false);
     const auto int32Options = scoreWorkspace.options().dtype(at::kInt);
@@ -156,7 +160,7 @@ Result RunMeta(
     return std::make_tuple(
         at::empty({geometry.receipts, kTileWidth, kSeedWords}, int32Options),
         at::empty({geometry.receipts}, int32Options),
-        at::empty({geometry.receipts}, int64Options),
+        at::empty({geometry.receipts, kReceiptIdentityWords}, int64Options),
         at::empty({geometry.receipts}, int32Options),
         at::empty({geometry.receipts}, int32Options));
 }
@@ -166,12 +170,12 @@ TORCH_LIBRARY(a5_score_receipt_executor, m)
 {
     m.def(
         "score_receipt_candidate_executor("
-        "Tensor score_workspace, Tensor tile_receipts, Tensor streaming_epoch, "
+        "Tensor score_workspace, Tensor tile_receipts, Tensor receipt_identity, "
         "Tensor score_source_lens, Tensor resident_threshold, "
         "Tensor resident_threshold_valid, Tensor kv_object_slots_snapshot, "
         "Tensor req_pool_entries, Tensor kv_object_map, Tensor kv_object_lens) "
         "-> (Tensor candidate_seeds, Tensor candidate_counts, "
-        "Tensor candidate_ready_epoch, Tensor receipt_status, "
+        "Tensor candidate_receipt_identity, Tensor receipt_status, "
         "Tensor receipt_owner)");
 }
 

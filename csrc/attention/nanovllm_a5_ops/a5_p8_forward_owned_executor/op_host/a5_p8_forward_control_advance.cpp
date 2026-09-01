@@ -17,6 +17,10 @@
 namespace {
 enum InputIndex : size_t {
     kForwardControl = 0,
+    // Graph-stable sticky arena health.  It is intentionally an explicit
+    // alias instead of a process-local error bit: every captured phase node
+    // observes the same forward admission outcome.
+    kP8ArenaHealth,
     kExpectedIdentity,
     kTransitionProgram,
     kTransitionResult,
@@ -25,12 +29,14 @@ enum InputIndex : size_t {
 
 enum OutputIndex : size_t {
     kForwardControlOut = 0,
+    kP8ArenaHealthOut,
     kTransitionResultOut,
     kOutputCount,
 };
 
 constexpr size_t kAliasInputs[kOutputCount] = {
     kForwardControl,
+    kP8ArenaHealth,
     kTransitionResult,
 };
 
@@ -46,15 +52,21 @@ static ge::graphStatus TilingA5P8ForwardControlAdvance(
     if (context == nullptr || context->GetPlatformInfo() == nullptr) {
         return ge::GRAPH_FAILED;
     }
+    constexpr ge::DataType kInputTypes[kInputCount] = {
+        ge::DT_INT64, ge::DT_INT32, ge::DT_INT64, ge::DT_INT64,
+        ge::DT_INT64,
+    };
     for (size_t index = 0U; index < kInputCount; ++index) {
         if (context->GetInputShape(index) == nullptr ||
             context->GetInputDesc(index) == nullptr ||
-            context->GetInputDesc(index)->GetDataType() != ge::DT_INT64) {
+            context->GetInputDesc(index)->GetDataType() != kInputTypes[index]) {
             return ge::GRAPH_FAILED;
         }
     }
     const gert::Shape& forward =
         context->GetInputShape(kForwardControl)->GetStorageShape();
+    const gert::Shape& arena_health =
+        context->GetInputShape(kP8ArenaHealth)->GetStorageShape();
     const gert::Shape& identity =
         context->GetInputShape(kExpectedIdentity)->GetStorageShape();
     const gert::Shape& program =
@@ -62,6 +74,7 @@ static ge::graphStatus TilingA5P8ForwardControlAdvance(
     const gert::Shape& result =
         context->GetInputShape(kTransitionResult)->GetStorageShape();
     if (!IsVectorOfLength(forward, kA5P8ControlWords) ||
+        !IsVectorOfLength(arena_health, 1) ||
         !IsVectorOfLength(identity, kA5P8IdentityWords) ||
         !IsVectorOfLength(program, kA5P8TransitionProgramWords) ||
         !IsVectorOfLength(result, kA5P8TransitionResultWords)) {
@@ -114,6 +127,7 @@ static ge::graphStatus InferA5P8ForwardControlAdvanceDataType(
         return ge::GRAPH_FAILED;
     }
     context->SetOutputDataType(kForwardControlOut, ge::DT_INT64);
+    context->SetOutputDataType(kP8ArenaHealthOut, ge::DT_INT32);
     context->SetOutputDataType(kTransitionResultOut, ge::DT_INT64);
     return ge::GRAPH_SUCCESS;
 }
@@ -123,20 +137,24 @@ public:
     explicit A5P8ForwardControlAdvance(const char* name) : OpDef(name) {
         const std::vector<ge::Format> formats = {ge::FORMAT_ND};
         const std::vector<ge::DataType> int64_types = {ge::DT_INT64};
+        const std::vector<ge::DataType> int32_types = {ge::DT_INT32};
         const char* input_names[kInputCount] = {
-            "forward_control", "expected_identity", "transition_program",
-            "transition_result",
+            "forward_control", "p8_arena_health", "expected_identity",
+            "transition_program", "transition_result",
         };
         const char* output_names[kOutputCount] = {
-            "forward_control", "transition_result",
+            "forward_control", "p8_arena_health", "transition_result",
         };
         for (size_t input = 0U; input < kInputCount; ++input) {
             this->Input(input_names[input]).ParamType(REQUIRED)
-                .DataType(int64_types).Format(formats);
+                .DataType(input == kP8ArenaHealth ? int32_types : int64_types)
+                .Format(formats);
         }
         for (size_t output = 0U; output < kOutputCount; ++output) {
             this->Output(output_names[output]).ParamType(REQUIRED)
-                .DataType(int64_types).Format(formats);
+                .DataType(output == kP8ArenaHealthOut ? int32_types
+                                                       : int64_types)
+                .Format(formats);
         }
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)

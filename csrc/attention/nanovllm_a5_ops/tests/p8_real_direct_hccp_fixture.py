@@ -12,6 +12,15 @@ The fixture is local-only.  A remote CPU-service ``link_to`` ABI is rejected
 before it allocates or binds anything.  Its C8 proof uses the separately built
 source-matched official C8 bridge supplied by the P8 runner; P8 itself never
 loads or modifies C8.
+
+The public fixture API is deliberately two-step:
+
+``prepare_p8_real_fixture(device)`` binds the fixed P8 arena/control shell
+before Stage-A can publish a receipt.  The runner admits that shell, then
+``attach_p8_stage_a_receipts(prepared, stage_a_outputs)`` replaces only the
+four immutable CandidateSeed inputs.  It never reconstructs any fixed arena
+tensor.  This keeps the runtime topology honest without adding a second
+ownership protocol or an artificial F1 replay.
 """
 
 from __future__ import annotations
@@ -209,12 +218,12 @@ def _assert_stage_a_shape(stage_a_outputs: tuple[torch.Tensor, ...]) -> Any:
     import test_score_receipt_candidate_executor as stage_a
 
     fixture = stage_a._fixture()
-    seeds, counts, ready_epoch, status = stage_a_outputs
+    seeds, counts, candidate_receipt_identity, status = stage_a_outputs
     expected_receipts = fixture.rows * ((fixture.source_capacity + 127) // 128)
     expected = (
         (tuple(seeds.shape), (expected_receipts, 128, 4)),
         (tuple(counts.shape), (expected_receipts,)),
-        (tuple(ready_epoch.shape), (expected_receipts,)),
+        (tuple(candidate_receipt_identity.shape), (expected_receipts, 4)),
         (tuple(status.shape), (expected_receipts,)),
     )
     if any(got != wanted for got, wanted in expected):
@@ -222,6 +231,17 @@ def _assert_stage_a_shape(stage_a_outputs: tuple[torch.Tensor, ...]) -> Any:
     if int(fixture.epoch) != FORWARD_EPOCH:
         raise RuntimeError(
             f"P8 fixture epoch drift: stage_a={fixture.epoch} expected={FORWARD_EPOCH}"
+        )
+    identity_cpu = candidate_receipt_identity.detach().cpu().reshape(-1, 4)
+    if (
+        not bool(torch.all(identity_cpu[:, 0] == FORWARD_EPOCH).item())
+        or not bool(torch.all(identity_cpu[:, 1] == 0).item())
+        or not bool(torch.all(identity_cpu[:, 2] == 0).item())
+        or int(torch.count_nonzero(identity_cpu[:, 3] <= 0)) != 0
+    ):
+        raise RuntimeError(
+            "P8 Stage-A CandidateReceiptIdentity must match forward=(37,0,0) "
+            "with a nonzero receipt generation"
         )
     return fixture
 
@@ -255,8 +275,10 @@ def build_p8_real_fixture(
         "runtime": runtime,
         "table": None,
         "control_bound": False,
+        "admitted": False,
         "handed_to_executor": False,
         "terminal_safe": False,
+        "reuse_fence_validated": False,
         "cleaned": False,
         "ddr_payload": _payload(entries),
         "c8_after": None,
@@ -274,10 +296,12 @@ def build_p8_real_fixture(
         if state["cleaned"]:
             return
         state["cleaned"] = True
-        if state["handed_to_executor"] and not state["terminal_safe"]:
+        if state["admitted"] and (
+            not state["terminal_safe"] or not state["reuse_fence_validated"]
+        ):
             print(
                 "P8_REAL_CLEANUP safe=0 action=process_exit_quarantine "
-                "reason=forward_terminal_not_validated",
+                "reason=forward_terminal_or_reuse_fence_not_validated",
                 flush=True,
             )
             return
@@ -317,7 +341,7 @@ def build_p8_real_fixture(
         access = runtime.access_table_view(state["table"], device="npu", capacity=entries)
         torch.npu.synchronize()
 
-        seeds, candidate_counts, candidate_ready_epoch, candidate_status = stage_a_outputs
+        seeds, candidate_counts, candidate_receipt_identity, candidate_status = stage_a_outputs
         forward_control = _npu(
             torch.tensor([FORWARD_EPOCH, 0, PHASE_POST << 32, 0], dtype=torch.int64),
             device,
@@ -343,7 +367,10 @@ def build_p8_real_fixture(
         request_output_indices = _npu(torch.full((QUEUE_COUNT, REQUEST_CAPACITY), -1, dtype=torch.int32), device)
         request_count = _npu(torch.zeros(QUEUE_COUNT, dtype=torch.int32), device)
         candidate_cursor = _npu(torch.zeros(seeds.size(0), dtype=torch.int32), device)
-        candidate_cursor_epoch = _npu(torch.zeros(seeds.size(0), dtype=torch.int64), device)
+        candidate_cursor_identity = _npu(
+            torch.zeros((seeds.size(0), 4), dtype=torch.int64), device
+        )
+        p8_arena_health = _npu(torch.zeros(1, dtype=torch.int32), device)
         # The P8 tiler runs up to min(available AIV, max(receipts, private rows)).
         # 64 rows covers a 48/72-AIV device without a silent stats OOB.
         worker_stats = _npu(torch.zeros((PRIVATE_ROWS, 16), dtype=torch.int64), device)
@@ -377,9 +404,10 @@ def build_p8_real_fixture(
         executor_inputs: tuple[torch.Tensor, ...] = (
             seeds,
             candidate_counts,
-            candidate_ready_epoch,
+            candidate_receipt_identity,
             candidate_status,
             forward_control,
+            p8_arena_health,
             _npu(fixture.score_source_lens, device),
             _npu(torch.tensor([1], dtype=torch.int32), device),
             _npu(fixture.req_pool_entries, device),
@@ -399,12 +427,10 @@ def build_p8_real_fixture(
             request_output_indices,
             request_count,
             candidate_cursor,
-            candidate_cursor_epoch,
+            candidate_cursor_identity,
             rows_per_entry,
             worker_stats,
         )
-        state["handed_to_executor"] = True
-
         result: dict[str, Any] = {
             "executor_inputs": executor_inputs,
             "expected_identity": expected_identity,
@@ -414,23 +440,27 @@ def build_p8_real_fixture(
             "drain_attempts": 16,
             "c8_baseline_before": c8_before,
             "cleanup": cleanup,
+            # Internal to this module's two-step fixture API.  The runner
+            # cannot receive this state as a P8 tensor; it only uses it to
+            # make cleanup quarantine-safe if Stage A fails after admission.
+            "_p8_fixture_state": state,
         }
 
         def validate_terminal(inputs: tuple[torch.Tensor, ...]) -> None:
             torch.npu.synchronize()
-            stats = inputs[26].detach().cpu()
+            stats = inputs[27].detach().cpu()
             stat_sums = [int(stats[:, column].sum()) for column in range(stats.size(1))]
             leases_cpu = queue_leases.detach().cpu()
-            source_map = inputs[11].detach().cpu()
-            object_map = inputs[12].detach().cpu()
-            ready_cpu = inputs[13].detach().cpu()
+            source_map = inputs[12].detach().cpu()
+            object_map = inputs[13].detach().cpu()
+            ready_cpu = inputs[14].detach().cpu()
             control_cpu = inputs[4].detach().cpu()
-            wave_cpu = inputs[17].detach().cpu()
-            private_records_cpu = inputs[18].detach().cpu()
-            ledger_source = inputs[19].detach().cpu()
-            ledger_object = inputs[20].detach().cpu()
-            ledger_output = inputs[21].detach().cpu()
-            output_cpu = inputs[15].detach().cpu()
+            wave_cpu = inputs[18].detach().cpu()
+            private_records_cpu = inputs[19].detach().cpu()
+            ledger_source = inputs[20].detach().cpu()
+            ledger_object = inputs[21].detach().cpu()
+            ledger_output = inputs[22].detach().cpu()
+            output_cpu = inputs[16].detach().cpu()
 
             required = {
                 "post": stat_sums[STAT_POST_COMMITTED],
@@ -475,6 +505,15 @@ def build_p8_real_fixture(
             wave_state = wave_cpu.view(torch.int32).reshape(QUEUE_COUNT, 64)[:, 3]
             if int(torch.count_nonzero(wave_state)) != 0:
                 raise AssertionError(f"P8 wave remained non-free after terminal: {wave_state.tolist()}")
+            receipt_identity = inputs[2].detach().cpu().reshape(-1, 4)
+            cursor_identity = inputs[25].detach().cpu().reshape(-1, 4)
+            status = inputs[3].detach().cpu()
+            if int(torch.count_nonzero(receipt_identity[:, 3])) != 0:
+                raise AssertionError("P8 terminal left a live CandidateReceiptIdentity")
+            if int(torch.count_nonzero(cursor_identity[:, 3])) != 0:
+                raise AssertionError("P8 terminal left a live cursor identity")
+            if not bool(torch.all(status == -6).item()):
+                raise AssertionError("P8 terminal did not tombstone candidate receipt status")
 
             observed: list[tuple[int, int, int, int]] = []
             for request in range(REQUEST_CAPACITY):
@@ -528,7 +567,7 @@ def build_p8_real_fixture(
                     f"request={request} output={output_index} source_offset={source_offset} "
                     f"object_offset={object_offset} first_byte={first} expected={expected_byte} "
                     f"actual={actual_value} output_sha16={_sha16(output_cpu[output_index])} "
-                    f"ddr_sha16={_sha16(state['ddr_payload'])} control_sha16={_sha16(inputs[16])}",
+                    f"ddr_sha16={_sha16(state['ddr_payload'])} control_sha16={_sha16(inputs[17])}",
                     flush=True,
                 )
                 raise AssertionError("P8 local Direct-HCCP payload byte comparison failed")
@@ -550,3 +589,162 @@ def build_p8_real_fixture(
     except Exception:
         cleanup()
         raise
+
+
+def _stage_a_shape_placeholder(device: torch.device) -> tuple[torch.Tensor, ...]:
+    """Provide ABI-sized, unpublished receipt storage for cold arena setup.
+
+    ``prepare_p8_real_fixture`` needs the static CandidateSeed dimensions to
+    bind the P8 graph tensors, but must not execute or publish Stage A.  These
+    values are never submitted to Stage B: ``attach_p8_stage_a_receipts``
+    replaces all four inputs after the runner's admission node succeeds.
+    """
+
+    import test_score_receipt_candidate_executor as stage_a
+
+    fixture = stage_a._fixture()
+    receipts = fixture.rows * ((fixture.source_capacity + 127) // 128)
+    identity = stage_a._receipt_identity(
+        fixture, graph_replay_generation=0, layer_control_index=0
+    )
+    return (
+        torch.full((receipts, 128, 4), -1, dtype=torch.int32, device=device),
+        torch.zeros((receipts,), dtype=torch.int32, device=device),
+        identity.to(device).contiguous(),
+        torch.zeros((receipts,), dtype=torch.int32, device=device),
+    )
+
+
+def prepare_p8_real_fixture(device: torch.device) -> dict[str, Any]:
+    """Cold-bind P8's fixed arena before Stage-A receipt publication.
+
+    This preserves the existing Direct-HCCP setup code while giving the graph
+    runner the required order: prepare fixed resources -> admission -> Stage
+    A.  The temporary candidate tensors are shape-only wiring and are replaced
+    before any P8 POST node can see them.
+    """
+
+    prepared = build_p8_real_fixture(device, _stage_a_shape_placeholder(device))
+    state = prepared.get("_p8_fixture_state")
+    inputs_value = prepared.get("executor_inputs")
+    if not isinstance(state, dict) or not isinstance(inputs_value, tuple):
+        raise RuntimeError("P8 cold fixture did not return internal arena state")
+    inputs = inputs_value
+    shell = {
+        "forward_control": inputs[4],
+        "p8_arena_health": inputs[5],
+        "fused_get_control": inputs[17],
+        "p8_wave_records": inputs[18],
+        "p8_private_records": inputs[19],
+        "expected_identity": prepared["expected_identity"],
+    }
+
+    def mark_admitted() -> None:
+        if state["admitted"]:
+            raise RuntimeError("P8 fixture admission marker was invoked twice")
+        state["admitted"] = True
+        print("P8_REAL_ADMISSION fixed_arena=1 stage_a_not_published_yet=1", flush=True)
+
+    prepared["arena_shell"] = shell
+    prepared["mark_admitted"] = mark_admitted
+    _attach_reuse_fence_validator(prepared)
+    return prepared
+
+
+def attach_p8_stage_a_receipts(
+    prepared: Mapping[str, Any], stage_a_outputs: tuple[torch.Tensor, ...]
+) -> dict[str, Any]:
+    """Attach exact Stage-A outputs without rebuilding the admitted arena."""
+
+    if not isinstance(prepared, dict):
+        raise RuntimeError("P8 prepared fixture must be the mutable real fixture mapping")
+    state = prepared.get("_p8_fixture_state")
+    inputs_value = prepared.get("executor_inputs")
+    if not isinstance(state, dict) or not isinstance(inputs_value, tuple):
+        raise RuntimeError("P8 prepared fixture lost its cold-bound arena state")
+    if not state["admitted"]:
+        raise RuntimeError("P8 refuses Stage-A receipt attachment before arena admission")
+    fixture = _assert_stage_a_shape(stage_a_outputs)
+    seeds, counts, candidate_receipt_identity, status = stage_a_outputs
+    previous = inputs_value
+    expected_shapes = (
+        tuple(previous[0].shape),
+        tuple(previous[1].shape),
+        tuple(previous[2].shape),
+        tuple(previous[3].shape),
+    )
+    actual_shapes = (
+        tuple(seeds.shape),
+        tuple(counts.shape),
+        tuple(candidate_receipt_identity.shape),
+        tuple(status.shape),
+    )
+    if actual_shapes != expected_shapes:
+        raise RuntimeError(
+            "P8 Stage-A outputs do not match cold arena receipt ABI: "
+            f"actual={actual_shapes} expected={expected_shapes}"
+        )
+    if int(fixture.epoch) != FORWARD_EPOCH:
+        raise RuntimeError("P8 Stage-A epoch drift during post-admission attachment")
+    # Only the published receipt inputs are replaced.  Index 4 onward retains
+    # the exact data pointers that the admission node inspected/leased.
+    prepared["executor_inputs"] = (
+        seeds,
+        counts,
+        candidate_receipt_identity,
+        status,
+        *previous[4:],
+    )
+    state["handed_to_executor"] = True
+    print(
+        "P8_REAL_RECEIPT_ATTACH stage_a_published_after_admission=1 "
+        "fixed_arena_reinitialized=0",
+        flush=True,
+    )
+    return prepared
+
+
+def _arena_tag_parts(value: int) -> tuple[int, int]:
+    """Decode the minimal native `(generation << 3) | state` lease tag."""
+
+    tag = int(value) & 0xFFFFFFFF
+    return tag & 0x7, tag >> 3
+
+
+def _validate_reuse_fence(prepared: Mapping[str, Any], inputs: tuple[torch.Tensor, ...]) -> None:
+    state = prepared.get("_p8_fixture_state")
+    if not isinstance(state, dict) or not state.get("admitted"):
+        raise AssertionError("P8 reuse fence cannot validate an unadmitted arena")
+    if not state.get("terminal_safe"):
+        raise AssertionError("P8 reuse fence reached before terminal CQ/private validation")
+    control = inputs[4].detach().cpu().reshape(-1).to(torch.int64).tolist()
+    phase = int((int(control[2]) >> 32) & 0xFFFFFFFF)
+    # These are the fixed low flag bits; the high half may cache lease
+    # generation and is deliberately not interpreted as an owner tuple.
+    flags = int(control[3])
+    if phase != 4 or (flags & ((1 << 2) | (1 << 3) | (1 << 4))) != ((1 << 2) | (1 << 3) | (1 << 4)):
+        raise AssertionError(
+            "P8 reuse fence requires exact->QSFA->forward terminal completion: "
+            f"phase={phase} flags=0x{flags:x}"
+        )
+    arena_state, generation = _arena_tag_parts(
+        int(inputs[5].detach().cpu().reshape(-1)[0])
+    )
+    if arena_state != 0 or generation <= 0:
+        raise AssertionError(
+            "P8 forward terminal did not release the admitted arena tag: "
+            f"state={arena_state} generation={generation}"
+        )
+    state["reuse_fence_validated"] = True
+    print(
+        "P8_REAL_REUSE_FENCE terminal_after_qsfa=1 "
+        f"arena_state={arena_state} lease_generation={generation} result=pass",
+        flush=True,
+    )
+
+
+def _attach_reuse_fence_validator(prepared: dict[str, Any]) -> None:
+    def validate_reuse_fence(inputs: tuple[torch.Tensor, ...]) -> None:
+        _validate_reuse_fence(prepared, inputs)
+
+    prepared["validate_reuse_fence"] = validate_reuse_fence

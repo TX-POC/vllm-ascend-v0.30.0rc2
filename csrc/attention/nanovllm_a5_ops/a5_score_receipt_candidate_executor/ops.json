@@ -5,7 +5,7 @@
     "input_desc": [
       {"name": "score_workspace", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "tile_receipts", "param_type": "required", "format": ["ND"], "type": ["int64"]},
-      {"name": "streaming_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "receipt_identity", "param_type": "required", "format": ["ND"], "type": ["int64"]},
       {"name": "score_source_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "resident_threshold", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "resident_threshold_valid", "param_type": "required", "format": ["ND"], "type": ["int32"]},
@@ -17,7 +17,7 @@
     "output_desc": [
       {"name": "candidate_seeds", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "candidate_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "candidate_ready_epoch", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "candidate_receipt_identity", "param_type": "required", "format": ["ND"], "type": ["int64"]},
       {"name": "receipt_status", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "receipt_owner", "param_type": "required", "format": ["ND"], "type": ["int32"]}
     ],

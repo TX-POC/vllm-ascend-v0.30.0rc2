@@ -22,10 +22,11 @@
 
 namespace {
 
-constexpr int64_t kInputCount = 27;
-constexpr int64_t kOutputCount = 16;
+constexpr int64_t kInputCount = 28;
+constexpr int64_t kOutputCount = 19;
 constexpr int64_t kCandidateCapacity = 128;
 constexpr int64_t kCandidateSeedWords = 4;
+constexpr int64_t kCandidateReceiptIdentityWords = 4;
 constexpr int64_t kForwardControlWords = 4;
 constexpr int64_t kStreamingControlWords = 16;
 constexpr int64_t kWaveRecordWords = 32;
@@ -36,6 +37,8 @@ constexpr int64_t kWorkerStatColumns = 16;
 constexpr int64_t kAdvanceIdentityWords = 3;
 constexpr int64_t kAdvanceProgramWords = 4;
 constexpr int64_t kAdvanceResultWords = 4;
+constexpr int64_t kAdmissionIdentityWords = 3;
+constexpr int64_t kAdmissionResultWords = 4;
 
 struct Geometry {
     int64_t receipts;
@@ -64,9 +67,10 @@ void CheckMatrix(const at::Tensor& tensor, int64_t rows, int64_t columns,
 
 Geometry ValidateShapes(
     const at::Tensor& candidate_seeds, const at::Tensor& candidate_counts,
-    const at::Tensor& candidate_ready_epoch,
+    const at::Tensor& candidate_receipt_identity,
     const at::Tensor& candidate_status, const at::Tensor& forward_control,
-    const at::Tensor& source_lens, const at::Tensor& kv_object_address_domain,
+    const at::Tensor& p8_arena_health, const at::Tensor& source_lens,
+    const at::Tensor& kv_object_address_domain,
     const at::Tensor& req_pool_entries, const at::Tensor& kv_object_map,
     const at::Tensor& kv_object_lens,
     const at::Tensor& kv_object_slots_snapshot,
@@ -82,7 +86,7 @@ Geometry ValidateShapes(
     const at::Tensor& queue_request_output_indices,
     const at::Tensor& queue_request_count,
     const at::Tensor& candidate_cursor,
-    const at::Tensor& candidate_cursor_epoch,
+    const at::Tensor& candidate_cursor_identity,
     const at::Tensor& rows_per_entry, const at::Tensor& worker_stats)
 {
     TORCH_CHECK(candidate_seeds.dim() == 3 && candidate_seeds.size(0) > 0 &&
@@ -91,9 +95,12 @@ Geometry ValidateShapes(
                 "candidate_seeds must be int32[N, 128, 4], N > 0.");
     const int64_t receipts = candidate_seeds.size(0);
     CheckVector(candidate_counts, receipts, "candidate_counts");
-    CheckVector(candidate_ready_epoch, receipts, "candidate_ready_epoch");
+    CheckMatrix(candidate_receipt_identity, receipts,
+                kCandidateReceiptIdentityWords,
+                "candidate_receipt_identity");
     CheckVector(candidate_status, receipts, "candidate_status");
     CheckVector(forward_control, kForwardControlWords, "forward_control");
+    CheckVector(p8_arena_health, 1, "p8_arena_health");
     TORCH_CHECK(source_lens.dim() == 1 && source_lens.numel() > 0,
                 "source_lens must be int32[R], R > 0.");
     const int64_t rows = source_lens.numel();
@@ -137,7 +144,9 @@ Geometry ValidateShapes(
                 "queue_request_output_indices");
     CheckVector(queue_request_count, queues, "queue_request_count");
     CheckVector(candidate_cursor, receipts, "candidate_cursor");
-    CheckVector(candidate_cursor_epoch, receipts, "candidate_cursor_epoch");
+    CheckMatrix(candidate_cursor_identity, receipts,
+                kCandidateReceiptIdentityWords,
+                "candidate_cursor_identity");
     CheckVector(rows_per_entry, 1, "rows_per_entry");
     TORCH_CHECK(worker_stats.dim() == 2 && worker_stats.size(0) > 0 &&
                     worker_stats.size(1) == kWorkerStatColumns,
@@ -157,9 +166,9 @@ void CheckNpuInputs(
         at::kInt,  at::kInt,  at::kLong, at::kInt,  at::kLong,
         at::kInt,  at::kInt,  at::kInt,  at::kInt,  at::kInt,
         at::kInt,  at::kInt,  at::kInt,  at::kInt,  at::kInt,
-        at::kByte, at::kLong, at::kLong, at::kLong, at::kLong,
-        at::kLong, at::kInt,  at::kInt,  at::kInt,  at::kLong,
-        at::kInt,  at::kLong,
+        at::kInt,  at::kByte, at::kLong, at::kLong, at::kLong,
+        at::kLong, at::kLong, at::kInt,  at::kInt,  at::kInt,
+        at::kLong, at::kInt,  at::kLong,
     };
     for (size_t index = 0; index < inputs.size(); ++index) {
         const at::Tensor& tensor = *inputs[index];
@@ -175,26 +184,111 @@ using Result = std::tuple<
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-    at::Tensor>;
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
 
-using AdvanceResult = std::tuple<at::Tensor, at::Tensor>;
+using AdvanceResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
+using AdmissionResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
+
+void ValidateArenaAdmissionInputs(
+    const at::Tensor& forward_control, const at::Tensor& p8_arena_health,
+    const at::Tensor& fused_get_control, const at::Tensor& p8_wave_records,
+    const at::Tensor& p8_private_records,
+    const at::Tensor& expected_identity,
+    const at::Tensor& admission_result, bool require_npu)
+{
+    CheckVector(forward_control, kForwardControlWords, "forward_control");
+    CheckVector(p8_arena_health, 1, "p8_arena_health");
+    CheckVector(fused_get_control, kStreamingControlWords,
+                "fused_get_control");
+    TORCH_CHECK(p8_wave_records.dim() == 2 && p8_wave_records.size(0) > 0 &&
+                    p8_wave_records.size(1) == kWaveRecordWords,
+                "p8_wave_records must be int64[Q, 32], Q > 0.");
+    TORCH_CHECK(p8_private_records.dim() == 2 &&
+                    p8_private_records.size(0) > 0 &&
+                    p8_private_records.size(1) == kPrivateRecordWords,
+                "p8_private_records must be int64[A, 10], A > 0.");
+    CheckVector(expected_identity, kAdmissionIdentityWords,
+                "expected_identity");
+    CheckVector(admission_result, kAdmissionResultWords,
+                "admission_result");
+    const std::array<const at::Tensor*, 7> tensors = {
+        &forward_control, &p8_arena_health, &fused_get_control,
+        &p8_wave_records, &p8_private_records, &expected_identity,
+        &admission_result,
+    };
+    const std::array<at::ScalarType, 7> dtypes = {
+        at::kLong, at::kInt, at::kLong, at::kLong, at::kLong, at::kLong,
+        at::kLong,
+    };
+    const at::Device device = forward_control.device();
+    if (require_npu) {
+        TORCH_CHECK(device.is_privateuseone(),
+                    "p8 arena admission gate requires NPU tensors.");
+    }
+    for (size_t index = 0; index < tensors.size(); ++index) {
+        const at::Tensor& tensor = *tensors[index];
+        TORCH_CHECK(tensor.device() == device && tensor.is_contiguous() &&
+                        tensor.scalar_type() == dtypes[index],
+                    "P8 arena admission input ", index,
+                    " must be contiguous, have its declared ABI dtype, and be on ",
+                    device.str(), ".");
+    }
+}
+
+AdmissionResult ArenaAdmissionNpu(
+    at::Tensor forward_control, at::Tensor p8_arena_health,
+    const at::Tensor& fused_get_control, const at::Tensor& p8_wave_records,
+    const at::Tensor& p8_private_records,
+    const at::Tensor& expected_identity, at::Tensor admission_result)
+{
+    ValidateArenaAdmissionInputs(forward_control, p8_arena_health,
+                                 fused_get_control, p8_wave_records,
+                                 p8_private_records, expected_identity,
+                                 admission_result, true);
+    auto keepalive = std::make_tuple(
+        forward_control, p8_arena_health, fused_get_control, p8_wave_records,
+        p8_private_records, expected_identity, admission_result);
+    EXEC_NPU_CMD_ORDERED(
+        aclnnA5P8ArenaAdmissionGate, keepalive, forward_control,
+        p8_arena_health, fused_get_control, p8_wave_records,
+        p8_private_records, expected_identity, admission_result);
+    return std::make_tuple(forward_control, p8_arena_health, admission_result);
+}
+
+AdmissionResult ArenaAdmissionMeta(
+    at::Tensor forward_control, at::Tensor p8_arena_health,
+    const at::Tensor& fused_get_control, const at::Tensor& p8_wave_records,
+    const at::Tensor& p8_private_records,
+    const at::Tensor& expected_identity, at::Tensor admission_result)
+{
+    ValidateArenaAdmissionInputs(forward_control, p8_arena_health,
+                                 fused_get_control, p8_wave_records,
+                                 p8_private_records, expected_identity,
+                                 admission_result, false);
+    return std::make_tuple(forward_control, p8_arena_health, admission_result);
+}
 
 void ValidateAdvanceInputs(const at::Tensor& forward_control,
+                           const at::Tensor& p8_arena_health,
                            const at::Tensor& expected_identity,
                            const at::Tensor& transition_program,
                            const at::Tensor& transition_result,
                            bool require_npu)
 {
     CheckVector(forward_control, kForwardControlWords, "forward_control");
+    CheckVector(p8_arena_health, 1, "p8_arena_health");
     CheckVector(expected_identity, kAdvanceIdentityWords,
                 "expected_identity");
     CheckVector(transition_program, kAdvanceProgramWords,
                 "transition_program");
     CheckVector(transition_result, kAdvanceResultWords,
                 "transition_result");
-    const std::array<const at::Tensor*, 4> tensors = {
-        &forward_control, &expected_identity, &transition_program,
-        &transition_result,
+    const std::array<const at::Tensor*, 5> tensors = {
+        &forward_control, &p8_arena_health, &expected_identity,
+        &transition_program, &transition_result,
+    };
+    const std::array<at::ScalarType, 5> dtypes = {
+        at::kLong, at::kInt, at::kLong, at::kLong, at::kLong,
     };
     const at::Device device = forward_control.device();
     if (require_npu) {
@@ -204,40 +298,48 @@ void ValidateAdvanceInputs(const at::Tensor& forward_control,
     for (size_t index = 0; index < tensors.size(); ++index) {
         const at::Tensor& tensor = *tensors[index];
         TORCH_CHECK(tensor.device() == device && tensor.is_contiguous() &&
-                        tensor.scalar_type() == at::kLong,
+                        tensor.scalar_type() == dtypes[index],
                     "P8 forward-control advance input ", index,
-                    " must be contiguous int64 on ", device.str(), ".");
+                    " must be contiguous with its declared ABI dtype on ",
+                    device.str(), ".");
     }
 }
 
 AdvanceResult AdvanceForwardControlNpu(
-    at::Tensor forward_control, const at::Tensor& expected_identity,
+    at::Tensor forward_control, at::Tensor p8_arena_health,
+    const at::Tensor& expected_identity,
     const at::Tensor& transition_program, at::Tensor transition_result)
 {
-    ValidateAdvanceInputs(forward_control, expected_identity,
+    ValidateAdvanceInputs(forward_control, p8_arena_health, expected_identity,
                           transition_program, transition_result, true);
-    auto keepalive = std::make_tuple(forward_control, expected_identity,
-                                     transition_program, transition_result);
+    auto keepalive = std::make_tuple(forward_control, p8_arena_health,
+                                     expected_identity, transition_program,
+                                     transition_result);
     EXEC_NPU_CMD_ORDERED(
         aclnnA5P8ForwardControlAdvance, keepalive, forward_control,
-        expected_identity, transition_program, transition_result);
-    return std::make_tuple(forward_control, transition_result);
+        p8_arena_health, expected_identity, transition_program,
+        transition_result);
+    return std::make_tuple(forward_control, p8_arena_health,
+                           transition_result);
 }
 
 AdvanceResult AdvanceForwardControlMeta(
-    at::Tensor forward_control, const at::Tensor& expected_identity,
+    at::Tensor forward_control, at::Tensor p8_arena_health,
+    const at::Tensor& expected_identity,
     const at::Tensor& transition_program, at::Tensor transition_result)
 {
-    ValidateAdvanceInputs(forward_control, expected_identity,
+    ValidateAdvanceInputs(forward_control, p8_arena_health, expected_identity,
                           transition_program, transition_result, false);
-    return std::make_tuple(forward_control, transition_result);
+    return std::make_tuple(forward_control, p8_arena_health,
+                           transition_result);
 }
 
 Result RunNpu(
     const at::Tensor& candidate_seeds, const at::Tensor& candidate_counts,
-    const at::Tensor& candidate_ready_epoch,
-    const at::Tensor& candidate_status, at::Tensor forward_control,
-    const at::Tensor& source_lens, const at::Tensor& kv_object_address_domain,
+    at::Tensor candidate_receipt_identity,
+    at::Tensor candidate_status, at::Tensor forward_control,
+    at::Tensor p8_arena_health, const at::Tensor& source_lens,
+    const at::Tensor& kv_object_address_domain,
     const at::Tensor& req_pool_entries, const at::Tensor& kv_object_map,
     const at::Tensor& kv_object_lens,
     const at::Tensor& kv_object_slots_snapshot,
@@ -249,31 +351,31 @@ Result RunNpu(
     at::Tensor queue_request_object_offsets,
     at::Tensor queue_request_output_indices,
     at::Tensor queue_request_count, at::Tensor candidate_cursor,
-    at::Tensor candidate_cursor_epoch, const at::Tensor& rows_per_entry,
+    at::Tensor candidate_cursor_identity, const at::Tensor& rows_per_entry,
     at::Tensor worker_stats)
 {
     const std::array<const at::Tensor*, kInputCount> inputs = {
-        &candidate_seeds, &candidate_counts, &candidate_ready_epoch,
-        &candidate_status, &forward_control, &source_lens,
+        &candidate_seeds, &candidate_counts, &candidate_receipt_identity,
+        &candidate_status, &forward_control, &p8_arena_health, &source_lens,
         &kv_object_address_domain, &req_pool_entries, &kv_object_map,
         &kv_object_lens, &kv_object_slots_snapshot, &private_source_to_slot,
         &private_object_to_slot, &private_ready_table, &private_slot_cursor,
         &private_packed_output, &fused_get_control, &p8_wave_records,
         &p8_private_records, &queue_request_source_offsets,
         &queue_request_object_offsets, &queue_request_output_indices,
-        &queue_request_count, &candidate_cursor, &candidate_cursor_epoch,
+        &queue_request_count, &candidate_cursor, &candidate_cursor_identity,
         &rows_per_entry, &worker_stats,
     };
     const Geometry geometry = ValidateShapes(
-        candidate_seeds, candidate_counts, candidate_ready_epoch,
-        candidate_status, forward_control, source_lens,
+        candidate_seeds, candidate_counts, candidate_receipt_identity,
+        candidate_status, forward_control, p8_arena_health, source_lens,
         kv_object_address_domain, req_pool_entries, kv_object_map,
         kv_object_lens, kv_object_slots_snapshot, private_source_to_slot,
         private_object_to_slot, private_ready_table, private_slot_cursor,
         private_packed_output, fused_get_control, p8_wave_records,
         p8_private_records, queue_request_source_offsets,
         queue_request_object_offsets, queue_request_output_indices,
-        queue_request_count, candidate_cursor, candidate_cursor_epoch,
+        queue_request_count, candidate_cursor, candidate_cursor_identity,
         rows_per_entry, worker_stats);
     CheckNpuInputs(candidate_seeds, inputs);
 
@@ -282,8 +384,9 @@ Result RunNpu(
         !(debug[0] == '0' && debug[1] == '\0')) {
         std::fprintf(
             stderr,
-            "P8_FORWARD_OWNED_BRIDGE_ABI tensors=27 mutable_refs=16 "
+            "P8_FORWARD_OWNED_BRIDGE_ABI tensors=28 mutable_refs=19 "
             "receipts=%lld queues=%lld private_rows=%lld phase_control=gm "
+            "arena_health=global_sticky "
             "c8_dependency=0 fixed_get_core=0\n",
             static_cast<long long>(geometry.receipts),
             static_cast<long long>(geometry.queues),
@@ -295,43 +398,46 @@ Result RunNpu(
     // ACLNN launch completes.  Device Post/CQ/private lifetime is *not* a
     // host closure: it is the P8 GM state machine carried by these tensors.
     auto keepalive = std::make_tuple(
-        candidate_seeds, candidate_counts, candidate_ready_epoch,
-        candidate_status, forward_control, source_lens,
+        candidate_seeds, candidate_counts, candidate_receipt_identity,
+        candidate_status, forward_control, p8_arena_health, source_lens,
         kv_object_address_domain, req_pool_entries, kv_object_map,
         kv_object_lens, kv_object_slots_snapshot, private_source_to_slot,
         private_object_to_slot, private_ready_table, private_slot_cursor,
         private_packed_output, fused_get_control, p8_wave_records,
         p8_private_records, queue_request_source_offsets,
         queue_request_object_offsets, queue_request_output_indices,
-        queue_request_count, candidate_cursor, candidate_cursor_epoch,
+        queue_request_count, candidate_cursor, candidate_cursor_identity,
         rows_per_entry, worker_stats);
     EXEC_NPU_CMD_ORDERED(
         aclnnA5P8ForwardOwnedExecutor, keepalive, candidate_seeds,
-        candidate_counts, candidate_ready_epoch, candidate_status,
-        forward_control, source_lens, kv_object_address_domain,
+        candidate_counts, candidate_receipt_identity, candidate_status,
+        forward_control, p8_arena_health, source_lens,
+        kv_object_address_domain,
         req_pool_entries, kv_object_map, kv_object_lens,
         kv_object_slots_snapshot, private_source_to_slot,
         private_object_to_slot, private_ready_table, private_slot_cursor,
         private_packed_output, fused_get_control, p8_wave_records,
         p8_private_records, queue_request_source_offsets,
         queue_request_object_offsets, queue_request_output_indices,
-        queue_request_count, candidate_cursor, candidate_cursor_epoch,
+        queue_request_count, candidate_cursor, candidate_cursor_identity,
         rows_per_entry, worker_stats);
     return std::make_tuple(
-        forward_control, private_source_to_slot, private_object_to_slot,
+        forward_control, p8_arena_health, private_source_to_slot,
+        private_object_to_slot,
         private_ready_table,
         private_slot_cursor, private_packed_output, fused_get_control,
         p8_wave_records, p8_private_records, queue_request_source_offsets,
         queue_request_object_offsets, queue_request_output_indices,
-        queue_request_count, candidate_cursor, candidate_cursor_epoch,
-        worker_stats);
+        queue_request_count, candidate_cursor, candidate_cursor_identity,
+        worker_stats, candidate_receipt_identity, candidate_status);
 }
 
 Result RunMeta(
     const at::Tensor& candidate_seeds, const at::Tensor& candidate_counts,
-    const at::Tensor& candidate_ready_epoch,
-    const at::Tensor& candidate_status, at::Tensor forward_control,
-    const at::Tensor& source_lens, const at::Tensor& kv_object_address_domain,
+    at::Tensor candidate_receipt_identity,
+    at::Tensor candidate_status, at::Tensor forward_control,
+    at::Tensor p8_arena_health, const at::Tensor& source_lens,
+    const at::Tensor& kv_object_address_domain,
     const at::Tensor& req_pool_entries, const at::Tensor& kv_object_map,
     const at::Tensor& kv_object_lens,
     const at::Tensor& kv_object_slots_snapshot,
@@ -343,28 +449,29 @@ Result RunMeta(
     at::Tensor queue_request_object_offsets,
     at::Tensor queue_request_output_indices,
     at::Tensor queue_request_count, at::Tensor candidate_cursor,
-    at::Tensor candidate_cursor_epoch, const at::Tensor& rows_per_entry,
+    at::Tensor candidate_cursor_identity, const at::Tensor& rows_per_entry,
     at::Tensor worker_stats)
 {
     (void)ValidateShapes(
-        candidate_seeds, candidate_counts, candidate_ready_epoch,
-        candidate_status, forward_control, source_lens,
+        candidate_seeds, candidate_counts, candidate_receipt_identity,
+        candidate_status, forward_control, p8_arena_health, source_lens,
         kv_object_address_domain, req_pool_entries, kv_object_map,
         kv_object_lens, kv_object_slots_snapshot, private_source_to_slot,
         private_object_to_slot, private_ready_table, private_slot_cursor,
         private_packed_output, fused_get_control, p8_wave_records,
         p8_private_records, queue_request_source_offsets,
         queue_request_object_offsets, queue_request_output_indices,
-        queue_request_count, candidate_cursor, candidate_cursor_epoch,
+        queue_request_count, candidate_cursor, candidate_cursor_identity,
         rows_per_entry, worker_stats);
     return std::make_tuple(
-        forward_control, private_source_to_slot, private_object_to_slot,
+        forward_control, p8_arena_health, private_source_to_slot,
+        private_object_to_slot,
         private_ready_table,
         private_slot_cursor, private_packed_output, fused_get_control,
         p8_wave_records, p8_private_records, queue_request_source_offsets,
         queue_request_object_offsets, queue_request_output_indices,
-        queue_request_count, candidate_cursor, candidate_cursor_epoch,
-        worker_stats);
+        queue_request_count, candidate_cursor, candidate_cursor_identity,
+        worker_stats, candidate_receipt_identity, candidate_status);
 }
 
 }  // namespace
@@ -374,48 +481,62 @@ TORCH_LIBRARY(a5_p8_forward_owned_executor, m)
     m.def(
         "forward_owned_executor("
         "Tensor candidate_seeds, Tensor candidate_counts, "
-        "Tensor candidate_ready_epoch, Tensor candidate_status, "
-        "Tensor(a!) forward_control, Tensor source_lens, "
+        "Tensor(r!) candidate_receipt_identity, Tensor(s!) candidate_status, "
+        "Tensor(a!) forward_control, Tensor(b!) p8_arena_health, "
+        "Tensor source_lens, "
         "Tensor kv_object_address_domain, Tensor req_pool_entries, "
         "Tensor kv_object_map, Tensor kv_object_lens, "
         "Tensor kv_object_slots_snapshot, "
-        "Tensor(b!) private_source_to_slot, Tensor(c!) private_object_to_slot, "
-        "Tensor(d!) private_ready_table, Tensor(e!) private_slot_cursor, "
-        "Tensor(f!) private_packed_output, Tensor(g!) fused_get_control, "
-        "Tensor(h!) p8_wave_records, Tensor(i!) p8_private_records, "
-        "Tensor(j!) queue_request_source_offsets, "
-        "Tensor(k!) queue_request_object_offsets, "
-        "Tensor(l!) queue_request_output_indices, "
-        "Tensor(m!) queue_request_count, Tensor(n!) candidate_cursor, "
-        "Tensor(o!) candidate_cursor_epoch, Tensor rows_per_entry, "
-        "Tensor(p!) worker_stats) -> ("
+        "Tensor(c!) private_source_to_slot, Tensor(d!) private_object_to_slot, "
+        "Tensor(e!) private_ready_table, Tensor(f!) private_slot_cursor, "
+        "Tensor(g!) private_packed_output, Tensor(h!) fused_get_control, "
+        "Tensor(i!) p8_wave_records, Tensor(j!) p8_private_records, "
+        "Tensor(k!) queue_request_source_offsets, "
+        "Tensor(l!) queue_request_object_offsets, "
+        "Tensor(m!) queue_request_output_indices, "
+        "Tensor(n!) queue_request_count, Tensor(o!) candidate_cursor, "
+        "Tensor(p!) candidate_cursor_identity, Tensor rows_per_entry, "
+        "Tensor(q!) worker_stats) -> ("
         "Tensor(a!) forward_control, "
-        "Tensor(b!) private_source_to_slot, Tensor(c!) private_object_to_slot, "
-        "Tensor(d!) private_ready_table, Tensor(e!) private_slot_cursor, "
-        "Tensor(f!) private_packed_output, Tensor(g!) fused_get_control, "
-        "Tensor(h!) p8_wave_records, Tensor(i!) p8_private_records, "
-        "Tensor(j!) queue_request_source_offsets, "
-        "Tensor(k!) queue_request_object_offsets, "
-        "Tensor(l!) queue_request_output_indices, "
-        "Tensor(m!) queue_request_count, Tensor(n!) candidate_cursor, "
-        "Tensor(o!) candidate_cursor_epoch, Tensor(p!) worker_stats)");
+        "Tensor(b!) p8_arena_health, "
+        "Tensor(c!) private_source_to_slot, Tensor(d!) private_object_to_slot, "
+        "Tensor(e!) private_ready_table, Tensor(f!) private_slot_cursor, "
+        "Tensor(g!) private_packed_output, Tensor(h!) fused_get_control, "
+        "Tensor(i!) p8_wave_records, Tensor(j!) p8_private_records, "
+        "Tensor(k!) queue_request_source_offsets, "
+        "Tensor(l!) queue_request_object_offsets, "
+        "Tensor(m!) queue_request_output_indices, "
+        "Tensor(n!) queue_request_count, Tensor(o!) candidate_cursor, "
+        "Tensor(p!) candidate_cursor_identity, Tensor(q!) worker_stats, "
+        "Tensor(r!) candidate_receipt_identity, Tensor(s!) candidate_status)");
     m.def(
         "advance_forward_control("
-        "Tensor(a!) forward_control, Tensor expected_identity, "
-        "Tensor transition_program, Tensor(b!) transition_result) -> ("
-        "Tensor(a!) forward_control, Tensor(b!) transition_result)");
+        "Tensor(a!) forward_control, Tensor(b!) p8_arena_health, "
+        "Tensor expected_identity, Tensor transition_program, "
+        "Tensor(c!) transition_result) -> (Tensor(a!) forward_control, "
+        "Tensor(b!) p8_arena_health, Tensor(c!) transition_result)");
+    m.def(
+        "arena_admission_gate("
+        "Tensor(a!) forward_control, Tensor(b!) p8_arena_health, "
+        "Tensor fused_get_control, Tensor p8_wave_records, "
+        "Tensor p8_private_records, Tensor expected_identity, "
+        "Tensor(c!) admission_result) -> ("
+        "Tensor(a!) forward_control, Tensor(b!) p8_arena_health, "
+        "Tensor(c!) admission_result)");
 }
 
 TORCH_LIBRARY_IMPL(a5_p8_forward_owned_executor, PrivateUse1, m)
 {
     m.impl("forward_owned_executor", &RunNpu);
     m.impl("advance_forward_control", &AdvanceForwardControlNpu);
+    m.impl("arena_admission_gate", &ArenaAdmissionNpu);
 }
 
 TORCH_LIBRARY_IMPL(a5_p8_forward_owned_executor, Meta, m)
 {
     m.impl("forward_owned_executor", &RunMeta);
     m.impl("advance_forward_control", &AdvanceForwardControlMeta);
+    m.impl("arena_admission_gate", &ArenaAdmissionMeta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -430,9 +551,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         contract["request_capacity"] = kRequestCapacity;
         contract["phases"] = "post,drain,qsfa_terminal,forward_terminal";
         contract["graph_phase_advance"] = true;
-        contract["advance_input_tensors"] = 4;
-        contract["advance_mutable_refs"] = 2;
+        contract["advance_input_tensors"] = 5;
+        contract["advance_mutable_refs"] = 3;
+        contract["arena_admission_graph_node"] = true;
+        contract["arena_admission_input_tensors"] = 7;
+        contract["arena_admission_mutable_refs"] = 3;
         contract["dynamic_queue_lease"] = true;
+        contract["global_arena_health"] = true;
         contract["fixed_get_core"] = false;
         contract["c8_dependency"] = false;
         return contract;

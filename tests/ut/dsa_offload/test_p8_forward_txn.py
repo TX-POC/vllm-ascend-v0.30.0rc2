@@ -10,6 +10,7 @@ from dataclasses import replace
 import pytest
 
 from vllm_ascend.dsa_offload.p8_forward_txn import (
+    ArenaLeaseState,
     CandidateState,
     ForwardPhase,
     ForwardState,
@@ -593,6 +594,345 @@ def test_p8_dynamic_drain_claim_has_one_owner_and_can_return_to_posted() -> None
     txn.leave_drain_pending(wave)
     assert resources.queues[0].state is QueueState.POSTED
     assert txn.try_claim_drain(wave) is True
+
+
+def test_p8_unposted_lease_release_requires_a_proven_filling_record() -> None:
+    """A pre-doorbell error may free a lease, but never a bound descriptor."""
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=2,
+        private_slot_capacity=2,
+    )
+    txn = resources.begin_forward(epoch=241, graph_generation=1)
+    txn.begin_admission()
+    txn.publish_candidate(0, producer=6, layer_control_index=0)
+    txn.reserve_private_slot(0, owner=6)
+    lease = txn.lease_queue(0, owner=6, layer_control_index=0)
+
+    # The queue itself is durable from acquisition, but it has not bound a
+    # descriptor.  Returning just this lease is safe; the separately owned
+    # PENDING private row remains explicit until it is abandoned.
+    txn.release_unposted_lease(lease)
+    assert resources.queues[0].state is QueueState.FREE
+    assert resources.private_slots[0].state is PrivateSlotState.PENDING
+    txn.abandon_unposted_candidate(0, owner=6)
+    assert resources.private_slots[0].state is PrivateSlotState.FREE
+
+    lease = txn.lease_queue(0, owner=6, layer_control_index=0)
+    txn.publish_candidate(1, producer=6, layer_control_index=0)
+    txn.reserve_private_slot(1, owner=6)
+    txn.prepare_post(lease, candidate_slots=[1])
+    with pytest.raises(P8QuarantineError, match="unposted lease release failure"):
+        txn.release_unposted_lease(lease)
+    assert resources.queues[0].state is QueueState.QUARANTINED
+    assert resources.private_slots[1].state is PrivateSlotState.QUARANTINED
+
+
+def test_p8_filling_release_claim_racing_forward_terminal_is_quarantined() -> None:
+    """Forward terminal wins over an incomplete no-work final CAS.
+
+    This is the native ``FILLING -> FILLING_RELEASE_CLAIMED`` race: no
+    descriptor was exposed, but the terminal owner cannot infer that the
+    second owner-table release CAS will happen.  It must therefore preserve a
+    recoverable quarantine rather than silently return the queue to FREE.
+    """
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    txn = resources.begin_forward(epoch=24101, graph_generation=1)
+    txn.begin_admission()
+    lease = txn.lease_queue(0, owner=6, layer_control_index=0)
+
+    txn.claim_unposted_filling_release(lease)
+    assert resources.queues[0].state is QueueState.FILLING_RELEASE_CLAIMED
+    txn.abort("forward terminal raced filling no-work release")
+    txn.enter_forward_terminal()
+
+    assert resources.queues[0].state is QueueState.QUARANTINED
+    with pytest.raises(P8QuarantineError, match="filling release final-CAS failure"):
+        txn.finalize_unposted_filling_release(lease)
+    assert not resources.arena_healthy
+
+
+def test_p8_filling_claimed_terminal_never_publishes_an_incomplete_identity() -> None:
+    """The first queue-claim CAS is terminal-visible but not reusable.
+
+    This models a producer stopping after ``FREE -> FILLING_CLAIMED`` and
+    before it can publish the complete wave identity.  ForwardTerminal must
+    quarantine the queue rather than infer that no descriptor could exist.
+    """
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    txn = resources.begin_forward(epoch=24102, graph_generation=1)
+    txn.begin_admission()
+    txn.lease_queue(0, owner=6, layer_control_index=0)
+    assert resources.queues[0].state is QueueState.FILLING_CLAIMED
+
+    txn.abort("terminal raced filling identity publication")
+    txn.enter_forward_terminal()
+
+    assert resources.queues[0].state is QueueState.QUARANTINED
+    assert not resources.arena_healthy
+
+
+def test_p8_private_allocating_has_owner_before_any_directory_publication() -> None:
+    """An interrupted private allocation leaves no orphan source/object map."""
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    txn = resources.begin_forward(epoch=24103, graph_generation=1)
+    txn.begin_admission()
+    private_slot = resources.claim_global_private_slot(
+        epoch=txn.epoch,
+        graph_generation=txn.graph_generation,
+        layer_control_index=0,
+        owner=6,
+    )
+    assert private_slot is not None
+    assert private_slot.state is PrivateSlotState.ALLOCATING
+    assert resources.private_source_to_slot == {}
+    assert resources.private_object_to_slot == {}
+    assert resources.private_ready[private_slot.slot_id] is PrivateSlotState.FREE
+
+    txn.abort("terminal raced private allocation")
+    txn.enter_forward_terminal()
+
+    assert private_slot.state is PrivateSlotState.QUARANTINED
+    assert not resources.arena_healthy
+
+
+def test_p8_active_forward_rejects_second_admission_without_poisoning_arena() -> None:
+    """Arena admission is forward ownership, not a permanently reserved core.
+
+    A second forward that arrives while the first one owns the fixed queue and
+    private-slot arena must be rejected as busy.  It must not mark the arena
+    unhealthy, because the original owner can still complete normally.
+    """
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    txn = resources.begin_forward(epoch=24104, graph_generation=1)
+
+    with pytest.raises(P8LifecycleError, match="still active"):
+        resources.begin_forward(epoch=24105, graph_generation=1)
+
+    assert resources.active_txn is txn
+    assert resources.arena_healthy
+
+
+def test_p8_arena_cannot_be_reused_before_terminal_release() -> None:
+    """Strict P8 holds the shared arena through the forward terminal fence.
+
+    No speculative wave is needed to prove this boundary: even an otherwise
+    empty forward owns the fixed arena until every graph terminal condition
+    has been observed and ``release`` performs the matching lease transition.
+    """
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    first = resources.begin_forward(epoch=24105, graph_generation=1)
+    first_generation = first.arena_lease_generation
+    assert resources.arena_lease_state is ArenaLeaseState.LEASED
+    assert resources.arena_lease_generation == first_generation
+
+    first.begin_admission()
+    first.seal_admission()
+    first.begin_draining()
+    first.begin_reconcile()
+    first.mark_exact_winners_confirmed(0)
+    first.mark_guaranteed_recall_terminal(0)
+    first.begin_qsfa_reading()
+    first.mark_qsfa_terminal(0)
+    first.mark_model_terminal_enqueued()
+    first.mark_model_terminal_observed()
+    first.enter_forward_terminal()
+
+    with pytest.raises(P8LifecycleError, match="still active"):
+        resources.begin_forward(epoch=24106, graph_generation=1)
+
+    first.release()
+    assert resources.arena_lease_state is ArenaLeaseState.IDLE
+    second = resources.begin_forward(epoch=24106, graph_generation=1)
+    assert second.arena_lease_generation == first_generation + 1
+    assert resources.arena_lease_state is ArenaLeaseState.LEASED
+
+
+def test_p8_stale_arena_terminal_cannot_free_or_quarantine_new_lease() -> None:
+    """A delayed terminal token is a no-op after a clean arena reacquire.
+
+    The normal strict lifecycle already prevents this situation.  This is the
+    minimal defense-in-depth proof that the state/generation CAS cannot turn
+    a stale old terminal into either a release or a quarantine of the new
+    forward.  It deliberately does not rely on epoch/replay/layer fields.
+    """
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    first = resources.begin_forward(epoch=24107, graph_generation=1)
+    first_generation = first.arena_lease_generation
+    first.abort("safe pre-post exact fallback")
+    first.enter_forward_terminal()
+    first.mark_fallback_ready()
+    assert resources.arena_lease_state is ArenaLeaseState.IDLE
+
+    second = resources.begin_forward(epoch=24108, graph_generation=2)
+    second_generation = second.arena_lease_generation
+    assert second_generation == first_generation + 1
+
+    assert resources.claim_arena_terminal(first_generation) is False
+    assert resources.complete_arena_terminal(first_generation) is False
+    assert (
+        resources.quarantine_arena_lease(
+            first_generation,
+            "late terminal from the first lease",
+        )
+        is False
+    )
+    assert resources.arena_lease_state is ArenaLeaseState.LEASED
+    assert resources.arena_lease_generation == second_generation
+    assert resources.arena_healthy
+    assert resources.active_txn is second
+
+
+def test_p8_unique_terminal_claim_blocks_duplicate_and_stale_release() -> None:
+    """Only one matching lease generation may lead the final arena release."""
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    first = resources.begin_forward(epoch=24109, graph_generation=1)
+    first_generation = first.arena_lease_generation
+    first.abort("safe pre-post exact fallback")
+    first.enter_forward_terminal()
+    first.mark_fallback_ready()
+
+    second = resources.begin_forward(epoch=24110, graph_generation=2)
+    second_generation = second.arena_lease_generation
+    assert second_generation == first_generation + 1
+
+    # This models the one device worker that wins the terminal CAS for the
+    # current lease.  A second terminal worker and an old F0 terminal both
+    # lose; neither can make a new F1 arena reusable.
+    assert resources.claim_arena_terminal(second_generation) is True
+    assert resources.arena_lease_state is ArenaLeaseState.TERMINAL_CLAIMED
+    assert resources.claim_arena_terminal(second_generation) is False
+    assert resources.complete_arena_terminal(first_generation) is False
+    assert resources.arena_lease_state is ArenaLeaseState.TERMINAL_CLAIMED
+    assert resources.arena_lease_generation == second_generation
+
+    assert resources.complete_arena_terminal(second_generation) is True
+    assert resources.arena_lease_state is ArenaLeaseState.IDLE
+
+
+def test_p8_filling_release_identity_mismatch_quarantines_lease() -> None:
+    """A stale pre-descriptor release is never silently treated as FREE."""
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    txn = resources.begin_forward(epoch=2411, graph_generation=1)
+    txn.begin_admission()
+    lease = txn.lease_queue(0, owner=6, layer_control_index=0)
+    forged = replace(lease, generation=lease.generation + 1)
+
+    with pytest.raises(P8QuarantineError, match="unposted lease release failure"):
+        txn.release_unposted_lease(forged)
+
+    assert resources.queues[0].state is QueueState.QUARANTINED
+    assert not resources.arena_healthy
+
+
+def test_p8_queue_epoch_mismatch_quarantines_before_any_cq_access() -> None:
+    """A late wave with a stale epoch must never reach the CQ poll path."""
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=1,
+        private_slot_capacity=1,
+    )
+    txn = resources.begin_forward(epoch=242, graph_generation=1)
+    txn.begin_admission()
+    txn.publish_candidate(0, producer=6, layer_control_index=0)
+    txn.reserve_private_slot(0, owner=6)
+    lease = txn.lease_queue(0, owner=6, layer_control_index=0)
+    txn.prepare_post(lease, candidate_slots=[0])
+    wave = txn.post_only(lease)
+
+    resources.queues[0].epoch += 1
+    with pytest.raises(P8QuarantineError, match="DRAIN claim identity failure"):
+        txn.try_claim_drain(wave)
+
+    assert resources.queues[0].state is QueueState.QUARANTINED
+    assert resources.private_slots[0].state is PrivateSlotState.QUARANTINED
+    assert not resources.arena_healthy
+
+
+def test_p8_one_layer_fault_latches_global_arena_and_sweeps_all_layers() -> None:
+    """A layer-local control fault cannot leave another layer admitting work."""
+
+    resources = P8FixedResources(
+        queue_count=1,
+        candidate_capacity=2,
+        private_slot_capacity=2,
+    )
+    txn = resources.begin_forward(epoch=243, graph_generation=1, expected_layers=2)
+    txn.retain_host_lease("shared-native-runtime")
+    txn.begin_admission()
+
+    # Layer 0 has crossed PostOnly; layer 1 only owns a PENDING private row.
+    # A global forward abort must quarantine both rather than allowing layer 1
+    # to treat the still-shared arena as a fresh admission opportunity.
+    txn.publish_candidate(0, producer=6, layer_control_index=0)
+    txn.reserve_private_slot(0, owner=6)
+    lease = txn.lease_queue(0, owner=6, layer_control_index=0)
+    txn.prepare_post(lease, candidate_slots=[0])
+    wave = txn.post_only(lease)
+    assert txn.try_claim_drain(wave)
+
+    txn.publish_candidate(1, producer=7, layer_control_index=1)
+    txn.reserve_private_slot(1, owner=7)
+    txn.abort("layer 0 could not prove its CQ identity")
+    txn.enter_forward_terminal()
+
+    assert not resources.arena_healthy
+    assert resources.arena_fault_reason is not None
+    assert resources.queues[0].state is QueueState.QUARANTINED
+    assert [slot.state for slot in resources.private_slots] == [
+        PrivateSlotState.QUARANTINED,
+        PrivateSlotState.QUARANTINED,
+    ]
+    assert [candidate.state for candidate in resources.candidates] == [
+        CandidateState.DEFERRED,
+        CandidateState.DEFERRED,
+    ]
+    txn.mark_fallback_ready()
+    assert resources.quarantine_keepalives == {"shared-native-runtime"}
+    with pytest.raises(P8QuarantineError, match="arena is unhealthy"):
+        resources.begin_forward(epoch=244, graph_generation=2, expected_layers=2)
 
 
 def test_p8_qsfa_release_requires_exact_mapping_cas_and_quarantines_partial_clear() -> None:

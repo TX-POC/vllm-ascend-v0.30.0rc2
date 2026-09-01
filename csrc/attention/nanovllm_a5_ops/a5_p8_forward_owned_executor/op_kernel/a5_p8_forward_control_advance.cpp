@@ -16,6 +16,7 @@
 #include "kernel_operator.h"
 #include "simt_api/asc_simt.h"
 
+#include "a5_p8_arena_tag.h"
 #include "a5_p8_forward_control_advance_tiling.h"
 #include "kvaf_device/kvaf_fused_full_get_device.h"
 
@@ -42,6 +43,11 @@ struct P8TransitionServiceResult {
 };
 static_assert(sizeof(P8TransitionServiceResult) == 16U,
               "P8 control-advance SIMT hand-off ABI changed");
+
+// A phase advance shares the same single tagged arena ticket as the executor.
+// It never poisons an IDLE or a later ACTIVE lease: token mismatch is a
+// diagnostic/no-op and graph topology owns recovery.
+using P8ArenaHealthLatchResult = a5_p8_arena::ArenaResult;
 
 constexpr uint64_t kP8RuntimeSettableFlags =
     kvaf_fused_get::kKvafP8ForwardFlagExactInputReady |
@@ -209,15 +215,18 @@ public:
         : pipe_(pipe), tiling_(tiling) {}
 
     __aicore__ inline void Init(GM_ADDR forward_control,
+                                GM_ADDR p8_arena_health,
                                 GM_ADDR expected_identity,
                                 GM_ADDR transition_program,
                                 GM_ADDR transition_result) {
         control_ = reinterpret_cast<__gm__ kvaf_fused_get::KvafP8ForwardControl*>(
             forward_control);
+        arenaHealth_ = reinterpret_cast<__gm__ int32_t*>(p8_arena_health);
         identity_ = reinterpret_cast<__gm__ int64_t*>(expected_identity);
         program_ = reinterpret_cast<__gm__ int64_t*>(transition_program);
         result_ = reinterpret_cast<__gm__ int64_t*>(transition_result);
         enabled_ = pipe_ != nullptr && tiling_ != nullptr && control_ != nullptr &&
+                   arenaHealth_ != nullptr &&
                    identity_ != nullptr && program_ != nullptr && result_ != nullptr &&
                    GetBlockIdx() == 0U;
         if (!enabled_) {
@@ -226,11 +235,15 @@ public:
         pipe_->InitBuffer(serviceBuffer_, sizeof(P8TransitionServiceResult));
         pipe_->InitBuffer(abortBuffer_,
                           sizeof(kvaf_fused_get::KvafP8ForwardAbortResult));
+        pipe_->InitBuffer(arenaHealthBuffer_, sizeof(P8ArenaHealthLatchResult));
         serviceResult_ = (__ubuf__ P8TransitionServiceResult*)
             serviceBuffer_.Get<uint8_t>().GetPhyAddr();
         abortResult_ = (__ubuf__ kvaf_fused_get::KvafP8ForwardAbortResult*)
             abortBuffer_.Get<uint8_t>().GetPhyAddr();
-        enabled_ = serviceResult_ != nullptr && abortResult_ != nullptr;
+        arenaHealthResult_ = (__ubuf__ P8ArenaHealthLatchResult*)
+            arenaHealthBuffer_.Get<uint8_t>().GetPhyAddr();
+        enabled_ = serviceResult_ != nullptr && abortResult_ != nullptr &&
+                   arenaHealthResult_ != nullptr;
     }
 
     __aicore__ inline void Process() {
@@ -253,6 +266,30 @@ public:
         const bool scalar_valid = epoch > 0 && replay >= 0 && layer >= 0 &&
             layer <= kUint32MaxAsInt64 && expected >= 0 &&
             next >= 0 && required >= 0 && set >= 0;
+        kvaf_fused_get::KvafP8ForwardControl ticket{};
+        const bool ticket_valid = scalar_valid &&
+            kvaf_fused_get::LoadKvafP8ForwardControlFromGm(control_, &ticket);
+        const uint32_t lease_generation = ticket_valid
+            ? kvaf_fused_get::GetKvafP8ForwardLeaseGeneration(ticket) : 0U;
+        const uint32_t active_tag = a5_p8_arena::MakeTag(
+            lease_generation, a5_p8_arena::kArenaActive);
+        // Every P8 phase node carries the admission ticket cached in the
+        // existing forward-control high flags word. A raw ACTIVE value is not
+        // sufficient: a delayed F1 advance must reject after F2 obtains g+1.
+        if (!ticket_valid || lease_generation == 0U ||
+            lease_generation > a5_p8_arena::kArenaGenerationMax ||
+            static_cast<uint32_t>(ReadGmByPassDCache<int32_t>(arenaHealth_))
+                != active_tag) {
+            WriteGmByPassDCache<int64_t>(result_ + 0U, 0);
+            WriteGmByPassDCache<int64_t>(result_ + 1U,
+                static_cast<int64_t>(
+                    kvaf_fused_get::kKvafP8ForwardPhaseInvalid));
+            WriteGmByPassDCache<int64_t>(result_ + 2U, 0);
+            WriteGmByPassDCache<int64_t>(result_ + 3U,
+                static_cast<int64_t>(kP8TransitionAbortGate));
+            DataSyncBarrier<MemDsbT::DDR>();
+            return;
+        }
         if (scalar_valid) {
             set_flag(PIPE_S, PIPE_V, simtEvent_);
             wait_flag(PIPE_S, PIPE_V, simtEvent_);
@@ -269,8 +306,18 @@ public:
         // is made fail-closed.  Mismatch/illegal-program paths leave phase
         // unchanged and are diagnosed for the graph runtime to handle.
         if (serviceResult_->error == kP8TransitionFlagCasFailed) {
-            (void)kvaf_fused_get::MarkKvafP8ForwardAbortFromAicore(
-                control_, abortResult_, simtEvent_);
+            // Persist unhealthy first: the abort record alone is layer-local,
+            // while arena health blocks an accidental next-forward reuse.
+            if (LatchArenaUnhealthy(active_tag)) {
+                kvaf_fused_get::KvafP8ForwardControl after{};
+                if (kvaf_fused_get::LoadKvafP8ForwardControlFromGm(
+                        control_, &after) &&
+                    kvaf_fused_get::GetKvafP8ForwardLeaseGeneration(after) ==
+                        lease_generation) {
+                    (void)kvaf_fused_get::MarkKvafP8ForwardAbortFromAicore(
+                        control_, abortResult_, simtEvent_);
+                }
+            }
         }
         WriteGmByPassDCache<int64_t>(result_ + 0U,
             static_cast<int64_t>(serviceResult_->success));
@@ -284,14 +331,35 @@ public:
     }
 
 private:
+    __aicore__ inline bool LatchArenaUnhealthy(uint32_t active_tag)
+    {
+        if (arenaHealth_ == nullptr || arenaHealthResult_ == nullptr) {
+            return false;
+        }
+        arenaHealthResult_->success = 0U;
+        arenaHealthResult_->observed_tag = 0U;
+        set_flag(PIPE_S, PIPE_V, simtEvent_);
+        wait_flag(PIPE_S, PIPE_V, simtEvent_);
+        AscendC::Simt::VF_CALL<a5_p8_arena::PoisonActiveLeaseSimtService>(
+            AscendC::Simt::Dim3{1U, 1U, 1U}, arenaHealth_, active_tag,
+            arenaHealthResult_);
+        set_flag(PIPE_V, PIPE_S, simtEvent_);
+        wait_flag(PIPE_V, PIPE_S, simtEvent_);
+        DataSyncBarrier<MemDsbT::DDR>();
+        return arenaHealthResult_->success != 0U;
+    }
+
     TPipe* pipe_ = nullptr;
     const A5P8ForwardControlAdvanceTilingData* tiling_ = nullptr;
     TBuf<TPosition::VECCALC> serviceBuffer_;
     TBuf<TPosition::VECCALC> abortBuffer_;
+    TBuf<TPosition::VECCALC> arenaHealthBuffer_;
     __ubuf__ P8TransitionServiceResult* serviceResult_ = nullptr;
     __ubuf__ kvaf_fused_get::KvafP8ForwardAbortResult* abortResult_ = nullptr;
+    __ubuf__ P8ArenaHealthLatchResult* arenaHealthResult_ = nullptr;
     event_t simtEvent_ = static_cast<event_t>(EVENT_ID0);
     __gm__ kvaf_fused_get::KvafP8ForwardControl* control_ = nullptr;
+    __gm__ int32_t* arenaHealth_ = nullptr;
     __gm__ int64_t* identity_ = nullptr;
     __gm__ int64_t* program_ = nullptr;
     __gm__ int64_t* result_ = nullptr;
@@ -301,11 +369,13 @@ private:
 }  // namespace
 
 extern "C" __global__ __aicore__ void a5_p8_forward_control_advance(
-    GM_ADDR forward_control, GM_ADDR expected_identity,
-    GM_ADDR transition_program, GM_ADDR transition_result,
-    GM_ADDR forward_control_ref, GM_ADDR transition_result_ref,
+    GM_ADDR forward_control, GM_ADDR p8_arena_health,
+    GM_ADDR expected_identity, GM_ADDR transition_program,
+    GM_ADDR transition_result, GM_ADDR forward_control_ref,
+    GM_ADDR p8_arena_health_ref, GM_ADDR transition_result_ref,
     GM_ADDR workspace, GM_ADDR tiling) {
     (void)forward_control_ref;
+    (void)p8_arena_health_ref;
     (void)transition_result_ref;
     (void)workspace;
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -313,7 +383,7 @@ extern "C" __global__ __aicore__ void a5_p8_forward_control_advance(
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
     A5P8ForwardControlAdvanceKernel op(&pipe, &tilingData);
-    op.Init(forward_control, expected_identity, transition_program,
-            transition_result);
+    op.Init(forward_control, p8_arena_health, expected_identity,
+            transition_program, transition_result);
     op.Process();
 }

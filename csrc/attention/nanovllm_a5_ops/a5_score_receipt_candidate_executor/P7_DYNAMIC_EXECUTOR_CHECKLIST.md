@@ -54,8 +54,10 @@ consumer：验证 receipt、ExactScoreScan 和 CandidateCompact 与 CPU oracle
 
 它的 NPU gate 是 `tests/test_score_receipt_candidate_executor.py`：测试自己构造
 已完成的 packed-score/receipt，不导入或启动 C8/KVAF，并逐元素比对
-`candidate_seeds`、`candidate_counts`、`candidate_ready_epoch` 和
-`receipt_status`。通过标志是 `P7_ORACLE_PASS`。
+`candidate_seeds`、`candidate_counts`、`candidate_receipt_identity` 和
+`receipt_status`。其中 identity 是 `[forward_epoch, replay_generation,
+layer_control_index, receipt_generation]`；前三项和 payload/status 先发布，
+最后一项 generation 才是 release marker。通过标志是 `P7_ORACLE_PASS`。
 
 ### P7.1：真正动态 Post/CQ executor
 
