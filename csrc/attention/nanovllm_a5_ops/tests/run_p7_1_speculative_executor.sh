@@ -44,12 +44,19 @@ ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-${ASCEND_CANN_PACKAGE_PATH:-/usr/local/Asc
 P7_PHYSICAL_NPU_ID="${P7_PHYSICAL_NPU_ID:-7}"
 P7_BUILD_JOBS="${P7_BUILD_JOBS:-16}"
 P7_RUNTIME_TIMEOUT="${P7_RUNTIME_TIMEOUT:-120s}"
+P7_TASK_QUEUE_ENABLE="${P7_TASK_QUEUE_ENABLE:-1}"
+P7_ASCEND_LAUNCH_BLOCKING="${P7_ASCEND_LAUNCH_BLOCKING:-0}"
 
 if [[ -z "$P7_KVAF_REPO" || ! -x "$P7_PYTHON" || "$P7_ARTIFACT_ROOT" != /* || \
       "$P7_ARTIFACT_ROOT" == "/" || ! "$P7_PHYSICAL_NPU_ID" =~ ^[0-9]+$ ]]; then
     printf 'P7_1_SOURCE ready=0 reason=missing_input vllm_repo=%s kvaf_repo=%s artifact_root=%s python=%s\n' \
         "$P7_CALLER_VLLM_REPO" "${P7_KVAF_REPO:-missing}" "$P7_ARTIFACT_ROOT" "${P7_PYTHON:-missing}"
     fail "missing_or_invalid_input"
+fi
+if [[ "$P7_TASK_QUEUE_ENABLE" != "1" || "$P7_ASCEND_LAUNCH_BLOCKING" != "0" ]]; then
+    printf 'P7_1_ENV_GATE pass=0 task_queue_enable=%s launch_blocking=%s required_task_queue_enable=1 required_launch_blocking=0\n' \
+        "$P7_TASK_QUEUE_ENABLE" "$P7_ASCEND_LAUNCH_BLOCKING"
+    fail "unsafe_ordered_launch_environment"
 fi
 
 # No prior P7/P3 assembly is allowed to influence this fresh run.
@@ -139,14 +146,21 @@ unset SOC_VERSION ASCEND_VISIBLE_DEVICES ASCEND_CUSTOM_OPP_PATH NANOVLLM_CUST_OP
 export A5_SOC_VERSION=ascend950
 export ASCEND_RT_VISIBLE_DEVICES="$P7_PHYSICAL_NPU_ID"
 export NPU_ID=0 DEVICE_ID=0
+# P7.1 has no safe inline/synchronous fallback.  Make the process-start
+# torch_npu task-queue contract explicit before the first Python import, then
+# re-export it after any OPP environment script below.
+export TASK_QUEUE_ENABLE="$P7_TASK_QUEUE_ENABLE"
+export ASCEND_LAUNCH_BLOCKING="$P7_ASCEND_LAUNCH_BLOCKING"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="${P7_OPS_ROOT}/tests${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONFAULTHANDLER=1
 export TORCH_SHOW_CPP_STACKTRACES=1
 ulimit -c 0 2>/dev/null || true
 
-printf 'P7_1_NPU physical=%s logical=0 runtime_visible=%s legacy_visible=unset\n' \
-    "$P7_PHYSICAL_NPU_ID" "$ASCEND_RT_VISIBLE_DEVICES"
+printf 'P7_1_NPU physical=%s logical=0 runtime_visible=%s task_queue_enable=%s launch_blocking=%s legacy_visible=unset\n' \
+    "$P7_PHYSICAL_NPU_ID" "$ASCEND_RT_VISIBLE_DEVICES" "$TASK_QUEUE_ENABLE" "$ASCEND_LAUNCH_BLOCKING"
+printf 'P7_1_ENV_GATE pass=1 task_queue_enable=%s launch_blocking=%s\n' \
+    "$TASK_QUEUE_ENABLE" "$ASCEND_LAUNCH_BLOCKING"
 "$P7_PYTHON" -c 'import torch, torch_npu; torch.npu.set_device(0); print("P7_1_PYTHON exe=%s torch=%s torch_npu=%s device=%s" % (__import__("sys").executable, torch.__version__, torch_npu.__version__, torch.npu.get_device_name(0)))' \
     2>&1 | tee "${P7_RUN_ROOT}/python_npu.log"
 P7_PYTHON_RC=${PIPESTATUS[0]}
@@ -227,7 +241,8 @@ P7_MANIFEST_TMP="${P7_MANIFEST}.tmp.$$"
     printf 'batch_get_kernel=%s\nbatch_put_kernel=%s\n' "$P7_KVAF_GET" "$P7_KVAF_PUT"
     printf 'opp_vendor=%s\nopapi=%s\n' "$P7_OPP_VENDOR" "$P7_OPAPI"
     printf 'bridge_python_root=%s\nbridge_so=%s\n' "$P7_BRIDGE_PYTHON_ROOT" "$P7_BRIDGE_SO"
-    printf 'p7_abi=31tensor_18refout\nready=1\n'
+    printf 'p7_abi=31tensor_18refout\ntask_queue_enable=%s\nlaunch_blocking=%s\nready=1\n' \
+        "$TASK_QUEUE_ENABLE" "$ASCEND_LAUNCH_BLOCKING"
 } >"$P7_MANIFEST_TMP" || fail "cannot_write_assembly_manifest"
 mv "$P7_MANIFEST_TMP" "$P7_MANIFEST" || fail "cannot_publish_assembly_manifest"
 
@@ -236,6 +251,8 @@ unset SOC_VERSION ASCEND_VISIBLE_DEVICES ASCEND_RT_VISIBLE_DEVICES
 export A5_SOC_VERSION=ascend950
 export ASCEND_RT_VISIBLE_DEVICES="$P7_PHYSICAL_NPU_ID"
 export NPU_ID=0 DEVICE_ID=0
+export TASK_QUEUE_ENABLE="$P7_TASK_QUEUE_ENABLE"
+export ASCEND_LAUNCH_BLOCKING="$P7_ASCEND_LAUNCH_BLOCKING"
 export P7_ASSEMBLY_MANIFEST="$P7_MANIFEST"
 export P7_ASSEMBLY_VLLM_SHA="$P7_VLLM_SHA"
 export P7_ASSEMBLY_KVAF_SHA="$P7_KVAF_SHA"

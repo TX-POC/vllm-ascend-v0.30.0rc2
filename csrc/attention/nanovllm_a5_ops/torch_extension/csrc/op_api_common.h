@@ -31,7 +31,6 @@
 #include <torch/extension.h>
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
-#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
 // Each standalone validation bridge owns a distinct resolver domain.  The

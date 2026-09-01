@@ -80,10 +80,19 @@ CPU/GIL 逐候选提交或固定 Get 核。设备端的 `PostOnly -> DMA -> CQ` 
 transaction `RuntimeResources`，并由现有 QSFA terminal 取出释放，不能直接调用底层 pybind
 接口或按进程全局清空 lease。
 
-P7.1 不支持 task queue 关闭或 sync-launch stream 的“同步降级”。这两种模式会让 ACLNN
-consumer 在 token 交给 `RuntimeResources` 之前内联执行；一旦 consumer 失败，就无法证明
-没有部分 device work，因而不能安全释放 Tensor keepalive。此时 bridge 必须在提交前
+P7.1 不支持 task queue 关闭或 sync-launch stream 的“同步降级”。进程必须在首次导入
+`torch_npu` 前同时设置 `TASK_QUEUE_ENABLE=1` 和 `ASCEND_LAUNCH_BLOCKING=0`；后者必须显式
+为 0，因为 blocking 模式会覆盖 task queue 并内联执行 closure。bridge 再通过公开的
+`isSyncLaunchStream()` 检查拒绝同步 stream。这里不调用 torch_npu 私有 C++ 配置 getter：
+该符号在部分运行库中不导出，会让 bridge 在安全检查之前就无法加载。三项中的任一条件不满足时，
+ACLNN consumer 可能在 token 交给 `RuntimeResources` 之前内联执行；一旦 consumer 失败，
+就无法证明没有部分 device work，因而不能安全释放 Tensor keepalive。此时 bridge 必须在提交前
 fail-closed，而不能换回 raw stream 或猜测性地做 early release。
+
+这两个环境变量是 **process-start 配置**，不是运行中可切换的开关：`torch_npu` 初始化后会
+缓存其 dispatch 模式。因此 runner 在任何 Python/Torch import 前固定它们，并打印
+`P7_1_ENV_GATE`；若继承了 `ASCEND_LAUNCH_BLOCKING=1` 或 task queue 不是 1，会在构建前直接
+退出。产品启动器也必须遵守同一规则，不能在已初始化的进程里试图“补开” task queue。
 
 ### 测试进程退出与产品路径要分开
 

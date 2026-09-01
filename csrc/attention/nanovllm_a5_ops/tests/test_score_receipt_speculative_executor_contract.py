@@ -294,8 +294,13 @@ def main() -> None:
         "MarkHostHandoffAccepted(",
         "P7_1_ORDERED_SUBMISSION",
         "P7_1_ORDERED_HOST_GATE",
-        "GetTaskQueueEnable()",
         "isSyncLaunchStream()",
+        "TASK_QUEUE_ENABLE",
+        "p7_task_queue_requested",
+        "ASCEND_LAUNCH_BLOCKING",
+        "p7_launch_blocking_disabled",
+        "launch_blocking=0",
+        "task_queue=framework_ordered",
         "p7_submission_plan.bisect",
         "namespace p7_opapi = nanovllm_a5_opapi;",
         "p7_opapi::ClearP7DirectLaunchTokenForCurrentThread()",
@@ -334,7 +339,6 @@ def main() -> None:
         "handoff_runopapi_by_value",
         "UseStreamResIfNeeded(acl_stream, true)",
         "UseStreamResIfNeeded(acl_stream, false)",
-        "torch_npu/csrc/core/npu/register/OptionsManager.h",
         "RTLD_NOW | RTLD_LOCAL",
         "GetAclTensorApiPair()",
         "P7_1_ACL_DSO",
@@ -347,6 +351,8 @@ def main() -> None:
     ):
         _require(op_api_common, token, op_api_common_path)
     _forbid(op_api_common, "aclDestroyAclOpExecutor(executor)", op_api_common_path)
+    _forbid(bridge, "OptionsManager", bridge_path)
+    _forbid(op_api_common, "OptionsManager.h", op_api_common_path)
     if "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC" in op_api_common or \
        "EXEC_NPU_CMD_P7_ZERO_WORKSPACE_DIRECT_ASYNC" in bridge:
         raise AssertionError(
@@ -471,6 +477,12 @@ def main() -> None:
         "P7_1_ORDERING_RECEIPT",
         "P7_1_FINAL_RECEIPT",
         "P7_PHYSICAL_NPU_ID",
+        "P7_TASK_QUEUE_ENABLE",
+        "TASK_QUEUE_ENABLE",
+        "P7_ASCEND_LAUNCH_BLOCKING",
+        "ASCEND_LAUNCH_BLOCKING",
+        "P7_1_ENV_GATE pass=0",
+        "P7_1_ENV_GATE pass=1",
     ):
         _require(full_runner, token, full_runner_path)
     for forbidden in ("find ", "--inplace", "P7_ARTIFACT_RUNTIME_EXACT", ".p7_kvaf_source_head"):

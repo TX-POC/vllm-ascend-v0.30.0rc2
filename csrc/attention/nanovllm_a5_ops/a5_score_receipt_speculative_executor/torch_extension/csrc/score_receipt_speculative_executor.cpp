@@ -260,24 +260,45 @@ Result RunNpu(
                 "P7.1 ordered async submission rejects cleanup-bisect mode; ",
                 "it would bypass the torch_npu task-queue ownership contract");
     auto p7_terminal_stream = c10_npu::getCurrentNPUStream();
-    const bool p7_task_queue_enabled =
-        c10_npu::option::OptionsManager::GetTaskQueueEnable();
+    const char *p7_task_queue_env = std::getenv("TASK_QUEUE_ENABLE");
+    const bool p7_task_queue_requested =
+        p7_task_queue_env != nullptr && std::strcmp(p7_task_queue_env, "1") == 0;
+    const char *p7_launch_blocking_env = std::getenv("ASCEND_LAUNCH_BLOCKING");
+    const bool p7_launch_blocking_disabled =
+        p7_launch_blocking_env == nullptr ||
+        std::strcmp(p7_launch_blocking_env, "0") == 0;
     const bool p7_sync_launch_stream = p7_terminal_stream.isSyncLaunchStream();
-    // P7 has one valid host contract: RunOpApi must enqueue its closure into
-    // torch_npu's ordinary task queue.  The inline/sync fallback can throw a
-    // consumer exception before a RuntimeResources terminal token is
+    // P7 has one valid host contract: RunOpApi owns the framework-ordered
+    // producer/consumer hand-off.  A sync launch stream can execute the
+    // consumer inline, before a RuntimeResources terminal token is
     // publishable, so it is intentionally unsupported rather than repaired
     // with an unsafe early Tensor-keepalive release.
-    TORCH_CHECK(p7_task_queue_enabled && !p7_sync_launch_stream,
-                "P7.1 requires torch_npu task queue enabled and a non-sync "
-                "launch stream; refusing inline ACLNN execution without a "
-                "RuntimeResources terminal owner. task_queue_enabled=",
-                p7_task_queue_enabled, " sync_launch_stream=",
-                p7_sync_launch_stream);
+    //
+    // Do not query the private torch_npu task-queue getter here.  It is
+    // declared by headers but is not exported by every supported torch_npu
+    // runtime, which makes the bridge unloadable before it can enforce this
+    // safety gate.  EXEC_NPU_CMD_ORDERED is the authoritative ordered-launch
+    // mechanism.  The process-start TASK_QUEUE_ENABLE=1 and
+    // ASCEND_LAUNCH_BLOCKING=0 contract, plus the public stream property,
+    // are the ABI-stable way to reject the unsafe inline path.  In
+    // particular, launch-blocking overrides task-queue dispatch even when
+    // TASK_QUEUE_ENABLE is set.
+    TORCH_CHECK(p7_task_queue_requested && p7_launch_blocking_disabled &&
+                    !p7_sync_launch_stream,
+                "P7.1 requires TASK_QUEUE_ENABLE=1 and "
+                "ASCEND_LAUNCH_BLOCKING=0 before torch_npu is initialized, "
+                "plus a non-sync launch stream; refusing inline ACLNN "
+                "execution without a RuntimeResources terminal owner. "
+                "TASK_QUEUE_ENABLE=",
+                p7_task_queue_env == nullptr ? "<unset>" : p7_task_queue_env,
+                " ASCEND_LAUNCH_BLOCKING=",
+                p7_launch_blocking_env == nullptr ? "<unset>" : p7_launch_blocking_env,
+                " sync_launch_stream=", p7_sync_launch_stream);
     if (DebugEnabled()) {
         std::fprintf(stderr,
-                     "P7_1_ORDERED_HOST_GATE task_queue_enabled=1 "
-                     "sync_launch_stream=0\n");
+                     "P7_1_ORDERED_HOST_GATE task_queue_enable=1 "
+                     "launch_blocking=0 sync_launch_stream=0 "
+                     "task_queue=framework_ordered\n");
         std::fflush(stderr);
     }
     const aclrtStream p7_terminal_acl_stream = p7_terminal_stream.stream(false);
