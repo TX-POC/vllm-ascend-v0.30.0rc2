@@ -143,8 +143,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream)",
             "c10_npu::UseStreamResInCurrentThread(inline_acl_stream)",
             "inline_npu_stream.getRepoStopFlag()",
-            "at_npu::native::ApplyDeterministicSnapshot(",
-            "c10_npu::CaptureDeterministicSnapshot()",
+            "no public deterministic-state",
             "RunDrainedCallerThreadHost(std::move(inline_acl_call))",
             "InitPtaCacheForWorkspace()",
             "ResolveSymbol(\"InitHugeMemThreadLocal\")",
@@ -157,6 +156,8 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             self.assertIn(token, direct_macro)
         for forbidden in (
             "at_npu::native::OpCommand::RunOpApi(",
+            "at_npu::native::ApplyDeterministicSnapshot(",
+            "c10_npu::CaptureDeterministicSnapshot()",
             "stream(false)",
             "aclrtSynchronizeStream",
             "pybind11::gil_scoped_release",

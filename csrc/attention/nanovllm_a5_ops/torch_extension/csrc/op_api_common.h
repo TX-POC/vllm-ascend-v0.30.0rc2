@@ -1788,11 +1788,11 @@ inline void LogOrderedHostDso(
       try {                                                                     \
         TORCH_CHECK(!inline_npu_stream.getRepoStopFlag(),                      \
                     #aclnn_api " refused after torch_npu FORCE STOP");        \
-        /* Preserve the public OpCommand deterministic setting before this    \
-         * raw launch.  ApplyDeterministicSnapshot owns its lock; no host     \
-         * queue callback or device synchronization is introduced here. */    \
-        at_npu::native::ApplyDeterministicSnapshot(                            \
-            c10_npu::CaptureDeterministicSnapshot(), true);                   \
+        /* The pinned torch_npu ABI exposes no public deterministic-state     \
+         * snapshot/apply API.  Do not emulate one with private symbols: P8's \
+         * deterministic behavior comes from its graph-visible control and    \
+         * state tensors, while this raw launch preserves the existing stream \
+         * ordering without mutating process-global framework state. */       \
         inline_pta_cache_active = InitPtaCacheForWorkspace();                  \
         LogOpApiLifecycle(                                                      \
             #aclnn_api,                                                         \
