@@ -705,8 +705,8 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         """Never run Stage-B against a merely existing, stale OPP package."""
         for token in (
             "P8_STAGE_B_TILING_ARTIFACT",
+            "P8_STAGE_B_TILING_ARTIFACT_CHECK",
             "stage_b_tiling_artifact_provenance_failed",
-            "stage_b_aclnn_ref_abi_invalid",
             "P8_TILING_DIAG_REVISION=p8_tiling_diag_v1",
             "P8_STAGE_B_ACLNN_TENSOR_REFS",
             "libcust_opmaster_rt2.0.so",

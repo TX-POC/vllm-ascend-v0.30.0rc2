@@ -379,24 +379,39 @@ P8_STAGE_B_INSTALLED_HOST="$P8_STAGE_B_VENDOR/op_impl/ai_core/tbe/customize_impl
 # the shim for our source literal would reject a correct package every time.
 P8_STAGE_B_TILING_RUNTIME_LIB="$P8_STAGE_B_VENDOR/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so"
 P8_STAGE_B_ACLNN_HEADER="$P8_STAGE_B_VENDOR/op_api/include/aclnn_a5_p8_forward_owned_executor.h"
-if [[ ! -r "$P8_STAGE_B_GENERATED_HOST" ||
-      ! -r "$P8_STAGE_B_INSTALLED_HOST" ||
-      ! -s "$P8_STAGE_B_TILING_RUNTIME_LIB" ||
-      ! -r "$P8_STAGE_B_ACLNN_HEADER" ]] ||
-   ! cmp -s "$P8_OPS_ROOT/a5_p8_forward_owned_executor/op_host/a5_p8_forward_owned_executor.cpp" \
-           "$P8_STAGE_B_GENERATED_HOST" ||
-   ! cmp -s "$P8_STAGE_B_GENERATED_HOST" "$P8_STAGE_B_INSTALLED_HOST" ||
-   ! grep -aFq 'P8_TILING_DIAG_REVISION=p8_tiling_diag_v1' "$P8_STAGE_B_TILING_RUNTIME_LIB"; then
-    runner_fail "stage_b_tiling_artifact_provenance_failed"
-    exit 1
+P8_STAGE_B_SOURCE_OVERLAY=0
+P8_STAGE_B_VENDOR_OVERLAY=0
+P8_STAGE_B_RUNTIME_MARKER=0
+if cmp -s "$P8_OPS_ROOT/a5_p8_forward_owned_executor/op_host/a5_p8_forward_owned_executor.cpp" \
+          "$P8_STAGE_B_GENERATED_HOST"; then
+    P8_STAGE_B_SOURCE_OVERLAY=1
 fi
-P8_STAGE_B_ACLNN_SIGNATURE="$(sed -n \
-    '/aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize(/,/);/p' \
-    "$P8_STAGE_B_ACLNN_HEADER")"
-P8_STAGE_B_ACLNN_TENSOR_REFS="$(printf '%s\n' "$P8_STAGE_B_ACLNN_SIGNATURE" | \
-    grep -Eo 'aclTensor[[:space:]]*\*' | wc -l | tr -d '[:space:]')"
-if [[ "$P8_STAGE_B_ACLNN_TENSOR_REFS" != "28" ]]; then
-    runner_fail "stage_b_aclnn_ref_abi_invalid:${P8_STAGE_B_ACLNN_TENSOR_REFS}"
+if cmp -s "$P8_STAGE_B_GENERATED_HOST" "$P8_STAGE_B_INSTALLED_HOST"; then
+    P8_STAGE_B_VENDOR_OVERLAY=1
+fi
+if grep -aFq 'P8_TILING_DIAG_REVISION=p8_tiling_diag_v1' \
+        "$P8_STAGE_B_TILING_RUNTIME_LIB" 2>/dev/null; then
+    P8_STAGE_B_RUNTIME_MARKER=1
+fi
+P8_STAGE_B_ACLNN_SIGNATURE=""
+P8_STAGE_B_ACLNN_TENSOR_REFS=missing
+if [[ -r "$P8_STAGE_B_ACLNN_HEADER" ]]; then
+    P8_STAGE_B_ACLNN_SIGNATURE="$(sed -n \
+        '/aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize(/,/);/p' \
+        "$P8_STAGE_B_ACLNN_HEADER")"
+    P8_STAGE_B_ACLNN_TENSOR_REFS="$(printf '%s\n' "$P8_STAGE_B_ACLNN_SIGNATURE" | \
+        grep -Eo 'aclTensor[[:space:]]*\*' | wc -l | tr -d '[:space:]')"
+fi
+printf 'P8_STAGE_B_TILING_ARTIFACT_CHECK source_overlay=%s vendor_overlay=%s runtime_marker=%s aclnn_tensor_refs=%s generated_host=%s installed_host=%s tiling_runtime_lib=%s header=%s\n' \
+    "$P8_STAGE_B_SOURCE_OVERLAY" "$P8_STAGE_B_VENDOR_OVERLAY" \
+    "$P8_STAGE_B_RUNTIME_MARKER" "$P8_STAGE_B_ACLNN_TENSOR_REFS" \
+    "$P8_STAGE_B_GENERATED_HOST" "$P8_STAGE_B_INSTALLED_HOST" \
+    "$P8_STAGE_B_TILING_RUNTIME_LIB" "$P8_STAGE_B_ACLNN_HEADER"
+if [[ "$P8_STAGE_B_SOURCE_OVERLAY" != "1" ||
+      "$P8_STAGE_B_VENDOR_OVERLAY" != "1" ||
+      "$P8_STAGE_B_RUNTIME_MARKER" != "1" ||
+      "$P8_STAGE_B_ACLNN_TENSOR_REFS" != "28" ]]; then
+    runner_fail "stage_b_tiling_artifact_provenance_failed"
     exit 1
 fi
 printf 'P8_STAGE_B_TILING_ARTIFACT marker=1 source_overlay=1 vendor_overlay=1 aclnn_tensor_refs=%s header=%s tiling_runtime_lib=%s\n' \
