@@ -342,17 +342,18 @@ public:
 
         uint32_t accepted_count = 0U;
         for (uint32_t seed_index = 0U; seed_index < view.count; ++seed_index) {
-            CandidateSeed& seed = view.seeds[seed_index];
-            if (!ReserveSeed(view, &seed) ||
+            __ubuf__ CandidateSeed* const seed = view.seeds + seed_index;
+            if (!ReserveSeed(view, seed) ||
                 !AppendKvafLayerResidentRequest(
-                    control_, &descriptor, static_cast<uint32_t>(seed.kvObject),
-                    view.rowsPerEntry, seed.residentSlot)) {
-                if (seed.residentSlot >= 0) {
+                    control_, &descriptor,
+                    static_cast<uint32_t>(seed->kvObject), view.rowsPerEntry,
+                    seed->residentSlot)) {
+                if (seed->residentSlot >= 0) {
                     RollbackCandidateResidentSlotFromAicore(
                         view.candidateSourceToSlot,
                         reservation_result_->sourceOffset, reservation_result_,
                         simt_event_);
-                    seed.residentSlot = kCandidateResidentSlotUnassigned;
+                    seed->residentSlot = kCandidateResidentSlotUnassigned;
                 }
                 continue;
             }
@@ -454,11 +455,19 @@ public:
 
         uint32_t accepted_count = 0U;
         for (uint32_t index = 0U; index < count; ++index) {
-            const CandidateSeed& seed = seeds[index];
-            if (!IsFixedRecallSeedValid(seed, resident_layout) ||
+            // A UB-resident seed cannot bind to an ordinary C++ reference:
+            // AscendC keeps the address space in its type.  Read its four
+            // scalar words into registers at this AICore boundary instead.
+            const int32_t seed_row = seeds[index].row;
+            const int32_t seed_source = seeds[index].source;
+            const int32_t seed_kv_object = seeds[index].kvObject;
+            const int32_t seed_resident_slot = seeds[index].residentSlot;
+            if (!IsFixedRecallSeedValid(seed_row, seed_source, seed_kv_object,
+                                        seed_resident_slot, resident_layout) ||
                 !AppendKvafLayerResidentRequest(
-                    control_, &descriptor, static_cast<uint32_t>(seed.kvObject),
-                    rows_per_entry, seed.residentSlot)) {
+                    control_, &descriptor,
+                    static_cast<uint32_t>(seed_kv_object), rows_per_entry,
+                    seed_resident_slot)) {
                 healthy_ = false;
                 break;
             }
@@ -532,14 +541,13 @@ private:
     }
 
     __aicore__ inline bool IsFixedRecallSeedValid(
-        const CandidateSeed& seed,
+        int32_t row, int32_t source, int32_t kv_object, int32_t resident_slot,
         const CanonicalResidentLayout& resident_layout) const
     {
-        return seed.row >= 0 && seed.source >= 0 && seed.kvObject >= 0 &&
-               static_cast<uint32_t>(seed.row) < resident_layout.rowCount &&
+        return row >= 0 && source >= 0 && kv_object >= 0 &&
+               static_cast<uint32_t>(row) < resident_layout.rowCount &&
                IsSlotInCanonicalRow(
-                   resident_layout, static_cast<uint32_t>(seed.row),
-                   seed.residentSlot);
+                   resident_layout, static_cast<uint32_t>(row), resident_slot);
     }
 
     __aicore__ inline bool ValidateView(const CandidatePostView& view) const
@@ -561,7 +569,7 @@ private:
     }
 
     __aicore__ inline bool ReserveSeed(const CandidatePostView& view,
-                                       CandidateSeed* seed)
+                                       __ubuf__ CandidateSeed* seed)
     {
         if (seed == nullptr || seed->row < 0 || seed->source < 0 ||
             seed->kvObject < 0 ||
@@ -583,12 +591,14 @@ private:
     __aicore__ inline void RollbackViewClaims(const CandidatePostView& view)
     {
         for (uint32_t seed_index = 0U; seed_index < view.count; ++seed_index) {
-            const CandidateSeed& seed = view.seeds[seed_index];
-            if (seed.residentSlot < 0 || seed.row < 0 || seed.source < 0) {
+            __ubuf__ const CandidateSeed* const seed =
+                view.seeds + seed_index;
+            if (seed->residentSlot < 0 || seed->row < 0 || seed->source < 0) {
                 continue;
             }
             const uint64_t source_offset =
-                static_cast<uint64_t>(seed.row) * view.sourceCapacity + seed.source;
+                static_cast<uint64_t>(seed->row) * view.sourceCapacity +
+                seed->source;
             RollbackCandidateResidentSlotFromAicore(
                 view.candidateSourceToSlot, source_offset, reservation_result_,
                 simt_event_);
@@ -598,15 +608,17 @@ private:
     __aicore__ inline bool CommitViewClaims(const CandidatePostView& view)
     {
         for (uint32_t seed_index = 0U; seed_index < view.count; ++seed_index) {
-            const CandidateSeed& seed = view.seeds[seed_index];
-            if (seed.residentSlot < 0) {
+            __ubuf__ const CandidateSeed* const seed =
+                view.seeds + seed_index;
+            if (seed->residentSlot < 0) {
                 continue;
             }
-            const uint32_t row = static_cast<uint32_t>(seed.row);
+            const uint32_t row = static_cast<uint32_t>(seed->row);
             if (!CommitCandidateResidentSlotFromAicore(
                     view.candidateSourceToSlot,
-                    static_cast<uint64_t>(row) * view.sourceCapacity + seed.source,
-                    seed.residentSlot, reservation_result_, simt_event_)) {
+                    static_cast<uint64_t>(row) * view.sourceCapacity +
+                        seed->source,
+                    seed->residentSlot, reservation_result_, simt_event_)) {
                 return false;
             }
         }

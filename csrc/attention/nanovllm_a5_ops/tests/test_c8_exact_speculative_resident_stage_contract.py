@@ -214,6 +214,27 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             POST_EXECUTOR,
         )
 
+    def test_device_closure_preserves_aicore_domains_and_ub_address_spaces(self) -> None:
+        """The compile-disabled seam still parses every P9 device helper."""
+        for result_type, helper in (
+            ("bool", "IsCanonicalLayout"),
+            ("int64_t", "CanonicalRowFirstSlot"),
+            ("bool", "IsSlotInCanonicalRow"),
+        ):
+            self.assertRegex(
+                KERNEL_CONTRACT,
+                rf"__aicore__\s+constexpr\s+{result_type}\s+{helper}\s*\(",
+            )
+        # `CandidatePostView.seeds` and Stage-B recall seeds live in UB.  A
+        # normal C++ reference silently changes address space under OPC; use
+        # explicit UB pointers or scalar register loads instead.
+        self.assertNotRegex(
+            POST_EXECUTOR, r"(?:const\s+)?CandidateSeed\s*&"
+        )
+        self.assertIn("__ubuf__ CandidateSeed* const seed", POST_EXECUTOR)
+        self.assertIn("__ubuf__ const CandidateSeed* const seed", POST_EXECUTOR)
+        self.assertIn("seed_kv_object", POST_EXECUTOR)
+
     def test_post_executor_resolves_the_staged_kvaf_device_closure_relatively(self) -> None:
         """OPC precompile cannot depend on an implicit op_kernel include path."""
         relative_include = (

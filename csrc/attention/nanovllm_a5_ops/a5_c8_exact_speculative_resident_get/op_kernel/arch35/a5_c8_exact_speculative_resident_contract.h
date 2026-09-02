@@ -122,7 +122,7 @@ constexpr bool IsSlotInRange(const CanonicalResidentRange range,
            residentSlot < range.firstSlot + range.slotCount;
 }
 
-constexpr bool IsCanonicalLayout(const CanonicalResidentLayout layout)
+__aicore__ constexpr bool IsCanonicalLayout(const CanonicalResidentLayout layout)
 {
     return layout.firstSlot >= 0 &&
            layout.slotsPerRow ==
@@ -130,16 +130,16 @@ constexpr bool IsCanonicalLayout(const CanonicalResidentLayout layout)
            layout.rowStride >= layout.slotsPerRow && layout.rowCount != 0U;
 }
 
-constexpr int64_t CanonicalRowFirstSlot(const CanonicalResidentLayout layout,
-                                        const uint32_t row)
+__aicore__ constexpr int64_t CanonicalRowFirstSlot(
+    const CanonicalResidentLayout layout, const uint32_t row)
 {
     return static_cast<int64_t>(layout.firstSlot) +
            static_cast<int64_t>(row) * layout.rowStride;
 }
 
-constexpr bool IsSlotInCanonicalRow(const CanonicalResidentLayout layout,
-                                    const uint32_t row,
-                                    const int32_t residentSlot)
+__aicore__ constexpr bool IsSlotInCanonicalRow(
+    const CanonicalResidentLayout layout, const uint32_t row,
+    const int32_t residentSlot)
 {
     const int64_t first = CanonicalRowFirstSlot(layout, row);
     return IsCanonicalLayout(layout) && row < layout.rowCount &&
