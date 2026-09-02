@@ -272,28 +272,77 @@ if [[ "${MODE}" == "stage" ]]; then
   exit 0
 fi
 
-# Generate a fresh CANN project.  The generated generic host stub is removed
-# only when it registers the same target; the overlay must leave exactly one
-# source-derived OP_ADD registration.  This prevents the repeated duplicate
-# OP_ADD/INI-section failure without editing generated metadata.
+# Generate a fresh CANN project.  ``msopgen`` owns this project's CMake
+# scaffold.  The upstream C8 ``op_host/CMakeLists.txt`` is for the monorepo
+# build and calls helpers such as ``add_op_to_compiled_list`` that deliberately
+# do not exist in the standalone CANN 9.1 scaffold.  It must therefore never
+# be copied over the generated CMake file.
+#
+# We still compile the source-derived C8 OpDef.  The source-only overlay keeps
+# its renamed ``*_def.cpp`` beside the generated stub, then removes exactly
+# that one generated stub.  This is the same CANN-9.1 staging pattern used by
+# the existing isolated source-derived builds: the generated CMake keeps its
+# source collection, while exactly one source-derived OP_ADD remains.
+#
+# This closes both historical failure modes at once: no legacy CMake macro and
+# no duplicate OP_ADD/INI section.
 msopgen gen -i "${STAGED_C8_ROOT}/ops.json" -f aclnn \
   -c "ai_core-${TARGET_SOC}" -lan cpp -op "${TARGET_OPERATOR}" \
   -out "${GENERATED_ROOT}"
+
+GENERATED_HOST_CMAKE="${GENERATED_ROOT}/op_host/CMakeLists.txt"
+[[ -f "${GENERATED_HOST_CMAKE}" ]] ||
+  fail "p9_generated_host_cmake_missing:path=${GENERATED_HOST_CMAKE}"
+if grep -Fq 'add_op_to_compiled_list' "${GENERATED_HOST_CMAKE}"; then
+  fail "p9_legacy_add_op_to_compiled_list_in_generated_cmake:path=${GENERATED_HOST_CMAKE}"
+fi
+
+copy_tree_without_repository_cmake() {
+  local source_dir="$1"
+  local destination_dir="$2"
+  local source_file relative_path destination_file
+
+  while IFS= read -r -d '' source_file; do
+    relative_path="${source_file#${source_dir}/}"
+    if [[ "${relative_path}" == 'CMakeLists.txt' || \
+          "${relative_path}" == */CMakeLists.txt ]]; then
+      continue
+    fi
+    destination_file="${destination_dir}/${relative_path}"
+    mkdir -p "$(dirname "${destination_file}")"
+    cp -f "${source_file}" "${destination_file}"
+  done < <(find "${source_dir}" -type f -print0)
+}
 
 mapfile -t GENERATED_HOST_SOURCES < <(
   find "${GENERATED_ROOT}/op_host" -type f \
     \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print | sort
 )
-cp -a "${STAGED_C8_ROOT}/op_host/." "${GENERATED_ROOT}/op_host/"
-cp -a "${STAGED_C8_ROOT}/op_kernel/." "${GENERATED_ROOT}/op_kernel/"
+
+copy_tree_without_repository_cmake \
+  "${STAGED_C8_ROOT}/op_host" "${GENERATED_ROOT}/op_host"
+copy_tree_without_repository_cmake \
+  "${STAGED_C8_ROOT}/op_kernel" "${GENERATED_ROOT}/op_kernel"
 
 OP_ADD_REGEX="OP_ADD[[:space:]]*\\([[:space:]]*${TARGET_OPERATOR}[[:space:]]*\\)"
+GENERATED_OP_ADD_STUBS=()
 for generated_source in "${GENERATED_HOST_SOURCES[@]}"; do
   if [[ -f "${generated_source}" ]] && grep -Eq "${OP_ADD_REGEX}" "${generated_source}"; then
-    rm -f "${generated_source}"
+    GENERATED_OP_ADD_STUBS+=("${generated_source}")
   fi
 done
+[[ "${#GENERATED_OP_ADD_STUBS[@]}" -eq 1 ]] ||
+  fail "p9_generated_op_add_stub_count:count=${#GENERATED_OP_ADD_STUBS[@]}:operator=${TARGET_OPERATOR}"
+rm -f "${GENERATED_OP_ADD_STUBS[0]}"
 
+STAGED_HOST_OPDEF="${GENERATED_ROOT}/op_host/a5_c8_exact_speculative_resident_get_def.cpp"
+[[ -f "${STAGED_HOST_OPDEF}" ]] ||
+  fail "p9_source_derived_host_opdef_missing:path=${STAGED_HOST_OPDEF}"
+
+if grep -Rqs --include='CMakeLists.txt' 'add_op_to_compiled_list' \
+    "${GENERATED_ROOT}/op_host" "${GENERATED_ROOT}/op_kernel"; then
+  fail "p9_legacy_add_op_to_compiled_list_leaked_after_staging"
+fi
 mapfile -t OP_ADD_SOURCES < <(
   while IFS= read -r source_file; do
     if grep -Eq "${OP_ADD_REGEX}" "${source_file}"; then
@@ -303,7 +352,9 @@ mapfile -t OP_ADD_SOURCES < <(
     \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) -print | sort)
 )
 [[ "${#OP_ADD_SOURCES[@]}" -eq 1 ]] ||
-  fail "p9_op_add_registration_count:count=${#OP_ADD_SOURCES[@]}:operator=${TARGET_OPERATOR}"
+  fail "p9_source_derived_op_add_registration_count:count=${#OP_ADD_SOURCES[@]}:operator=${TARGET_OPERATOR}"
+printf 'P9_HOST_STAGING cmake=msopgen_preserved source_opdef=%s generated_stub_removed=%s\n' \
+  "${STAGED_HOST_OPDEF}" "${GENERATED_OP_ADD_STUBS[0]}"
 
 STAGED_MAKESELF_DIR="${GENERATED_ROOT}/third_party/makeself"
 mkdir -p "${STAGED_MAKESELF_DIR}"

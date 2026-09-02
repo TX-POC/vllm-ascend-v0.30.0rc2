@@ -294,6 +294,20 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertIn("P9_POST_EXECUTOR_HEADER", P9_BUILD_SCRIPT)
         self.assertIn("P9_FINALIZER_HEADER", P9_BUILD_SCRIPT)
         self.assertIn("p9_stage_b_finalizer_include_missing", P9_BUILD_SCRIPT)
+        # P9 uses msopgen's standalone CMake scaffold.  Copying the official
+        # C8 op_host directory over it revives a monorepo-only macro
+        # (add_op_to_compiled_list) and fails before any P9 code compiles.
+        # The generated OP_ADD stub is removed only after source files are
+        # staged without CMakeLists.txt, leaving one source-derived OpDef.
+        self.assertIn("P9_HOST_STAGING", P9_BUILD_SCRIPT)
+        self.assertIn("p9_legacy_add_op_to_compiled_list_leaked_after_staging", P9_BUILD_SCRIPT)
+        self.assertIn("p9_generated_op_add_stub_count", P9_BUILD_SCRIPT)
+        self.assertIn("copy_tree_without_repository_cmake", P9_BUILD_SCRIPT)
+        self.assertIn("p9_source_derived_op_add_registration_count", P9_BUILD_SCRIPT)
+        self.assertNotIn(
+            'cp -a "${STAGED_C8_ROOT}/op_host/." "${GENERATED_ROOT}/op_host/"',
+            P9_BUILD_SCRIPT,
+        )
         self.assertIn("build_p9_exact_resident_opp.sh", (TARGET_ROOT / "README.md").read_text())
         self.assertEqual(
             CONTRACT["non_goals"],
