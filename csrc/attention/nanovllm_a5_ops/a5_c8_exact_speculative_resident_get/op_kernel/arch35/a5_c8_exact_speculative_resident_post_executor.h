@@ -45,7 +45,9 @@ using kvaf_layer_resident_get::ReturnKvafLayerResidentQueueFromAicore;
 using kvaf_layer_resident_get::ReturnKvafLayerResidentUnpostedQueueFromAicore;
 using kvaf_layer_resident_get::TryAcquireKvafLayerResidentQueueFromAicore;
 using kvaf_layer_resident_get::TryRetireKvafLayerResidentBatchGet;
-using vllm_ascend::a5_c8_exact_speculative_resident::IsSlotInCanonicalRow;
+using vllm_ascend::a5_c8_exact_speculative_resident::CanonicalResidentSlotTable;
+using vllm_ascend::a5_c8_exact_speculative_resident::IsCanonicalResidentSlotTableValid;
+using vllm_ascend::a5_c8_exact_speculative_resident::LoadCanonicalResidentLogicalSlot;
 using vllm_ascend::a5_c8_exact_speculative_resident::kExactRecallWaveCapacity;
 
 constexpr int32_t kCandidateSourceClaiming = -2;
@@ -59,37 +61,39 @@ static_assert(kExactRecallWaveCapacity ==
 // it is not a TBuf, a ring in GM, or a cross-forward record.
 struct CandidateSlotReservationResult {
     uint64_t sourceOffset;
-    int32_t residentSlot;
+    int32_t residentSlotOrdinal;
     uint32_t success;
 };
 static_assert(sizeof(CandidateSlotReservationResult) == 16U,
               "P9 candidate reservation hand-off ABI changed");
 
-// Reserve one canonical destination before descriptor assembly.  `-2` is a
-// short pre-doorbell claim only: it becomes an absolute resident row after
-// Begin accepted, or returns to -1 if this wave never reaches Begin.  The
-// per-row cursor is monotonic for this invocation.  A failed reservation can
-// burn a cursor value but can never point two requests at one output row;
-// exact recall covers the resulting speculative miss.
+// Reserve one canonical table ordinal before descriptor assembly. `-2` is a
+// short pre-doorbell claim only: it becomes an ordinal after Begin accepted,
+// or returns to -1 if this wave never reaches Begin. The descriptor resolves
+// its physical row from resident_block_table[row, logical_slot / 128]
+// immediately before Append; QSFA later consumes that logical slot.
+// The per-row cursor is monotonic for this invocation. A failed reservation
+// can burn an ordinal but can never point two requests at one output row.
 __simt_vf__ __aicore__ LAUNCH_BOUND(1)
 inline void ReserveCandidateResidentSlotSimt(
     __gm__ int32_t* candidate_source_to_slot,
     __gm__ int32_t* candidate_slot_cursor,
-    uint32_t row, uint32_t source, uint32_t source_capacity,
-    int32_t first_slot, int32_t row_stride, uint32_t row_count,
+    __gm__ int32_t* req_pool_entries,
+    CanonicalResidentSlotTable canonical_slots, uint32_t row,
+    uint32_t source, uint32_t source_capacity, uint32_t row_count,
     __ubuf__ CandidateSlotReservationResult* result)
 {
     if (candidate_source_to_slot == nullptr || candidate_slot_cursor == nullptr ||
-        result == nullptr || source_capacity == 0U || row >= row_count ||
-        source >= source_capacity || first_slot < 0 ||
-        row_stride < static_cast<int32_t>(kCanonicalResidentSlotCount)) {
+        req_pool_entries == nullptr || result == nullptr || source_capacity == 0U ||
+        row >= row_count || source >= source_capacity ||
+        !IsCanonicalResidentSlotTableValid(canonical_slots)) {
         return;
     }
 
     const uint64_t source_offset =
         static_cast<uint64_t>(row) * source_capacity + source;
     result->sourceOffset = source_offset;
-    result->residentSlot = kCandidateResidentSlotUnassigned;
+    result->residentSlotOrdinal = kCandidateResidentSlotUnassigned;
     result->success = 0U;
 
     if (asc_atomic_cas(candidate_source_to_slot + source_offset,
@@ -106,33 +110,45 @@ inline void ReserveCandidateResidentSlotSimt(
         return;
     }
 
-    const int64_t absolute_slot = static_cast<int64_t>(first_slot) +
-                                  static_cast<int64_t>(row) * row_stride +
-                                  static_cast<int64_t>(local_slot);
-    if (absolute_slot < 0 || absolute_slot > INT32_MAX ||
-        local_slot >= kCanonicalResidentSlotCount) {
+    const int32_t pool_row = req_pool_entries[row];
+    if (pool_row < 0 || static_cast<uint32_t>(pool_row) >=
+                            canonical_slots.poolCount) {
+        (void)asc_atomic_cas(candidate_source_to_slot + source_offset,
+                             kCandidateSourceClaiming,
+                             kCandidateSourceUnmapped);
+        return;
+    }
+    const int32_t logical_slot = LoadCanonicalResidentLogicalSlot(
+        canonical_slots, static_cast<uint32_t>(pool_row), local_slot);
+    // Admission has already proved the complete canonical slot table is
+    // disjoint from persistent_object_slots_snapshot.  Do not rescan that
+    // O(pool*object) table for every score candidate: it would turn the
+    // intended asynchronous path into a device-wide hot-path scan.
+    if (logical_slot < 0) {
         (void)asc_atomic_cas(candidate_source_to_slot + source_offset,
                              kCandidateSourceClaiming,
                              kCandidateSourceUnmapped);
         return;
     }
 
-    result->residentSlot = static_cast<int32_t>(absolute_slot);
+    result->residentSlotOrdinal = static_cast<int32_t>(local_slot);
     result->success = 1U;
 }
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(1)
 inline void CommitCandidateResidentSlotSimt(
     __gm__ int32_t* candidate_source_to_slot,
-    uint64_t source_offset, int32_t resident_slot,
+    uint64_t source_offset, int32_t resident_slot_ordinal,
     __ubuf__ CandidateSlotReservationResult* result)
 {
     if (candidate_source_to_slot == nullptr || result == nullptr ||
-        resident_slot < 0) {
+        resident_slot_ordinal < 0 ||
+        static_cast<uint32_t>(resident_slot_ordinal) >=
+            kCanonicalResidentSlotCount) {
         return;
     }
     result->sourceOffset = source_offset;
-    result->residentSlot = resident_slot;
+    result->residentSlotOrdinal = resident_slot_ordinal;
     result->success = 0U;
 
     // This is a post-acceptance receipt, not a payload-ready bit. Stage B
@@ -143,7 +159,7 @@ inline void CommitCandidateResidentSlotSimt(
     AscendC::Simt::ThreadFence();
     if (asc_atomic_cas(candidate_source_to_slot + source_offset,
                        kCandidateSourceClaiming,
-                       resident_slot) != kCandidateSourceClaiming) {
+                       resident_slot_ordinal) != kCandidateSourceClaiming) {
         return;
     }
     AscendC::Simt::ThreadFence();
@@ -159,7 +175,7 @@ inline void RollbackCandidateResidentSlotSimt(
         return;
     }
     result->sourceOffset = source_offset;
-    result->residentSlot = kCandidateResidentSlotUnassigned;
+    result->residentSlotOrdinal = kCandidateResidentSlotUnassigned;
     result->success =
         asc_atomic_cas(candidate_source_to_slot + source_offset,
                        kCandidateSourceClaiming,
@@ -171,8 +187,9 @@ inline void RollbackCandidateResidentSlotSimt(
 __aicore__ inline bool ReserveCandidateResidentSlotFromAicore(
     __gm__ int32_t* candidate_source_to_slot,
     __gm__ int32_t* candidate_slot_cursor,
-    uint32_t row, uint32_t source, uint32_t source_capacity,
-    CanonicalResidentLayout resident_layout,
+    __gm__ int32_t* req_pool_entries,
+    CanonicalResidentSlotTable canonical_slots, uint32_t row,
+    uint32_t source, uint32_t source_capacity, uint32_t row_count,
     __ubuf__ CandidateSlotReservationResult* result, event_t simt_event)
 {
     if (result == nullptr) {
@@ -183,9 +200,8 @@ __aicore__ inline bool ReserveCandidateResidentSlotFromAicore(
     wait_flag(PIPE_S, PIPE_V, simt_event);
     AscendC::Simt::VF_CALL<ReserveCandidateResidentSlotSimt>(
         AscendC::Simt::Dim3{1U, 1U, 1U}, candidate_source_to_slot,
-        candidate_slot_cursor, row, source, source_capacity,
-        resident_layout.firstSlot, resident_layout.rowStride,
-        resident_layout.rowCount, result);
+        candidate_slot_cursor, req_pool_entries, canonical_slots, row, source,
+        source_capacity, row_count, result);
     set_flag(PIPE_V, PIPE_S, simt_event);
     wait_flag(PIPE_V, PIPE_S, simt_event);
     return result->success != 0U;
@@ -193,7 +209,7 @@ __aicore__ inline bool ReserveCandidateResidentSlotFromAicore(
 
 __aicore__ inline bool CommitCandidateResidentSlotFromAicore(
     __gm__ int32_t* candidate_source_to_slot,
-    uint64_t source_offset, int32_t resident_slot,
+    uint64_t source_offset, int32_t resident_slot_ordinal,
     __ubuf__ CandidateSlotReservationResult* result, event_t simt_event)
 {
     if (result == nullptr) {
@@ -204,7 +220,7 @@ __aicore__ inline bool CommitCandidateResidentSlotFromAicore(
     wait_flag(PIPE_S, PIPE_V, simt_event);
     AscendC::Simt::VF_CALL<CommitCandidateResidentSlotSimt>(
         AscendC::Simt::Dim3{1U, 1U, 1U}, candidate_source_to_slot,
-        source_offset, resident_slot, result);
+        source_offset, resident_slot_ordinal, result);
     set_flag(PIPE_V, PIPE_S, simt_event);
     wait_flag(PIPE_V, PIPE_S, simt_event);
     return result->success != 0U;
@@ -343,17 +359,22 @@ public:
         uint32_t accepted_count = 0U;
         for (uint32_t seed_index = 0U; seed_index < view.count; ++seed_index) {
             __ubuf__ CandidateSeed* const seed = view.seeds + seed_index;
+            int32_t physical_row = -1;
             if (!ReserveSeed(view, seed) ||
+                !ResolvePhysicalResidentRow(
+                    view, static_cast<uint32_t>(seed->row),
+                    static_cast<uint32_t>(seed->residentSlotOrdinal),
+                    &physical_row) ||
                 !AppendKvafLayerResidentRequest(
                     control_, &descriptor,
                     static_cast<uint32_t>(seed->kvObject), view.rowsPerEntry,
-                    seed->residentSlot)) {
-                if (seed->residentSlot >= 0) {
+                    physical_row)) {
+                if (seed->residentSlotOrdinal >= 0) {
                     RollbackCandidateResidentSlotFromAicore(
                         view.candidateSourceToSlot,
                         reservation_result_->sourceOffset, reservation_result_,
                         simt_event_);
-                    seed->residentSlot = kCandidateResidentSlotUnassigned;
+                    seed->residentSlotOrdinal = kCandidateResidentSlotUnassigned;
                 }
                 continue;
             }
@@ -416,19 +437,23 @@ public:
     }
 
     // Stage B uses this after official Top-K is final.  Its seeds already
-    // name otherwise-unused rows in the caller's fixed canonical interval;
+    // name otherwise-unused ordinals in the caller's fixed canonical table;
     // unlike score-time speculation, no source->slot reservation or map
     // publication is needed.  The call remains PostOnly: the finalizer drains
     // this one local wave before it reuses the seed scratch for the next
     // bounded recall microbatch or exposes attention_slots to QSFA.
     __aicore__ inline bool TryPostFixedRecallSeeds(
         __ubuf__ const CandidateSeed* seeds, uint32_t count,
-        const CanonicalResidentLayout& resident_layout,
-        uint32_t rows_per_entry)
+        __gm__ int32_t* req_pool_entries,
+        __gm__ int32_t* resident_block_table,
+        CanonicalResidentSlotTable canonical_slots, uint32_t row_count,
+        uint32_t resident_block_capacity, uint32_t rows_per_entry)
     {
         if (!Enabled() || seeds == nullptr || count == 0U ||
             count > kExactRecallWaveCapacity || rows_per_entry == 0U ||
-            !ValidateResidentLayout(resident_layout)) {
+            req_pool_entries == nullptr || resident_block_table == nullptr ||
+            row_count == 0U || resident_block_capacity == 0U ||
+            !IsCanonicalResidentSlotTableValid(canonical_slots)) {
             return false;
         }
         TryRetireAtScoreBoundary();
@@ -461,13 +486,18 @@ public:
             const int32_t seed_row = seeds[index].row;
             const int32_t seed_source = seeds[index].source;
             const int32_t seed_kv_object = seeds[index].kvObject;
-            const int32_t seed_resident_slot = seeds[index].residentSlot;
+            const int32_t seed_resident_slot_ordinal =
+                seeds[index].residentSlotOrdinal;
+            int32_t physical_row = -1;
             if (!IsFixedRecallSeedValid(seed_row, seed_source, seed_kv_object,
-                                        seed_resident_slot, resident_layout) ||
+                                        seed_resident_slot_ordinal,
+                                        req_pool_entries, resident_block_table,
+                                        canonical_slots, row_count,
+                                        resident_block_capacity, &physical_row) ||
                 !AppendKvafLayerResidentRequest(
                     control_, &descriptor,
                     static_cast<uint32_t>(seed_kv_object), rows_per_entry,
-                    seed_resident_slot)) {
+                    physical_row)) {
                 healthy_ = false;
                 break;
             }
@@ -523,31 +553,47 @@ public:
     }
 
 private:
-    __aicore__ inline bool ValidateResidentLayout(
-        const CanonicalResidentLayout& layout) const
+    __aicore__ inline bool IsFixedRecallSeedValid(
+        int32_t row, int32_t source, int32_t kv_object,
+        int32_t resident_slot_ordinal, __gm__ int32_t* req_pool_entries,
+        __gm__ int32_t* resident_block_table,
+        CanonicalResidentSlotTable canonical_slots, uint32_t row_count,
+        uint32_t resident_block_capacity,
+        int32_t* physical_row) const
     {
-        if (!IsCanonicalLayout(layout)) {
+        if (physical_row == nullptr || row < 0 || source < 0 || kv_object < 0 ||
+            resident_slot_ordinal < 0 || req_pool_entries == nullptr ||
+            resident_block_table == nullptr ||
+            static_cast<uint32_t>(row) >= row_count ||
+            static_cast<uint32_t>(resident_slot_ordinal) >=
+                kCanonicalResidentSlotCount ||
+            !IsCanonicalResidentSlotTableValid(canonical_slots)) {
             return false;
         }
-        const int64_t range_end =
-            static_cast<int64_t>(control_.resident_row_base) +
-            control_.resident_row_count;
-        const int64_t layout_end =
-            static_cast<int64_t>(layout.firstSlot) +
-            static_cast<int64_t>(layout.rowCount - 1U) * layout.rowStride +
-            layout.slotsPerRow;
-        return layout.firstSlot >= control_.resident_row_base &&
-               layout_end <= range_end;
-    }
-
-    __aicore__ inline bool IsFixedRecallSeedValid(
-        int32_t row, int32_t source, int32_t kv_object, int32_t resident_slot,
-        const CanonicalResidentLayout& resident_layout) const
-    {
-        return row >= 0 && source >= 0 && kv_object >= 0 &&
-               static_cast<uint32_t>(row) < resident_layout.rowCount &&
-               IsSlotInCanonicalRow(
-                   resident_layout, static_cast<uint32_t>(row), resident_slot);
+        const int32_t pool_row = req_pool_entries[static_cast<uint32_t>(row)];
+        if (pool_row < 0 || static_cast<uint32_t>(pool_row) >= canonical_slots.poolCount ||
+            LoadCanonicalResidentLogicalSlot(
+                canonical_slots, static_cast<uint32_t>(pool_row),
+                static_cast<uint32_t>(resident_slot_ordinal)) < 0) {
+            return false;
+        }
+        const int32_t logical = LoadCanonicalResidentLogicalSlot(
+            canonical_slots, static_cast<uint32_t>(pool_row),
+            static_cast<uint32_t>(resident_slot_ordinal));
+        if (logical < 0 || resident_block_capacity == 0U ||
+            static_cast<uint32_t>(logical) / 128U >= resident_block_capacity) {
+            return false;
+        }
+        const int32_t block = resident_block_table[
+            static_cast<uint64_t>(static_cast<uint32_t>(row)) *
+                resident_block_capacity + static_cast<uint32_t>(logical) / 128U];
+        if (block < 0 || static_cast<uint64_t>(block) >
+                             (static_cast<uint64_t>(INT32_MAX) -
+                              (static_cast<uint32_t>(logical) & 127U)) / 128U) {
+            return false;
+        }
+        *physical_row = block * 128 + (logical & 127);
+        return true;
     }
 
     __aicore__ inline bool ValidateView(const CandidatePostView& view) const
@@ -556,16 +602,65 @@ private:
             view.count > kCandidateMicrobatchCapacity ||
             view.candidateSourceToSlot == nullptr ||
             view.candidateSlotCursor == nullptr ||
+            view.reqPoolEntries == nullptr ||
+            view.persistentObjectSlotsSnapshot == nullptr ||
+            view.canonicalResidentSlots == nullptr || view.residentBlockTable == nullptr ||
             reinterpret_cast<__gm__ const uint8_t*>(
                 view.layerResidentGetControl) !=
                 reinterpret_cast<__gm__ const uint8_t*>(control_gm_) ||
-            view.rowCount == 0U ||
-            view.rowCount != view.residentLayout.rowCount ||
+            view.rowCount == 0U || view.activeRowCount > view.rowCount ||
+            view.poolSize == 0U || view.kvObjectCapacity == 0U ||
+            view.residentBlockCapacity == 0U ||
             view.sourceCapacity == 0U || view.rowsPerEntry == 0U ||
-            !IsCanonicalLayout(view.residentLayout)) {
+            !IsCanonicalResidentSlotTableValid(CanonicalResidentSlotTable{
+                view.canonicalResidentSlots, view.poolSize})) {
             return false;
         }
-        return ValidateResidentLayout(view.residentLayout);
+        return true;
+    }
+
+    // The graph table stores logical QSFA slots. This helper converts through
+    // the execution-row resident_block_table at the only descriptor assembly
+    // point, so no affine execution-row assumption can leak into transport.
+    __aicore__ inline bool ResolvePhysicalResidentRow(
+        const CandidatePostView& view, uint32_t row, uint32_t ordinal,
+        int32_t* physical_row) const
+    {
+        if (physical_row == nullptr || view.reqPoolEntries == nullptr ||
+            view.canonicalResidentSlots == nullptr || row >= view.rowCount ||
+            row >= view.activeRowCount ||
+            ordinal >= kCanonicalResidentSlotCount ||
+            view.residentBlockTable == nullptr ||
+            view.residentBlockCapacity == 0U) {
+            return false;
+        }
+        const CanonicalResidentSlotTable table{view.canonicalResidentSlots,
+                                                view.poolSize};
+        if (!IsCanonicalResidentSlotTableValid(table)) {
+            return false;
+        }
+        const int32_t pool_row = view.reqPoolEntries[row];
+        if (pool_row < 0 || static_cast<uint32_t>(pool_row) >= table.poolCount ||
+            LoadCanonicalResidentLogicalSlot(
+                table, static_cast<uint32_t>(pool_row), ordinal) < 0) {
+            return false;
+        }
+        const int32_t logical = LoadCanonicalResidentLogicalSlot(
+            table, static_cast<uint32_t>(pool_row), ordinal);
+        if (logical < 0 || static_cast<uint32_t>(logical) / 128U >=
+                               view.residentBlockCapacity) {
+            return false;
+        }
+        const int32_t block = view.residentBlockTable[
+            static_cast<uint64_t>(row) * view.residentBlockCapacity +
+            static_cast<uint32_t>(logical) / 128U];
+        if (block < 0 || static_cast<uint64_t>(block) >
+                             (static_cast<uint64_t>(INT32_MAX) -
+                              (static_cast<uint32_t>(logical) & 127U)) / 128U) {
+            return false;
+        }
+        *physical_row = block * 128 + (logical & 127);
+        return true;
     }
 
     __aicore__ inline bool ReserveSeed(const CandidatePostView& view,
@@ -573,18 +668,22 @@ private:
     {
         if (seed == nullptr || seed->row < 0 || seed->source < 0 ||
             seed->kvObject < 0 ||
-            static_cast<uint32_t>(seed->row) >= view.residentLayout.rowCount ||
+            static_cast<uint32_t>(seed->row) >= view.rowCount ||
+            static_cast<uint32_t>(seed->row) >= view.activeRowCount ||
             static_cast<uint32_t>(seed->source) >= view.sourceCapacity) {
             return false;
         }
         if (!ReserveCandidateResidentSlotFromAicore(
                 view.candidateSourceToSlot, view.candidateSlotCursor,
+                view.reqPoolEntries,
+                CanonicalResidentSlotTable{view.canonicalResidentSlots,
+                                           view.poolSize},
                 static_cast<uint32_t>(seed->row),
                 static_cast<uint32_t>(seed->source), view.sourceCapacity,
-                view.residentLayout, reservation_result_, simt_event_)) {
+                view.rowCount, reservation_result_, simt_event_)) {
             return false;
         }
-        seed->residentSlot = reservation_result_->residentSlot;
+        seed->residentSlotOrdinal = reservation_result_->residentSlotOrdinal;
         return true;
     }
 
@@ -593,7 +692,7 @@ private:
         for (uint32_t seed_index = 0U; seed_index < view.count; ++seed_index) {
             __ubuf__ const CandidateSeed* const seed =
                 view.seeds + seed_index;
-            if (seed->residentSlot < 0 || seed->row < 0 || seed->source < 0) {
+            if (seed->residentSlotOrdinal < 0 || seed->row < 0 || seed->source < 0) {
                 continue;
             }
             const uint64_t source_offset =
@@ -610,7 +709,7 @@ private:
         for (uint32_t seed_index = 0U; seed_index < view.count; ++seed_index) {
             __ubuf__ const CandidateSeed* const seed =
                 view.seeds + seed_index;
-            if (seed->residentSlot < 0) {
+            if (seed->residentSlotOrdinal < 0) {
                 continue;
             }
             const uint32_t row = static_cast<uint32_t>(seed->row);
@@ -618,7 +717,7 @@ private:
                     view.candidateSourceToSlot,
                     static_cast<uint64_t>(row) * view.sourceCapacity +
                         seed->source,
-                    seed->residentSlot, reservation_result_, simt_event_)) {
+                    seed->residentSlotOrdinal, reservation_result_, simt_event_)) {
                 return false;
             }
         }

@@ -38,9 +38,9 @@ namespace exact_speculative_resident {
 using namespace AscendC;
 using kvaf_layer_resident_get::KvafLayerResidentQueueLeaseResult;
 using vllm_ascend::a5_c8_exact_speculative_resident::CandidateSeed;
-using vllm_ascend::a5_c8_exact_speculative_resident::CanonicalResidentLayout;
-using vllm_ascend::a5_c8_exact_speculative_resident::IsCanonicalLayout;
-using vllm_ascend::a5_c8_exact_speculative_resident::IsSlotInCanonicalRow;
+using vllm_ascend::a5_c8_exact_speculative_resident::CanonicalResidentSlotTable;
+using vllm_ascend::a5_c8_exact_speculative_resident::IsCanonicalResidentSlotTableValid;
+using vllm_ascend::a5_c8_exact_speculative_resident::LoadCanonicalResidentLogicalSlot;
 using vllm_ascend::a5_c8_exact_speculative_resident::kCanonicalResidentSlotCount;
 using vllm_ascend::a5_c8_exact_speculative_resident::kExactRecallWaveCapacity;
 using vllm_ascend::a5_c8_exact_speculative_resident::kExactRecallSeedScratchOffset;
@@ -85,6 +85,9 @@ struct C8ExactSpeculativeResidentFinalizerConfig {
     __gm__ uint8_t* kvObjectMap;
     __gm__ uint8_t* kvObjectLens;
     __gm__ uint8_t* persistentObjectSlotsSnapshot;
+    __gm__ uint8_t* canonicalResidentSlots;
+    __gm__ uint8_t* residentBlockTable;
+    __gm__ uint8_t* activeRowCount;
     __gm__ uint8_t* candidateSourceToSlot;
     __gm__ uint8_t* attentionSlots;
     __gm__ uint8_t* terminalPostStats;
@@ -94,9 +97,9 @@ struct C8ExactSpeculativeResidentFinalizerConfig {
     uint32_t sourceCapacity;
     uint32_t poolSize;
     uint32_t kvObjectCapacity;
+    uint32_t residentBlockCapacity;
     uint32_t rowsPerEntry;
     uint32_t producerId;
-    CanonicalResidentLayout residentLayout;
 };
 
 // Queue contention is expected when multiple LI workers finish score scan at
@@ -124,6 +127,18 @@ public:
             valid_ = false;
             return;
         }
+        // This is the only graph-replay padding check.  It precedes every
+        // pool/table/map dereference, because padding execution rows may
+        // alias a live pool row and must never post or finalize P9 work.
+        activeRowCount_.SetGlobalBuffer(
+            reinterpret_cast<__gm__ int32_t*>(config_.activeRowCount));
+        const int32_t active_rows = activeRowCount_.GetValue(0U);
+        if (active_rows < 0 || static_cast<uint32_t>(active_rows) >
+            config_.rowCount) {
+            valid_ = false;
+            return;
+        }
+        activeRowCountValue_ = static_cast<uint32_t>(active_rows);
         reqPoolEntries_.SetGlobalBuffer(
             reinterpret_cast<__gm__ int32_t*>(config_.reqPoolEntries));
         kvObjectMap_.SetGlobalBuffer(
@@ -133,6 +148,8 @@ public:
         persistentObjectSlots_.SetGlobalBuffer(
             reinterpret_cast<__gm__ int32_t*>(
                 config_.persistentObjectSlotsSnapshot));
+        canonicalResidentSlots_.SetGlobalBuffer(
+            reinterpret_cast<__gm__ int32_t*>(config_.canonicalResidentSlots));
         candidateSourceToSlot_.SetGlobalBuffer(
             reinterpret_cast<__gm__ int32_t*>(config_.candidateSourceToSlot));
         attentionSlots_.SetGlobalBuffer(
@@ -164,6 +181,12 @@ public:
             stats.failure = 1U;
             StoreStats(row, stats);
             return false;
+        }
+        if (row >= activeRowCountValue_) {
+            // Captured graph padding reuses a resident pool row.  Treat it
+            // as an official-C8-only row: do not touch P9 control, maps,
+            // table, stats, or fixed resident slots.
+            return true;
         }
 
         // At this boundary an unposted score-time batch has no descriptor and
@@ -230,19 +253,20 @@ public:
                 static_cast<uint64_t>(pool_row) * config_.kvObjectCapacity +
                 static_cast<uint32_t>(kv_object));
             if (persistent_slot >= 0) {
-                if (IsSlotInCanonicalRow(config_.residentLayout, row,
-                                         persistent_slot)) {
-                    MarkUsedSlot(row, persistent_slot, used_slots);
-                }
+                // Admission has already proved that the fixed speculative
+                // logical table is disjoint from every persistent slot.  Do
+                // not linearly search 2048 entries per persistent winner:
+                // it cannot find a legal speculative ordinal and would make
+                // terminal Top-K resolution unnecessarily quadratic.
                 StoreAttentionSlot(row, topk_index, persistent_slot);
                 ++stats.persistent_winners;
                 continue;
             }
 
-            const int32_t candidate_slot = candidateSourceToSlot_.GetValue(
+            const int32_t candidate_ordinal = candidateSourceToSlot_.GetValue(
                 static_cast<uint64_t>(row) * config_.sourceCapacity +
                 static_cast<uint32_t>(source));
-            if (candidate_slot == kCandidateSourceClaiming) {
+            if (candidate_ordinal == kCandidateSourceClaiming) {
                 // Drain preceding the map read makes this a protocol error,
                 // not an ordinary miss.  Returning a row that might still be
                 // written would break the fixed-slot output contract.
@@ -250,19 +274,28 @@ public:
                 StoreStats(row, stats);
                 return false;
             }
-            if (candidate_slot >= 0) {
-                if (!IsSlotInCanonicalRow(config_.residentLayout, row,
-                                          candidate_slot)) {
+            if (candidate_ordinal >= 0) {
+                if (static_cast<uint32_t>(candidate_ordinal) >=
+                    kCanonicalResidentSlotCount) {
                     stats.failure = 1U;
                     StoreStats(row, stats);
                     return false;
                 }
-                MarkUsedSlot(row, candidate_slot, used_slots);
-                StoreAttentionSlot(row, topk_index, candidate_slot);
+                const int32_t logical_slot = LoadCanonicalResidentLogicalSlot(
+                    CanonicalTable(), static_cast<uint32_t>(pool_row),
+                    static_cast<uint32_t>(candidate_ordinal));
+                if (logical_slot < 0) {
+                    stats.failure = 1U;
+                    StoreStats(row, stats);
+                    return false;
+                }
+                MarkUsedOrdinal(static_cast<uint32_t>(candidate_ordinal),
+                                used_slots);
+                StoreAttentionSlot(row, topk_index, logical_slot);
                 ++stats.speculative_winners;
                 continue;
             }
-            if (candidate_slot != kCandidateSourceUnmapped) {
+            if (candidate_ordinal != kCandidateSourceUnmapped) {
                 stats.failure = 1U;
                 StoreStats(row, stats);
                 return false;
@@ -276,9 +309,18 @@ public:
                 }
             }
 
-            int32_t recall_slot = -1;
-            if (!AllocateUnusedSlot(row, used_slots, &next_free_slot,
-                                    &recall_slot)) {
+            uint32_t recall_ordinal = 0U;
+            if (!AllocateUnusedOrdinal(static_cast<uint32_t>(pool_row),
+                                       used_slots, &next_free_slot,
+                                       &recall_ordinal)) {
+                stats.failure = 1U;
+                StoreStats(row, stats);
+                return false;
+            }
+            const int32_t recall_slot = LoadCanonicalResidentLogicalSlot(
+                CanonicalTable(), static_cast<uint32_t>(pool_row),
+                recall_ordinal);
+            if (recall_slot < 0) {
                 stats.failure = 1U;
                 StoreStats(row, stats);
                 return false;
@@ -286,7 +328,8 @@ public:
             recall_seeds[recall_count].row = static_cast<int32_t>(row);
             recall_seeds[recall_count].source = source;
             recall_seeds[recall_count].kvObject = kv_object;
-            recall_seeds[recall_count].residentSlot = recall_slot;
+            recall_seeds[recall_count].residentSlotOrdinal =
+                static_cast<int32_t>(recall_ordinal);
             ++recall_count;
             ++stats.recall_winners;
             StoreAttentionSlot(row, topk_index, recall_slot);
@@ -317,13 +360,19 @@ private:
         return config.reqPoolEntries != nullptr && config.kvObjectMap != nullptr &&
                config.kvObjectLens != nullptr &&
                config.persistentObjectSlotsSnapshot != nullptr &&
+               config.canonicalResidentSlots != nullptr &&
+               config.residentBlockTable != nullptr &&
+               config.activeRowCount != nullptr &&
                config.candidateSourceToSlot != nullptr &&
                config.attentionSlots != nullptr &&
                config.layerResidentGetControl != nullptr && config.rowCount != 0U &&
                config.sourceCapacity != 0U && config.poolSize != 0U &&
-               config.kvObjectCapacity != 0U && config.rowsPerEntry != 0U &&
-               IsCanonicalLayout(config.residentLayout) &&
-               config.residentLayout.rowCount == config.rowCount &&
+               config.kvObjectCapacity != 0U &&
+               config.residentBlockCapacity != 0U &&
+               config.rowsPerEntry != 0U &&
+               IsCanonicalResidentSlotTableValid(CanonicalResidentSlotTable{
+                   reinterpret_cast<__gm__ int32_t*>(
+                       config.canonicalResidentSlots), config.poolSize}) &&
                kP9ScratchBytes <= kExistingC8InvalidScratchBytes;
     }
 
@@ -337,59 +386,50 @@ private:
         }
     }
 
-    __aicore__ inline bool IsUsedSlot(uint32_t row, int32_t resident_slot,
-                                      __ubuf__ const uint8_t* used_slots) const
+    __aicore__ inline CanonicalResidentSlotTable CanonicalTable() const
     {
-        if (used_slots == nullptr ||
-            !IsSlotInCanonicalRow(config_.residentLayout, row,
-                                  resident_slot)) {
-            return true;
-        }
-        const int64_t first =
-            static_cast<int64_t>(config_.residentLayout.firstSlot) +
-            static_cast<int64_t>(row) * config_.residentLayout.rowStride;
-        const uint32_t local = static_cast<uint32_t>(
-            static_cast<int64_t>(resident_slot) - first);
-        return (used_slots[local / 8U] & (1U << (local % 8U))) != 0U;
+        return CanonicalResidentSlotTable{
+            reinterpret_cast<__gm__ int32_t*>(config_.canonicalResidentSlots),
+            config_.poolSize};
     }
 
-    __aicore__ inline void MarkUsedSlot(uint32_t row, int32_t resident_slot,
-                                        __ubuf__ uint8_t* used_slots) const
+    __aicore__ inline bool IsUsedOrdinal(
+        uint32_t ordinal, __ubuf__ const uint8_t* used_slots) const
     {
-        if (used_slots == nullptr ||
-            !IsSlotInCanonicalRow(config_.residentLayout, row,
-                                  resident_slot)) {
+        return used_slots == nullptr || ordinal >= kCanonicalResidentSlotCount ||
+               (used_slots[ordinal / 8U] & (1U << (ordinal % 8U))) != 0U;
+    }
+
+    __aicore__ inline void MarkUsedOrdinal(uint32_t ordinal,
+                                           __ubuf__ uint8_t* used_slots) const
+    {
+        if (used_slots == nullptr || ordinal >= kCanonicalResidentSlotCount) {
             return;
         }
-        const int64_t first =
-            static_cast<int64_t>(config_.residentLayout.firstSlot) +
-            static_cast<int64_t>(row) * config_.residentLayout.rowStride;
-        const uint32_t local = static_cast<uint32_t>(
-            static_cast<int64_t>(resident_slot) - first);
-        used_slots[local / 8U] |= static_cast<uint8_t>(1U << (local % 8U));
+        used_slots[ordinal / 8U] |= static_cast<uint8_t>(1U << (ordinal % 8U));
     }
 
-    __aicore__ inline bool AllocateUnusedSlot(uint32_t row,
-                                               __ubuf__ uint8_t* used_slots,
-                                               uint32_t* next_free_slot,
-                                               int32_t* resident_slot) const
+    __aicore__ inline bool AllocateUnusedOrdinal(
+        uint32_t pool_row, __ubuf__ uint8_t* used_slots,
+        uint32_t* next_free_slot,
+        uint32_t* ordinal) const
     {
-        if (used_slots == nullptr || next_free_slot == nullptr ||
-            resident_slot == nullptr) {
+        if (used_slots == nullptr || next_free_slot == nullptr || ordinal == nullptr) {
             return false;
         }
-        const int64_t first =
-            static_cast<int64_t>(config_.residentLayout.firstSlot) +
-            static_cast<int64_t>(row) * config_.residentLayout.rowStride;
         for (uint32_t probe = *next_free_slot;
              probe < kCanonicalResidentSlotCount; ++probe) {
-            const int64_t candidate = first + probe;
-            if (candidate < 0 || candidate > INT32_MAX ||
-                IsUsedSlot(row, static_cast<int32_t>(candidate), used_slots)) {
+            const int32_t logical = LoadCanonicalResidentLogicalSlot(
+                CanonicalTable(), pool_row, probe);
+            // The host admission path validates that the fixed canonical
+            // region is structurally disjoint from every persistent slot.
+            // Keep terminal selection O(TopK): a snapshot scan here would
+            // be an accidental candidate-times-object hot path.
+            if (IsUsedOrdinal(probe, used_slots) || logical < 0) {
                 continue;
             }
-            *resident_slot = static_cast<int32_t>(candidate);
-            MarkUsedSlot(row, *resident_slot, used_slots);
+            *ordinal = probe;
+            MarkUsedOrdinal(probe, used_slots);
             *next_free_slot = probe + 1U;
             return true;
         }
@@ -440,7 +480,11 @@ private:
         for (uint32_t retry = 0U; retry < kExactRecallQueueRetryLimit;
              ++retry) {
             if (executor->TryPostFixedRecallSeeds(
-                    recall_seeds, *recall_count, config_.residentLayout,
+                    recall_seeds, *recall_count,
+                    reinterpret_cast<__gm__ int32_t*>(config_.reqPoolEntries),
+                    reinterpret_cast<__gm__ int32_t*>(config_.residentBlockTable),
+                    CanonicalTable(), activeRowCountValue_,
+                    config_.residentBlockCapacity,
                     config_.rowsPerEntry)) {
                 posted = true;
                 break;
@@ -497,10 +541,13 @@ private:
     GlobalTensor<int32_t> kvObjectMap_;
     GlobalTensor<int32_t> kvObjectLens_;
     GlobalTensor<int32_t> persistentObjectSlots_;
+    GlobalTensor<int32_t> canonicalResidentSlots_;
+    GlobalTensor<int32_t> activeRowCount_;
     GlobalTensor<int32_t> candidateSourceToSlot_;
     GlobalTensor<int32_t> attentionSlots_;
     GlobalTensor<int32_t> terminalPostStats_;
     bool valid_ = false;
+    uint32_t activeRowCountValue_ = 0U;
 };
 
 }  // namespace exact_speculative_resident

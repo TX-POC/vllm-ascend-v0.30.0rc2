@@ -5,7 +5,7 @@ This suite intentionally runs without CANN.  It takes a fresh copy of the
 official C8 source, applies the checked-in overlay, then proves three things
 before an expensive OPP build is allowed:
 
-* the public schema is exactly P9's 21-input / 6-output ABI;
+* the public schema is exactly P9's 23-input / 6-output ABI;
 * the official score and Top-K implementation are preserved byte-for-byte
   except for anchored P9 calls at legal boundaries; and
 * all P9 inputs reach the source-derived wrapper, preload, and vector path in
@@ -50,11 +50,13 @@ P9_INPUTS = [
     ("kv_object_map", "int32"),
     ("kv_object_lens", "int32"),
     ("persistent_object_slots_snapshot", "int32"),
-    ("canonical_resident_layout", "int32"),
+    ("canonical_resident_slots", "int32"),
     ("candidate_source_to_slot", "int32"),
     ("candidate_slot_cursor", "int32"),
     ("layer_resident_get_control", "int64"),
     ("rows_per_entry", "int32"),
+    ("resident_block_table", "int32"),
+    ("active_row_count", "int32"),
 ]
 OUTPUTS = [
     ("sparse_indices", "int32"),
@@ -111,13 +113,13 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
         for relative in entries:
             self.assertTrue((OVERLAY_ROOT / relative).is_file(), relative)
 
-    def test_ops_schema_is_exact_active_21_input_6_output_abi(self) -> None:
+    def test_ops_schema_is_exact_active_23_input_6_output_abi(self) -> None:
         ops = json.loads((OVERLAY_ROOT / "ops.json").read_text(encoding="utf-8"))
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0]["op"], "A5C8ExactSpeculativeResidentGet")
         self.assertEqual(tensor_schema(ops[0]["input_desc"]), OFFICIAL_INPUTS + P9_INPUTS)
         self.assertEqual(tensor_schema(ops[0]["output_desc"]), OUTPUTS)
-        self.assertEqual(len(ops[0]["input_desc"]), 21)
+        self.assertEqual(len(ops[0]["input_desc"]), 23)
         self.assertEqual(len(ops[0]["output_desc"]), 6)
         self.assertNotIn(
             "resident_packed_output",
@@ -253,11 +255,13 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
                 "kvObjectMap",
                 "kvObjectLens",
                 "persistentObjectSlotsSnapshot",
-                "canonicalResidentLayout",
+                "canonicalResidentSlots",
                 "candidateSourceToSlot",
                 "candidateSlotCursor",
                 "layerResidentGetControl",
                 "rowsPerEntry",
+                "residentBlockTable",
+                "activeRowCount",
                 "attentionSlots",
                 "terminalPostStats",
                 "candidateSourceToSlotRef",
@@ -277,10 +281,16 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
             self.assertNotIn("this.Output(", host_def)
             for token in (
                 'this->Input("runtime_enable")',
+                'this->Input("canonical_resident_slots")',
+                'this->Input("resident_block_table")',
+                'this->Input("active_row_count")',
                 'this->Output("attention_slots")',
                 'this->Output("candidate_source_to_slot_ref")',
                 'this->Output("candidate_slot_cursor_ref")',
                 'aicore_config_950.Input("runtime_enable")',
+                'aicore_config_950.Input("canonical_resident_slots")',
+                'aicore_config_950.Input("resident_block_table")',
+                'aicore_config_950.Input("active_row_count")',
                 'aicore_config_950.Output("attention_slots")',
                 'aicore_config_950.Output("candidate_source_to_slot_ref")',
                 'aicore_config_950.Output("candidate_slot_cursor_ref")',
@@ -293,7 +303,8 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
             # run before the official AIV InitBuffers call establishes that
             # local tensor.  The disabled path is intentionally an official
             # C8 execution plus one runtime-enable word read: no borrowed UB,
-            # P9 layout GM, or P9 event hand-off is allowed before that gate.
+            # P9 slot/table/control GM, or P9 event hand-off is allowed before
+            # that gate.
             preload_init = applier.function_body(
                 preload, "QLIPreload<QLIT>::Init(__gm__"
             )
@@ -318,21 +329,46 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
             self.assertNotIn("WaitFlag<", disabled_prefix)
             self.assertLess(
                 runtime_gate,
-                p9_runtime.index("layoutGm.SetGlobalBuffer"),
+                p9_runtime.index("activeRowCount == nullptr"),
+            )
+            # Graph padding may reuse a live pool row.  Queue/control setup
+            # is therefore lazy: InitP9Runtime installs only score state; the
+            # first Direct-HCCP control read occurs in a helper guarded by a
+            # concrete row that passed active_row_count.
+            self.assertNotIn("p9PostExecutor_.Init(", p9_runtime)
+            ensure_executor = applier.function_body(
+                staged_vector, "QLIVector<QLIT>::EnsureP9PostExecutor"
+            )
+            self.assertLess(
+                ensure_executor.index("activeRow >= p9ScoreHook_.ActiveRowCount()"),
+                ensure_executor.index("rowsPerEntryGm.GetValue(0U)"),
+            )
+            post_boundary = applier.function_body(
+                staged_vector, "QLIVector<QLIT>::P9PostAtScoreBoundary"
+            )
+            self.assertLess(
+                post_boundary.index("activeRow >= p9ScoreHook_.ActiveRowCount()"),
+                post_boundary.index("EnsureP9PostExecutor(activeRow)"),
             )
 
             # Tiling validates all P9 shapes before GetStorageShape() and
-            # carries the exact 21-input ABI's index 14 (`kv_object_lens`).
+            # carries the exact 23-input ABI's index 14 (`kv_object_lens`).
             # This makes an ABI mismatch fail during host tiling rather than
             # at an unchecked device GM access.
             for token in (
                 "P9_KV_OBJECT_LENS_INDEX",
+                "P9_CANONICAL_RESIDENT_SLOTS_INDEX",
+                "P9_RESIDENT_BLOCK_TABLE_INDEX",
+                "P9_ACTIVE_ROW_COUNT_INDEX",
                 "p9RuntimeEnableStorage == nullptr",
                 "p9ThresholdStorage == nullptr",
                 "p9ThresholdValidStorage == nullptr",
                 "p9LensStorage == nullptr",
                 "p9RuntimeEnable.GetDim(0) != 1",
                 "p9Lens.GetDim(0) != p9RowCount",
+                "p9CanonicalSlots.GetDim(1) != 2048",
+                "p9ResidentBlockTable.GetDim(0) != p9RowCount",
+                "p9ActiveRowCount.GetDim(0) != 1",
             ):
                 self.assertIn(token, tiling)
             first_shape_read = tiling.index("p9SparseStorage->GetStorageShape()")

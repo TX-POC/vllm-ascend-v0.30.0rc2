@@ -30,11 +30,13 @@ P9_INPUTS = (
     "kv_object_map",
     "kv_object_lens",
     "persistent_object_slots_snapshot",
-    "canonical_resident_layout",
+    "canonical_resident_slots",
     "candidate_source_to_slot",
     "candidate_slot_cursor",
     "layer_resident_get_control",
     "rows_per_entry",
+    "resident_block_table",
+    "active_row_count",
 )
 P9_OUTPUTS = (
     "attention_slots",
@@ -45,7 +47,7 @@ P9_OUTPUTS = (
 
 
 class A5C8ExactSpeculativeResidentBridgeContractTest(unittest.TestCase):
-    def test_atomic_cann_abi_has_the_frozen_21_input_6_output_shape(self) -> None:
+    def test_atomic_cann_abi_has_the_frozen_23_input_6_output_shape(self) -> None:
         self.assertEqual(len(OPS), 1)
         op = OPS[0]
         self.assertEqual(op["op"], "A5C8ExactSpeculativeResidentGet")
@@ -73,13 +75,14 @@ class A5C8ExactSpeculativeResidentBridgeContractTest(unittest.TestCase):
         self.assertEqual(
             [entry["name"] for entry in op["output_desc"][2:]], list(P9_OUTPUTS)
         )
-        self.assertEqual(len(op["input_desc"]), 21)
+        self.assertEqual(len(op["input_desc"]), 23)
         self.assertEqual(len(op["output_desc"]), 6)
 
     def test_bridge_preserves_the_same_order_and_hides_only_internal_aliases(self) -> None:
         for token in (
             "official_tensor_inputs\"] = 9",
-            "p9_tensor_inputs\"] = 12",
+            "p9_tensor_inputs\"] = 14",
+            "operator_tensor_inputs\"] = 23",
             "public_outputs\"] = 4",
             "mutable_output_aliases\"] = 2",
             "Tensor(a!) candidate_source_to_slot",
@@ -99,14 +102,35 @@ class A5C8ExactSpeculativeResidentBridgeContractTest(unittest.TestCase):
     def test_control_and_alias_shapes_are_checked_before_aclnn(self) -> None:
         for token in (
             "kLayerResidentGetControlWords = 16",
-            "kCanonicalResidentLayoutWords = 4",
             "layer_resident_get_control must be int64[16]",
-            "canonical_resident_layout must be int32[4]",
+            "canonical_resident_slots must be int32[P,2048]",
+            "resident_block_table must be int32[R,B]",
+            "active_row_count must be graph-visible int32[1]",
             "candidate_source_to_slot must be int32[R,S]",
             "candidate_slot_cursor",
             "rows_per_entry",
         ):
             self.assertIn(token, BRIDGE)
+
+    def test_bridge_requires_logical_slot_table_and_execution_row_block_table(self) -> None:
+        # Logical slots are what QSFA consumes.  Physical Direct-HCCP output
+        # rows derive separately from the execution-row resident block table;
+        # accepting an affine layout or a [P,2048,2] pair would be incorrect
+        # whenever req_pool_entries is permuted.
+        for token in (
+            "canonical_resident_slots.dim() == 2",
+            "canonical_resident_slots.size(1) == kExactSparseCount",
+            "resident_block_table.dim() == 2",
+            "resident_block_table.size(0) == rows",
+            "resident_block_table.size(1) > 0",
+        ):
+            self.assertIn(token, BRIDGE)
+        for forbidden in (
+            "canonical_resident_layout",
+            "CanonicalResidentLayout",
+            "resident_packed_output",
+        ):
+            self.assertNotIn(forbidden, BRIDGE)
 
     def test_bridge_and_generated_opp_share_runnable_layout_defaults(self) -> None:
         """Default dispatch must not select the invalid dense-key layout."""

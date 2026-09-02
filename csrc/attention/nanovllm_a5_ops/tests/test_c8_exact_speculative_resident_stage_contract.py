@@ -92,11 +92,13 @@ P9_INPUTS = [
     ("kv_object_map", "int32"),
     ("kv_object_lens", "int32"),
     ("persistent_object_slots_snapshot", "int32"),
-    ("canonical_resident_layout", "int32"),
+    ("canonical_resident_slots", "int32"),
     ("candidate_source_to_slot", "int32"),
     ("candidate_slot_cursor", "int32"),
     ("layer_resident_get_control", "int64"),
     ("rows_per_entry", "int32"),
+    ("resident_block_table", "int32"),
+    ("active_row_count", "int32"),
 ]
 OUTPUTS = [
     ("sparse_indices", "int32"),
@@ -143,9 +145,9 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertLess(score_reduce, score_publish)
         self.assertLess(score_publish, process_topk)
 
-    def test_exact_21_input_6_output_graph_abi_and_aliases(self) -> None:
+    def test_exact_23_input_6_output_graph_abi_and_aliases(self) -> None:
         abi = CONTRACT["operator_abi"]
-        self.assertEqual(abi["input_count"], 21)
+        self.assertEqual(abi["input_count"], 23)
         self.assertEqual(abi["output_count"], 6)
         self.assertEqual(contract_schema(abi["inputs"]), OFFICIAL_INPUTS + P9_INPUTS)
         self.assertEqual(contract_schema(abi["outputs"]), OUTPUTS)
@@ -161,32 +163,35 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertEqual(CONTRACT["target"], "A5C8ExactSpeculativeResidentGet")
         self.assertEqual(
             CONTRACT["candidate_seed"]["words"],
-            ["row", "source", "kv_object", "resident_slot"],
+            ["row", "source", "kv_object", "resident_slot_ordinal"],
         )
-        self.assertEqual(
-            CONTRACT["candidate_seed"]["cross_wave_slot_invariant"],
-            "CandidateCompact never assigns one resident_slot to two initial "
-            "waves; Stage-B drains every initial wave before it may reuse a "
-            "non-winner entry in the same invocation for exact recall",
-        )
+        invariant = CONTRACT["candidate_seed"]["cross_wave_slot_invariant"]
+        self.assertIn("resident_slot_ordinal", invariant)
+        self.assertIn("same invocation", invariant)
+        self.assertIn("disjoint from persistent object slots", invariant)
         resource = CONTRACT["resource_model"]
-        layout = resource["canonical_resident_layout"]
-        self.assertEqual(layout["input"], "canonical_resident_layout")
-        self.assertEqual(layout["shape"], "[first_slot, slots_per_row, row_stride, row_count]")
-        self.assertEqual(layout["slot_count"], 2048)
-        self.assertIn("widened to uint32", layout["meaning"])
+        slots = resource["canonical_resident_slots"]
+        self.assertEqual(slots["input"], "canonical_resident_slots")
+        self.assertEqual(slots["shape"], "[pool_size, 2048]")
+        self.assertEqual(slots["slot_count"], 2048)
+        self.assertIn("req_pool_entries[r]", slots["meaning"])
+        self.assertIn("resident_block_table[r, logical_slot/128]", slots["meaning"])
+        active_gate = resource["active_row_gate"]
+        self.assertEqual(active_gate["input"], "active_row_count")
+        self.assertEqual(active_gate["shape"], "[1]")
+        self.assertIn("may alias a pool row", active_gate["meaning"])
         self.assertFalse(resource["fixed_get_core_partition"])
         self.assertFalse(resource["persistent_slot_map_mutation_during_score_scan"])
         for token in (
             "kCanonicalResidentSlotCount = 2048U",
-            "kCandidateResidentSlot = 3U",
+            "kCandidateResidentSlotOrdinal = 3U",
             "struct CandidateSeed",
-            "struct CanonicalResidentRange",
+            "struct CanonicalResidentSlotTable",
+            "LoadCanonicalResidentLogicalSlot",
             "kInitialDrain",
             "kExactRecall",
             "kRecallDrain",
             "kComplete",
-            "IsSlotInRange",
         ):
             self.assertIn(token, KERNEL_CONTRACT)
         for forbidden in (
@@ -197,6 +202,9 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             "replay",
             "fixed_get_core_partition",
             "31+1",
+            "CanonicalResidentRange",
+            "IsSlotInRange",
+            "IsPersistentLogicalSlot",
         ):
             self.assertNotIn(forbidden, KERNEL_CONTRACT.lower())
 
@@ -235,7 +243,6 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             "TBuf<",
             "private_arena",
             "forward_control",
-            "replay",
             "epoch",
             "quarantine",
             "fixed_get_core",
@@ -250,6 +257,46 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             POST_EXECUTOR.index("BeginKvafLayerResidentBatchGet(control_, lease"),
             POST_EXECUTOR.index("CommitViewClaims(view)"),
         )
+        # No score-time candidate path scans every persistent object to prove
+        # slot disjointness.  That is a host/admission invariant of the fixed
+        # high resident pool; doing it per seed would turn compaction into
+        # candidate_count * object_capacity work.
+        self.assertNotIn("IsPersistentLogicalSlot", POST_EXECUTOR)
+        self.assertNotIn("IsPersistentLogicalSlot", FINALIZER)
+        self.assertNotIn("FindCanonicalOrdinal", FINALIZER)
+
+    def test_execution_row_mapping_and_graph_padding_gate_are_explicit(self) -> None:
+        """P9 separates logical QSFA slots from execution-row physical rows."""
+        for required in (
+            "reqPoolEntries[row]",
+            "LoadCanonicalResidentLogicalSlot",
+            "residentBlockTable",
+            "block * 128 + (logical & 127)",
+            "row >= view.activeRowCount",
+        ):
+            self.assertIn(required, POST_EXECUTOR)
+        for required in (
+            "row >= activeRowCountValue_",
+            "LoadCanonicalResidentLogicalSlot",
+            "StoreAttentionSlot(row, topk_index, logical_slot)",
+            "source >= config_.sourceCapacity",
+        ):
+            self.assertIn(required, FINALIZER)
+        self.assertLess(
+            FINALIZER.index("source >= config_.sourceCapacity"),
+            FINALIZER.index("kvObjectMap_.GetValue("),
+        )
+        for required in (
+            "lastTileFirstActiveRow_",
+            "row < activeRowCountValue_",
+            "FindFirstActiveRow",
+        ):
+            self.assertIn(required, SCORE_HOOK)
+        # A P9 active row is allowed to use a permuted pool row; graph padding
+        # is independently gated, not inferred from candidate length or pool
+        # identity.  The runtime fixture supplies a nonidentity example.
+        self.assertIn("may alias a pool row", CONTRACT["resource_model"]["active_row_gate"]["meaning"])
+        self.assertIn("execution row r resolves pool", CONTRACT["resource_model"]["canonical_resident_slots"]["meaning"])
 
     def test_stage_b_only_exposes_terminal_normal_resident_slots(self) -> None:
         stage_b = CONTRACT["stage_b"]
@@ -285,7 +332,6 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         for forbidden in (
             "private_arena",
             "forward_control",
-            "replay",
             "epoch",
             "quarantine",
             "fixed_get_core",
@@ -304,6 +350,9 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             "seam=active_abi",
             "runtimeEnable",
             "rowsPerEntry",
+            "canonicalResidentSlots",
+            "residentBlockTable",
+            "activeRowCount",
             "candidateSourceToSlotRef",
             "candidateSlotCursorRef",
         ):
@@ -330,6 +379,7 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             "P9_STAGE_B_FINALIZER_HEADER",
             "P9_KVAF_SOURCE_CONTRACT_PASS",
             "copy_tree_without_repository_cmake",
+            "official9_plus14_inputs_6_outputs",
         ):
             self.assertIn(required, P9_BUILD_SCRIPT)
         self.assertNotIn("seam=compile_disabled", P9_BUILD_SCRIPT)

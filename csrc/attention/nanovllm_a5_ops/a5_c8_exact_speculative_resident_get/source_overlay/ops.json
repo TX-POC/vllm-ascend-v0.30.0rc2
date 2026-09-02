@@ -19,11 +19,13 @@
       {"name": "kv_object_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "kv_object_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "persistent_object_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "canonical_resident_layout", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "canonical_resident_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "candidate_source_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "candidate_slot_cursor", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "layer_resident_get_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
-      {"name": "rows_per_entry", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+      {"name": "rows_per_entry", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "active_row_count", "param_type": "required", "format": ["ND"], "type": ["int32"]}
     ],
     "output_desc": [
       {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},

@@ -3,7 +3,7 @@
 // This is intentionally a *dedicated* resolver and registration domain.  It
 // borrows only the mechanical descriptor/launch discipline of
 // a5_c8_resident_seed: it does not import that operator, P7, or P8.  The
-// matching generated P9 OPP must expose the 21-input / 6-output ACLNN ABI
+// matching generated P9 OPP must expose the 23-input / 6-output ACLNN ABI
 // below in one atomic host/kernel/bridge change.  In particular, the two
 // trailing ACLNN outputs are caller-owned aliases; the public Torch result
 // deliberately contains only the four non-alias outputs.
@@ -31,7 +31,6 @@ constexpr int64_t kExactSparseCount = 2048;
 constexpr int64_t kA5IndexHeads = 64;
 constexpr int64_t kA5KeyHeads = 1;
 constexpr int64_t kA5HeadDim = 128;
-constexpr int64_t kCanonicalResidentLayoutWords = 4;
 constexpr int64_t kLayerResidentGetControlWords = 16;
 constexpr int64_t kTerminalPostStatWords = 7;
 
@@ -306,10 +305,12 @@ P9ShapeInfo ValidateInputs(
     const at::Tensor& req_pool_entries, const at::Tensor& kv_object_map,
     const at::Tensor& kv_object_lens,
     const at::Tensor& persistent_object_slots_snapshot,
-    const at::Tensor& canonical_resident_layout,
+    const at::Tensor& canonical_resident_slots,
     at::Tensor& candidate_source_to_slot, at::Tensor& candidate_slot_cursor,
     const at::Tensor& layer_resident_get_control,
-    const at::Tensor& rows_per_entry, int64_t query_quant_mode,
+    const at::Tensor& rows_per_entry,
+    const at::Tensor& resident_block_table,
+    const at::Tensor& active_row_count, int64_t query_quant_mode,
     int64_t key_quant_mode, const std::string& layout_query,
     const std::string& layout_key, int64_t sparse_count, int64_t cmp_ratio,
     int64_t stride, int64_t scale_stride, bool require_npu)
@@ -341,11 +342,13 @@ P9ShapeInfo ValidateInputs(
              {&kv_object_lens, "kv_object_lens"},
              {&persistent_object_slots_snapshot,
               "persistent_object_slots_snapshot"},
-             {&canonical_resident_layout, "canonical_resident_layout"},
+             {&canonical_resident_slots, "canonical_resident_slots"},
              {&candidate_source_to_slot, "candidate_source_to_slot"},
              {&candidate_slot_cursor, "candidate_slot_cursor"},
              {&layer_resident_get_control, "layer_resident_get_control"},
              {&rows_per_entry, "rows_per_entry"},
+             {&resident_block_table, "resident_block_table"},
+             {&active_row_count, "active_row_count"},
          }) {
         RequireSameDevice(query, *item.first, item.second, true);
     }
@@ -371,10 +374,12 @@ P9ShapeInfo ValidateInputs(
              {&kv_object_lens, "kv_object_lens"},
              {&persistent_object_slots_snapshot,
               "persistent_object_slots_snapshot"},
-             {&canonical_resident_layout, "canonical_resident_layout"},
+             {&canonical_resident_slots, "canonical_resident_slots"},
              {&candidate_source_to_slot, "candidate_source_to_slot"},
              {&candidate_slot_cursor, "candidate_slot_cursor"},
              {&rows_per_entry, "rows_per_entry"},
+             {&resident_block_table, "resident_block_table"},
+             {&active_row_count, "active_row_count"},
          }) {
         RequireInt32(*item.first, item.second);
     }
@@ -385,17 +390,14 @@ P9ShapeInfo ValidateInputs(
                 "metadata must contain exactly 1024 int32 words.");
     TORCH_CHECK(runtime_enable.dim() == 1 && runtime_enable.size(0) == 1,
                 "runtime_enable must be int32[1].");
-    TORCH_CHECK(canonical_resident_layout.dim() == 1 &&
-                    canonical_resident_layout.size(0) ==
-                        kCanonicalResidentLayoutWords,
-                "canonical_resident_layout must be int32[4]: "
-                "[first_slot, slots_per_row, row_stride, row_count].");
     TORCH_CHECK(layer_resident_get_control.dim() == 1 &&
                     layer_resident_get_control.size(0) ==
                         kLayerResidentGetControlWords,
                 "layer_resident_get_control must be int64[16].");
     TORCH_CHECK(rows_per_entry.dim() == 1 && rows_per_entry.size(0) == 1,
                 "rows_per_entry must be int32[1].");
+    TORCH_CHECK(active_row_count.dim() == 1 && active_row_count.size(0) == 1,
+                "active_row_count must be graph-visible int32[1].");
 
     TORCH_CHECK(query_quant_mode == 0 && key_quant_mode == 0 &&
                     cmp_ratio == 1,
@@ -425,6 +427,11 @@ P9ShapeInfo ValidateInputs(
                     persistent_object_slots_snapshot.size(1) > 0,
                 "persistent_object_slots_snapshot must be int32[P,O] with "
                 "the same P as kv_object_map.");
+    TORCH_CHECK(canonical_resident_slots.dim() == 2 &&
+                    canonical_resident_slots.size(0) == pool_count &&
+                    canonical_resident_slots.size(1) == kExactSparseCount,
+                "canonical_resident_slots must be int32[P,2048] with P=",
+                pool_count, ".");
     TORCH_CHECK(candidate_source_to_slot.dim() == 2 &&
                     candidate_source_to_slot.size(0) == rows &&
                     candidate_source_to_slot.size(1) == source_count,
@@ -432,6 +439,12 @@ P9ShapeInfo ValidateInputs(
                 candidate_source_to_slot.size(0), ",",
                 candidate_source_to_slot.size(1), "] expected [", rows, ",",
                 source_count, "].");
+    TORCH_CHECK(resident_block_table.dim() == 2 &&
+                    resident_block_table.size(0) == rows &&
+                    resident_block_table.size(1) > 0,
+                "resident_block_table must be int32[R,B] with R=", rows,
+                " and positive B; physical HCCP destination is resolved per "
+                "execution row.");
 
     const int64_t physical_stride = key.stride(0);
     const int64_t physical_scale_stride = key_scale.stride(0);
@@ -444,11 +457,10 @@ P9ShapeInfo ValidateInputs(
                 "scale_stride must equal key_dequant_scale.stride(0): got ",
                 scale_stride, " expected ", physical_scale_stride, ".");
 
-    // The four layout words are dynamic, device-resident graph data.  Reading
-    // them on the host would introduce a synchronization edge and defeat the
-    // asynchronous path.  The generated P9 tiler/kernel must fail closed on
-    // invalid values (including slots_per_row != 2048) before dereference;
-    // this bridge validates their exact ABI shape and type only.
+    // `active_row_count` and slot/table values stay device-resident graph
+    // data.  Host value reads would add a synchronization edge.  The P9
+    // tiler validates ranks/dimensions, while the device gates every P9
+    // pool/table access on runtime_enable and active_row_count.
     return {sparse_shape, rows, source_count, pool_count,
             persistent_object_slots_snapshot.size(1)};
 }
@@ -464,10 +476,12 @@ PublicResult AllocateAndLaunch(
     const at::Tensor& req_pool_entries, const at::Tensor& kv_object_map,
     const at::Tensor& kv_object_lens,
     const at::Tensor& persistent_object_slots_snapshot,
-    const at::Tensor& canonical_resident_layout,
+    const at::Tensor& canonical_resident_slots,
     at::Tensor candidate_source_to_slot, at::Tensor candidate_slot_cursor,
     const at::Tensor& layer_resident_get_control,
-    const at::Tensor& rows_per_entry, int64_t query_quant_mode,
+    const at::Tensor& rows_per_entry,
+    const at::Tensor& resident_block_table,
+    const at::Tensor& active_row_count, int64_t query_quant_mode,
     int64_t key_quant_mode, const std::string& layout_query,
     const std::string& layout_key, int64_t sparse_count, int64_t sparse_mode,
     int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio,
@@ -478,8 +492,9 @@ PublicResult AllocateAndLaunch(
         actual_key_lengths, block_table, metadata, runtime_enable,
         resident_threshold, resident_threshold_valid, req_pool_entries,
         kv_object_map, kv_object_lens, persistent_object_slots_snapshot,
-        canonical_resident_layout, candidate_source_to_slot,
+        canonical_resident_slots, candidate_source_to_slot,
         candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
+        resident_block_table, active_row_count,
         query_quant_mode, key_quant_mode, layout_query, layout_key,
         sparse_count, cmp_ratio, stride, scale_stride, true);
 
@@ -501,12 +516,13 @@ PublicResult AllocateAndLaunch(
         actual_key_lengths, block_table, metadata, runtime_enable,
         resident_threshold, resident_threshold_valid, req_pool_entries,
         kv_object_map, kv_object_lens, persistent_object_slots_snapshot,
-        canonical_resident_layout, candidate_source_to_slot,
+        canonical_resident_slots, candidate_source_to_slot,
         candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
+        resident_block_table, active_row_count,
         sparse_indices, sparse_values, attention_slots, terminal_post_stats);
 
     // ABI order is frozen by stage_a_b_contract.json:
-    // 9 official inputs, 12 P9 inputs, official attrs, four public outputs,
+    // 9 official inputs, 14 P9 inputs, official attrs, four public outputs,
     // then two caller-owned output aliases.  Do not reorder the two aliases:
     // graph mutation visibility is part of the target ABI.
     //
@@ -525,8 +541,9 @@ PublicResult AllocateAndLaunch(
         block_table, metadata, runtime_enable, resident_threshold,
         resident_threshold_valid, req_pool_entries, kv_object_map,
         kv_object_lens, persistent_object_slots_snapshot,
-        canonical_resident_layout, candidate_source_to_slot,
+        canonical_resident_slots, candidate_source_to_slot,
         candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
+        resident_block_table, active_row_count,
         query_quant_mode, key_quant_mode, layout_query_ptr, layout_key_ptr,
         sparse_count, sparse_mode, pre_tokens, next_tokens, cmp_ratio,
         return_values, stride, scale_stride, sparse_indices, sparse_values,
@@ -547,10 +564,12 @@ PublicResult A5C8ExactSpeculativeResidentGetNpu(
     const at::Tensor& req_pool_entries, const at::Tensor& kv_object_map,
     const at::Tensor& kv_object_lens,
     const at::Tensor& persistent_object_slots_snapshot,
-    const at::Tensor& canonical_resident_layout,
+    const at::Tensor& canonical_resident_slots,
     at::Tensor candidate_source_to_slot, at::Tensor candidate_slot_cursor,
     const at::Tensor& layer_resident_get_control,
-    const at::Tensor& rows_per_entry, int64_t query_quant_mode,
+    const at::Tensor& rows_per_entry,
+    const at::Tensor& resident_block_table,
+    const at::Tensor& active_row_count, int64_t query_quant_mode,
     int64_t key_quant_mode, std::string layout_query, std::string layout_key,
     int64_t sparse_count, int64_t sparse_mode, int64_t pre_tokens,
     int64_t next_tokens, int64_t cmp_ratio, bool return_values, int64_t stride,
@@ -561,8 +580,9 @@ PublicResult A5C8ExactSpeculativeResidentGetNpu(
         actual_key_lengths, block_table, metadata, runtime_enable,
         resident_threshold, resident_threshold_valid, req_pool_entries,
         kv_object_map, kv_object_lens, persistent_object_slots_snapshot,
-        canonical_resident_layout, candidate_source_to_slot,
+        canonical_resident_slots, candidate_source_to_slot,
         candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
+        resident_block_table, active_row_count,
         query_quant_mode, key_quant_mode, layout_query, layout_key,
         sparse_count, sparse_mode, pre_tokens, next_tokens, cmp_ratio,
         return_values, stride, scale_stride);
@@ -579,10 +599,12 @@ PublicResult A5C8ExactSpeculativeResidentGetMeta(
     const at::Tensor& req_pool_entries, const at::Tensor& kv_object_map,
     const at::Tensor& kv_object_lens,
     const at::Tensor& persistent_object_slots_snapshot,
-    const at::Tensor& canonical_resident_layout,
+    const at::Tensor& canonical_resident_slots,
     at::Tensor candidate_source_to_slot, at::Tensor candidate_slot_cursor,
     const at::Tensor& layer_resident_get_control,
-    const at::Tensor& rows_per_entry, int64_t query_quant_mode,
+    const at::Tensor& rows_per_entry,
+    const at::Tensor& resident_block_table,
+    const at::Tensor& active_row_count, int64_t query_quant_mode,
     int64_t key_quant_mode, std::string layout_query, std::string layout_key,
     int64_t sparse_count, int64_t sparse_mode, int64_t pre_tokens,
     int64_t next_tokens, int64_t cmp_ratio, bool return_values, int64_t stride,
@@ -593,8 +615,9 @@ PublicResult A5C8ExactSpeculativeResidentGetMeta(
         actual_key_lengths, block_table, metadata, runtime_enable,
         resident_threshold, resident_threshold_valid, req_pool_entries,
         kv_object_map, kv_object_lens, persistent_object_slots_snapshot,
-        canonical_resident_layout, candidate_source_to_slot,
+        canonical_resident_slots, candidate_source_to_slot,
         candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
+        resident_block_table, active_row_count,
         query_quant_mode, key_quant_mode, layout_query, layout_key,
         sparse_count, cmp_ratio, stride, scale_stride, false);
     auto int_options = query.options().dtype(at::kInt);
@@ -620,10 +643,11 @@ TORCH_LIBRARY(a5_c8_exact_speculative_resident_get, m)
         "Tensor resident_threshold, Tensor resident_threshold_valid, "
         "Tensor req_pool_entries, Tensor kv_object_map, "
         "Tensor kv_object_lens, Tensor persistent_object_slots_snapshot, "
-        "Tensor canonical_resident_layout, "
+        "Tensor canonical_resident_slots, "
         "Tensor(a!) candidate_source_to_slot, "
         "Tensor(b!) candidate_slot_cursor, "
         "Tensor layer_resident_get_control, Tensor rows_per_entry, "
+        "Tensor resident_block_table, Tensor active_row_count, "
         "int query_quant_mode=0, int key_quant_mode=0, "
         "str layout_query='BSND', str layout_key='PA_BSND', "
         "int sparse_count=2048, int sparse_mode=3, "
@@ -651,7 +675,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("p9_bridge_contract", [] {
         pybind11::dict contract;
         contract["official_tensor_inputs"] = 9;
-        contract["p9_tensor_inputs"] = 12;
+        contract["p9_tensor_inputs"] = 14;
+        contract["operator_tensor_inputs"] = 23;
         contract["public_outputs"] = 4;
         contract["mutable_output_aliases"] = 2;
         contract["sparse_count"] = kExactSparseCount;

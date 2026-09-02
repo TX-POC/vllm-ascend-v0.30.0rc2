@@ -2,7 +2,7 @@
 """Apply the atomic active P9 source-derived C8 overlay.
 
 The overlay is deliberately mechanical: it extends the official C8 ABI from
-9/2 to P9's exact 21/6 schema, wires those values through the official kernel
+9/2 to P9's exact 23/6 schema, wires those values through the official kernel
 wrapper and QLIPreload/QLIVector path, then inserts only two bounded source
 seams.  It never rewrites C8's score reduction or Top-K selection.  Every
 transformation is an exact anchor; an upstream drift fails before CANN is
@@ -269,8 +269,9 @@ def inject_kernel_wrapper_abi(wrapper_path: Path) -> None:
     new_init = (
         "        op.Init(query, key, weights, queryScale, keyScale, actualSeqLengthsQ, actualSeqLengthsK, blocktable, \\\n"
         "                metadata, runtimeEnable, residentThreshold, residentThresholdValid, reqPoolEntries, kvObjectMap, \\\n"
-        "                kvObjectLens, persistentObjectSlotsSnapshot, canonicalResidentLayout, candidateSourceToSlot, \\\n"
-        "                candidateSlotCursor, layerResidentGetControl, rowsPerEntry, sparseIndices, attentionSlots, \\\n"
+        "                kvObjectLens, persistentObjectSlotsSnapshot, canonicalResidentSlots, candidateSourceToSlot, \\\n"
+        "                candidateSlotCursor, layerResidentGetControl, rowsPerEntry, residentBlockTable, activeRowCount, \\\n"
+        "                sparseIndices, attentionSlots, \\\n"
         "                terminalPostStats, candidateSourceToSlotRef, candidateSlotCursorRef, user, tiling_data, &tPipe);"
     )
     source = replace_exactly_once(source, old_init, new_init, "kernel_wrapper_init")
@@ -285,9 +286,10 @@ def inject_kernel_wrapper_abi(wrapper_path: Path) -> None:
         "                                                   __gm__ uint8_t *runtimeEnable, __gm__ uint8_t *residentThreshold,\n"
         "                                                   __gm__ uint8_t *residentThresholdValid, __gm__ uint8_t *reqPoolEntries,\n"
         "                                                   __gm__ uint8_t *kvObjectMap, __gm__ uint8_t *kvObjectLens,\n"
-        "                                                   __gm__ uint8_t *persistentObjectSlotsSnapshot, __gm__ uint8_t *canonicalResidentLayout,\n"
+        "                                                   __gm__ uint8_t *persistentObjectSlotsSnapshot, __gm__ uint8_t *canonicalResidentSlots,\n"
         "                                                   __gm__ uint8_t *candidateSourceToSlot, __gm__ uint8_t *candidateSlotCursor,\n"
         "                                                   __gm__ uint8_t *layerResidentGetControl, __gm__ uint8_t *rowsPerEntry,\n"
+        "                                                   __gm__ uint8_t *residentBlockTable, __gm__ uint8_t *activeRowCount,\n"
         "                                                   __gm__ uint8_t *sparseIndices, __gm__ uint8_t *sparseValues,\n"
         "                                                   __gm__ uint8_t *attentionSlots, __gm__ uint8_t *terminalPostStats,\n"
         "                                                   __gm__ uint8_t *candidateSourceToSlotRef, __gm__ uint8_t *candidateSlotCursorRef,\n"
@@ -309,7 +311,7 @@ def inject_kernel_wrapper_abi(wrapper_path: Path) -> None:
 
 
 def inject_preload_abi(preload_path: Path) -> None:
-    """Pass the 12 P9 inputs into QLIVector after its official UB setup.
+    """Pass the 14 P9 inputs into QLIVector after its official UB setup.
 
     `InitP9Runtime` deliberately runs *after* `InitBuffers()` and only on an
     AIV.  It borrows C8's existing invalid-index scratch, so calling it when
@@ -331,9 +333,10 @@ def inject_preload_abi(preload_path: Path) -> None:
         "                                __gm__ uint8_t *residentThreshold, __gm__ uint8_t *residentThresholdValid,\n"
         "                                __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *kvObjectMap,\n"
         "                                __gm__ uint8_t *kvObjectLens, __gm__ uint8_t *persistentObjectSlotsSnapshot,\n"
-        "                                __gm__ uint8_t *canonicalResidentLayout, __gm__ uint8_t *candidateSourceToSlot,\n"
+        "                                __gm__ uint8_t *canonicalResidentSlots, __gm__ uint8_t *candidateSourceToSlot,\n"
         "                                __gm__ uint8_t *candidateSlotCursor, __gm__ uint8_t *layerResidentGetControl,\n"
-        "                                __gm__ uint8_t *rowsPerEntry, __gm__ uint8_t *sparseIndices,\n"
+        "                                __gm__ uint8_t *rowsPerEntry, __gm__ uint8_t *residentBlockTable,\n"
+        "                                __gm__ uint8_t *activeRowCount, __gm__ uint8_t *sparseIndices,\n"
         "                                __gm__ uint8_t *attentionSlots, __gm__ uint8_t *terminalPostStats,\n"
         "                                __gm__ uint8_t *candidateSourceToSlotRef, __gm__ uint8_t *candidateSlotCursorRef,\n"
         "                                __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);"
@@ -350,9 +353,10 @@ def inject_preload_abi(preload_path: Path) -> None:
         "                                              __gm__ uint8_t *runtimeEnable, __gm__ uint8_t *residentThreshold,\n"
         "                                              __gm__ uint8_t *residentThresholdValid, __gm__ uint8_t *reqPoolEntries,\n"
         "                                              __gm__ uint8_t *kvObjectMap, __gm__ uint8_t *kvObjectLens,\n"
-        "                                              __gm__ uint8_t *persistentObjectSlotsSnapshot, __gm__ uint8_t *canonicalResidentLayout,\n"
+        "                                              __gm__ uint8_t *persistentObjectSlotsSnapshot, __gm__ uint8_t *canonicalResidentSlots,\n"
         "                                              __gm__ uint8_t *candidateSourceToSlot, __gm__ uint8_t *candidateSlotCursor,\n"
         "                                              __gm__ uint8_t *layerResidentGetControl, __gm__ uint8_t *rowsPerEntry,\n"
+        "                                              __gm__ uint8_t *residentBlockTable, __gm__ uint8_t *activeRowCount,\n"
         "                                              __gm__ uint8_t *sparseIndices, __gm__ uint8_t *attentionSlots,\n"
         "                                              __gm__ uint8_t *terminalPostStats, __gm__ uint8_t *candidateSourceToSlotRef,\n"
         "                                              __gm__ uint8_t *candidateSlotCursorRef, __gm__ uint8_t *workspace,\n"
@@ -368,9 +372,10 @@ def inject_preload_abi(preload_path: Path) -> None:
         "    if ASCEND_IS_AIV {\n"
         "        vectorService.InitP9Runtime(runtimeEnable, residentThreshold, residentThresholdValid,\n"
         "                                       reqPoolEntries, kvObjectMap, kvObjectLens,\n"
-        "                                       persistentObjectSlotsSnapshot, canonicalResidentLayout,\n"
+        "                                       persistentObjectSlotsSnapshot, canonicalResidentSlots,\n"
         "                                       candidateSourceToSlot, candidateSlotCursor,\n"
-        "                                       layerResidentGetControl, rowsPerEntry, attentionSlots,\n"
+        "                                       layerResidentGetControl, rowsPerEntry, residentBlockTable, activeRowCount,\n"
+        "                                       attentionSlots,\n"
         "                                       terminalPostStats, tiling);\n"
         "    }\n"
         "    // Outputs 4/5 are ABI aliases of inputs 17/18.  They deliberately\n"
@@ -407,9 +412,10 @@ def inject_vector_runtime(vector_path: Path) -> None:
         "        __gm__ uint8_t* runtimeEnable, __gm__ uint8_t* residentThreshold,\n"
         "        __gm__ uint8_t* residentThresholdValid, __gm__ uint8_t* reqPoolEntries,\n"
         "        __gm__ uint8_t* kvObjectMap, __gm__ uint8_t* kvObjectLens,\n"
-        "        __gm__ uint8_t* persistentObjectSlotsSnapshot, __gm__ uint8_t* canonicalResidentLayout,\n"
+        "        __gm__ uint8_t* persistentObjectSlotsSnapshot, __gm__ uint8_t* canonicalResidentSlots,\n"
         "        __gm__ uint8_t* candidateSourceToSlot, __gm__ uint8_t* candidateSlotCursor,\n"
         "        __gm__ uint8_t* layerResidentGetControl, __gm__ uint8_t* rowsPerEntry,\n"
+        "        __gm__ uint8_t* residentBlockTable, __gm__ uint8_t* activeRowCount,\n"
         "        __gm__ uint8_t* attentionSlots, __gm__ uint8_t* terminalPostStats,\n"
         "        const QLITilingData* tilingData);\n"
         "    __aicore__ inline void P9ObserveScoreSeam(const LocalTensor<uint16_t>& outBase,\n"
@@ -417,6 +423,7 @@ def inject_vector_runtime(vector_path: Path) -> None:
         "                                                   int64_t curAivS1ProcNum, int64_t curS2Idx);\n"
         "    __aicore__ inline void P9PostAtScoreBoundary();\n"
         "    __aicore__ inline void P9FinalizeExactTopKRow(uint32_t row);\n"
+        "    __aicore__ inline bool EnsureP9PostExecutor(uint32_t activeRow);\n"
     )
     source = replace_exactly_once(
         source, declaration_anchor, declaration_insert, "vector_p9_declarations"
@@ -427,6 +434,10 @@ def inject_vector_runtime(vector_path: Path) -> None:
         "    // P9 state is invocation-local and reuses only outInvalidBuf_.  It is\n"
         "    // not a private arena and does not reserve an AIV for Get.\n"
         "    bool p9RuntimeActive_ = false;\n"
+        "    // A Direct-HCCP executor is constructed lazily only after an active\n"
+        "    // execution row has crossed the graph-padding gate.\n"
+        "    bool p9PostExecutorInitialized_ = false;\n"
+        "    __gm__ uint8_t* p9RowsPerEntry_ = nullptr;\n"
         "    exact_speculative_resident::C8ExactSpeculativeResidentScoreHook p9ScoreHook_;\n"
         "    exact_speculative_resident::C8ExactSpeculativeResidentPostExecutor p9PostExecutor_;\n"
         "    exact_speculative_resident::C8ExactSpeculativeResidentScoreHookConfig p9ScoreConfig_{};\n"
@@ -443,50 +454,56 @@ __aicore__ inline void QLIVector<QLIT>::InitP9Runtime(
     __gm__ uint8_t* runtimeEnable, __gm__ uint8_t* residentThreshold,
     __gm__ uint8_t* residentThresholdValid, __gm__ uint8_t* reqPoolEntries,
     __gm__ uint8_t* kvObjectMap, __gm__ uint8_t* kvObjectLens,
-    __gm__ uint8_t* persistentObjectSlotsSnapshot, __gm__ uint8_t* canonicalResidentLayout,
+    __gm__ uint8_t* persistentObjectSlotsSnapshot, __gm__ uint8_t* canonicalResidentSlots,
     __gm__ uint8_t* candidateSourceToSlot, __gm__ uint8_t* candidateSlotCursor,
     __gm__ uint8_t* layerResidentGetControl, __gm__ uint8_t* rowsPerEntry,
+    __gm__ uint8_t* residentBlockTable, __gm__ uint8_t* activeRowCount,
     __gm__ uint8_t* attentionSlots, __gm__ uint8_t* terminalPostStats,
     const QLITilingData* tilingData)
 {
     p9RuntimeActive_ = false;
-    if (tilingData == nullptr || runtimeEnable == nullptr || residentThreshold == nullptr ||
-        residentThresholdValid == nullptr || reqPoolEntries == nullptr || kvObjectMap == nullptr ||
-        kvObjectLens == nullptr || persistentObjectSlotsSnapshot == nullptr ||
-        canonicalResidentLayout == nullptr || candidateSourceToSlot == nullptr ||
-        candidateSlotCursor == nullptr || layerResidentGetControl == nullptr ||
-        rowsPerEntry == nullptr || attentionSlots == nullptr ||
+    p9PostExecutorInitialized_ = false;
+    p9RowsPerEntry_ = nullptr;
+    if (tilingData == nullptr || runtimeEnable == nullptr ||
         !vllm_ascend::a5_c8_exact_speculative_resident::IsP9ExistingScratchLayoutValid(
             topkCount_ * sizeof(int32_t))) {
         return;
     }
 
     // runtime_enable is the only P9 control read permitted on the C8-equivalent
-    // disabled path.  Do not touch layout/map/queue state until it is one.
+    // disabled path.  Do not validate or touch table/map/queue state until
+    // it is one; graph placeholders remain legal under runtime_enable=0.
     GlobalTensor<int32_t> runtimeEnableGm;
     runtimeEnableGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(runtimeEnable));
     if (runtimeEnableGm.GetValue(0U) != 1) {
         return;
     }
 
-    GlobalTensor<int32_t> layoutGm;
-    GlobalTensor<int32_t> rowsPerEntryGm;
-    layoutGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(canonicalResidentLayout));
-    rowsPerEntryGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rowsPerEntry));
-    vllm_ascend::a5_c8_exact_speculative_resident::CanonicalResidentLayout layout{};
-    layout.firstSlot = layoutGm.GetValue(0U);
-    layout.slotsPerRow = layoutGm.GetValue(1U);
-    layout.rowStride = layoutGm.GetValue(2U);
-    const int32_t layoutRowCount = layoutGm.GetValue(3U);
-    const int32_t rowsPerEntryValue = rowsPerEntryGm.GetValue(0U);
-    if (layoutRowCount <= 0 || rowsPerEntryValue <= 0 ||
-        tilingData->p9PoolSize == 0U || tilingData->p9SourceCapacity == 0U ||
-        tilingData->p9KvObjectCapacity == 0U || tilingData->p9RowCount == 0U) {
+    // A captured all-padding replay is another exact-C8 control case.  Read
+    // only its graph-visible row count before requiring any map/table/control
+    // pointer: there is no active execution row that could legally consume
+    // those P9 inputs.  Per-worker padding is gated again at the score seam.
+    if (activeRowCount == nullptr || tilingData->p9RowCount == 0U) {
         return;
     }
-    layout.rowCount = static_cast<uint32_t>(layoutRowCount);
-    if (!vllm_ascend::a5_c8_exact_speculative_resident::IsCanonicalLayout(layout) ||
-        layout.rowCount != tilingData->p9RowCount) {
+    GlobalTensor<int32_t> activeRowCountGm;
+    activeRowCountGm.SetGlobalBuffer(
+        reinterpret_cast<__gm__ int32_t*>(activeRowCount));
+    const int32_t activeRowCountValue = activeRowCountGm.GetValue(0U);
+    if (activeRowCountValue <= 0 ||
+        static_cast<uint32_t>(activeRowCountValue) > tilingData->p9RowCount) {
+        return;
+    }
+
+    if (residentThreshold == nullptr || residentThresholdValid == nullptr ||
+        reqPoolEntries == nullptr || kvObjectMap == nullptr || kvObjectLens == nullptr ||
+        persistentObjectSlotsSnapshot == nullptr || canonicalResidentSlots == nullptr ||
+        candidateSourceToSlot == nullptr || candidateSlotCursor == nullptr ||
+        residentBlockTable == nullptr ||
+        attentionSlots == nullptr ||
+        tilingData->p9PoolSize == 0U || tilingData->p9SourceCapacity == 0U ||
+        tilingData->p9KvObjectCapacity == 0U || tilingData->p9RowCount == 0U ||
+        tilingData->p9ResidentBlockCapacity == 0U) {
         return;
     }
 
@@ -497,16 +514,23 @@ __aicore__ inline void QLIVector<QLIT>::InitP9Runtime(
     p9ScoreConfig_.kvObjectMap = kvObjectMap;
     p9ScoreConfig_.kvObjectLens = kvObjectLens;
     p9ScoreConfig_.persistentObjectSlotsSnapshot = persistentObjectSlotsSnapshot;
+    p9ScoreConfig_.canonicalResidentSlots = canonicalResidentSlots;
+    p9ScoreConfig_.residentBlockTable = residentBlockTable;
+    p9ScoreConfig_.activeRowCount = activeRowCount;
     p9ScoreConfig_.candidateSourceToSlot = candidateSourceToSlot;
     p9ScoreConfig_.candidateSlotCursor = candidateSlotCursor;
     p9ScoreConfig_.layerResidentGetControl = layerResidentGetControl;
+    p9RowsPerEntry_ = rowsPerEntry;
     p9ScoreConfig_.rowCount = tilingData->p9RowCount;
     p9ScoreConfig_.sourceCapacity = tilingData->p9SourceCapacity;
     p9ScoreConfig_.poolSize = tilingData->p9PoolSize;
     p9ScoreConfig_.kvObjectCapacity = tilingData->p9KvObjectCapacity;
-    p9ScoreConfig_.rowsPerEntry = static_cast<uint32_t>(rowsPerEntryValue);
+    p9ScoreConfig_.residentBlockCapacity = tilingData->p9ResidentBlockCapacity;
+    // Do not read rows_per_entry or layer_resident_get_control here.  A
+    // graph replay may have no active rows; the lazy executor below reads
+    // transport control only after a concrete row survives active_row_count.
+    p9ScoreConfig_.rowsPerEntry = 0U;
     p9ScoreConfig_.producerId = static_cast<uint32_t>(blockId_);
-    p9ScoreConfig_.residentLayout = layout;
 
     __ubuf__ uint8_t* const scratch = reinterpret_cast<__ubuf__ uint8_t*>(outInvalidLocal_.GetPhyAddr());
     if (scratch == nullptr) {
@@ -515,19 +539,8 @@ __aicore__ inline void QLIVector<QLIT>::InitP9Runtime(
     __ubuf__ exact_speculative_resident::CandidateSeed* const candidateScratch =
         reinterpret_cast<__ubuf__ exact_speculative_resident::CandidateSeed*>(
         scratch + vllm_ascend::a5_c8_exact_speculative_resident::kCandidateSeedScratchOffset);
-    __ubuf__ kvaf_layer_resident_get::KvafLayerResidentQueueLeaseResult* const leaseResult =
-        reinterpret_cast<__ubuf__ kvaf_layer_resident_get::KvafLayerResidentQueueLeaseResult*>(
-            scratch + vllm_ascend::a5_c8_exact_speculative_resident::kQueueLeaseReceiptScratchOffset);
-    __ubuf__ exact_speculative_resident::CandidateSlotReservationResult* const reservationResult =
-        reinterpret_cast<__ubuf__ exact_speculative_resident::CandidateSlotReservationResult*>(
-            scratch + vllm_ascend::a5_c8_exact_speculative_resident::kCandidateReservationScratchOffset);
     p9ScoreHook_.Init(p9ScoreConfig_, constInfo_, candidateScratch);
     if (!p9ScoreHook_.Enabled()) {
-        return;
-    }
-    p9PostExecutor_.Init(layerResidentGetControl, p9ScoreConfig_.producerId,
-                         leaseResult, reservationResult, static_cast<event_t>(EVENT_ID0));
-    if (!p9PostExecutor_.Enabled()) {
         return;
     }
 
@@ -535,6 +548,9 @@ __aicore__ inline void QLIVector<QLIT>::InitP9Runtime(
     p9FinalizerConfig_.kvObjectMap = kvObjectMap;
     p9FinalizerConfig_.kvObjectLens = kvObjectLens;
     p9FinalizerConfig_.persistentObjectSlotsSnapshot = persistentObjectSlotsSnapshot;
+    p9FinalizerConfig_.canonicalResidentSlots = canonicalResidentSlots;
+    p9FinalizerConfig_.residentBlockTable = residentBlockTable;
+    p9FinalizerConfig_.activeRowCount = activeRowCount;
     p9FinalizerConfig_.candidateSourceToSlot = candidateSourceToSlot;
     p9FinalizerConfig_.attentionSlots = attentionSlots;
     p9FinalizerConfig_.terminalPostStats = terminalPostStats;
@@ -543,10 +559,59 @@ __aicore__ inline void QLIVector<QLIT>::InitP9Runtime(
     p9FinalizerConfig_.sourceCapacity = tilingData->p9SourceCapacity;
     p9FinalizerConfig_.poolSize = tilingData->p9PoolSize;
     p9FinalizerConfig_.kvObjectCapacity = tilingData->p9KvObjectCapacity;
-    p9FinalizerConfig_.rowsPerEntry = static_cast<uint32_t>(rowsPerEntryValue);
+    p9FinalizerConfig_.residentBlockCapacity = tilingData->p9ResidentBlockCapacity;
+    p9FinalizerConfig_.rowsPerEntry = 0U;
     p9FinalizerConfig_.producerId = p9ScoreConfig_.producerId;
-    p9FinalizerConfig_.residentLayout = layout;
     p9RuntimeActive_ = true;
+}
+
+template <typename QLIT>
+__aicore__ inline bool QLIVector<QLIT>::EnsureP9PostExecutor(uint32_t activeRow)
+{
+    // This is the only entry point that reads Direct-HCCP control or creates
+    // an executor.  Keeping the active-row check adjacent to the first
+    // control read prevents graph-padding rows (which can alias a live pool
+    // row) from acquiring queues, polling CQ, or publishing descriptors.
+    if (!p9RuntimeActive_ || activeRow >= p9ScoreHook_.ActiveRowCount()) {
+        return false;
+    }
+    if (p9PostExecutorInitialized_) {
+        return p9PostExecutor_.Enabled();
+    }
+    if (p9RowsPerEntry_ == nullptr ||
+        p9ScoreConfig_.layerResidentGetControl == nullptr) {
+        return false;
+    }
+
+    GlobalTensor<int32_t> rowsPerEntryGm;
+    rowsPerEntryGm.SetGlobalBuffer(
+        reinterpret_cast<__gm__ int32_t*>(p9RowsPerEntry_));
+    const int32_t rowsPerEntryValue = rowsPerEntryGm.GetValue(0U);
+    if (rowsPerEntryValue <= 0) {
+        return false;
+    }
+
+    __ubuf__ uint8_t* const scratch =
+        reinterpret_cast<__ubuf__ uint8_t*>(outInvalidLocal_.GetPhyAddr());
+    if (scratch == nullptr) {
+        return false;
+    }
+    __ubuf__ kvaf_layer_resident_get::KvafLayerResidentQueueLeaseResult* const leaseResult =
+        reinterpret_cast<__ubuf__ kvaf_layer_resident_get::KvafLayerResidentQueueLeaseResult*>(
+            scratch + vllm_ascend::a5_c8_exact_speculative_resident::kQueueLeaseReceiptScratchOffset);
+    __ubuf__ exact_speculative_resident::CandidateSlotReservationResult* const reservationResult =
+        reinterpret_cast<__ubuf__ exact_speculative_resident::CandidateSlotReservationResult*>(
+            scratch + vllm_ascend::a5_c8_exact_speculative_resident::kCandidateReservationScratchOffset);
+    p9ScoreHook_.SetRowsPerEntry(static_cast<uint32_t>(rowsPerEntryValue));
+    p9FinalizerConfig_.rowsPerEntry = static_cast<uint32_t>(rowsPerEntryValue);
+    p9PostExecutor_.Init(p9ScoreConfig_.layerResidentGetControl,
+                         p9ScoreConfig_.producerId, leaseResult,
+                         reservationResult, static_cast<event_t>(EVENT_ID0));
+    if (!p9PostExecutor_.Enabled()) {
+        return false;
+    }
+    p9PostExecutorInitialized_ = true;
+    return true;
 }
 
 template <typename QLIT>
@@ -557,7 +622,6 @@ __aicore__ inline void QLIVector<QLIT>::P9ObserveScoreSeam(
     if (!p9RuntimeActive_) {
         return;
     }
-    p9PostExecutor_.TryRetireAtScoreBoundary();
     p9ScoreHook_.CompactExactScoreTile(outBase, info, curAivS1Idx,
                                        curAivS1ProcNum, curS2Idx);
 }
@@ -566,6 +630,23 @@ template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::P9PostAtScoreBoundary()
 {
     if (!p9RuntimeActive_) {
+        return;
+    }
+    const uint32_t activeRow = p9ScoreHook_.LastTileFirstActiveRow();
+    // Every score-publication hook consumes exactly one observation marker.
+    // Clearing it makes a future accidental unpaired post hook fail closed
+    // instead of reusing an older active-row permission.
+    p9ScoreHook_.ClearLastTileActiveRow();
+    if (activeRow >= p9ScoreHook_.ActiveRowCount()) {
+        return;
+    }
+    // Do not touch queue/CQ control for an active score tile that has no
+    // postable receipt until an earlier active tile has initialized it.
+    if (!p9PostExecutorInitialized_ && !p9ScoreHook_.HasReadyPostView()) {
+        return;
+    }
+    if (!EnsureP9PostExecutor(activeRow)) {
+        p9RuntimeActive_ = false;
         return;
     }
     p9PostExecutor_.TryRetireAtScoreBoundary();
@@ -579,7 +660,11 @@ __aicore__ inline void QLIVector<QLIT>::P9FinalizeExactTopKRow(uint32_t row)
     // or P9 GM state.  Active P9 runs before C8 submits its sparse-index DMA:
     // V owns indicesOutLocal_ after the unchanged TOPK_V_MTE3 wait, and C8
     // retains its original MTE3->V token after this method returns.
-    if (!p9RuntimeActive_) {
+    if (!p9RuntimeActive_ || row >= p9ScoreHook_.ActiveRowCount()) {
+        return;
+    }
+    if (!EnsureP9PostExecutor(row)) {
+        p9RuntimeActive_ = false;
         return;
     }
     exact_speculative_resident::C8ExactSpeculativeResidentFinalizer finalizer;
@@ -622,11 +707,13 @@ def inject_tiling_abi(tiling_header_path: Path, tiling_source_path: Path) -> Non
         "constexpr uint32_t P9_KV_OBJECT_MAP_INDEX = 13;\n"
         "constexpr uint32_t P9_KV_OBJECT_LENS_INDEX = 14;\n"
         "constexpr uint32_t P9_PERSISTENT_OBJECT_SLOTS_INDEX = 15;\n"
-        "constexpr uint32_t P9_CANONICAL_RESIDENT_LAYOUT_INDEX = 16;\n"
+        "constexpr uint32_t P9_CANONICAL_RESIDENT_SLOTS_INDEX = 16;\n"
         "constexpr uint32_t P9_CANDIDATE_SOURCE_TO_SLOT_INDEX = 17;\n"
         "constexpr uint32_t P9_CANDIDATE_SLOT_CURSOR_INDEX = 18;\n"
         "constexpr uint32_t P9_LAYER_RESIDENT_GET_CONTROL_INDEX = 19;\n"
-        "constexpr uint32_t P9_ROWS_PER_ENTRY_INDEX = 20;\n",
+        "constexpr uint32_t P9_ROWS_PER_ENTRY_INDEX = 20;\n"
+        "constexpr uint32_t P9_RESIDENT_BLOCK_TABLE_INDEX = 21;\n"
+        "constexpr uint32_t P9_ACTIVE_ROW_COUNT_INDEX = 22;\n",
         "tiling_p9_input_indices",
     )
     header = replace_exactly_once(
@@ -637,7 +724,8 @@ def inject_tiling_abi(tiling_header_path: Path, tiling_source_path: Path) -> Non
         "TILING_DATA_FIELD_DEF(uint32_t, p9RowCount)\n"
         "TILING_DATA_FIELD_DEF(uint32_t, p9PoolSize)\n"
         "TILING_DATA_FIELD_DEF(uint32_t, p9SourceCapacity)\n"
-        "TILING_DATA_FIELD_DEF(uint32_t, p9KvObjectCapacity)\n",
+        "TILING_DATA_FIELD_DEF(uint32_t, p9KvObjectCapacity)\n"
+        "TILING_DATA_FIELD_DEF(uint32_t, p9ResidentBlockCapacity)\n",
         "tiling_p9_fields",
     )
     tiling_header_path.write_text(header, encoding="utf-8")
@@ -653,7 +741,7 @@ def inject_tiling_abi(tiling_header_path: Path, tiling_source_path: Path) -> Non
     )
     tiling_anchor = "    tilingData_.set_scaleStride(tilingInfo->scaleStride);\n"
     tiling_block = tiling_anchor + r'''    // P9 dimensions are derived from graph tensor shapes, not from a hidden
-    // control tensor.  This keeps the 21-input ABI closed while preserving
+    // control tensor.  This keeps the 23-input ABI explicit while preserving
     // device-side bounds for req_pool_entries -> kv_object_map -> snapshot.
     const auto* p9SparseStorage = context_->GetOutputShape(0);
     const auto* p9RuntimeEnableStorage = context_->GetInputShape(P9_RUNTIME_ENABLE_INDEX);
@@ -665,15 +753,18 @@ def inject_tiling_abi(tiling_header_path: Path, tiling_source_path: Path) -> Non
     const auto* p9SnapshotStorage = context_->GetInputShape(P9_PERSISTENT_OBJECT_SLOTS_INDEX);
     const auto* p9SourceToSlotStorage = context_->GetInputShape(P9_CANDIDATE_SOURCE_TO_SLOT_INDEX);
     const auto* p9CursorStorage = context_->GetInputShape(P9_CANDIDATE_SLOT_CURSOR_INDEX);
-    const auto* p9LayoutStorage = context_->GetInputShape(P9_CANONICAL_RESIDENT_LAYOUT_INDEX);
+    const auto* p9CanonicalSlotsStorage = context_->GetInputShape(P9_CANONICAL_RESIDENT_SLOTS_INDEX);
     const auto* p9RowsStorage = context_->GetInputShape(P9_ROWS_PER_ENTRY_INDEX);
     const auto* p9ControlStorage = context_->GetInputShape(P9_LAYER_RESIDENT_GET_CONTROL_INDEX);
+    const auto* p9ResidentBlockTableStorage = context_->GetInputShape(P9_RESIDENT_BLOCK_TABLE_INDEX);
+    const auto* p9ActiveRowCountStorage = context_->GetInputShape(P9_ACTIVE_ROW_COUNT_INDEX);
     if (p9SparseStorage == nullptr || p9RuntimeEnableStorage == nullptr ||
         p9ThresholdStorage == nullptr || p9ThresholdValidStorage == nullptr ||
         p9ReqStorage == nullptr || p9MapStorage == nullptr || p9LensStorage == nullptr ||
         p9SnapshotStorage == nullptr || p9SourceToSlotStorage == nullptr ||
-        p9CursorStorage == nullptr || p9LayoutStorage == nullptr ||
-        p9RowsStorage == nullptr || p9ControlStorage == nullptr) {
+        p9CursorStorage == nullptr || p9CanonicalSlotsStorage == nullptr ||
+        p9RowsStorage == nullptr || p9ControlStorage == nullptr ||
+        p9ResidentBlockTableStorage == nullptr || p9ActiveRowCountStorage == nullptr) {
         return ge::GRAPH_FAILED;
     }
     const gert::Shape p9Sparse = p9SparseStorage->GetStorageShape();
@@ -686,16 +777,21 @@ def inject_tiling_abi(tiling_header_path: Path, tiling_source_path: Path) -> Non
     const gert::Shape p9Snapshot = p9SnapshotStorage->GetStorageShape();
     const gert::Shape p9SourceToSlot = p9SourceToSlotStorage->GetStorageShape();
     const gert::Shape p9Cursor = p9CursorStorage->GetStorageShape();
-    const gert::Shape p9Layout = p9LayoutStorage->GetStorageShape();
+    const gert::Shape p9CanonicalSlots = p9CanonicalSlotsStorage->GetStorageShape();
     const gert::Shape p9Rows = p9RowsStorage->GetStorageShape();
     const gert::Shape p9Control = p9ControlStorage->GetStorageShape();
+    const gert::Shape p9ResidentBlockTable = p9ResidentBlockTableStorage->GetStorageShape();
+    const gert::Shape p9ActiveRowCount = p9ActiveRowCountStorage->GetStorageShape();
     int64_t p9RowCount = 1;
     if (p9Sparse.GetDimNum() < 1 || p9Sparse.GetDim(p9Sparse.GetDimNum() - 1) != 2048 ||
         p9Map.GetDimNum() != 2 || p9Map.GetDim(0) <= 0 || p9Map.GetDim(1) <= 0 ||
         p9Snapshot.GetDimNum() != 2 || p9Snapshot.GetDim(0) != p9Map.GetDim(0) ||
-        p9Snapshot.GetDim(1) <= 0 || p9Layout.GetDimNum() != 1 || p9Layout.GetDim(0) != 4 ||
+        p9Snapshot.GetDim(1) <= 0 || p9CanonicalSlots.GetDimNum() != 2 ||
+        p9CanonicalSlots.GetDim(0) != p9Map.GetDim(0) ||
+        p9CanonicalSlots.GetDim(1) != 2048 ||
         p9Rows.GetDimNum() != 1 || p9Rows.GetDim(0) != 1 ||
-        p9Control.GetDimNum() != 1 || p9Control.GetDim(0) != 16) {
+        p9Control.GetDimNum() != 1 || p9Control.GetDim(0) != 16 ||
+        p9ActiveRowCount.GetDimNum() != 1 || p9ActiveRowCount.GetDim(0) != 1) {
         return ge::GRAPH_FAILED;
     }
     for (size_t dim = 0; dim + 1 < p9Sparse.GetDimNum(); ++dim) {
@@ -713,15 +809,21 @@ def inject_tiling_abi(tiling_header_path: Path, tiling_source_path: Path) -> Non
         p9Cursor.GetDimNum() != 1 || p9Cursor.GetDim(0) != p9RowCount ||
         p9SourceToSlot.GetDimNum() != 2 || p9SourceToSlot.GetDim(0) != p9RowCount ||
         p9SourceToSlot.GetDim(1) != p9Map.GetDim(1) ||
+        p9ResidentBlockTable.GetDimNum() != 2 ||
+        p9ResidentBlockTable.GetDim(0) != p9RowCount ||
+        p9ResidentBlockTable.GetDim(1) <= 0 ||
         p9Map.GetDim(0) > static_cast<int64_t>(UINT32_MAX) ||
         p9Map.GetDim(1) > static_cast<int64_t>(UINT32_MAX) ||
-        p9Snapshot.GetDim(1) > static_cast<int64_t>(UINT32_MAX)) {
+        p9Snapshot.GetDim(1) > static_cast<int64_t>(UINT32_MAX) ||
+        p9ResidentBlockTable.GetDim(1) > static_cast<int64_t>(UINT32_MAX)) {
         return ge::GRAPH_FAILED;
     }
     tilingData_.set_p9RowCount(static_cast<uint32_t>(p9RowCount));
     tilingData_.set_p9PoolSize(static_cast<uint32_t>(p9Map.GetDim(0)));
     tilingData_.set_p9SourceCapacity(static_cast<uint32_t>(p9Map.GetDim(1)));
     tilingData_.set_p9KvObjectCapacity(static_cast<uint32_t>(p9Snapshot.GetDim(1)));
+    tilingData_.set_p9ResidentBlockCapacity(
+        static_cast<uint32_t>(p9ResidentBlockTable.GetDim(1)));
 '''
     source = replace_exactly_once(source, tiling_anchor, tiling_block, "tiling_p9_dimensions")
     tiling_source_path.write_text(source, encoding="utf-8")
@@ -738,11 +840,13 @@ def p9_input_chain(receiver: str) -> str:
         ("kv_object_map", "ge::DT_INT32"),
         ("kv_object_lens", "ge::DT_INT32"),
         ("persistent_object_slots_snapshot", "ge::DT_INT32"),
-        ("canonical_resident_layout", "ge::DT_INT32"),
+        ("canonical_resident_slots", "ge::DT_INT32"),
         ("candidate_source_to_slot", "ge::DT_INT32"),
         ("candidate_slot_cursor", "ge::DT_INT32"),
         ("layer_resident_get_control", "ge::DT_INT64"),
         ("rows_per_entry", "ge::DT_INT32"),
+        ("resident_block_table", "ge::DT_INT32"),
+        ("active_row_count", "ge::DT_INT32"),
     )
     return "".join(
         f'        {receiver}Input("{name}")\n'
@@ -775,7 +879,7 @@ def inject_host_abi(host_def_path: Path, infer_shape_path: Path) -> None:
         "            .AutoContiguous();\n"
     )
     source = replace_exactly_once(
-        source, metadata_base, metadata_base + "        // P9 active ABI inputs 9..20.\n" + p9_input_chain("this->"),
+        source, metadata_base, metadata_base + "        // P9 active ABI inputs 9..22.\n" + p9_input_chain("this->"),
         "host_def_p9_base_inputs",
     )
     sparse_values_base = (
@@ -805,7 +909,7 @@ def inject_host_abi(host_def_path: Path, infer_shape_path: Path) -> None:
     )
     # The active P9 kernel source is arch35/Ascend950-only.  Leaving the
     # official 910B/910_93 AICore configs in the cloned OpDef would advertise
-    # the expanded 21/6 schema for an unchanged 9/2 device entrypoint.  Do
+    # the expanded 23/6 schema for an unchanged 9/2 device entrypoint.  Do
     # not make that a late runtime dispatch failure: P9 has one supported
     # target configuration, Ascend950.
     unsupported_config_block = (
@@ -823,7 +927,7 @@ def inject_host_abi(host_def_path: Path, infer_shape_path: Path) -> None:
         source,
         unsupported_config_block,
         "        // P9 is source-derived from the Ascend950 C8 path only.\n"
-        "        // Do not advertise its 21/6 ABI for legacy 9/2 kernels.\n\n",
+        "        // Do not advertise its 23/6 ABI for legacy 9/2 kernels.\n\n",
         "host_def_remove_unsupported_aicore_configs",
     )
     host_def_path.write_text(source, encoding="utf-8")
@@ -1020,11 +1124,13 @@ def validate_output(staged_root: Path, topk_hash: str) -> None:
         ("kv_object_map", "int32"),
         ("kv_object_lens", "int32"),
         ("persistent_object_slots_snapshot", "int32"),
-        ("canonical_resident_layout", "int32"),
+        ("canonical_resident_slots", "int32"),
         ("candidate_source_to_slot", "int32"),
         ("candidate_slot_cursor", "int32"),
         ("layer_resident_get_control", "int64"),
         ("rows_per_entry", "int32"),
+        ("resident_block_table", "int32"),
+        ("active_row_count", "int32"),
     )
     expected_outputs = (
         ("sparse_indices", "int32"),
@@ -1047,13 +1153,15 @@ def validate_output(staged_root: Path, topk_hash: str) -> None:
             "staged_ops_json_abi_invalid:"
             f"inputs={actual_inputs}:outputs={actual_outputs}"
         )
+    if len(actual_inputs) != 23 or len(actual_outputs) != 6:
+        fail("staged_ops_json_23_6_abi_invalid")
     if "resident_packed_output" in (staged_root / OPS_RELATIVE).read_text(
         encoding="utf-8"
     ):
         fail("staged_ops_json_redundant_resident_output")
 
     # Mechanical generated-source checks.  The Python applier is the only
-    # safe place to catch a plausible-looking 21/6 JSON paired with a C++
+    # safe place to catch a plausible-looking 23/6 JSON paired with a C++
     # receiver typo or an early P9 scratch borrow, before a remote CANN build
     # consumes tens of minutes.
     wrapper = checked_file(
@@ -1085,7 +1193,8 @@ def validate_output(staged_root: Path, topk_hash: str) -> None:
         fail("staged_host_def_advertises_legacy_9_2_kernel")
     for token in (
         "runtimeEnable", "candidateSourceToSlotRef", "candidateSlotCursorRef",
-        "attentionSlots", "terminalPostStats",
+        "attentionSlots", "terminalPostStats", "canonicalResidentSlots",
+        "residentBlockTable", "activeRowCount",
     ):
         if token not in wrapper:
             fail(f"staged_wrapper_p9_argument_missing:value={token}")
@@ -1102,13 +1211,26 @@ def validate_output(staged_root: Path, topk_hash: str) -> None:
     scratch_borrow = p9_runtime.find("outInvalidLocal_.GetPhyAddr()")
     if runtime_gate < 0 or scratch_borrow < 0 or runtime_gate >= scratch_borrow:
         fail("staged_runtime_enable_not_before_scratch_borrow")
+    for forbidden in ("canonicalResidentLayout", "CanonicalResidentLayout",
+                      "IsCanonicalLayout"):
+        if forbidden in p9_runtime:
+            fail(f"staged_runtime_legacy_affine_layout:value={forbidden}")
+    active_gate = p9_runtime.find("activeRowCount == nullptr")
+    if active_gate < 0 or active_gate <= runtime_gate:
+        fail("staged_runtime_active_row_gate_missing_or_before_enable")
     for token in (
         "P9_KV_OBJECT_LENS_INDEX",
+        "P9_CANONICAL_RESIDENT_SLOTS_INDEX",
+        "P9_RESIDENT_BLOCK_TABLE_INDEX",
+        "P9_ACTIVE_ROW_COUNT_INDEX",
         "p9RuntimeEnableStorage == nullptr",
         "p9ThresholdStorage == nullptr",
         "p9ThresholdValidStorage == nullptr",
         "p9LensStorage == nullptr",
         "p9RuntimeEnable.GetDim(0) != 1",
+        "p9CanonicalSlots.GetDim(1) != 2048",
+        "p9ResidentBlockTable.GetDim(0) != p9RowCount",
+        "p9ActiveRowCount.GetDim(0) != 1",
     ):
         if token not in tiling:
             fail(f"staged_tiling_p9_validation_missing:value={token}")
@@ -1146,7 +1268,7 @@ def main(argv: Iterable[str]) -> int:
     copy_overlay_input(overlay_root, staged_root)
     # Keep this ordering atomic: every signature/host/tiling/vector change is
     # made before the two active score/Top-K seams are inserted.  A missing
-    # anchor therefore aborts staging rather than producing a 21/6 JSON paired
+    # anchor therefore aborts staging rather than producing a 23/6 JSON paired
     # with an old 9/2 kernel path.
     inject_kernel_wrapper_abi(staged_root / KERNEL_WRAPPER_RELATIVE)
     inject_preload_abi(staged_root / PRELOAD_RELATIVE)

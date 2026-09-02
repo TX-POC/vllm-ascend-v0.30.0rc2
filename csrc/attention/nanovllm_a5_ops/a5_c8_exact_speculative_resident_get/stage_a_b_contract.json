@@ -1,9 +1,9 @@
 {
   "format": 2,
   "target": "A5C8ExactSpeculativeResidentGet",
-  "abi_status": "active atomic ABI: 21 inputs and 6 outputs; the official C8 inputs 0..8 and outputs 0..1 keep their original order and types, while P9 appends one graph-visible direct-resident contract without a redundant resident-payload pointer",
+  "abi_status": "active atomic ABI: 23 inputs and 6 outputs; the official C8 inputs 0..8 and outputs 0..1 keep their original order and types, while P9 appends graph-visible fixed-slot, execution-row physical mapping, and active-row controls without a redundant resident-payload pointer",
   "operator_abi": {
-    "input_count": 21,
+    "input_count": 23,
     "output_count": 6,
     "inputs": [
       {"index": 0, "name": "query", "dtype": "int8", "role": "official_c8"},
@@ -22,11 +22,13 @@
       {"index": 13, "name": "kv_object_map", "dtype": "int32", "role": "p9_mapping"},
       {"index": 14, "name": "kv_object_lens", "dtype": "int32", "role": "p9_mapping"},
       {"index": 15, "name": "persistent_object_slots_snapshot", "dtype": "int32", "role": "p9_mapping"},
-      {"index": 16, "name": "canonical_resident_layout", "dtype": "int32", "role": "p9_layout"},
+      {"index": 16, "name": "canonical_resident_slots", "dtype": "int32", "role": "p9_fixed_logical_slots"},
       {"index": 17, "name": "candidate_source_to_slot", "dtype": "int32", "role": "p9_mutable_alias_input"},
       {"index": 18, "name": "candidate_slot_cursor", "dtype": "int32", "role": "p9_mutable_alias_input"},
       {"index": 19, "name": "layer_resident_get_control", "dtype": "int64", "role": "p9_direct_hccp_control"},
-      {"index": 20, "name": "rows_per_entry", "dtype": "int32", "role": "p9_direct_hccp_control"}
+      {"index": 20, "name": "rows_per_entry", "dtype": "int32", "role": "p9_direct_hccp_control"},
+      {"index": 21, "name": "resident_block_table", "dtype": "int32", "role": "p9_execution_row_physical_map"},
+      {"index": 22, "name": "active_row_count", "dtype": "int32", "role": "p9_graph_padding_gate"}
     ],
     "outputs": [
       {"index": 0, "name": "sparse_indices", "dtype": "int32", "role": "official_c8"},
@@ -53,23 +55,28 @@
     "worker_assignment": "any C8 worker may dynamically acquire an invocation-local queue",
     "fixed_get_core_partition": false,
     "persistent_slot_map_mutation_during_score_scan": false,
-    "canonical_resident_layout": {
-      "input": "canonical_resident_layout",
+    "canonical_resident_slots": {
+      "input": "canonical_resident_slots",
       "dtype": "int32",
-      "shape": "[first_slot, slots_per_row, row_stride, row_count]",
+      "shape": "[pool_size, 2048]",
       "slot_count": 2048,
-      "meaning": "caller-reserved normal-resident row-major ranges; all four words are nonnegative int32, slots_per_row must be 2048, and row_count is widened to uint32 only after host validation"
+      "meaning": "caller-reserved stable logical QSFA slots; execution row r resolves pool p=req_pool_entries[r], while physical Direct-HCCP output is resident_block_table[r, logical_slot/128]*128+(logical_slot%128)"
+    },
+    "active_row_gate": {
+      "input": "active_row_count",
+      "shape": "[1]",
+      "meaning": "only rows [0, active_row_count) may access P9 pool/table/control state; graph padding rows may alias a pool row but perform no P9 score, post, finalizer, or output action"
     }
   },
   "candidate_seed": {
     "dtype": "int32",
-    "words": ["row", "source", "kv_object", "resident_slot"],
-    "slot_assignment": "one candidate receives one distinct fixed resident slot before PostOnly",
+    "words": ["row", "source", "kv_object", "resident_slot_ordinal"],
+    "slot_assignment": "one candidate receives one distinct fixed-table ordinal before PostOnly; descriptor physical output is resolved only from the execution-row resident_block_table",
     "maps": {
       "candidate_source_to_slot": "int32[R, S], initialized to -1; written only after the fully published descriptor is accepted by PostOnly",
       "candidate_slot_cursor": "int32[R], invocation-local monotonic admission cursor; it only prevents duplicate initial posts and is not used for cross-invocation reuse"
     },
-    "cross_wave_slot_invariant": "CandidateCompact never assigns one resident_slot to two initial waves; Stage-B drains every initial wave before it may reuse a non-winner entry in the same invocation for exact recall"
+    "cross_wave_slot_invariant": "CandidateCompact never assigns one resident_slot_ordinal to two initial waves; Stage-B drains every initial wave before it may reuse a non-winner entry in the same invocation for exact recall; admission verifies the complete fixed logical table is disjoint from persistent object slots before any PostOnly"
   },
   "stage_a": {
     "name": "score_scan_candidate_post",
@@ -82,11 +89,13 @@
       "kv_object_map",
       "kv_object_lens",
       "persistent_object_slots_snapshot",
-      "canonical_resident_layout",
+      "canonical_resident_slots",
       "candidate_source_to_slot",
       "candidate_slot_cursor",
       "layer_resident_get_control",
-      "rows_per_entry"
+      "rows_per_entry",
+      "resident_block_table",
+      "active_row_count"
     ],
     "outputs": [
       "official_sparse_indices",
@@ -107,9 +116,11 @@
       "official_sparse_indices",
       "candidate_source_to_slot",
       "persistent_object_slots_snapshot",
-      "canonical_resident_layout",
+      "canonical_resident_slots",
       "layer_resident_get_control",
-      "rows_per_entry"
+      "rows_per_entry",
+      "resident_block_table",
+      "active_row_count"
     ],
     "outputs": ["attention_slots", "terminal_post_stats"],
     "winner_resolution_order": [

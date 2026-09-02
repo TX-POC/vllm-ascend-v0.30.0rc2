@@ -72,7 +72,10 @@ enum CandidateSeedWord : uint32_t {
     kCandidateRow = 0U,
     kCandidateSource = 1U,
     kCandidateKvObject = 2U,
-    kCandidateResidentSlot = 3U,
+    // This is a per-pool canonical-slot *ordinal*, never an affine physical
+    // row.  The Direct-HCCP descriptor and final attention_slots resolve it
+    // through canonical_resident_slots[req_pool_entries[row], ordinal].
+    kCandidateResidentSlotOrdinal = 3U,
 };
 
 // A candidate owns one supplied normal-resident destination until the
@@ -82,23 +85,20 @@ struct CandidateSeed {
     int32_t row;
     int32_t source;
     int32_t kvObject;
-    int32_t residentSlot;
+    int32_t residentSlotOrdinal;
 };
 
-struct CanonicalResidentRange {
-    int32_t firstSlot;
-    int32_t slotCount;
-};
-
-// One logical C8 output row owns one fixed canonical Top-2048 interval.  The
-// intervals may live inside a larger layer allocation, hence rowStride can be
-// larger than 2048.  CandidateCompact assigns only a row's own interval; it
-// never partitions that interval by AIV, Direct-HCCP queue, or worker id.
-struct CanonicalResidentLayout {
-    int32_t firstSlot;
-    int32_t slotsPerRow;
-    int32_t rowStride;
-    uint32_t rowCount;
+// `canonical_resident_slots` is a graph-visible int32[P, 2048] table. P is
+// the resident-token-pool row count, not the current execution row count:
+// execution row r must first resolve p = req_pool_entries[r].  Each table
+// entry is a stable logical QSFA slot. The P9-only resident_block_table input
+// is execution-row indexed and converts it to the packed-cache physical HCCP
+// output row. This deliberately replaces the earlier affine [first_slot,
+// slots_per_row, stride, rows] assumption: request rows may be a non-identity
+// permutation of pool rows during a captured forward.
+struct CanonicalResidentSlotTable {
+    __gm__ int32_t* slots;
+    uint32_t poolCount;
 };
 
 enum class CompletionPhase : uint32_t {
@@ -109,42 +109,22 @@ enum class CompletionPhase : uint32_t {
     kComplete = 4U,
 };
 
-constexpr bool IsCanonicalRange(const CanonicalResidentRange range)
+__aicore__ inline bool IsCanonicalResidentSlotTableValid(
+    const CanonicalResidentSlotTable table)
 {
-    return range.firstSlot >= 0 &&
-           range.slotCount == static_cast<int32_t>(kCanonicalResidentSlotCount);
+    return table.slots != nullptr && table.poolCount != 0U;
 }
 
-constexpr bool IsSlotInRange(const CanonicalResidentRange range,
-                             const int32_t residentSlot)
+__aicore__ inline int32_t LoadCanonicalResidentLogicalSlot(
+    const CanonicalResidentSlotTable table, const uint32_t pool_row,
+    const uint32_t ordinal)
 {
-    return IsCanonicalRange(range) && residentSlot >= range.firstSlot &&
-           residentSlot < range.firstSlot + range.slotCount;
-}
-
-__aicore__ constexpr bool IsCanonicalLayout(const CanonicalResidentLayout layout)
-{
-    return layout.firstSlot >= 0 &&
-           layout.slotsPerRow ==
-               static_cast<int32_t>(kCanonicalResidentSlotCount) &&
-           layout.rowStride >= layout.slotsPerRow && layout.rowCount != 0U;
-}
-
-__aicore__ constexpr int64_t CanonicalRowFirstSlot(
-    const CanonicalResidentLayout layout, const uint32_t row)
-{
-    return static_cast<int64_t>(layout.firstSlot) +
-           static_cast<int64_t>(row) * layout.rowStride;
-}
-
-__aicore__ constexpr bool IsSlotInCanonicalRow(
-    const CanonicalResidentLayout layout, const uint32_t row,
-    const int32_t residentSlot)
-{
-    const int64_t first = CanonicalRowFirstSlot(layout, row);
-    return IsCanonicalLayout(layout) && row < layout.rowCount &&
-           static_cast<int64_t>(residentSlot) >= first &&
-           static_cast<int64_t>(residentSlot) < first + layout.slotsPerRow;
+    if (!IsCanonicalResidentSlotTableValid(table) ||
+        pool_row >= table.poolCount || ordinal >= kCanonicalResidentSlotCount) {
+        return -1;
+    }
+    return table.slots[static_cast<uint64_t>(pool_row) *
+                           kCanonicalResidentSlotCount + ordinal];
 }
 
 static_assert(sizeof(CandidateSeed) == kCandidateSeedWords * sizeof(int32_t),

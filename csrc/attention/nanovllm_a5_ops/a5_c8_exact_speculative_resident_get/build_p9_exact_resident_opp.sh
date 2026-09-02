@@ -219,7 +219,7 @@ staged_kvaf_root=${STAGED_KVAF_ROOT}
 target_soc=${TARGET_SOC}
 score_seam=active
 stage_b_finalizer=active
-p9_abi=official9_plus12_inputs_6_outputs
+p9_abi=official9_plus14_inputs_6_outputs
 p9_transport_headers=active_score_seam_stage_b_finalizer
 cann_3rd_lib_path=${CANN_3RD_LIB_PATH:-<stage-only>}
 EOF
@@ -285,9 +285,10 @@ expected_inputs = [
     "actual_seq_lengths_query", "actual_seq_lengths_key", "block_table", "metadata",
     "runtime_enable", "resident_threshold", "resident_threshold_valid",
     "req_pool_entries", "kv_object_map", "kv_object_lens",
-    "persistent_object_slots_snapshot", "canonical_resident_layout",
+    "persistent_object_slots_snapshot", "canonical_resident_slots",
     "candidate_source_to_slot", "candidate_slot_cursor",
-    "layer_resident_get_control", "rows_per_entry",
+    "layer_resident_get_control", "rows_per_entry", "resident_block_table",
+    "active_row_count",
 ]
 expected_outputs = [
     "sparse_indices", "sparse_values", "attention_slots", "terminal_post_stats",
@@ -300,8 +301,9 @@ if outputs != expected_outputs:
 types = {item.get("name"): tuple(item.get("type", [])) for item in op["input_desc"]}
 for name in ("runtime_enable", "resident_threshold", "resident_threshold_valid",
              "req_pool_entries", "kv_object_map", "kv_object_lens",
-             "persistent_object_slots_snapshot", "canonical_resident_layout",
-             "candidate_source_to_slot", "candidate_slot_cursor", "rows_per_entry"):
+             "persistent_object_slots_snapshot", "canonical_resident_slots",
+             "candidate_source_to_slot", "candidate_slot_cursor", "rows_per_entry",
+             "resident_block_table", "active_row_count"):
     if types.get(name) != ("int32",):
         raise SystemExit("input_type_mismatch:" + name)
 if types.get("layer_resident_get_control") != ("int64",):
@@ -312,7 +314,7 @@ if attrs.get("layout_query") != "BSND" or attrs.get("layout_key") != "PA_BSND":
         "layout_default_mismatch:query=%s:key=%s" %
         (attrs.get("layout_query"), attrs.get("layout_key"))
     )
-print("P9_ACTIVE_ABI_PASS inputs=21 outputs=6 control=int64_raw layout=BSND/PA_BSND rows_per_entry=int32")
+print("P9_ACTIVE_ABI_PASS inputs=23 outputs=6 control=int64_raw logical_slots=P2048 resident_block_table=RB active_row_count=int32")
 PY
 }
 
