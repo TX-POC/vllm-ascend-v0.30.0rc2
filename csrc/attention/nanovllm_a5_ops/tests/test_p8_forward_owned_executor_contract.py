@@ -159,6 +159,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "at_npu::native::OpCommand::RunOpApi(",
             "stream(false)",
             "aclrtSynchronizeStream",
+            "pybind11::gil_scoped_release",
         ):
             self.assertNotIn(forbidden, direct_macro)
         self.assertIn("NPUCachingAllocator::recordStream", self.op_api_common)

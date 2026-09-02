@@ -31,10 +31,6 @@
 #include <c10/util/Exception.h>
 #include <torch/extension.h>
 
-#ifndef BUILD_LIBTORCH
-#include <pybind11/pybind11.h>
-#endif
-
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUFunctions.h"
@@ -975,19 +971,19 @@ inline void RequireDrainedCallerThreadAsyncOpApiContract(
   }
 }
 
-// OpCommandImpl would release the Python GIL before invoking an inline ACLNN
-// host handler, but it is not a public torch_npu extension header.  Keep this
-// small equivalent local: it applies only while the caller owns the GIL, never
-// waits for the NPU stream, and lets RAII reacquire the GIL before an exception
-// escapes back through the bridge.
+// Keep the call in the Python bridge's caller thread.  Unlike generic
+// OpCommand, P8 deliberately retains the GIL over this short host-only region:
+// `stream()` has just drained prior producer submissions, and retaining the
+// GIL prevents another Python submitter from inserting new work on the same
+// stream between that drain and this raw ACLNN launch.  This is not a device
+// synchronization; the launch still returns as soon as it is enqueued.
+//
+// P8's graph contract has one Python forward submitter.  Supporting arbitrary
+// concurrent submitters will use a dedicated P8 stream plus explicit event
+// edges, rather than pretending a bridge-local mutex can serialize foreign
+// torch_npu queue producers.
 template <typename Function>
 inline int RunDrainedCallerThreadHost(Function&& function) {
-#ifndef BUILD_LIBTORCH
-  if (PyGILState_Check() != 0) {
-    pybind11::gil_scoped_release release;
-    return std::forward<Function>(function)();
-  }
-#endif
   return std::forward<Function>(function)();
 }
 
@@ -1871,9 +1867,9 @@ inline void LogOrderedHostDso(
       }                                                                         \
     };                                                                          \
     /* Do not delegate `inline_acl_call` to RunOpApi: doing so would enqueue  \
-     * this bridge closure in torch_npu's private ReleaseQueue.  We reproduce \
-     * only its public-facing GIL-release property around the synchronous     \
-     * host handler; the ACL launch above is still asynchronous on the NPU. */\
+     * this bridge closure in torch_npu's private ReleaseQueue.  This direct  \
+     * call retains the caller's GIL only through the host handler; the ACL   \
+     * launch above remains asynchronous on the NPU. */                         \
     LogOpApiLifecycle(#aclnn_api, "caller_thread_direct_dispatch_begin");    \
     const int inline_direct_status =                                           \
         RunDrainedCallerThreadHost(std::move(inline_acl_call));                \
