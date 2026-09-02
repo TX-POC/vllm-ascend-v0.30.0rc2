@@ -374,16 +374,19 @@ fi
 P8_STAGE_B_VENDOR="$P8_STAGE_B_OPP/vendors/customize"
 P8_STAGE_B_GENERATED_HOST="$P8_STAGE_B_BUILD/custom_op/op_host/a5_p8_forward_owned_executor.cpp"
 P8_STAGE_B_INSTALLED_HOST="$P8_STAGE_B_VENDOR/op_impl/ai_core/tbe/customize_impl/dynamic/a5_p8_forward_owned_executor.cpp"
-P8_STAGE_B_TILING_LIB="$P8_STAGE_B_VENDOR/op_impl/ai_core/tbe/op_tiling/liboptiling.so"
+# `liboptiling.so` is the framework-facing shim.  The Stage-B host tiler
+# compiled by this package lives in the vendor runtime library below.  Checking
+# the shim for our source literal would reject a correct package every time.
+P8_STAGE_B_TILING_RUNTIME_LIB="$P8_STAGE_B_VENDOR/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so"
 P8_STAGE_B_ACLNN_HEADER="$P8_STAGE_B_VENDOR/op_api/include/aclnn_a5_p8_forward_owned_executor.h"
 if [[ ! -r "$P8_STAGE_B_GENERATED_HOST" ||
       ! -r "$P8_STAGE_B_INSTALLED_HOST" ||
-      ! -s "$P8_STAGE_B_TILING_LIB" ||
+      ! -s "$P8_STAGE_B_TILING_RUNTIME_LIB" ||
       ! -r "$P8_STAGE_B_ACLNN_HEADER" ]] ||
    ! cmp -s "$P8_OPS_ROOT/a5_p8_forward_owned_executor/op_host/a5_p8_forward_owned_executor.cpp" \
            "$P8_STAGE_B_GENERATED_HOST" ||
    ! cmp -s "$P8_STAGE_B_GENERATED_HOST" "$P8_STAGE_B_INSTALLED_HOST" ||
-   ! grep -aFq 'P8_TILING_DIAG_REVISION=p8_tiling_diag_v1' "$P8_STAGE_B_TILING_LIB"; then
+   ! grep -aFq 'P8_TILING_DIAG_REVISION=p8_tiling_diag_v1' "$P8_STAGE_B_TILING_RUNTIME_LIB"; then
     runner_fail "stage_b_tiling_artifact_provenance_failed"
     exit 1
 fi
@@ -396,8 +399,8 @@ if [[ "$P8_STAGE_B_ACLNN_TENSOR_REFS" != "28" ]]; then
     runner_fail "stage_b_aclnn_ref_abi_invalid:${P8_STAGE_B_ACLNN_TENSOR_REFS}"
     exit 1
 fi
-printf 'P8_STAGE_B_TILING_ARTIFACT marker=1 source_overlay=1 vendor_overlay=1 aclnn_tensor_refs=%s header=%s tiling_lib=%s\n' \
-    "$P8_STAGE_B_ACLNN_TENSOR_REFS" "$P8_STAGE_B_ACLNN_HEADER" "$P8_STAGE_B_TILING_LIB"
+printf 'P8_STAGE_B_TILING_ARTIFACT marker=1 source_overlay=1 vendor_overlay=1 aclnn_tensor_refs=%s header=%s tiling_runtime_lib=%s\n' \
+    "$P8_STAGE_B_ACLNN_TENSOR_REFS" "$P8_STAGE_B_ACLNN_HEADER" "$P8_STAGE_B_TILING_RUNTIME_LIB"
 
 export USE_NINJA=0
 export NANOVLLM_A5_SCORE_RECEIPT_EXECUTOR_BUILD_JOBS="$P8_BUILD_JOBS"

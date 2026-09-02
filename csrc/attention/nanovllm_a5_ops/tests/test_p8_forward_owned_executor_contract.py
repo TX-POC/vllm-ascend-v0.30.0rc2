@@ -709,7 +709,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "stage_b_aclnn_ref_abi_invalid",
             "P8_TILING_DIAG_REVISION=p8_tiling_diag_v1",
             "P8_STAGE_B_ACLNN_TENSOR_REFS",
-            "liboptiling.so",
+            "libcust_opmaster_rt2.0.so",
             "aclnn_a5_p8_forward_owned_executor.h",
         ):
             self.assertIn(token, self.runner)
