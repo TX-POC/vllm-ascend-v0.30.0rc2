@@ -625,7 +625,7 @@ TORCH_LIBRARY(a5_c8_exact_speculative_resident_get, m)
         "Tensor(b!) candidate_slot_cursor, "
         "Tensor layer_resident_get_control, Tensor rows_per_entry, "
         "int query_quant_mode=0, int key_quant_mode=0, "
-        "str layout_query='TND', str layout_key='PA_BSND', "
+        "str layout_query='BSND', str layout_key='PA_BSND', "
         "int sparse_count=2048, int sparse_mode=3, "
         "int pre_tokens=9223372036854775807, "
         "int next_tokens=9223372036854775807, int cmp_ratio=1, "

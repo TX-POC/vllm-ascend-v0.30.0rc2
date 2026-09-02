@@ -108,6 +108,15 @@ class A5C8ExactSpeculativeResidentBridgeContractTest(unittest.TestCase):
         ):
             self.assertIn(token, BRIDGE)
 
+    def test_bridge_and_generated_opp_share_runnable_layout_defaults(self) -> None:
+        """Default dispatch must not select the invalid dense-key layout."""
+        self.assertIn(
+            "str layout_query='BSND', str layout_key='PA_BSND'", BRIDGE
+        )
+        attrs = {entry["name"]: entry["default_value"] for entry in OPS[0]["attr"]}
+        self.assertEqual(attrs["layout_query"], "BSND")
+        self.assertEqual(attrs["layout_key"], "PA_BSND")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

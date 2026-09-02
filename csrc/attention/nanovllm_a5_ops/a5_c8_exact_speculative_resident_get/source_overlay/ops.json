@@ -37,7 +37,7 @@
       {"name": "query_quant_mode", "type": "int", "default_value": "0"},
       {"name": "key_quant_mode", "type": "int", "default_value": "0"},
       {"name": "layout_query", "type": "str", "default_value": "BSND"},
-      {"name": "layout_key", "type": "str", "default_value": "BSND"},
+      {"name": "layout_key", "type": "str", "default_value": "PA_BSND"},
       {"name": "sparse_count", "type": "int", "default_value": "2048"},
       {"name": "sparse_mode", "type": "int", "default_value": "3"},
       {"name": "pre_tokens", "type": "int", "default_value": "9223372036854775807"},
