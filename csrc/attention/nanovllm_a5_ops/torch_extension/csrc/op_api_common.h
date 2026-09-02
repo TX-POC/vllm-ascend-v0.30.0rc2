@@ -271,17 +271,31 @@ inline aclTensor *ConvertTensor(
                  static_cast<size_t>(tensor.dim()), tensor.data_ptr());
     std::fflush(stderr);
   }
-  std::vector<int64_t> storage_dims(
-      tensor.sizes().begin(), tensor.sizes().end());
+  // `aclTensor` keeps the tensor description until GetWorkspaceSize has
+  // consumed it.  The previous implementation constructed `storage_dims` as
+  // a local vector and passed its data pointer to aclCreateTensor.  That
+  // pointer was already invalid by the time the deferred task-queue consumer
+  // called GetWorkspaceSize.  It can surface as a late, input-specific
+  // `storage_rank=<null>` tiler failure (P8's rows_per_entry was the first
+  // reproducible instance), even though the source at::Tensor is valid.
+  //
+  // This launcher intentionally models ND storage as the logical tensor
+  // shape.  `sizes` is backed by TensorImpl, and the value-owned Tensor
+  // keepalive remains live through the deferred WorkspaceSize/launch call.
+  // Reuse that stable storage instead of manufacturing a short-lived shape
+  // buffer.  Do not replace this with `tensor.storage()` metadata: that would
+  // reintroduce the private NPUStorageImpl dependency this adapter avoids.
+  const auto sizes = tensor.sizes();
+  const auto strides = tensor.strides();
   return acl_tensor_api.create(
-      tensor.sizes().data(),
-      static_cast<uint64_t>(tensor.dim()),
+      sizes.data(),
+      static_cast<uint64_t>(sizes.size()),
       acl_dtype,
-      tensor.strides().data(),
+      strides.data(),
       0,
       ACL_FORMAT_ND,
-      storage_dims.data(),
-      static_cast<uint64_t>(storage_dims.size()),
+      sizes.data(),
+      static_cast<uint64_t>(sizes.size()),
       tensor.data_ptr());
 }
 

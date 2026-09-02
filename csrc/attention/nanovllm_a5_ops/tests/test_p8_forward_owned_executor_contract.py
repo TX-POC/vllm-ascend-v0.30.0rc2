@@ -165,6 +165,27 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.runner)
 
+    def test_acl_tensor_storage_shape_is_owned_by_the_live_aten_tensor(self) -> None:
+        """A deferred ACLNN descriptor must not retain a local shape buffer.
+
+        P8's input 26 (`rows_per_entry`) is a real int32[1] GM tensor.  The
+        bridge validates it correctly before enqueue, so a later tiler report
+        of `storage_rank=<null>` identifies descriptor construction/lifetime,
+        not a reason to weaken the P8 ABI.  The launcher uses the TensorImpl-
+        backed sizes pointer for both view and ND storage shape; the
+        tensor-owned deferred closure keeps that Tensor alive through
+        GetWorkspaceSize and launch.
+        """
+        convert_tensor = self._function_body(
+            self.op_api_common,
+            "inline aclTensor *ConvertTensor(",
+        )
+        self.assertIn("const auto sizes = tensor.sizes();", convert_tensor)
+        self.assertIn("const auto strides = tensor.strides();", convert_tensor)
+        self.assertNotIn("std::vector<int64_t> storage_dims", convert_tensor)
+        self.assertIn("sizes.data(),\n      static_cast<uint64_t>(sizes.size()),", convert_tensor)
+        self.assertIn("strides.data(),", convert_tensor)
+
     def test_runner_can_cut_prepost_before_real_post_without_rebuild(self) -> None:
         """One fresh assembly may isolate then exercise the valid POST path."""
         for token in (
