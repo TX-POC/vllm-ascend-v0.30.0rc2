@@ -1841,14 +1841,15 @@ inline void LogOrderedHostDso(
           inline_converted_released = true;                                    \
           LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");          \
           /* TQ0 dispatches on this caller thread.  It does not use          \
-           * RunOpApi or torch_npu's delayed ReleaseQueue, so the deferred    \
-           * bridge's recordStream-and-clear workaround does not apply here.  \
-           * P8 graph inputs and returned aliases own the ATen values through \
-           * this graph submission.  Recording every input on the same stream \
-           * adds a second allocator-retirement edge and can corrupt the      \
-           * direct-launch synchronize path.  Keep this direct path free of   \
-           * both ReleaseQueue-only operations. */                             \
-          LogOpApiLifecycle(#aclnn_api, "caller_thread_tensor_lifetime_graph_owned"); \
+           * RunOpApi or torch_npu's delayed ReleaseQueue, so it must not     \
+           * reuse the deferred bridge's allocator recordStream workaround.   \
+           * That extra same-stream retirement edge can corrupt the           \
+           * direct-launch synchronize path.  The graph owns P8 input/output  \
+           * tensors; drop only this local duplicate tuple before TLS teardown \
+           * so its TensorImpl destructors cannot run after HugeMem/PTA is     \
+           * dismantled. */                                                    \
+          ClearTensorTuple(inline_args);                                       \
+          LogOpApiLifecycle(#aclnn_api, "caller_thread_tensor_captures_released"); \
           inline_cleanup_host_tls();                                            \
           return inline_launch_status;                                         \
         } catch (...) {                                                         \

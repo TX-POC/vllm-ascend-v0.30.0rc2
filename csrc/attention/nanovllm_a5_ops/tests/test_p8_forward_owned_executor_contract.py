@@ -202,17 +202,19 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "RunOpApi",
         ):
             self.assertNotIn(forbidden, direct_code)
-        # recordStream + ClearTensorTuple is a ReleaseQueue-destructor
-        # workaround for deferred launchers.  TQ0 runs on the caller thread
-        # and has no ReleaseQueue, so it must not add a second allocator
-        # retirement edge to the same stream.
+        # TQ0 runs on the caller thread and has no ReleaseQueue, so it must
+        # not add the deferred launcher's allocator recordStream edge.  It
+        # still drops its local Tensor copies before host TLS teardown.
         self.assertIn("NPUCachingAllocator::recordStream", self.op_api_common)
         self.assertNotIn("RecordTensorTupleOnNpuStream(", direct_macro)
-        self.assertNotIn("ClearTensorTuple(inline_args)", direct_macro)
-        self.assertIn("caller_thread_tensor_lifetime_graph_owned", direct_macro)
+        self.assertIn("ClearTensorTuple(inline_args)", direct_macro)
+        self.assertIn("caller_thread_tensor_captures_released", direct_macro)
         release = direct_macro.index("ReleaseTuple(inline_converted)")
-        cleanup = direct_macro.index("inline_cleanup_host_tls()", release)
+        clear = direct_macro.index("ClearTensorTuple(inline_args)", release)
+        cleanup = direct_macro.index("inline_cleanup_host_tls()", clear)
         self.assertLess(release, cleanup)
+        self.assertLess(release, clear)
+        self.assertLess(clear, cleanup)
         self.assertNotIn("auto keepalive = std::make_tuple", self.bridge)
         self.assertNotIn("auto keepalive = std::make_tuple", self.stage_a_bridge)
         stage_a_host = (
