@@ -8,6 +8,9 @@
 // trailing ACLNN outputs are caller-owned aliases; the public Torch result
 // deliberately contains only the four non-alias outputs.
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <tuple>
@@ -46,6 +49,183 @@ struct P9ShapeInfo {
     int64_t pool_count = 0;
     int64_t object_count = 0;
 };
+
+// P9 has one caller-thread, current-stream launch boundary.  This is not a
+// generic bridge mode: P9 deliberately keeps its ACLNN host objects out of
+// torch_npu's deferred host queue, because the device-side operator owns the
+// CandidateSeed -> PostOnly -> CQ pipeline and the caller only needs to
+// enqueue the one atomic graph node.  The device launch remains asynchronous.
+//
+// The raw stream is safe only with task queue disabled before torch_npu is
+// imported.  P9 does not bind a resource quota or a fixed AIV partition here;
+// it preserves the caller's graph-stream ordering and lets the kernel's
+// dynamic device scheduler own transport resources.
+void RequireP9CallerThreadDirectAsyncContract()
+{
+    const char* task_queue = std::getenv("TASK_QUEUE_ENABLE");
+    const char* launch_blocking = std::getenv("ASCEND_LAUNCH_BLOCKING");
+    TORCH_CHECK(
+        task_queue != nullptr && std::strcmp(task_queue, "0") == 0 &&
+            (launch_blocking == nullptr ||
+             std::strcmp(launch_blocking, "0") == 0),
+        "P9 direct asynchronous ACLNN launch requires TASK_QUEUE_ENABLE=0 "
+        "and ASCEND_LAUNCH_BLOCKING=0 before torch_npu import. "
+        "TASK_QUEUE_ENABLE=",
+        task_queue == nullptr ? "<unset>" : task_queue,
+        " ASCEND_LAUNCH_BLOCKING=",
+        launch_blocking == nullptr ? "<unset>" : launch_blocking);
+    std::fprintf(stderr,
+                 "P9_DIRECT_ASYNC_HOST_GATE task_queue_enable=0 "
+                 "launch_blocking=0 host_lifecycle=caller_thread "
+                 "queue_order=caller_submission_current_stream "
+                 "device_launch=async\\n");
+    std::fflush(stderr);
+}
+
+void LogP9DirectAsyncStage(const char* api, const char* stage,
+                           uint64_t workspace_bytes = 0)
+{
+    if (!nanovllm_a5_opapi::OpApiDebugEnabled()) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "P9_DIRECT_ASYNC_STAGE api=%s stage=%s workspace_bytes=%llu\\n",
+                 api, stage,
+                 static_cast<unsigned long long>(workspace_bytes));
+    std::fflush(stderr);
+}
+
+// Invoke one generated ACLNN operation directly on the caller's current raw
+// stream.  In contrast to the legacy ordered bridge, there is no deferred
+// host closure: descriptor/TLS lifetime finishes on this same caller thread.
+//
+// Non-zero ACLNN workspace is supported.  It is allocated on exactly the
+// current stream used by the direct launch, so the NPU allocator's creating-
+// stream lifetime is already sufficient.  Do not add recordStream here: the
+// known-safe direct path deliberately avoids an extra same-stream retirement
+// edge, which can recreate the post-submit lifetime failure this route avoids.
+// Inputs/outputs are graph-owned or returned from this bridge; local duplicate
+// handles are dropped only after host descriptors are released.
+template <typename TensorKeepaliveTuple, typename... Args>
+void LaunchP9CallerThreadDirectAsync(
+    const char* api_name, void* workspace_addr_fn, void* launch_addr_fn,
+    const at::Tensor& workspace_reference,
+    TensorKeepaliveTuple tensor_keepalive, Args&... args)
+{
+    using namespace nanovllm_a5_opapi;
+
+    TORCH_CHECK(workspace_addr_fn != nullptr && launch_addr_fn != nullptr,
+                api_name,
+                " or its GetWorkspaceSize entrypoint is unavailable from the "
+                "P9 repository-local libcust_opapi.so");
+    RequireP9CallerThreadDirectAsyncContract();
+    LogResolvedOpApi(api_name, workspace_addr_fn, launch_addr_fn);
+
+    const auto npu_stream = c10_npu::getCurrentNPUStream();
+    const aclrtStream acl_stream = npu_stream.stream(false);
+    TORCH_CHECK(acl_stream != nullptr,
+                api_name, " received a null current ACL stream");
+    LogP9DirectAsyncStage(api_name, "current_stream_ready");
+
+    bool huge_mem_active = false;
+    const auto init_huge_mem = reinterpret_cast<InitHugeMemThreadLocalFn>(
+        ResolveSymbol("InitHugeMemThreadLocal"));
+    const auto uninit_huge_mem = reinterpret_cast<UnInitHugeMemThreadLocalFn>(
+        ResolveSymbol("UnInitHugeMemThreadLocal"));
+    const auto release_huge_mem = reinterpret_cast<ReleaseHugeMemFn>(
+        ResolveSymbol("ReleaseHugeMem"));
+    const auto cleanup_host_tls = [&]() noexcept {
+        if (huge_mem_active) {
+            if (release_huge_mem != nullptr) {
+                release_huge_mem(nullptr, false);
+            }
+            if (uninit_huge_mem != nullptr) {
+                uninit_huge_mem(nullptr, false);
+            }
+            huge_mem_active = false;
+        }
+        LogP9DirectAsyncStage(api_name, "caller_tls_released");
+    };
+
+    try {
+        // PTA cache TLS belongs to torch_npu for this caller-thread route.
+        // Do not initialize or tear down that framework-owned state here.
+        if (init_huge_mem != nullptr) {
+            (void)init_huge_mem(nullptr, false);
+            huge_mem_active = true;
+        }
+        LogP9DirectAsyncStage(api_name, "host_descriptor_begin");
+
+        uint64_t workspace_size = 0;
+        aclOpExecutor* executor = nullptr;
+        auto converted = ConvertTypes(args..., &workspace_size, &executor);
+        bool converted_released = false;
+        try {
+            LogConvertedDescriptorSet(api_name, converted);
+            const auto workspace_fn =
+                WorkspaceFunction(converted, workspace_addr_fn);
+            const int workspace_status = CallTuple(workspace_fn, converted);
+            TORCH_CHECK(workspace_status == 0,
+                        "call ", api_name,
+                        "GetWorkspaceSize failed: ", RecentAclError());
+            TORCH_CHECK(
+                workspace_size <=
+                    static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                api_name, " workspace is too large for an ATen byte tensor: ",
+                workspace_size);
+
+            at::Tensor workspace;
+            void* workspace_ptr = nullptr;
+            if (workspace_size != 0) {
+                workspace = at::empty(
+                    {static_cast<int64_t>(workspace_size)},
+                    workspace_reference.options().dtype(at::kByte));
+                workspace_ptr = workspace.data_ptr();
+            }
+            LogP9DirectAsyncStage(api_name, "workspace_allocated",
+                                  workspace_size);
+
+            const auto launch_fn = reinterpret_cast<OpApiLaunchFn>(launch_addr_fn);
+            LogP9DirectAsyncStage(api_name, "launch_begin", workspace_size);
+            const int launch_status =
+                launch_fn(workspace_ptr, workspace_size, executor, acl_stream);
+            TORCH_CHECK(launch_status == 0, "call ", api_name,
+                        " failed: ", RecentAclError());
+            LogP9DirectAsyncStage(api_name, "launch_enqueued", workspace_size);
+
+            // `tensor_keepalive` contains every tensor ACLNN argument,
+            // including all caller-owned outputs and mutable output aliases.
+            // The workspace was created on `npu_stream` and launched on this
+            // exact stream; retain it locally through descriptor release, but
+            // do not record it again on its creating stream.
+            ReleaseTuple(converted);
+            converted_released = true;
+            LogP9DirectAsyncStage(api_name, "descriptors_released",
+                                  workspace_size);
+            ClearTensorTuple(tensor_keepalive);
+            // `workspace` was created and launched on this exact stream, so
+            // it needs no recordStream edge.  Drop its local TensorImpl before
+            // HugeMem TLS teardown, matching the direct caller-thread lifetime
+            // discipline and avoiding a post-submit destructor on torn-down
+            // host allocator state.
+            workspace = at::Tensor();
+            LogP9DirectAsyncStage(api_name, "workspace_handle_released",
+                                  workspace_size);
+            cleanup_host_tls();
+            LogP9DirectAsyncStage(api_name, "submit_done", workspace_size);
+            return;
+        } catch (...) {
+            if (!converted_released) {
+                ReleaseTuple(converted);
+            }
+            throw;
+        }
+    } catch (...) {
+        cleanup_host_tls();
+        LogP9DirectAsyncStage(api_name, "submit_failed");
+        throw;
+    }
+}
 
 void RequireSameDevice(const at::Tensor& anchor, const at::Tensor& value,
                        const char* name, bool require_contiguous)
@@ -329,12 +509,22 @@ PublicResult AllocateAndLaunch(
     // 9 official inputs, 12 P9 inputs, official attrs, four public outputs,
     // then two caller-owned output aliases.  Do not reorder the two aliases:
     // graph mutation visibility is part of the target ABI.
-    EXEC_NPU_CMD_ORDERED(
-        aclnnA5C8ExactSpeculativeResidentGet, keepalive,
-        query, key_arg, weights, query_scale, key_scale, actual_query_lengths,
-        actual_key_lengths, block_table, metadata, runtime_enable,
-        resident_threshold, resident_threshold_valid, req_pool_entries,
-        kv_object_map, kv_object_lens, persistent_object_slots_snapshot,
+    //
+    // P9 does not delegate this launch to a generic host queue.  Its one
+    // caller-thread helper owns the generated descriptor/TLS lifetime and
+    // keeps a possible non-zero workspace on the raw current stream through
+    // descriptor release before returning to the surrounding forward graph.
+    static void* workspace_addr_fn = nanovllm_a5_opapi::ResolveSymbol(
+        "aclnnA5C8ExactSpeculativeResidentGetGetWorkspaceSize");
+    static void* launch_addr_fn = nanovllm_a5_opapi::ResolveSymbol(
+        "aclnnA5C8ExactSpeculativeResidentGet");
+    LaunchP9CallerThreadDirectAsync(
+        "aclnnA5C8ExactSpeculativeResidentGet", workspace_addr_fn,
+        launch_addr_fn, query, std::move(keepalive), query, key_arg, weights,
+        query_scale, key_scale, actual_query_lengths, actual_key_lengths,
+        block_table, metadata, runtime_enable, resident_threshold,
+        resident_threshold_valid, req_pool_entries, kv_object_map,
+        kv_object_lens, persistent_object_slots_snapshot,
         canonical_resident_layout, candidate_source_to_slot,
         candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
         query_quant_mode, key_quant_mode, layout_query_ptr, layout_key_ptr,
