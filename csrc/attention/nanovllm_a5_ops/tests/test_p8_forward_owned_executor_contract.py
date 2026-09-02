@@ -185,6 +185,13 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         self.assertNotIn("std::vector<int64_t> storage_dims", convert_tensor)
         self.assertIn("sizes.data(),\n      static_cast<uint64_t>(sizes.size()),", convert_tensor)
         self.assertIn("strides.data(),", convert_tensor)
+        self.assertIn("aclCreateTensor returned null", convert_tensor)
+        self.assertIn("return descriptor;", convert_tensor)
+        for token in (
+            "P7_1_DESCRIPTOR_ARG api=%s index=%zu descriptor=%p",
+            "LogConvertedDescriptorArgument(api, I, std::get<I>(args))",
+        ):
+            self.assertIn(token, self.op_api_common)
 
     def test_runner_can_cut_prepost_before_real_post_without_rebuild(self) -> None:
         """One fresh assembly may isolate then exercise the valid POST path."""

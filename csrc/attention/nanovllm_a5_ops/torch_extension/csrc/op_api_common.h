@@ -287,7 +287,7 @@ inline aclTensor *ConvertTensor(
   // reintroduce the private NPUStorageImpl dependency this adapter avoids.
   const auto sizes = tensor.sizes();
   const auto strides = tensor.strides();
-  return acl_tensor_api.create(
+  aclTensor *descriptor = acl_tensor_api.create(
       sizes.data(),
       static_cast<uint64_t>(sizes.size()),
       acl_dtype,
@@ -297,6 +297,17 @@ inline aclTensor *ConvertTensor(
       sizes.data(),
       static_cast<uint64_t>(sizes.size()),
       tensor.data_ptr());
+  // Do not turn a failed descriptor allocation into a later opaque tiler
+  // error.  In particular, a null descriptor at P8 input 26 is otherwise
+  // indistinguishable from a descriptor whose storage shape was lost after
+  // construction.  Keep this check here so every bridge gets the same
+  // fail-fast boundary before GetWorkspaceSize.
+  TORCH_CHECK(descriptor != nullptr,
+              "aclCreateTensor returned null: aten_dtype=",
+              c10::toString(tensor.scalar_type()),
+              " rank=", sizes.size(),
+              " device=", tensor.device().str());
+  return descriptor;
 }
 
 inline aclTensor *ConvertType(const at::Tensor &tensor) {
@@ -767,6 +778,24 @@ inline void CollectAclTensorDescriptor(
 template <typename T>
 inline void CollectAclTensorDescriptor(T, std::vector<void *> *) {}
 
+inline void LogConvertedDescriptorArgument(
+    const char *api, size_t index, aclTensor *descriptor) {
+  if (!OpApiDebugEnabled()) {
+    return;
+  }
+  // This is deliberately one line per ACL tensor, rather than a host-address
+  // dump of every tuple member.  It lets a P8 run identify whether its
+  // zero-based input 26 (`rows_per_entry`) failed descriptor creation or
+  // survived creation and later lost shape materialization in CANN.
+  std::fprintf(stderr,
+               "P7_1_DESCRIPTOR_ARG api=%s index=%zu descriptor=%p\n",
+               api, index, static_cast<void *>(descriptor));
+  std::fflush(stderr);
+}
+
+template <typename T>
+inline void LogConvertedDescriptorArgument(const char *, size_t, T) {}
+
 template <typename Tuple, size_t... I>
 inline void LogConvertedDescriptorSetImpl(
     const char *api, Tuple &args, std::index_sequence<I...>) {
@@ -785,6 +814,8 @@ inline void LogConvertedDescriptorSetImpl(
       sizeof...(I),
       descriptors.size(),
       unique.size());
+  (void)std::initializer_list<int>{
+      (LogConvertedDescriptorArgument(api, I, std::get<I>(args)), 0)...};
   std::fflush(stderr);
 }
 
