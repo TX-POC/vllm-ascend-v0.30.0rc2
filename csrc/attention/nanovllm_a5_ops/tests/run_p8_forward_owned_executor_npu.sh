@@ -85,12 +85,14 @@ run_logged() {
 # private UseStreamResInCurrentThread symbol and fails only at Python import.
 # Check the actual DSO before any runtime Python process can load it.
 #
-# Do not require ldd -r itself to return zero: normal Python extension symbols
-# can be supplied by the embedding interpreter rather than an ELF DT_NEEDED
-# library.  The contract here is narrower and exact: no P8 bridge may import a
-# private torch_npu queue/resource symbol, and no c10_npu/at_npu symbol may be
-# unresolved by the deployed dynamic loader.  ldd -r remains recorded so a new
-# deployment-side loader problem is visible in the bounded log.
+# Do not require ldd -r itself to resolve every public torch_npu symbol: a
+# normal Python extension is loaded after torch_npu has initialized the Python
+# process, whereas ldd inspects the extension as a standalone ELF object.
+# `getCurrentNPUStream`, `stream(false)`, and allocator recordStream are
+# expected public imports of the P8 direct bridge.  The exact fresh-process
+# Stage-B probe below is the authoritative loader check for those symbols.
+# This binary gate remains strict for private task-queue/resource APIs, whose
+# presence is wrong even if a particular deployment happens to resolve them.
 p8_stage_b_direct_abi_gate() {
     local bridge_so="$1"
     local log="$2"
@@ -138,16 +140,15 @@ p8_stage_b_direct_abi_gate() {
             "$log" | sed -n '1,32p'
         return 1
     fi
-    if grep -Eq 'undefined symbol:.*(c10_npu|at_npu)::' "$log"; then
-        printf 'P8_BRIDGE_ABI_FAIL reason=unresolved_torch_npu_symbol bridge=%s ldd_r=%s log=%s\n' \
-            "$bridge_so" "$ldd_rc" "$log"
-        grep -E 'undefined symbol:.*(c10_npu|at_npu)::' "$log" | sed -n '1,32p'
-        return 1
-    fi
-
-    printf 'P8_BRIDGE_ABI_C10_UNDEFINED bridge=%s symbols_begin\n' "$bridge_so"
-    grep -E '(c10_npu|at_npu)::' "$log" | sed -n '1,48p' || true
-    printf 'P8_BRIDGE_ABI_C10_UNDEFINED bridge=%s symbols_end\n' "$bridge_so"
+    # Keep the standalone-ELF view in the log, but never mistake normal
+    # public imports for a loader failure.  The immediately following
+    # `stage_b_tq0_probe` imports this exact bridge into a fresh torch_npu
+    # process and performs a real fail-closed launch before the full graph.
+    printf 'P8_BRIDGE_ABI_PUBLIC_DYNAMIC_IMPORTS bridge=%s symbols_begin\n' \
+        "$bridge_so"
+    grep -E 'undefined symbol:.*(c10_npu|at_npu)::' "$log" | sed -n '1,48p' || true
+    printf 'P8_BRIDGE_ABI_PUBLIC_DYNAMIC_IMPORTS bridge=%s symbols_end\n' \
+        "$bridge_so"
     printf 'P8_BRIDGE_ABI_PASS bridge=%s ldd_r=%s log=%s\n' \
         "$bridge_so" "$ldd_rc" "$log"
 }
@@ -212,6 +213,7 @@ P8_OPS_ROOT="$P8_VLLM_ROOT/csrc/attention/nanovllm_a5_ops"
 P8_REFERENCE_OPS_ROOT="$P8_REFERENCE_VLLM_ROOT/csrc/attention/nanovllm_a5_ops"
 P8_BUILD_SCRIPT="$P8_OPS_ROOT/build_nanovllm_ops.sh"
 P8_RUNTIME_TEST="$P8_OPS_ROOT/tests/test_p8_forward_owned_executor_runtime.py"
+P8_STAGE_B_FAIL_CLOSED_PROBE="$P8_OPS_ROOT/tests/p8_stage_b_fail_closed_probe.py"
 P8_STAGE_A_SETUP="$P8_OPS_ROOT/a5_score_receipt_candidate_executor/torch_extension/score_receipt_candidate_executor_setup.py"
 P8_STAGE_B_SETUP="$P8_OPS_ROOT/a5_p8_forward_owned_executor/torch_extension/p8_forward_owned_executor_setup.py"
 P8_REFERENCE_BUILD_SCRIPT="$P8_REFERENCE_OPS_ROOT/a5_official_c8_reference/build_reference_opp.sh"
@@ -223,6 +225,7 @@ P8_REFERENCE_CONTRACT_TEST="$P8_OPS_ROOT/tests/test_official_c8_reference_contra
 # a helper is tracked as mode 100644, before P8 gets a chance to build.
 if [[ ! -f "$P8_BUILD_SCRIPT" || ! -r "$P8_BUILD_SCRIPT" ||
       ! -f "$P8_RUNTIME_TEST" || ! -r "$P8_RUNTIME_TEST" ||
+      ! -f "$P8_STAGE_B_FAIL_CLOSED_PROBE" || ! -r "$P8_STAGE_B_FAIL_CLOSED_PROBE" ||
       ! -f "$P8_STAGE_A_SETUP" || ! -r "$P8_STAGE_A_SETUP" ||
       ! -f "$P8_STAGE_B_SETUP" || ! -r "$P8_STAGE_B_SETUP" ||
       ! -f "$P8_REFERENCE_BUILD_SCRIPT" || ! -r "$P8_REFERENCE_BUILD_SCRIPT" ||
@@ -578,6 +581,19 @@ fi
 if ! p8_stage_b_direct_abi_gate \
     "$P8_STAGE_B_BRIDGE_SO" "$P8_RUN_ROOT/stage_b_bridge_abi.log"; then
     runner_fail "stage_b_bridge_private_torch_npu_abi"
+    exit 1
+fi
+
+# Resolve the bridge inside the same kind of fresh torch_npu Python process
+# used by the real graph, then make the valid all-zero-control invocation.  It
+# is intentionally Stage-B-only: this is the precise gate for public C10
+# imports and ACLNN dispatch, not a second C8/KVAF integration run.
+if ! run_logged stage_b_tq0_probe "$P8_RUN_ROOT/stage_b_tq0_probe.log" \
+    timeout -k 30s "$P8_TEST_TIMEOUT" "$P8_PYTHON" "$P8_STAGE_B_FAIL_CLOSED_PROBE" \
+      --device npu:0 \
+      --stage-b-bridge-root "$P8_STAGE_B_BRIDGE" \
+      --stage-b-opp-root "$P8_STAGE_B_OPP"; then
+    printf 'P8_RUNNER_FAIL stage=stage_b_tq0_probe result=%s\n' "$P8_RUN_ROOT"
     exit 1
 fi
 

@@ -318,25 +318,32 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "ldd -r",
             "nm -D --undefined-only",
             "P8_BRIDGE_ABI_SCAN",
-            "P8_BRIDGE_ABI_C10_UNDEFINED",
+            "P8_BRIDGE_ABI_PUBLIC_DYNAMIC_IMPORTS",
             "P8_BRIDGE_ABI_PASS",
             "P8_BRIDGE_ABI_FAIL reason=private_torch_npu_symbol",
-            "P8_BRIDGE_ABI_FAIL reason=unresolved_torch_npu_symbol",
             "UseStreamResInCurrentThread",
             "OptionsManager::",
             "NPUStream::stream\\(\\)",
             "NPUStream::isSyncLaunchStream",
             "NPUStream::getRepoStopFlag",
             "OpCommand::RunOpApi",
-            "undefined symbol:.*(c10_npu|at_npu)::",
+            'stage_b_tq0_probe "$P8_RUN_ROOT/stage_b_tq0_probe.log"',
+            '"$P8_STAGE_B_FAIL_CLOSED_PROBE"',
+            "P8_RUNNER_FAIL stage=stage_b_tq0_probe",
         ):
             self.assertIn(token, self.runner)
+        self.assertNotIn(
+            "P8_BRIDGE_ABI_FAIL reason=unresolved_torch_npu_symbol",
+            self.runner,
+        )
 
         bridge_build = self.runner.index('stage_b_bridge "$P8_RUN_ROOT/stage_b_bridge.log"')
         bridge_gate = self.runner.index("if ! p8_stage_b_direct_abi_gate")
+        bridge_probe = self.runner.index('stage_b_tq0_probe "$P8_RUN_ROOT/stage_b_tq0_probe.log"')
         runtime_pythonpath = self.runner.index('export PYTHONPATH="$P8_KVAF_BUILD/python:')
         self.assertLess(bridge_build, bridge_gate)
-        self.assertLess(bridge_gate, runtime_pythonpath)
+        self.assertLess(bridge_gate, bridge_probe)
+        self.assertLess(bridge_probe, runtime_pythonpath)
 
     def test_acl_tensor_storage_shape_is_owned_by_the_live_aten_tensor(self) -> None:
         """A deferred ACLNN descriptor must not retain a local shape buffer.
