@@ -66,6 +66,12 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             CONTRACT["candidate_seed"]["words"],
             ["row", "source", "kv_object", "resident_slot"],
         )
+        self.assertEqual(
+            CONTRACT["candidate_seed"]["cross_wave_slot_invariant"],
+            "CandidateCompact never assigns one resident_slot to two initial "
+            "waves; Stage-B may reuse a non-winner slot only after every "
+            "initial wave targeting it is terminal",
+        )
         resource = CONTRACT["resource_model"]
         fixed = resource["canonical_resident_range"]
         self.assertEqual(fixed["input"], "speculative_resident_slots")

@@ -27,7 +27,8 @@
   "candidate_seed": {
     "dtype": "int32",
     "words": ["row", "source", "kv_object", "resident_slot"],
-    "slot_assignment": "one candidate receives one distinct fixed resident slot before PostOnly"
+    "slot_assignment": "one candidate receives one distinct fixed resident slot before PostOnly",
+    "cross_wave_slot_invariant": "CandidateCompact never assigns one resident_slot to two initial waves; Stage-B may reuse a non-winner slot only after every initial wave targeting it is terminal"
   },
   "stage_a": {
     "name": "score_scan_candidate_post",
