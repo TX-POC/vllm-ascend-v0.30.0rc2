@@ -298,12 +298,13 @@ AdmissionResult ArenaAdmissionNpu(
                                  fused_get_control, p8_wave_records,
                                  p8_private_records, expected_identity,
                                  admission_result, true);
-    auto keepalive = std::make_tuple(
-        forward_control, p8_arena_health, fused_get_control, p8_wave_records,
-        p8_private_records, expected_identity, admission_result);
+    // P8 has no host-side OrderedLaunchFailureObserver. The deferred macro's
+    // value-owned ACLNN argument tuple is therefore its single Tensor
+    // lifetime owner; carrying this second tuple into torch_npu's ReleaseQueue
+    // only duplicates NPU TensorImpl destruction during process teardown.
     RequireP8DeferredHostContract();
     EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
-        aclnnA5P8ArenaAdmissionGate, keepalive, forward_control,
+        aclnnA5P8ArenaAdmissionGate, std::tuple<>{}, forward_control,
         p8_arena_health, fused_get_control, p8_wave_records,
         p8_private_records, expected_identity, admission_result);
     return std::make_tuple(forward_control, p8_arena_health, admission_result);
@@ -366,12 +367,9 @@ AdvanceResult AdvanceForwardControlNpu(
 {
     ValidateAdvanceInputs(forward_control, p8_arena_health, expected_identity,
                           transition_program, transition_result, true);
-    auto keepalive = std::make_tuple(forward_control, p8_arena_health,
-                                     expected_identity, transition_program,
-                                     transition_result);
     RequireP8DeferredHostContract();
     EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
-        aclnnA5P8ForwardControlAdvance, keepalive, forward_control,
+        aclnnA5P8ForwardControlAdvance, std::tuple<>{}, forward_control,
         p8_arena_health, expected_identity, transition_program,
         transition_result);
     return std::make_tuple(forward_control, p8_arena_health,
@@ -449,20 +447,9 @@ Result RunNpu(
         std::fflush(stderr);
     }
 
-    // OpCommand retains this value-owned tuple until the framework-ordered
-    // ACLNN launch completes.  Device Post/CQ/private lifetime is *not* a
-    // host closure: it is the P8 GM state machine carried by these tensors.
-    auto keepalive = std::make_tuple(
-        candidate_seeds, candidate_counts, candidate_receipt_identity,
-        candidate_status, forward_control, p8_arena_health, source_lens,
-        kv_object_address_domain, req_pool_entries, kv_object_map,
-        kv_object_lens, kv_object_slots_snapshot, private_source_to_slot,
-        private_object_to_slot, private_ready_table, private_slot_cursor,
-        private_packed_output, fused_get_control, p8_wave_records,
-        p8_private_records, queue_request_source_offsets,
-        queue_request_object_offsets, queue_request_output_indices,
-        queue_request_count, candidate_cursor, candidate_cursor_identity,
-        rows_per_entry, worker_stats);
+    // The macro owns one value tuple containing these 28 ACLNN arguments.
+    // P8 has no P7 host-failure observer, so do not add a duplicate tensor
+    // tuple that the framework would destroy later on ReleaseQueue.
     RequireP8DeferredHostContract();
     // Bind GetWorkspaceSize through the generated OPP declaration.  The
     // generic bridge macro infers a function pointer from a tuple; that is
@@ -471,7 +458,7 @@ Result RunNpu(
     // authoritative contract and deliberately carries no 19-output suffix.
     EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED(
         aclnnA5P8ForwardOwnedExecutor,
-        decltype(&aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize), keepalive,
+        decltype(&aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize), std::tuple<>{},
         candidate_seeds,
         candidate_counts, candidate_receipt_identity, candidate_status,
         forward_control, p8_arena_health, source_lens,

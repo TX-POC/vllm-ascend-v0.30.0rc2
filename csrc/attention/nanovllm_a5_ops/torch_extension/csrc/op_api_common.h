@@ -31,6 +31,7 @@
 #include <torch/extension.h>
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
 // Each standalone validation bridge owns a distinct resolver domain.  The
@@ -361,6 +362,52 @@ template <typename Tuple>
 inline void ReleaseTuple(Tuple &args) {
   constexpr size_t kSize = std::tuple_size<Tuple>::value;
   ReleaseTuple(args, std::make_index_sequence<kSize>{});
+}
+
+// RunOpApi's task consumer executes the launch closure, but torch_npu moves
+// the closure into a separate ReleaseQueue before it destroys the closure.
+// `torch.npu.synchronize()` drains the launch queue and the device stream; it
+// does not make that later host-side closure destruction an ATen-Tensor
+// lifetime boundary. Record each Tensor storage on the actual NPU stream
+// immediately after a successful launch, then the closure can discard its
+// Tensor values before it reaches ReleaseQueue. This keeps device memory alive
+// through the stream without leaving TensorImpl destruction to a
+// teardown-order-dependent background thread.
+inline void RecordTensorStorageOnNpuStream(
+    const at::Tensor &tensor, c10_npu::NPUStream stream) {
+  if (!tensor.defined()) {
+    return;
+  }
+  c10_npu::NPUCachingAllocator::recordStream(
+      tensor.storage().data_ptr(), stream);
+}
+
+template <typename Tuple, size_t... I>
+inline void RecordTensorTupleOnNpuStream(
+    Tuple &args, c10_npu::NPUStream stream, std::index_sequence<I...>) {
+  (void)std::initializer_list<int>{
+      (RecordTensorStorageOnNpuStream(std::get<I>(args), stream), 0)...};
+}
+
+template <typename Tuple>
+inline void RecordTensorTupleOnNpuStream(
+    Tuple &args, c10_npu::NPUStream stream) {
+  constexpr size_t kSize = std::tuple_size<Tuple>::value;
+  RecordTensorTupleOnNpuStream(args, stream,
+                               std::make_index_sequence<kSize>{});
+}
+
+template <typename Tuple, size_t... I>
+inline void ClearTensorTuple(
+    Tuple &args, std::index_sequence<I...>) noexcept {
+  (void)std::initializer_list<int>{
+      ((std::get<I>(args) = at::Tensor()), 0)...};
+}
+
+template <typename Tuple>
+inline void ClearTensorTuple(Tuple &args) noexcept {
+  constexpr size_t kSize = std::tuple_size<Tuple>::value;
+  ClearTensorTuple(args, std::make_index_sequence<kSize>{});
 }
 
 // P7.1 launches one ACLNN executor through torch_npu's ordinary host task
@@ -1463,7 +1510,8 @@ inline void LogOrderedHostDso(
     auto deferred_acl_call =                                                  \
         [deferred_args = std::move(deferred_args),                            \
          deferred_tensor_keepalive = std::move(deferred_tensor_keepalive),   \
-         deferred_acl_stream, deferred_workspace_addr_fn,                     \
+         deferred_npu_stream, deferred_acl_stream,                            \
+         deferred_workspace_addr_fn,                                          \
          deferred_launch_addr_fn]() mutable -> int {                          \
       bool deferred_pta_cache_active = false;                                 \
       bool deferred_huge_mem_active = false;                                  \
@@ -1548,9 +1596,17 @@ inline void LogOrderedHostDso(
               deferred_launch_status == 0,                                    \
               "call " #aclnn_api " failed: ", RecentAclError());           \
           LogOpApiLifecycle(#aclnn_api, "launch_done");                     \
+          RecordTensorTupleOnNpuStream(                                       \
+              deferred_args, deferred_npu_stream);                            \
+          LogOpApiLifecycle(#aclnn_api, "tensor_lifetime_recorded");        \
           ReleaseTuple(deferred_converted);                                   \
           deferred_converted_released = true;                                 \
           LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");         \
+          /* `deferred_args` is the only P8 Tensor capture. After stream     \
+           * recording, clear it on the launch consumer instead of leaving   \
+           * TensorImpl destruction to torch_npu's asynchronous ReleaseQueue. */\
+          ClearTensorTuple(deferred_args);                                    \
+          LogOpApiLifecycle(#aclnn_api, "tensor_keepalive_released");       \
           deferred_cleanup_consumer_tls();                                    \
           return deferred_launch_status;                                      \
         } catch (...) {                                                        \

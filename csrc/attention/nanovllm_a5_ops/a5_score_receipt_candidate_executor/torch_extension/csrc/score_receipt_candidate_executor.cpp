@@ -127,16 +127,12 @@ Result RunNpu(
         {geometry.receipts, kReceiptIdentityWords}, int64Options);
     auto receiptStatus = at::empty({geometry.receipts}, int32Options);
     auto receiptOwner = at::empty({geometry.receipts}, int32Options);
-    auto keepalive = std::make_tuple(
-        scoreWorkspace, tileReceipts, receiptIdentity, scoreSourceLens,
-        residentThreshold, residentThresholdValid, kvObjectSlotsSnapshot,
-        reqPoolEntries, kvObjectMap, kvObjectLens, candidateSeeds,
-        candidateCounts, candidateReceiptIdentity, receiptStatus, receiptOwner);
     // Stage-A is part of the same P8 graph closure.  It has a zero-workspace
-    // ABI and only Tensor arguments, so keep its ACLNN descriptors/executor
-    // on the torch_npu consumer thread just like Stage-B.
+    // ABI and only Tensor arguments. Its deferred macro owns one value tuple
+    // of those arguments; there is no P8 host-failure observer, so a duplicate
+    // tuple must not be retained by torch_npu's later ReleaseQueue teardown.
     EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
-        aclnnA5ScoreReceiptCandidateExecutor, keepalive, scoreWorkspace,
+        aclnnA5ScoreReceiptCandidateExecutor, std::tuple<>{}, scoreWorkspace,
         tileReceipts, receiptIdentity, scoreSourceLens, residentThreshold,
         residentThresholdValid, kvObjectSlotsSnapshot, reqPoolEntries,
         kvObjectMap, kvObjectLens, candidateSeeds, candidateCounts,

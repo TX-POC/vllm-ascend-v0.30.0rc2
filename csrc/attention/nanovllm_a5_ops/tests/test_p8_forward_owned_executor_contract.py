@@ -138,6 +138,19 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "handoff_runopapi_tensor_owned_deferred",
         ):
             self.assertIn(token, generic)
+        self.assertIn("NPUCachingAllocator::recordStream", self.op_api_common)
+        self.assertIn("RecordTensorTupleOnNpuStream(", generic)
+        self.assertIn("deferred_args, deferred_npu_stream", generic)
+        self.assertIn("ClearTensorTuple(deferred_args)", generic)
+        record = generic.index("RecordTensorTupleOnNpuStream(")
+        release = generic.index("ReleaseTuple(deferred_converted)", record)
+        clear = generic.index("ClearTensorTuple(deferred_args)", release)
+        self.assertLess(record, release)
+        self.assertLess(release, clear)
+        self.assertNotIn("auto keepalive = std::make_tuple", self.bridge)
+        self.assertNotIn("auto keepalive = std::make_tuple", self.stage_a_bridge)
+        self.assertEqual(self.bridge.count("std::tuple<>{}"), 3)
+        self.assertEqual(self.stage_a_bridge.count("std::tuple<>{}"), 1)
         stage_a_host = (
             OPS_ROOT
             / "a5_score_receipt_candidate_executor"
