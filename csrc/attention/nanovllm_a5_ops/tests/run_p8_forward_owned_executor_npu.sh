@@ -31,10 +31,11 @@ P8_PYTHON="${P8_PYTHON:-$(command -v python3 2>/dev/null || true)}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.0}"
 P8_BUILD_JOBS="${P8_BUILD_JOBS:-16}"
 P8_TEST_TIMEOUT="${P8_TEST_TIMEOUT:-300s}"
-# P8's three ACLNN nodes use the consumer-owned deferred launcher.  Make its
-# process-start torch_npu contract explicit before the first Python/NPU use;
-# a non-sync stream alone cannot prevent launch-blocking from executing the
-# consumer inline.
+# P8 performs the host-side ACLNN lifecycle in the caller and leaves only
+# device work asynchronous on the current NPU stream.  Keep torch_npu's task
+# queue enabled for normal producer ordering.  The P8 bridge explicitly calls
+# current_stream.stream() to drain *preceding host submissions* before direct
+# ACLNN dispatch; it never transfers its own bridge closure into ReleaseQueue.
 P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-1}"
 P8_ASCEND_LAUNCH_BLOCKING="${P8_ASCEND_LAUNCH_BLOCKING:-0}"
 # CANN's downloaded source dependencies belong to the stable, exact reference
@@ -114,9 +115,9 @@ if [[ "$P8_RUNTIME_CASE" != "full" &&
 fi
 if [[ "$P8_TASK_QUEUE_ENABLE" != "1" ||
       "$P8_ASCEND_LAUNCH_BLOCKING" != "0" ]]; then
-    printf 'P8_DEFERRED_HOST_ENV pass=0 task_queue_enable=%s launch_blocking=%s required_task_queue_enable=1 required_launch_blocking=0\n' \
+    printf 'P8_DRAINED_DIRECT_HOST_ENV pass=0 task_queue_enable=%s launch_blocking=%s required_task_queue_enable=1 required_launch_blocking=0\n' \
         "$P8_TASK_QUEUE_ENABLE" "$P8_ASCEND_LAUNCH_BLOCKING"
-    runner_fail "unsafe_deferred_launch_environment"
+    runner_fail "unsafe_drained_direct_launch_environment"
     exit 2
 fi
 
@@ -198,10 +199,10 @@ export ASCEND_HOME_PATH
 export ASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH"
 # This must happen before the NPU probe, which is the first Python process to
 # import torch_npu.  Re-export after CANN's environment script so a shell
-# default cannot silently override the deferred-launch ownership contract.
+# default cannot silently override the drained-direct ownership contract.
 export TASK_QUEUE_ENABLE="$P8_TASK_QUEUE_ENABLE"
 export ASCEND_LAUNCH_BLOCKING="$P8_ASCEND_LAUNCH_BLOCKING"
-printf 'P8_DEFERRED_HOST_ENV pass=1 task_queue_enable=%s launch_blocking=%s physical=7 logical=0\n' \
+printf 'P8_DRAINED_DIRECT_HOST_ENV pass=1 task_queue_enable=%s launch_blocking=%s physical=7 logical=0 queue_order=stream_drain\n' \
     "$TASK_QUEUE_ENABLE" "$ASCEND_LAUNCH_BLOCKING"
 # The runner owns a three-OPP process (unchanged C8, Stage A, Stage B).  Do
 # not inherit vendor paths or opapi handles from an earlier P3/P7/P8 shell;
@@ -216,12 +217,18 @@ P8_PROBE_LOG="${P8_OPS_ROOT}/build/p8_probe_${P8_VLLM_EXPECTED_SHA:0:12}_${P8_KV
 mkdir -p "$(dirname "$P8_PROBE_LOG")"
 if ! run_logged npu7_probe "$P8_PROBE_LOG" "$P8_PYTHON" -c '
 import os, torch, torch_npu
+requested_queue = int(os.environ["TASK_QUEUE_ENABLE"])
+effective_queue = int(torch_npu.npu.get_task_queue_enable())
+if effective_queue != requested_queue:
+    raise RuntimeError(
+        "TASK_QUEUE_ENABLE was latched before runner setup: "
+        f"requested={requested_queue} effective={effective_queue}")
 torch.npu.set_device(0)
 value = torch.ones(1, device="npu:0").cpu().item()
-print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s" % (
+print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s task_queue_requested=%s task_queue_effective=%s" % (
     os.environ.get("P8_PHYSICAL_NPU_ID"),
     os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
-    torch.npu.get_device_name(0), value))
+    torch.npu.get_device_name(0), value, requested_queue, effective_queue))
 '; then
     runner_fail "npu7_probe_failed"
     exit 1

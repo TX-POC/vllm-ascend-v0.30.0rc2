@@ -197,50 +197,12 @@ using Result = std::tuple<
 using AdvanceResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 using AdmissionResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 
-// P8 passes only value-owned ATen tensors to its three zero-workspace ACLNN
-// nodes.  They must use the consumer-owned deferred launcher: torch_npu may
-// run RunOpApi on a task-queue thread after this Python caller returns, so
-// producer-thread aclTensor/executor/PTA/HugeMem state is invalid there.
-void RequireP8DeferredHostContract()
-{
-    const char* task_queue = std::getenv("TASK_QUEUE_ENABLE");
-    const char* launch_blocking = std::getenv("ASCEND_LAUNCH_BLOCKING");
-    const auto stream = c10_npu::getCurrentNPUStream();
-    // The deferred macro creates and destroys ACLNN descriptors, executors,
-    // and PTA/HugeMem state in the framework task-queue consumer.  A
-    // non-sync stream alone is not enough to establish that hand-off:
-    // launch-blocking can still force an inline launch, and a disabled task
-    // queue has no consumer-owner contract at all.  Keep this identical to
-    // the already proven P7 ordered-launch precondition, but do not add P7's
-    // long-lived terminal tensor lease here: P8 keeps the 28 input tensors
-    // alive through the ACLNN launch and its device state is owned by the
-    // graph-visible forward arena.
-    const bool task_queue_requested =
-        task_queue != nullptr && std::strcmp(task_queue, "1") == 0;
-    const bool launch_blocking_disabled =
-        launch_blocking == nullptr || std::strcmp(launch_blocking, "0") == 0;
-    const bool sync_launch_stream = stream.isSyncLaunchStream();
-    TORCH_CHECK(task_queue_requested && launch_blocking_disabled &&
-                    !sync_launch_stream,
-                "P8 requires TASK_QUEUE_ENABLE=1 and "
-                "ASCEND_LAUNCH_BLOCKING=0 before torch_npu is initialized, "
-                "plus a non-sync launch stream; refusing an unsafe inline "
-                "ACLNN deferred submission. TASK_QUEUE_ENABLE=",
-                task_queue == nullptr ? "<unset>" : task_queue,
-                " ASCEND_LAUNCH_BLOCKING=",
-                launch_blocking == nullptr ? "<unset>" : launch_blocking,
-                " sync_launch_stream=", sync_launch_stream);
-    if (const char* debug = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
-        debug != nullptr && debug[0] != '\0' &&
-        !(debug[0] == '0' && debug[1] == '\0')) {
-        std::fprintf(
-            stderr,
-            "P8_DEFERRED_HOST_GATE task_queue_enable=1 "
-            "launch_blocking=0 sync_launch_stream=0 "
-            "host_lifetime=consumer_owned\n");
-        std::fflush(stderr);
-    }
-}
+// P8's four ACLNN nodes take only value-owned ATen tensors and declare zero
+// workspace.  They use the P8-only drained-direct launcher below rather than
+// torch_npu's task-queue consumer: the caller owns descriptor/PTA/HugeMem
+// setup and teardown, while the generated ACLNN launch remains asynchronous
+// on the current NPU stream.  This removes the ReleaseQueue teardown edge
+// without changing device-side Post/CQ ownership or C8 math.
 
 void ValidateArenaAdmissionInputs(
     const at::Tensor& forward_control, const at::Tensor& p8_arena_health,
@@ -298,13 +260,8 @@ AdmissionResult ArenaAdmissionNpu(
                                  fused_get_control, p8_wave_records,
                                  p8_private_records, expected_identity,
                                  admission_result, true);
-    // P8 has no host-side OrderedLaunchFailureObserver. The deferred macro's
-    // value-owned ACLNN argument tuple is therefore its single Tensor
-    // lifetime owner; carrying this second tuple into torch_npu's ReleaseQueue
-    // only duplicates NPU TensorImpl destruction during process teardown.
-    RequireP8DeferredHostContract();
-    EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
-        aclnnA5P8ArenaAdmissionGate, std::tuple<>{}, forward_control,
+    EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE(
+        aclnnA5P8ArenaAdmissionGate, forward_control,
         p8_arena_health, fused_get_control, p8_wave_records,
         p8_private_records, expected_identity, admission_result);
     return std::make_tuple(forward_control, p8_arena_health, admission_result);
@@ -367,9 +324,8 @@ AdvanceResult AdvanceForwardControlNpu(
 {
     ValidateAdvanceInputs(forward_control, p8_arena_health, expected_identity,
                           transition_program, transition_result, true);
-    RequireP8DeferredHostContract();
-    EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(
-        aclnnA5P8ForwardControlAdvance, std::tuple<>{}, forward_control,
+    EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE(
+        aclnnA5P8ForwardControlAdvance, forward_control,
         p8_arena_health, expected_identity, transition_program,
         transition_result);
     return std::make_tuple(forward_control, p8_arena_health,
@@ -447,18 +403,14 @@ Result RunNpu(
         std::fflush(stderr);
     }
 
-    // The macro owns one value tuple containing these 28 ACLNN arguments.
-    // P8 has no P7 host-failure observer, so do not add a duplicate tensor
-    // tuple that the framework would destroy later on ReleaseQueue.
-    RequireP8DeferredHostContract();
     // Bind GetWorkspaceSize through the generated OPP declaration.  The
     // generic bridge macro infers a function pointer from a tuple; that is
     // insufficient for a source-generated ACLNN ABI because a mismatch can
     // still be callable at the C++ level.  This exact 28-input type is the
     // authoritative contract and deliberately carries no 19-output suffix.
-    EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED(
+    EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_TYPED(
         aclnnA5P8ForwardOwnedExecutor,
-        decltype(&aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize), std::tuple<>{},
+        decltype(&aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize),
         candidate_seeds,
         candidate_counts, candidate_receipt_identity, candidate_status,
         forward_control, p8_arena_health, source_lens,

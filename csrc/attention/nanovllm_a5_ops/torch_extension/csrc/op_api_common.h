@@ -2,10 +2,11 @@
 
 // Minimal, self-contained ACLNN launcher for nanovllm_dsa_a5.
 //
-// Bridges below use torch_npu's OpCommand task-queue contract.  Device-side
-// PostOnly/CQ work can remain asynchronous without bypassing this host-order
-// contract: one ordered ACLNN submission preserves all preceding Tensor
-// producer dependencies on the same stream.
+// Generic bridges below use torch_npu's OpCommand task-queue contract.  The
+// P8-only drained-direct macro is the explicit exception: it drains preceding
+// producer submissions on the current stream, then performs its own ACLNN
+// host lifecycle without putting a bridge closure into ReleaseQueue.  In both
+// cases device-side PostOnly/CQ work remains asynchronous.
 
 #include <algorithm>
 #include <cstdlib>
@@ -30,8 +31,13 @@
 #include <c10/util/Exception.h>
 #include <torch/extension.h>
 
+#ifndef BUILD_LIBTORCH
+#include <pybind11/pybind11.h>
+#endif
+
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
 // Each standalone validation bridge owns a distinct resolver domain.  The
@@ -928,6 +934,62 @@ inline void UseStreamResIfNeeded(aclrtStream stream, bool enqueue) {
       RecentAclError());
 }
 
+// P8 deliberately does not hand its ACLNN host lifecycle to torch_npu's
+// task queue.  On this torch_npu revision an executed RunOpApi callback is
+// moved to a private ReleaseQueue, whose destruction is not covered by
+// torch.npu.synchronize().  A bridge-local callback can therefore outlive
+// Python/DSO teardown even after all device work is complete.
+//
+// Before P8 calls ACLNN directly, `NPUStream::stream()` drains only preceding
+// host task-queue submissions for this stream; it does not synchronize device
+// execution.  Thus it preserves C8/Stage-A -> Stage-B stream order without
+// sending P8's own closure into ReleaseQueue.  The device executor still owns
+// candidate Post/CQ progress; this host code executes once per graph node,
+// not once per candidate or CQ.
+inline void RequireDrainedCallerThreadAsyncOpApiContract(
+    const c10_npu::NPUStream& stream) {
+  const char* launch_blocking = std::getenv("ASCEND_LAUNCH_BLOCKING");
+  const bool effective_task_queue =
+      c10_npu::option::OptionsManager::GetTaskQueueEnable();
+  const bool effective_launch_blocking =
+      c10_npu::option::OptionsManager::CheckBlockingEnable();
+  TORCH_CHECK(
+      !effective_launch_blocking && !stream.isSyncLaunchStream(),
+      "P8 drained caller-thread async ACLNN requires "
+      "ASCEND_LAUNCH_BLOCKING=0 and a non-sync launch stream. "
+      "effective_task_queue=", effective_task_queue,
+      " ASCEND_LAUNCH_BLOCKING=",
+      launch_blocking == nullptr ? "<unset>" : launch_blocking,
+      " effective_launch_blocking=", effective_launch_blocking,
+      " sync_launch_stream=", stream.isSyncLaunchStream());
+  if (OpApiDebugEnabled()) {
+    std::fprintf(
+        stderr,
+        "P8_DRAINED_DIRECT_HOST_GATE task_queue_effective=%d "
+        "launch_blocking_effective=0 sync_launch_stream=0 "
+        "host_lifecycle=caller_thread queue_order=drained "
+        "device_launch=async\n",
+        static_cast<int>(effective_task_queue));
+    std::fflush(stderr);
+  }
+}
+
+// OpCommandImpl would release the Python GIL before invoking an inline ACLNN
+// host handler, but it is not a public torch_npu extension header.  Keep this
+// small equivalent local: it applies only while the caller owns the GIL, never
+// waits for the NPU stream, and lets RAII reacquire the GIL before an exception
+// escapes back through the bridge.
+template <typename Function>
+inline int RunDrainedCallerThreadHost(Function&& function) {
+#ifndef BUILD_LIBTORCH
+  if (PyGILState_Check() != 0) {
+    pybind11::gil_scoped_release release;
+    return std::forward<Function>(function)();
+  }
+#endif
+  return std::forward<Function>(function)();
+}
+
 inline void LogOpApiLifecycle(const char *api, const char *stage) {
   if (!OpApiDebugEnabled()) {
     return;
@@ -1650,3 +1712,173 @@ inline void LogOrderedHostDso(
       aclnn_api,                                                              \
       reinterpret_cast<workspace_function_type>(deferred_workspace_addr_fn), \
       tensor_keepalive, __VA_ARGS__)
+
+// P8-only caller-thread counterpart of the deferred launcher above.  It is
+// intentionally a separate macro rather than a mode switch in the generic
+// P7 launcher: P7 still needs task-queue ownership, whereas P8 must not place
+// a bridge closure into torch_npu's private ReleaseQueue.  The only allowed
+// ABI is value-owned at::Tensor arguments and zero ACLNN workspace.
+//
+// `NPUStream::stream()` (without `false`) first drains preceding host task
+// queue submissions for this stream, then returns the same ACL stream.  The
+// caller consequently preserves producer ordering while it performs only the
+// ACLNN *host* lifecycle directly.  Its device launch remains asynchronous:
+// this macro never calls aclrtSynchronizeStream or a sync-launch stream.
+//
+// It must not call RunOpApi.  That API transfers its handler to torch_npu's
+// private ReleaseQueue after execution; a bridge-local std::function can then
+// survive Python/DSO teardown even after torch.npu.synchronize() returns.
+#define EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_IMPL(    \
+    aclnn_api, workspace_function_expression, ...)                             \
+  do {                                                                          \
+    using namespace nanovllm_a5_opapi;                                         \
+    static void *inline_workspace_addr_fn =                                    \
+        ResolveSymbol(#aclnn_api "GetWorkspaceSize");                         \
+    static void *inline_launch_addr_fn = ResolveSymbol(#aclnn_api);            \
+    TORCH_CHECK(                                                                \
+        inline_workspace_addr_fn != nullptr && inline_launch_addr_fn != nullptr,\
+        #aclnn_api,                                                             \
+        " or ",                                                                \
+        #aclnn_api "GetWorkspaceSize is missing from repository-local ",      \
+        "libcust_opapi.so");                                                  \
+    LogResolvedOpApi(#aclnn_api, inline_workspace_addr_fn,                     \
+                     inline_launch_addr_fn);                                   \
+    auto inline_npu_stream = c10_npu::getCurrentNPUStream();                   \
+    aclrtStream inline_acl_stream = inline_npu_stream.stream();                \
+    TORCH_CHECK(inline_acl_stream != nullptr,                                  \
+                #aclnn_api " received a null current ACL stream");            \
+    RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream);           \
+    LogOpApiLifecycle(#aclnn_api, "caller_thread_stream_drained");           \
+    /* std::make_tuple decays every at::Tensor argument to value ownership. */ \
+    auto inline_args = std::make_tuple(__VA_ARGS__);                            \
+    auto inline_acl_call =                                                      \
+        [inline_args = std::move(inline_args),                                 \
+         inline_npu_stream, inline_acl_stream]() mutable -> int {             \
+      bool inline_pta_cache_active = false;                                    \
+      bool inline_huge_mem_active = false;                                     \
+      auto inline_init_huge_mem =                                               \
+          reinterpret_cast<InitHugeMemThreadLocalFn>(                          \
+              ResolveSymbol("InitHugeMemThreadLocal"));                       \
+      auto inline_uninit_huge_mem =                                             \
+          reinterpret_cast<UnInitHugeMemThreadLocalFn>(                        \
+              ResolveSymbol("UnInitHugeMemThreadLocal"));                     \
+      auto inline_release_huge_mem =                                           \
+          reinterpret_cast<ReleaseHugeMemFn>(ResolveSymbol("ReleaseHugeMem"));\
+      auto inline_cleanup_host_tls = [&]() noexcept {                          \
+        if (inline_huge_mem_active) {                                          \
+          if (inline_release_huge_mem != nullptr) {                            \
+            inline_release_huge_mem(nullptr, false);                           \
+          }                                                                     \
+          if (inline_uninit_huge_mem != nullptr) {                             \
+            inline_uninit_huge_mem(nullptr, false);                            \
+          }                                                                     \
+          inline_huge_mem_active = false;                                      \
+        }                                                                       \
+        if (inline_pta_cache_active) {                                         \
+          UnInitPtaCacheForWorkspace(true);                                    \
+          inline_pta_cache_active = false;                                     \
+        }                                                                       \
+        LogOpApiLifecycle(#aclnn_api, "caller_thread_tls_uninit");           \
+      };                                                                        \
+      try {                                                                     \
+        inline_pta_cache_active = InitPtaCacheForWorkspace();                  \
+        LogOpApiLifecycle(                                                      \
+            #aclnn_api,                                                         \
+            inline_pta_cache_active ? "caller_thread_pta_cache_ready"        \
+                                    : "caller_thread_pta_cache_unavailable"); \
+        LogOrderedHostDso(#aclnn_api, inline_workspace_addr_fn,                \
+                          inline_launch_addr_fn, inline_init_huge_mem,         \
+                          inline_release_huge_mem,                              \
+                          inline_uninit_huge_mem);                              \
+        if (inline_init_huge_mem != nullptr) {                                 \
+          (void)inline_init_huge_mem(nullptr, false);                          \
+          inline_huge_mem_active = true;                                       \
+          LogOpApiLifecycle(#aclnn_api, "caller_thread_huge_mem_ready");     \
+        }                                                                       \
+        uint64_t inline_workspace_size = 0;                                    \
+        uint64_t *inline_workspace_size_ptr = &inline_workspace_size;          \
+        aclOpExecutor *inline_executor = nullptr;                              \
+        aclOpExecutor **inline_executor_ptr = &inline_executor;                \
+        auto inline_converted = std::apply(                                    \
+            [&](auto &...inline_args_ref) {                                    \
+              return ConvertTypes(inline_args_ref...,                          \
+                                  inline_workspace_size_ptr,                    \
+                                  inline_executor_ptr);                         \
+            },                                                                  \
+            inline_args);                                                       \
+        LogConvertedDescriptorSet(#aclnn_api, inline_converted);               \
+        bool inline_converted_released = false;                                \
+        try {                                                                   \
+          auto inline_workspace_fn = workspace_function_expression;            \
+          LogOpApiLifecycle(#aclnn_api, "caller_thread_workspace_fn_ready"); \
+          LogOpApiLifecycle(#aclnn_api, "caller_thread_workspace_call_begin");\
+          const int inline_workspace_status =                                  \
+              CallTuple(inline_workspace_fn, inline_converted);                \
+          LogOpApiLifecycle(#aclnn_api, "caller_thread_workspace_call_end");\
+          TORCH_CHECK(                                                         \
+              inline_workspace_status == 0,                                    \
+              "call " #aclnn_api "GetWorkspaceSize failed: ",               \
+              RecentAclError());                                               \
+          TORCH_CHECK(                                                         \
+              inline_workspace_size == 0,                                      \
+              #aclnn_api " requires zero ACLNN workspace for the P8 inline ",\
+              "asynchronous launch path; got ", inline_workspace_size);      \
+          LogOpApiLifecycle(#aclnn_api, "caller_thread_workspace_ready");   \
+          auto inline_launch_fn =                                              \
+              reinterpret_cast<OpApiLaunchFn>(inline_launch_addr_fn);          \
+          LogOpApiLifecycle(#aclnn_api, "launch_begin");                     \
+          const int inline_launch_status =                                     \
+              inline_launch_fn(nullptr, inline_workspace_size,                 \
+                               inline_executor, inline_acl_stream);            \
+          TORCH_CHECK(                                                         \
+              inline_launch_status == 0,                                       \
+              "call " #aclnn_api " failed: ", RecentAclError());            \
+          LogOpApiLifecycle(#aclnn_api, "launch_done");                      \
+          RecordTensorTupleOnNpuStream(inline_args, inline_npu_stream);        \
+          LogOpApiLifecycle(#aclnn_api, "tensor_lifetime_recorded");         \
+          ReleaseTuple(inline_converted);                                      \
+          inline_converted_released = true;                                    \
+          LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");          \
+          ClearTensorTuple(inline_args);                                       \
+          LogOpApiLifecycle(#aclnn_api, "tensor_keepalive_released");        \
+          inline_cleanup_host_tls();                                            \
+          return inline_launch_status;                                         \
+        } catch (...) {                                                         \
+          if (!inline_converted_released) {                                    \
+            ReleaseTuple(inline_converted);                                    \
+          }                                                                     \
+          throw;                                                                \
+        }                                                                       \
+      } catch (...) {                                                           \
+        inline_cleanup_host_tls();                                              \
+        LogOpApiLifecycle(#aclnn_api, "caller_thread_failed_quarantined");  \
+        throw;                                                                  \
+      }                                                                         \
+    };                                                                          \
+    /* Do not delegate `inline_acl_call` to RunOpApi: doing so would enqueue  \
+     * this bridge closure in torch_npu's private ReleaseQueue.  We reproduce \
+     * only its public-facing GIL-release property around the synchronous     \
+     * host handler; the ACL launch above is still asynchronous on the NPU. */\
+    LogOpApiLifecycle(#aclnn_api, "caller_thread_direct_dispatch_begin");    \
+    const int inline_direct_status =                                           \
+        RunDrainedCallerThreadHost(std::move(inline_acl_call));                \
+    TORCH_CHECK(inline_direct_status == 0,                                    \
+                "call " #aclnn_api " direct host dispatch failed: ",          \
+                RecentAclError());                                            \
+    LogOpApiLifecycle(#aclnn_api, "caller_thread_direct_dispatch_done");     \
+    LogOpApiLifecycle(#aclnn_api, "submit_done");                             \
+  } while (false)
+
+#define EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE(        \
+    aclnn_api, ...)                                                            \
+  EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_IMPL(          \
+      aclnn_api,                                                               \
+      WorkspaceFunction(inline_converted, inline_workspace_addr_fn),          \
+      __VA_ARGS__)
+
+#define EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_TYPED(  \
+    aclnn_api, workspace_function_type, ...)                                  \
+  EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_IMPL(          \
+      aclnn_api,                                                               \
+      reinterpret_cast<workspace_function_type>(inline_workspace_addr_fn),   \
+      __VA_ARGS__)

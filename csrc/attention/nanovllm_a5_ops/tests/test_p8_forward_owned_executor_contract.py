@@ -108,49 +108,67 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         cls.stage_a_bridge = STAGE_A_BRIDGE.read_text(encoding="utf-8")
         cls.op_api_common = OP_API_COMMON.read_text(encoding="utf-8")
 
-    def test_p8_acl_host_lifetime_is_tensor_owned_and_deferred(self) -> None:
-        """P8 must not recreate P7's producer-TLS descriptor lifetime bug."""
-        deferred = "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE("
-        typed_deferred = "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED("
-        self.assertEqual(self.bridge.count(deferred), 2)
-        self.assertEqual(self.bridge.count(typed_deferred), 1)
-        self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.bridge)
-        self.assertEqual(self.stage_a_bridge.count(deferred), 1)
-        self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.stage_a_bridge)
-        self.assertEqual(
-            self.bridge.count("RequireP8DeferredHostContract();"), 3
+    def test_p8_acl_host_lifecycle_is_drained_direct_and_tensor_owned(self) -> None:
+        """P8 bypasses ReleaseQueue without synchronizing device execution."""
+        direct = "EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE("
+        typed_direct = (
+            "EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_TYPED("
         )
-        self.assertIn("#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE", self.op_api_common)
-        generic = self.op_api_common[
+        deferred = "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE("
+        self.assertEqual(self.bridge.count(direct), 2)
+        self.assertEqual(self.bridge.count(typed_direct), 1)
+        self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.bridge)
+        self.assertEqual(self.stage_a_bridge.count(direct), 1)
+        self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.stage_a_bridge)
+        self.assertNotIn(deferred, self.bridge)
+        self.assertNotIn(deferred, self.stage_a_bridge)
+        self.assertNotIn("RunOpApi", self.bridge)
+        self.assertNotIn("RunOpApi", self.stage_a_bridge)
+        self.assertNotIn("UseStreamResIfNeeded", self.bridge)
+        self.assertNotIn("UseStreamResIfNeeded", self.stage_a_bridge)
+        self.assertIn(
+            "#define EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE",
+            self.op_api_common,
+        )
+        direct_macro = self.op_api_common[
             self.op_api_common.index(
-                "#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE"
-            ):
+                "#define EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_IMPL"
+            ):self.op_api_common.index(
+                "#define EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_TYPED"
+            )
         ]
         for token in (
             "std::make_tuple(__VA_ARGS__)",
-            "UseStreamResIfNeeded(deferred_acl_stream, false)",
+            "inline_npu_stream.stream()",
+            "RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream)",
+            "RunDrainedCallerThreadHost(std::move(inline_acl_call))",
             "InitPtaCacheForWorkspace()",
             "ResolveSymbol(\"InitHugeMemThreadLocal\")",
-            "ConvertTypes(deferred_args_ref...",
-            "deferred_workspace_size == 0",
-            "ReleaseTuple(deferred_converted)",
+            "ConvertTypes(inline_args_ref...",
+            "inline_workspace_size == 0",
+            "ReleaseTuple(inline_converted)",
             "UnInitPtaCacheForWorkspace(true)",
-            "handoff_runopapi_tensor_owned_deferred",
+            "caller_thread_direct_dispatch_done",
         ):
-            self.assertIn(token, generic)
+            self.assertIn(token, direct_macro)
+        for forbidden in (
+            "at_npu::native::OpCommand::RunOpApi(",
+            "UseStreamResIfNeeded",
+            "stream(false)",
+            "aclrtSynchronizeStream",
+        ):
+            self.assertNotIn(forbidden, direct_macro)
         self.assertIn("NPUCachingAllocator::recordStream", self.op_api_common)
-        self.assertIn("RecordTensorTupleOnNpuStream(", generic)
-        self.assertIn("deferred_args, deferred_npu_stream", generic)
-        self.assertIn("ClearTensorTuple(deferred_args)", generic)
-        record = generic.index("RecordTensorTupleOnNpuStream(")
-        release = generic.index("ReleaseTuple(deferred_converted)", record)
-        clear = generic.index("ClearTensorTuple(deferred_args)", release)
+        self.assertIn("RecordTensorTupleOnNpuStream(", direct_macro)
+        self.assertIn("inline_args, inline_npu_stream", direct_macro)
+        self.assertIn("ClearTensorTuple(inline_args)", direct_macro)
+        record = direct_macro.index("RecordTensorTupleOnNpuStream(")
+        release = direct_macro.index("ReleaseTuple(inline_converted)", record)
+        clear = direct_macro.index("ClearTensorTuple(inline_args)", release)
         self.assertLess(record, release)
         self.assertLess(release, clear)
         self.assertNotIn("auto keepalive = std::make_tuple", self.bridge)
         self.assertNotIn("auto keepalive = std::make_tuple", self.stage_a_bridge)
-        self.assertEqual(self.bridge.count("std::tuple<>{}"), 3)
-        self.assertEqual(self.stage_a_bridge.count("std::tuple<>{}"), 1)
         stage_a_host = (
             OPS_ROOT
             / "a5_score_receipt_candidate_executor"
@@ -172,7 +190,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         """
         for token in (
             '#include "aclnn_a5_p8_forward_owned_executor.h"',
-            "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED(",
+            "EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_TYPED(",
             "decltype(&aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize)",
             "authoritative contract and deliberately carries no 19-output suffix",
         ):
@@ -189,11 +207,11 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.p8_setup)
         for token in (
-            "#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED",
-            "reinterpret_cast<workspace_function_type>(deferred_workspace_addr_fn)",
-            '"consumer_workspace_fn_ready"',
-            '"consumer_workspace_call_begin"',
-            '"consumer_workspace_call_end"',
+            "#define EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE_TYPED",
+            "reinterpret_cast<workspace_function_type>(inline_workspace_addr_fn)",
+            '"caller_thread_workspace_fn_ready"',
+            '"caller_thread_workspace_call_begin"',
+            '"caller_thread_workspace_call_end"',
         ):
             self.assertIn(token, self.op_api_common)
         export_index = self.runner.index(
@@ -205,24 +223,25 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         self.assertLess(cann_export_index, bridge_index)
         self.assertNotIn("47", self.bridge)
 
-    def test_p8_deferred_host_contract_requires_task_queue_before_npu_use(self) -> None:
-        """Deferred descriptor ownership has no safe inline fallback."""
+    def test_p8_drained_direct_host_contract_keeps_task_queue_ordering(self) -> None:
+        """P8 drains prior producers but owns its own async ACLNN lifecycle."""
         for token in (
-            'std::strcmp(task_queue, "1") == 0',
-            'std::strcmp(launch_blocking, "0") == 0',
-            "TASK_QUEUE_ENABLE=1",
-            "ASCEND_LAUNCH_BLOCKING=0",
-            "unsafe inline ",
-            "ACLNN deferred submission",
+            "RequireDrainedCallerThreadAsyncOpApiContract",
+            "OptionsManager::GetTaskQueueEnable()",
+            "CheckBlockingEnable()",
+            "P8_DRAINED_DIRECT_HOST_GATE",
+            "device_launch=async",
+            "RunDrainedCallerThreadHost",
         ):
-            self.assertIn(token, self.bridge)
+            self.assertIn(token, self.op_api_common)
         for token in (
             'P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-1}"',
             'P8_ASCEND_LAUNCH_BLOCKING="${P8_ASCEND_LAUNCH_BLOCKING:-0}"',
-            'runner_fail "unsafe_deferred_launch_environment"',
+            'runner_fail "unsafe_drained_direct_launch_environment"',
             'export TASK_QUEUE_ENABLE="$P8_TASK_QUEUE_ENABLE"',
             'export ASCEND_LAUNCH_BLOCKING="$P8_ASCEND_LAUNCH_BLOCKING"',
-            "P8_DEFERRED_HOST_ENV pass=1",
+            "P8_DRAINED_DIRECT_HOST_ENV pass=1",
+            "torch_npu.npu.get_task_queue_enable()",
         ):
             self.assertIn(token, self.runner)
 
