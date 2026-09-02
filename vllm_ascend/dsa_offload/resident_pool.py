@@ -26,6 +26,7 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_LIDU_TOKEN_CAPACITY,
     DSA_OP_BACKEND_NANOVLLM_A5,
     DSA_REQUIRED_CACHE_BLOCK_SIZE,
+    DSA_SFA_COMPUTE_TOPK,
 )
 
 
@@ -42,6 +43,7 @@ class DSAResidentTokenPool:
         device: torch.device,
         op_backend: str = "default",
         block_size: int = DSA_REQUIRED_CACHE_BLOCK_SIZE,
+        reserve_speculative_resident_slots: bool = False,
     ) -> None:
         if max_num_reqs <= 0:
             raise ValueError("DSA resident pool capacity must be positive")
@@ -68,6 +70,27 @@ class DSAResidentTokenPool:
         self._uses_nanovllm_a5_pool = (
             self.op_backend == DSA_OP_BACKEND_NANOVLLM_A5
         )
+        self._reserves_speculative_resident_slots = bool(
+            reserve_speculative_resident_slots
+        )
+        if (
+            self._reserves_speculative_resident_slots
+            and not self._uses_nanovllm_a5_pool
+        ):
+            raise ValueError(
+                "Speculative resident slots require the nanovllm_a5 "
+                "DSA backend"
+            )
+        if (
+            self._reserves_speculative_resident_slots
+            and self.max_resident_budget_tokens < 2 * DSA_SFA_COMPUTE_TOPK
+        ):
+            raise ValueError(
+                "DSA resident pool capacity cannot reserve the fixed "
+                "speculative range: "
+                f"capacity={self.max_resident_budget_tokens}, "
+                f"required={2 * DSA_SFA_COMPUTE_TOPK}"
+            )
 
         if self._uses_nanovllm_a5_pool:
             max_logical_blocks = cdiv(self.max_model_len, self.block_size)
@@ -116,6 +139,20 @@ class DSAResidentTokenPool:
             dtype=torch.int32,
             device=self.device,
         )
+        self._speculative_resident_slots: torch.Tensor | None
+        if self._reserves_speculative_resident_slots:
+            self._speculative_resident_slots = torch.full(
+                (
+                    self.num_layers,
+                    self.storage_rows,
+                    DSA_SFA_COMPUTE_TOPK,
+                ),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            self._speculative_resident_slots = None
         if self.cache_metadata_index is not None:
             self._cache_slots[
                 :,
@@ -171,12 +208,19 @@ class DSAResidentTokenPool:
 
         if self._uses_nanovllm_a5_pool:
             assert self._identity_slots is not None
+            normal_budget_tokens = self._normal_budget_tokens(
+                target_budget_tokens
+            )
             self._cache_slots[
-                :, pool_index, :target_budget_tokens
+                :, pool_index, :normal_budget_tokens
             ].copy_(
-                self._identity_slots[:target_budget_tokens]
+                self._identity_slots[:normal_budget_tokens]
                 .view(1, -1)
                 .expand(self.num_layers, -1)
+            )
+            self._install_speculative_resident_slots(
+                pool_index,
+                target_budget_tokens,
             )
         else:
             assert self.cache_metadata_index is not None
@@ -208,6 +252,38 @@ class DSAResidentTokenPool:
                 f"[0, {self.num_layers})"
             )
         return self._cache_slots[layer_id]
+
+    def get_speculative_resident_slots(
+        self,
+        layer_id: int,
+    ) -> torch.Tensor | None:
+        """Return each pool row's fixed speculative resident range.
+
+        The range exists only when explicitly enabled for the nanovllm A5
+        backend.  It is initialized at sparse-request admission and occupies
+        exactly the high ``DSA_SFA_COMPUTE_TOPK`` slots of that request's
+        resident budget.  Normal source-to-slot mappings never use it.
+        """
+
+        layer_id = int(layer_id)
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(
+                f"DSA layer_id={layer_id} is outside "
+                f"[0, {self.num_layers})"
+            )
+        if self._speculative_resident_slots is None:
+            return None
+        return self._speculative_resident_slots[layer_id]
+
+    @property
+    def speculative_resident_slot_count(self) -> int:
+        """Number of fixed high-end slots reserved per admitted A5 row."""
+
+        return (
+            DSA_SFA_COMPUTE_TOPK
+            if self._speculative_resident_slots is not None
+            else 0
+        )
 
     @property
     def graph_capture_row_count(self) -> int:
@@ -252,13 +328,21 @@ class DSAResidentTokenPool:
             self._cache_slots[:, :row_count].fill_(-1)
             if self._uses_nanovllm_a5_pool:
                 assert self._identity_slots is not None
+                normal_budget_tokens = self._normal_budget_tokens(
+                    target_budget_tokens
+                )
                 self._cache_slots[
-                    :, :row_count, :target_budget_tokens
+                    :, :row_count, :normal_budget_tokens
                 ].copy_(
-                    self._identity_slots[:target_budget_tokens]
+                    self._identity_slots[:normal_budget_tokens]
                     .view(1, 1, -1)
                     .expand(self.num_layers, row_count, -1)
                 )
+                for pool_index in range(row_count):
+                    self._install_speculative_resident_slots(
+                        pool_index,
+                        target_budget_tokens,
+                    )
             else:
                 assert self.cache_metadata_index is not None
                 self._cache_slots[
@@ -269,6 +353,10 @@ class DSAResidentTokenPool:
         except Exception:
             with suppress(Exception):
                 self._cache_slots[:, :row_count].fill_(-1)
+                if self._speculative_resident_slots is not None:
+                    self._speculative_resident_slots[
+                        :, :row_count
+                    ].fill_(-1)
                 if self.cache_metadata_index is not None:
                     self._cache_slots[
                         :,
@@ -285,6 +373,8 @@ class DSAResidentTokenPool:
         if not row_count:
             return
         self._cache_slots[:, :row_count].fill_(-1)
+        if self._speculative_resident_slots is not None:
+            self._speculative_resident_slots[:, :row_count].fill_(-1)
         if self.cache_metadata_index is not None:
             self._cache_slots[
                 :,
@@ -303,9 +393,46 @@ class DSAResidentTokenPool:
 
     def _clear_index(self, pool_index: int) -> None:
         self._cache_slots[:, pool_index].fill_(-1)
+        if self._speculative_resident_slots is not None:
+            self._speculative_resident_slots[:, pool_index].fill_(-1)
         if self.cache_metadata_index is not None:
             self._cache_slots[
                 :,
                 pool_index,
                 self.cache_metadata_index,
             ].zero_()
+
+    def _normal_budget_tokens(self, target_budget_tokens: int) -> int:
+        """Return the portion of an A5 resident budget usable by source maps."""
+
+        if not self._reserves_speculative_resident_slots:
+            return target_budget_tokens
+        if target_budget_tokens < 2 * DSA_SFA_COMPUTE_TOPK:
+            raise ValueError(
+                "DSA resident budget cannot reserve the fixed speculative "
+                "range: "
+                f"budget={target_budget_tokens}, "
+                f"required={2 * DSA_SFA_COMPUTE_TOPK}"
+            )
+        return target_budget_tokens - DSA_SFA_COMPUTE_TOPK
+
+    def _install_speculative_resident_slots(
+        self,
+        pool_index: int,
+        target_budget_tokens: int,
+    ) -> None:
+        """Install the canonical high-end range for one A5 pool row."""
+
+        if self._speculative_resident_slots is None:
+            return
+        start = self._normal_budget_tokens(target_budget_tokens)
+        slots = torch.arange(
+            start,
+            target_budget_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        assert slots.numel() == DSA_SFA_COMPUTE_TOPK
+        self._speculative_resident_slots[:, pool_index].copy_(
+            slots.view(1, -1).expand(self.num_layers, -1)
+        )
