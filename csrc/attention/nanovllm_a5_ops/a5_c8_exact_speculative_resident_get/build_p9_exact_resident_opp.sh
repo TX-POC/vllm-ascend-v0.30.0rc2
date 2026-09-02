@@ -102,6 +102,7 @@ KVAF_RESIDENT_HEADER="${KVAF_DEMO_ROOT}/kernel/kvaf_layer_resident_get_device.h"
 KVAF_DENSE_SOURCE="${KVAF_DEMO_ROOT}/kernel/execute_batch_get_aiv.asc"
 KVAF_ABI_HEADER="${KVAF_DEMO_ROOT}/include/batch_get_abi.h"
 KVAF_DIRECT_ABI_HEADER="${KVAF_DEMO_ROOT}/include/direct_hccp_abi.h"
+KVAF_RESIDENT_CONTRACT_TEST="${KVAF_ROOT}/tests/python/test_layer_resident_get_source_contract.py"
 
 for required in \
   "${OFFICIAL_C8_ROOT}/CMakeLists.txt" \
@@ -116,10 +117,19 @@ for required in \
   "${KVAF_RESIDENT_HEADER}" \
   "${KVAF_DENSE_SOURCE}" \
   "${KVAF_ABI_HEADER}" \
-  "${KVAF_DIRECT_ABI_HEADER}"; do
+  "${KVAF_DIRECT_ABI_HEADER}" \
+  "${KVAF_RESIDENT_CONTRACT_TEST}"; do
   [[ -f "${required}" ]] || fail "source_closure_file_missing:path=${required}"
 done
 [[ -d "${OVERLAY_ROOT}" ]] || fail "p9_overlay_root_missing:path=${OVERLAY_ROOT}"
+
+# P9 embeds KVAF's device header into a fresh source-derived C8 project.  Run
+# its source-level ABI contract before msopgen so a bad C/global namespace
+# alias fails in milliseconds rather than after CANN has compiled the C8 OPP.
+command -v python3 >/dev/null 2>&1 || fail "python3_missing_for_kvaf_contract"
+python3 "${KVAF_RESIDENT_CONTRACT_TEST}" ||
+  fail "kvaf_layer_resident_source_contract_failed:path=${KVAF_RESIDENT_CONTRACT_TEST}"
+printf 'P9_KVAF_SOURCE_CONTRACT_PASS path=%s\n' "${KVAF_RESIDENT_CONTRACT_TEST}"
 
 # The source-derived C8 target must not silently import the retired private
 # arena/score-receipt implementation.  These names are forbidden in the P9

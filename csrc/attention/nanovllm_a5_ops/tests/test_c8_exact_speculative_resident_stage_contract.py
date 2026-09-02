@@ -329,6 +329,9 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertIn("P9_POST_EXECUTOR_HEADER", P9_BUILD_SCRIPT)
         self.assertIn("P9_FINALIZER_HEADER", P9_BUILD_SCRIPT)
         self.assertIn("p9_stage_b_finalizer_include_missing", P9_BUILD_SCRIPT)
+        self.assertIn("KVAF_RESIDENT_CONTRACT_TEST", P9_BUILD_SCRIPT)
+        self.assertIn("P9_KVAF_SOURCE_CONTRACT_PASS", P9_BUILD_SCRIPT)
+        self.assertIn("kvaf_layer_resident_source_contract_failed", P9_BUILD_SCRIPT)
         # P9 uses msopgen's standalone CMake scaffold.  Copying the official
         # C8 op_host directory over it revives a monorepo-only macro
         # (add_op_to_compiled_list) and fails before any P9 code compiles.
