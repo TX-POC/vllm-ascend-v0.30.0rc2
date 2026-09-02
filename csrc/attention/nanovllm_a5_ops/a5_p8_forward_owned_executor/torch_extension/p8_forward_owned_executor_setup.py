@@ -23,6 +23,23 @@ ROOT = Path(__file__).resolve().parent
 OPS_ROOT = ROOT.parents[1]
 COMMON_CSRC = OPS_ROOT / "torch_extension" / "csrc"
 TORCH_NPU_ROOT = Path(torch_npu.__file__).resolve().parent
+P8_OPP_ROOT = Path(
+    os.environ.get("NANOVLLM_A5_P8_FORWARD_OWNED_OPP", "")
+).expanduser()
+P8_ACLNN_INCLUDE = P8_OPP_ROOT / "vendors" / "customize" / "op_api" / "include"
+P8_ACLNN_HEADER = P8_ACLNN_INCLUDE / "aclnn_a5_p8_forward_owned_executor.h"
+
+# P8's Stage-B bridge is never allowed to infer a workspace ABI from a stale
+# DSO or an ad-hoc tuple.  The runner constructs this OPP in its unique run
+# directory and exports the exact root before building the bridge.  Refuse to
+# build if its generated public header is absent.
+if not P8_ACLNN_HEADER.is_file():
+    raise RuntimeError(
+        "P8 requires a freshly generated Stage-B ACLNN header at "
+        f"{P8_ACLNN_HEADER}; build the exact P8 Stage-B OPP first and export "
+        "NANOVLLM_A5_P8_FORWARD_OWNED_OPP."
+    )
+
 MAX_JOBS = int(
     os.getenv(
         "NANOVLLM_A5_P8_FORWARD_OWNED_EXECUTOR_BUILD_JOBS",
@@ -46,6 +63,7 @@ setup(
             sources=[str(ROOT / "csrc" / "p8_forward_owned_executor.cpp")],
             extra_compile_args=[
                 f"-I{TORCH_NPU_ROOT / 'include' / 'third_party' / 'acl' / 'inc'}",
+                f"-I{P8_ACLNN_INCLUDE}",
                 f"-I{COMMON_CSRC}",
                 "-D_GNU_SOURCE",
                 "-O3",

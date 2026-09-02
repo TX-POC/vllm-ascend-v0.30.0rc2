@@ -1436,8 +1436,8 @@ inline void LogOrderedHostDso(
 // generated host tilers explicitly declare zero workspace.  Do not relax the
 // workspace check without first defining an explicit stream-lifetime owner
 // for a consumer-created workspace Tensor.
-#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(                    \
-    aclnn_api, tensor_keepalive, ...)                                         \
+#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_IMPL(               \
+    aclnn_api, workspace_function_expression, tensor_keepalive, ...)         \
   do {                                                                         \
     using namespace nanovllm_a5_opapi;                                        \
     static void *deferred_workspace_addr_fn =                                 \
@@ -1523,10 +1523,12 @@ inline void LogOrderedHostDso(
         LogConvertedDescriptorSet(#aclnn_api, deferred_converted);            \
         bool deferred_converted_released = false;                             \
         try {                                                                  \
-          auto deferred_workspace_fn =                                        \
-              WorkspaceFunction(deferred_converted, deferred_workspace_addr_fn);\
+          auto deferred_workspace_fn = workspace_function_expression;         \
+          LogOpApiLifecycle(#aclnn_api, "consumer_workspace_fn_ready");     \
+          LogOpApiLifecycle(#aclnn_api, "consumer_workspace_call_begin");  \
           const int deferred_workspace_status =                               \
               CallTuple(deferred_workspace_fn, deferred_converted);          \
+          LogOpApiLifecycle(#aclnn_api, "consumer_workspace_call_end");    \
           TORCH_CHECK(                                                        \
               deferred_workspace_status == 0,                                 \
               "call " #aclnn_api "GetWorkspaceSize failed: ",              \
@@ -1569,3 +1571,26 @@ inline void LogOrderedHostDso(
     /* The producer never owns ACLNN TLS or descriptors on this path. */     \
     LogOpApiLifecycle(#aclnn_api, "submit_done");                            \
   } while (false)
+
+// The common form derives the signature from the converted ACL descriptor
+// tuple.  It remains the right choice for operators whose source tree does
+// not ship an OPP-generated public ACLNN header.
+#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE(                    \
+    aclnn_api, tensor_keepalive, ...)                                         \
+  EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_IMPL(                     \
+      aclnn_api,                                                              \
+      WorkspaceFunction(deferred_converted, deferred_workspace_addr_fn),     \
+      tensor_keepalive, __VA_ARGS__)
+
+// Operators with a freshly generated ACLNN header may bind the exact C ABI
+// instead of recreating it from a tuple.  This is intentionally an opt-in
+// narrow variant: it keeps existing bridges source-compatible while making
+// a generated signature mismatch a compile-time failure in the new bridge.
+// `workspace_function_type` should be
+// `decltype(&aclnn<Op>GetWorkspaceSize)` from that generated header.
+#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED(              \
+    aclnn_api, workspace_function_type, tensor_keepalive, ...)               \
+  EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_IMPL(                     \
+      aclnn_api,                                                              \
+      reinterpret_cast<workspace_function_type>(deferred_workspace_addr_fn), \
+      tensor_keepalive, __VA_ARGS__)

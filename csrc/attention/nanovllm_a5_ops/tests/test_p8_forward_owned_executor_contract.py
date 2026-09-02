@@ -42,6 +42,7 @@ REFERENCE_BUILD = OPS_ROOT / "a5_official_c8_reference" / "build_reference_opp.s
 BRIDGE = (
     P8_ROOT / "torch_extension" / "csrc" / "p8_forward_owned_executor.cpp"
 )
+P8_SETUP = P8_ROOT / "torch_extension" / "p8_forward_owned_executor_setup.py"
 STAGE_A_BRIDGE = (
     OPS_ROOT
     / "a5_score_receipt_candidate_executor"
@@ -103,13 +104,16 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         cls.runner = RUNNER.read_text(encoding="utf-8")
         cls.reference_build = REFERENCE_BUILD.read_text(encoding="utf-8")
         cls.bridge = BRIDGE.read_text(encoding="utf-8")
+        cls.p8_setup = P8_SETUP.read_text(encoding="utf-8")
         cls.stage_a_bridge = STAGE_A_BRIDGE.read_text(encoding="utf-8")
         cls.op_api_common = OP_API_COMMON.read_text(encoding="utf-8")
 
     def test_p8_acl_host_lifetime_is_tensor_owned_and_deferred(self) -> None:
         """P8 must not recreate P7's producer-TLS descriptor lifetime bug."""
         deferred = "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE("
-        self.assertEqual(self.bridge.count(deferred), 3)
+        typed_deferred = "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED("
+        self.assertEqual(self.bridge.count(deferred), 2)
+        self.assertEqual(self.bridge.count(typed_deferred), 1)
         self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.bridge)
         self.assertEqual(self.stage_a_bridge.count(deferred), 1)
         self.assertNotIn("EXEC_NPU_CMD_ORDERED(", self.stage_a_bridge)
@@ -143,6 +147,45 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         for host in (HOST, ADMISSION_HOST, ADVANCE_HOST, stage_a_host):
             source = host.read_text(encoding="utf-8")
             self.assertIn("GetWorkspaceSizes(1)[0] = 0U", source)
+
+    def test_stage_b_uses_its_generated_28_tensor_workspace_signature(self) -> None:
+        """P8 Stage-B must compile against the OPP it resolves at runtime.
+
+        The generated header is the one authoritative declaration of the
+        same-name mutable-ref ABI.  It has 28 Tensor inputs, not a synthetic
+        47-argument suffix containing the 19 Python aliases.  Binding dlsym
+        through ``decltype`` makes a generated-host ABI change fail during the
+        scoped bridge build, before task-queue execution can enter CANN.
+        """
+        for token in (
+            '#include "aclnn_a5_p8_forward_owned_executor.h"',
+            "EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED(",
+            "decltype(&aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize)",
+            "authoritative contract and deliberately carries no 19-output suffix",
+        ):
+            self.assertIn(token, self.bridge)
+        for token in (
+            "NANOVLLM_A5_P8_FORWARD_OWNED_OPP",
+            "P8_ACLNN_INCLUDE",
+            "aclnn_a5_p8_forward_owned_executor.h",
+            'f"-I{P8_ACLNN_INCLUDE}"',
+            "freshly generated Stage-B ACLNN header",
+        ):
+            self.assertIn(token, self.p8_setup)
+        for token in (
+            "#define EXEC_NPU_CMD_TENSOR_OWNED_DEFERRED_ZERO_WORKSPACE_TYPED",
+            "reinterpret_cast<workspace_function_type>(deferred_workspace_addr_fn)",
+            '"consumer_workspace_fn_ready"',
+            '"consumer_workspace_call_begin"',
+            '"consumer_workspace_call_end"',
+        ):
+            self.assertIn(token, self.op_api_common)
+        export_index = self.runner.index(
+            'export NANOVLLM_A5_P8_FORWARD_OWNED_OPP="$P8_STAGE_B_OPP"'
+        )
+        bridge_index = self.runner.index('stage_b_bridge "$P8_RUN_ROOT/stage_b_bridge.log"')
+        self.assertLess(export_index, bridge_index)
+        self.assertNotIn("47", self.bridge)
 
     def test_p8_deferred_host_contract_requires_task_queue_before_npu_use(self) -> None:
         """Deferred descriptor ownership has no safe inline fallback."""
