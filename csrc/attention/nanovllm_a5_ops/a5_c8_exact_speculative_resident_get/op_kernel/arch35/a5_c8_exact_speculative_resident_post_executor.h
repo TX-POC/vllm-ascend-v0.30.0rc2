@@ -19,7 +19,12 @@
 
 #include "a5_c8_exact_speculative_resident_contract.h"
 #include "a5_c8_exact_speculative_resident_score_hook.h"
-#include "kvaf_layer_resident/kvaf_layer_resident_get_device.h"
+// This header is compiled from op_kernel/arch35 while the KVAF Direct-HCCP
+// closure is deliberately staged beside it at op_kernel/kvaf_layer_resident.
+// Use a path relative to this header, rather than relying on an implicit
+// op_kernel include directory: CANN's OPC precompile only guarantees the
+// current arch35 directory for source-derived standalone OPPs.
+#include "../kvaf_layer_resident/kvaf_layer_resident_get_device.h"
 
 namespace QLIKernel {
 namespace exact_speculative_resident {

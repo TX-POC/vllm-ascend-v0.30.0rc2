@@ -214,6 +214,20 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             POST_EXECUTOR,
         )
 
+    def test_post_executor_resolves_the_staged_kvaf_device_closure_relatively(self) -> None:
+        """OPC precompile cannot depend on an implicit op_kernel include path."""
+        relative_include = (
+            '../kvaf_layer_resident/kvaf_layer_resident_get_device.h'
+        )
+        self.assertIn(f'#include "{relative_include}"', POST_EXECUTOR)
+        # The builder owns the exact staged layout, so assert both the source
+        # requirement and its fail-closed file-resolution check here.
+        self.assertIn("P9_KVAF_RELATIVE_INCLUDE", P9_BUILD_SCRIPT)
+        self.assertIn(
+            "p9_post_executor_kvaf_relative_include_unresolvable",
+            P9_BUILD_SCRIPT,
+        )
+
     def test_existing_c8_invalid_scratch_has_a_complete_fixed_layout(self) -> None:
         for token in (
             "kExistingC8InvalidScratchBytes",

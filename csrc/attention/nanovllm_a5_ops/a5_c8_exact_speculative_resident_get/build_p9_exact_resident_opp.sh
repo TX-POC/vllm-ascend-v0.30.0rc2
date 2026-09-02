@@ -181,6 +181,18 @@ install -m 0644 "${KVAF_ABI_HEADER}" "${STAGED_KVAF_ROOT}/batch_get_abi.h"
 install -m 0644 "${KVAF_DIRECT_ABI_HEADER}" \
   "${STAGED_KVAF_ROOT}/direct_hccp_abi.h"
 
+# The P9 post executor is an arch35 header; it must reach the staged KVAF
+# closure through a relative include.  Do this cheap, source-side closure
+# check before msopgen/CMake so a missing or incorrectly rooted device header
+# cannot waste a complete isolated OPP build.
+P9_POST_EXECUTOR_STAGE_PATH="${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_post_executor.h"
+P9_KVAF_RELATIVE_INCLUDE='../kvaf_layer_resident/kvaf_layer_resident_get_device.h'
+grep -Fq "#include \"${P9_KVAF_RELATIVE_INCLUDE}\"" \
+  "${P9_POST_EXECUTOR_STAGE_PATH}" ||
+  fail "p9_post_executor_kvaf_relative_include_missing:path=${P9_POST_EXECUTOR_STAGE_PATH}"
+[[ -f "${STAGED_C8_ROOT}/op_kernel/arch35/${P9_KVAF_RELATIVE_INCLUDE}" ]] ||
+  fail "p9_post_executor_kvaf_relative_include_unresolvable:path=${P9_POST_EXECUTOR_STAGE_PATH}:include=${P9_KVAF_RELATIVE_INCLUDE}"
+
 cat > "${PACKAGE_ROOT}/P9_PROVENANCE" <<EOF
 format=1
 kind=source_derived_c8_exact_speculative_resident
