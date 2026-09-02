@@ -1753,13 +1753,12 @@ inline void LogOrderedHostDso(
     aclrtStream inline_acl_stream = inline_npu_stream.stream();                \
     TORCH_CHECK(inline_acl_stream != nullptr,                                  \
                 #aclnn_api " received a null current ACL stream");            \
-    if (c10_npu::is_core_control_enabled()) {                                  \
-      /* This is a caller-thread binding, not the old producer/consumer       \
-       * handoff.  It preserves a dynamically configured stream quota without\
-       * pinning any P8 work to a physical AIV core. */                         \
-      c10_npu::UseStreamResInCurrentThread(inline_acl_stream);                 \
-      LogOpApiLifecycle(#aclnn_api, "caller_thread_core_res_bound");         \
-    }                                                                           \
+    /* P8 owns no CANN stream-resource quota.  Its scheduler is the device    \
+     * queue lease, not a caller-thread AIV binding: binding a quota here      \
+     * would both revive the rejected fixed-core design and import             \
+     * torch_npu's non-exported UseStreamResInCurrentThread symbol into the    \
+     * bridge DSO.  The existing stream remains intact; P8 neither sets,       \
+     * binds, resets, nor unbinds stream resources. */                         \
     LogOpApiLifecycle(#aclnn_api, "caller_thread_stream_drained");           \
     /* std::make_tuple decays every at::Tensor argument to value ownership. */ \
     auto inline_args = std::make_tuple(__VA_ARGS__);                            \

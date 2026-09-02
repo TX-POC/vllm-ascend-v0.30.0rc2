@@ -92,6 +92,12 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
                     return source[opening + 1:index]
         raise AssertionError(f"unterminated body for {signature}")
 
+    @staticmethod
+    def _strip_cpp_comments(source: str) -> str:
+        """Keep an ABI-surface test about code, not explanatory comments."""
+        source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+        return re.sub(r"//[^\n]*", "", source)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.kernel = KERNEL.read_text(encoding="utf-8")
@@ -143,7 +149,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "std::make_tuple(__VA_ARGS__)",
             "inline_npu_stream.stream()",
             "RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream)",
-            "c10_npu::UseStreamResInCurrentThread(inline_acl_stream)",
+            "P8 owns no CANN stream-resource quota",
             "inline_npu_stream.getRepoStopFlag()",
             "no public deterministic-state",
             "RunDrainedCallerThreadHost(std::move(inline_acl_call))",
@@ -160,11 +166,36 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "at_npu::native::OpCommand::RunOpApi(",
             "at_npu::native::ApplyDeterministicSnapshot(",
             "c10_npu::CaptureDeterministicSnapshot()",
+            "c10_npu::is_core_control_enabled()",
+            "c10_npu::UseStreamResInCurrentThread(",
+            "aclrtUseStreamResInCurrentThread",
             "stream(false)",
             "aclrtSynchronizeStream",
             "pybind11::gil_scoped_release",
         ):
             self.assertNotIn(forbidden, direct_macro)
+
+        # P8 deliberately owns no stream-resource quota or TLS binding.  Its
+        # only torch_npu-qualified call in the direct-launch macro is getting
+        # the framework's current stream to drain prior task-queue producers.
+        # Keep this narrow: the generic header still has P7 handoff helpers.
+        direct_code = self._strip_cpp_comments(direct_macro)
+        qualified = set(
+            re.findall(r"\b(?:c10_npu|at_npu)(?:::[A-Za-z_]\w*)+", direct_code)
+        )
+        self.assertEqual(qualified, {"c10_npu::getCurrentNPUStream"})
+        for forbidden in (
+            "UseStreamResIfNeeded(",
+            "GetUseStreamResFn(",
+            "GetUseStreamResFuncCoreNum(",
+            "aclrtUseStreamResInCurrentThread",
+            "aclrtSetStreamResLimit",
+            "aclrtResetStreamResLimit",
+            "dlsym(",
+            "OpenLibraryOnce(",
+            "RunOpApi",
+        ):
+            self.assertNotIn(forbidden, direct_code)
         self.assertIn("NPUCachingAllocator::recordStream", self.op_api_common)
         self.assertIn("RecordTensorTupleOnNpuStream(", direct_macro)
         self.assertIn("inline_args, inline_npu_stream", direct_macro)
