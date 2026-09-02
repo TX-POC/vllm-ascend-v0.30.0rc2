@@ -43,6 +43,7 @@ BRIDGE = (
     P8_ROOT / "torch_extension" / "csrc" / "p8_forward_owned_executor.cpp"
 )
 P8_SETUP = P8_ROOT / "torch_extension" / "p8_forward_owned_executor_setup.py"
+P8_FAIL_CLOSED_PROBE = OPS_ROOT / "tests" / "p8_stage_b_fail_closed_probe.py"
 STAGE_A_BRIDGE = (
     OPS_ROOT
     / "a5_score_receipt_candidate_executor"
@@ -105,6 +106,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         cls.reference_build = REFERENCE_BUILD.read_text(encoding="utf-8")
         cls.bridge = BRIDGE.read_text(encoding="utf-8")
         cls.p8_setup = P8_SETUP.read_text(encoding="utf-8")
+        cls.p8_fail_closed_probe = P8_FAIL_CLOSED_PROBE.read_text(encoding="utf-8")
         cls.stage_a_bridge = STAGE_A_BRIDGE.read_text(encoding="utf-8")
         cls.op_api_common = OP_API_COMMON.read_text(encoding="utf-8")
 
@@ -246,9 +248,23 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             'export TASK_QUEUE_ENABLE="$P8_TASK_QUEUE_ENABLE"',
             'export ASCEND_LAUNCH_BLOCKING="$P8_ASCEND_LAUNCH_BLOCKING"',
             "P8_DRAINED_DIRECT_HOST_ENV pass=1",
-            "torch_npu.npu.get_task_queue_enable()",
+            "task_queue_runtime_guard=bridge_cpp_options_manager",
         ):
             self.assertIn(token, self.runner)
+        for source in (self.runner, self.p8_fail_closed_probe):
+            self.assertNotIn("torch_npu.npu.get_task_queue_enable()", source)
+        for token in (
+            "task_queue_requested={requested_task_queue}",
+            "task_queue_runtime_guard=bridge_cpp_options_manager",
+            "OptionsManager at the direct ACLNN launch boundary",
+        ):
+            self.assertIn(token, self.p8_fail_closed_probe)
+        direct_gate = self._function_body(
+            self.op_api_common,
+            "inline void RequireDrainedCallerThreadAsyncOpApiContract(",
+        )
+        self.assertIn("effective_task_queue && !effective_launch_blocking", direct_gate)
+        self.assertIn("OptionsManager is compiled into this bridge", direct_gate)
 
     def test_acl_tensor_storage_shape_is_owned_by_the_live_aten_tensor(self) -> None:
         """A deferred ACLNN descriptor must not retain a local shape buffer.

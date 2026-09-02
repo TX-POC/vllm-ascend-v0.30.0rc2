@@ -222,17 +222,18 @@ mkdir -p "$(dirname "$P8_PROBE_LOG")"
 if ! run_logged npu7_probe "$P8_PROBE_LOG" "$P8_PYTHON" -c '
 import os, torch, torch_npu
 requested_queue = int(os.environ["TASK_QUEUE_ENABLE"])
-effective_queue = int(torch_npu.npu.get_task_queue_enable())
-if effective_queue != requested_queue:
+launch_blocking = os.environ.get("ASCEND_LAUNCH_BLOCKING", "")
+if requested_queue != 1 or launch_blocking not in ("", "0"):
     raise RuntimeError(
-        "TASK_QUEUE_ENABLE was latched before runner setup: "
-        f"requested={requested_queue} effective={effective_queue}")
+        "unsafe P8 process-start environment: "
+        f"TASK_QUEUE_ENABLE={requested_queue} "
+        f"ASCEND_LAUNCH_BLOCKING={launch_blocking or '<unset>'}")
 torch.npu.set_device(0)
 value = torch.ones(1, device="npu:0").cpu().item()
-print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s task_queue_requested=%s task_queue_effective=%s" % (
+print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s task_queue_requested=%s task_queue_runtime_guard=bridge_cpp_options_manager" % (
     os.environ.get("P8_PHYSICAL_NPU_ID"),
     os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
-    torch.npu.get_device_name(0), value, requested_queue, effective_queue))
+    torch.npu.get_device_name(0), value, requested_queue))
 '; then
     runner_fail "npu7_probe_failed"
     exit 1

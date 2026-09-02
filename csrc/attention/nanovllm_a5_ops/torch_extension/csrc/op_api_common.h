@@ -950,8 +950,15 @@ inline void RequireDrainedCallerThreadAsyncOpApiContract(
       c10_npu::option::OptionsManager::GetTaskQueueEnable();
   const bool effective_launch_blocking =
       c10_npu::option::OptionsManager::CheckBlockingEnable();
+  // The Python torch_npu module does not expose a stable
+  // ``get_task_queue_enable`` query on every supported build.  Keep the one
+  // authoritative effective-state check here, at the actual direct-launch
+  // boundary, where OptionsManager is compiled into this bridge from the
+  // pinned torch_npu headers.  Checking only the environment would accept a
+  // process in which torch_npu had already latched task queue disabled.
   TORCH_CHECK(
-      !effective_launch_blocking && !stream.isSyncLaunchStream(),
+      effective_task_queue && !effective_launch_blocking &&
+          !stream.isSyncLaunchStream(),
       "P8 drained caller-thread async ACLNN requires "
       "ASCEND_LAUNCH_BLOCKING=0 and a non-sync launch stream. "
       "effective_task_queue=", effective_task_queue,

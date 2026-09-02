@@ -113,14 +113,14 @@ def _require_drained_direct_environment() -> int:
             f"TASK_QUEUE_ENABLE={task_queue or '<unset>'} "
             f"ASCEND_LAUNCH_BLOCKING={launch_blocking or '<unset>'}"
         )
-    effective = int(torch_npu.npu.get_task_queue_enable())
-    if effective != 1:
-        raise RuntimeError(
-            "P8_STAGE_B_PROBE_BLOCKED "
-            "reason=task_queue_latched_before_environment "
-            f"requested=1 effective={effective}"
-        )
-    return effective
+    # ``torch_npu.npu.get_task_queue_enable`` is not a public Python API in
+    # the pinned runtime.  Do not replace this with a best-effort Python
+    # introspection path: it would turn a compatibility issue into either a
+    # false pass or an AttributeError before Stage-B is exercised.  This probe
+    # is launched in a fresh process with the two variables set by its runner;
+    # the Stage-B bridge then verifies the *effective* latched state through
+    # OptionsManager at the direct ACLNN launch boundary.
+    return 1
 
 
 def _npu(value: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -216,7 +216,7 @@ def _assert_fail_closed(inputs: tuple[torch.Tensor, ...], before: tuple[torch.Te
 
 def main() -> None:
     args = _parse_args()
-    effective_task_queue = _require_drained_direct_environment()
+    requested_task_queue = _require_drained_direct_environment()
     bridge_root = _require_directory("stage_b_bridge_root", args.stage_b_bridge_root)
     opp_root = _require_directory("stage_b_opp_root", args.stage_b_opp_root)
     opapi = opp_root / "vendors" / "customize" / "op_api" / "lib" / "libcust_opapi.so"
@@ -260,7 +260,8 @@ def main() -> None:
         "P8_STAGE_B_PROBE_CONFIG "
         f"device={device} physical={os.environ.get('P8_PHYSICAL_NPU_ID', 'unspecified')} "
         f"visible={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'unset')!r} "
-        f"task_queue_effective={effective_task_queue} "
+        f"task_queue_requested={requested_task_queue} "
+        "task_queue_runtime_guard=bridge_cpp_options_manager "
         f"inputs={len(inputs)} candidate_count={candidate_count} "
         f"fused_control_nonzero={fused_control_nonzero} "
         f"bridge={package_path.parent} native={native_path} opapi={opapi}",
