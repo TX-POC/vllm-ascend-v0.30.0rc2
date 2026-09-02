@@ -198,11 +198,12 @@ using AdvanceResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 using AdmissionResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 
 // P8's four ACLNN nodes take only value-owned ATen tensors and declare zero
-// workspace.  They use the P8-only drained-direct launcher below rather than
-// torch_npu's task-queue consumer: the caller owns descriptor/PTA/HugeMem
-// setup and teardown, while the generated ACLNN launch remains asynchronous
-// on the current NPU stream.  This removes the ReleaseQueue teardown edge
-// without changing device-side Post/CQ ownership or C8 math.
+// workspace.  They use the P8-only TQ0 direct launcher below rather than
+// torch_npu's task-queue consumer: one caller submits graph nodes in FIFO
+// order to the current stream, owns descriptor/PTA/HugeMem setup and teardown,
+// and leaves the generated ACLNN launch asynchronous.  This removes the
+// ReleaseQueue teardown edge without changing device-side Post/CQ ownership or
+// C8 math.
 
 void ValidateArenaAdmissionInputs(
     const at::Tensor& forward_control, const at::Tensor& p8_arena_health,

@@ -3,10 +3,10 @@
 // Minimal, self-contained ACLNN launcher for nanovllm_dsa_a5.
 //
 // Generic bridges below use torch_npu's OpCommand task-queue contract.  The
-// P8-only drained-direct macro is the explicit exception: it drains preceding
-// producer submissions on the current stream, then performs its own ACLNN
-// host lifecycle without putting a bridge closure into ReleaseQueue.  In both
-// cases device-side PostOnly/CQ work remains asynchronous.
+// P8-only direct macro is the explicit TQ0 acceptance path: the caller
+// submits all graph nodes directly to one current stream, then performs its
+// own ACLNN host lifecycle without putting a bridge closure into ReleaseQueue.
+// Device-side PostOnly/CQ work remains asynchronous.
 
 #include <algorithm>
 #include <cstdlib>
@@ -33,8 +33,6 @@
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
-#include "torch_npu/csrc/core/npu/NPUFunctions.h"
-#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
 // Each standalone validation bridge owns a distinct resolver domain.  The
@@ -937,61 +935,51 @@ inline void UseStreamResIfNeeded(aclrtStream stream, bool enqueue) {
 // torch.npu.synchronize().  A bridge-local callback can therefore outlive
 // Python/DSO teardown even after all device work is complete.
 //
-// Before P8 calls ACLNN directly, `NPUStream::stream()` drains only preceding
-// host task-queue submissions for this stream; it does not synchronize device
-// execution.  Thus it preserves C8/Stage-A -> Stage-B stream order without
-// sending P8's own closure into ReleaseQueue.  The device executor still owns
-// candidate Post/CQ progress; this host code executes once per graph node,
-// not once per candidate or CQ.
-inline void RequireDrainedCallerThreadAsyncOpApiContract(
-    const c10_npu::NPUStream& stream) {
+// There is no public torch_npu ABI that drains its host task queue and then
+// returns a raw ACL stream for bridge-local ACLNN.  P8 must not emulate that
+// boundary with header-only c10_npu internals: the deployed runtime need not
+// export them.  The direct acceptance path therefore requires task queue
+// disabled before Python imports torch_npu.  C8, Stage-A and P8 are submitted
+// by one caller in program order to the same current stream.
+//
+// This is deliberately not the future TQ1 product contract.  TQ1 will use a
+// framework-ordered trampoline with an explicit lifecycle owner; it may not
+// use this raw direct path.
+inline void RequireP8Tq0DirectAsyncOpApiContract() {
+  const char* task_queue = std::getenv("TASK_QUEUE_ENABLE");
   const char* launch_blocking = std::getenv("ASCEND_LAUNCH_BLOCKING");
-  const bool effective_task_queue =
-      c10_npu::option::OptionsManager::GetTaskQueueEnable();
-  const bool effective_launch_blocking =
-      c10_npu::option::OptionsManager::CheckBlockingEnable();
-  // The Python torch_npu module does not expose a stable
-  // ``get_task_queue_enable`` query on every supported build.  Keep the one
-  // authoritative effective-state check here, at the actual direct-launch
-  // boundary, where OptionsManager is compiled into this bridge from the
-  // pinned torch_npu headers.  Checking only the environment would accept a
-  // process in which torch_npu had already latched task queue disabled.
   TORCH_CHECK(
-      effective_task_queue && !effective_launch_blocking &&
-          !stream.isSyncLaunchStream(),
-      "P8 drained caller-thread async ACLNN requires "
-      "ASCEND_LAUNCH_BLOCKING=0 and a non-sync launch stream. "
-      "effective_task_queue=", effective_task_queue,
+      task_queue != nullptr && std::strcmp(task_queue, "0") == 0 &&
+          (launch_blocking == nullptr ||
+           std::strcmp(launch_blocking, "0") == 0),
+      "P8 TQ0 direct ACLNN requires TASK_QUEUE_ENABLE=0 and "
+      "ASCEND_LAUNCH_BLOCKING=0 before torch_npu import. "
+      "TASK_QUEUE_ENABLE=",
+      task_queue == nullptr ? "<unset>" : task_queue,
       " ASCEND_LAUNCH_BLOCKING=",
-      launch_blocking == nullptr ? "<unset>" : launch_blocking,
-      " effective_launch_blocking=", effective_launch_blocking,
-      " sync_launch_stream=", stream.isSyncLaunchStream());
+      launch_blocking == nullptr ? "<unset>" : launch_blocking);
   if (OpApiDebugEnabled()) {
     std::fprintf(
         stderr,
-        "P8_DRAINED_DIRECT_HOST_GATE task_queue_effective=%d "
-        "launch_blocking_effective=0 sync_launch_stream=0 "
-        "host_lifecycle=caller_thread queue_order=drained "
-        "device_launch=async\n",
-        static_cast<int>(effective_task_queue));
+        "P8_TQ0_DIRECT_HOST_GATE task_queue_enable=0 "
+        "launch_blocking=0 host_lifecycle=caller_thread "
+        "queue_order=caller_submission_tq0 "
+        "device_launch=async\n");
     std::fflush(stderr);
   }
 }
 
 // Keep the call in the Python bridge's caller thread.  Unlike generic
-// OpCommand, P8 deliberately retains the GIL over this short host-only region:
-// `stream()` has just drained prior producer submissions, and retaining the
-// GIL prevents another Python submitter from inserting new work on the same
-// stream between that drain and this raw ACLNN launch.  This is not a device
-// synchronization; the launch still returns as soon as it is enqueued.
+// OpCommand, P8 deliberately retains the GIL over this short host-only
+// region.  TQ0 makes the caller's graph submission order authoritative, and
+// the launch still returns as soon as its device work is enqueued.
 //
-// P8's current graph contract has no concurrent native or Python producer on
-// this shared stream while the direct host region runs.  Supporting arbitrary
-// concurrent submitters will use a dedicated P8 stream plus explicit event
+// P8's current acceptance contract has one Python graph submitter on this
+// stream.  A future TQ1 path will use framework ordering plus explicit event
 // edges, rather than pretending a bridge-local mutex can serialize foreign
-// torch_npu queue producers.
+// task-queue producers.
 template <typename Function>
-inline int RunDrainedCallerThreadHost(Function&& function) {
+inline int RunP8Tq0CallerThreadHost(Function&& function) {
   return std::forward<Function>(function)();
 }
 
@@ -1724,11 +1712,10 @@ inline void LogOrderedHostDso(
 // a bridge closure into torch_npu's private ReleaseQueue.  The only allowed
 // ABI is value-owned at::Tensor arguments and zero ACLNN workspace.
 //
-// `NPUStream::stream()` (without `false`) first drains preceding host task
-// queue submissions for this stream, then returns the same ACL stream.  The
-// caller consequently preserves producer ordering while it performs only the
-// ACLNN *host* lifecycle directly.  Its device launch remains asynchronous:
-// this macro never calls aclrtSynchronizeStream or a sync-launch stream.
+// This TQ0 acceptance macro uses `NPUStream::stream(false)`: the raw current
+// stream is safe only because every graph node is submitted directly by the
+// same caller.  It preserves FIFO stream order and keeps device launch
+// asynchronous; it never calls aclrtSynchronizeStream.
 //
 // It must not call RunOpApi.  That API transfers its handler to torch_npu's
 // private ReleaseQueue after execution; a bridge-local std::function can then
@@ -1749,8 +1736,8 @@ inline void LogOrderedHostDso(
     LogResolvedOpApi(#aclnn_api, inline_workspace_addr_fn,                     \
                      inline_launch_addr_fn);                                   \
     auto inline_npu_stream = c10_npu::getCurrentNPUStream();                   \
-    RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream);           \
-    aclrtStream inline_acl_stream = inline_npu_stream.stream();                \
+    RequireP8Tq0DirectAsyncOpApiContract();                                    \
+    aclrtStream inline_acl_stream = inline_npu_stream.stream(false);           \
     TORCH_CHECK(inline_acl_stream != nullptr,                                  \
                 #aclnn_api " received a null current ACL stream");            \
     /* P8 owns no CANN stream-resource quota.  Its scheduler is the device    \
@@ -1759,7 +1746,7 @@ inline void LogOrderedHostDso(
      * torch_npu's non-exported UseStreamResInCurrentThread symbol into the    \
      * bridge DSO.  The existing stream remains intact; P8 neither sets,       \
      * binds, resets, nor unbinds stream resources. */                         \
-    LogOpApiLifecycle(#aclnn_api, "caller_thread_stream_drained");           \
+    LogOpApiLifecycle(#aclnn_api, "caller_thread_tq0_stream_ready");         \
     /* std::make_tuple decays every at::Tensor argument to value ownership. */ \
     auto inline_args = std::make_tuple(__VA_ARGS__);                            \
     auto inline_acl_call =                                                      \
@@ -1792,8 +1779,6 @@ inline void LogOrderedHostDso(
         LogOpApiLifecycle(#aclnn_api, "caller_thread_tls_uninit");           \
       };                                                                        \
       try {                                                                     \
-        TORCH_CHECK(!inline_npu_stream.getRepoStopFlag(),                      \
-                    #aclnn_api " refused after torch_npu FORCE STOP");        \
         /* The pinned torch_npu ABI exposes no public deterministic-state     \
          * snapshot/apply API.  Do not emulate one with private symbols: P8's \
          * deterministic behavior comes from its graph-visible control and    \
@@ -1879,7 +1864,7 @@ inline void LogOrderedHostDso(
      * launch above remains asynchronous on the NPU. */                         \
     LogOpApiLifecycle(#aclnn_api, "caller_thread_direct_dispatch_begin");    \
     const int inline_direct_status =                                           \
-        RunDrainedCallerThreadHost(std::move(inline_acl_call));                \
+        RunP8Tq0CallerThreadHost(std::move(inline_acl_call));                  \
     TORCH_CHECK(inline_direct_status == 0,                                    \
                 "call " #aclnn_api " direct host dispatch failed: ",          \
                 RecentAclError());                                            \

@@ -35,12 +35,11 @@ P8_PYTHON="${P8_PYTHON:-$(command -v python3 2>/dev/null || true)}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.0}"
 P8_BUILD_JOBS="${P8_BUILD_JOBS:-16}"
 P8_TEST_TIMEOUT="${P8_TEST_TIMEOUT:-300s}"
-# P8 performs the host-side ACLNN lifecycle in the caller and leaves only
-# device work asynchronous on the current NPU stream.  Keep torch_npu's task
-# queue enabled for normal producer ordering.  The P8 bridge explicitly calls
-# current_stream.stream() to drain *preceding host submissions* before direct
-# ACLNN dispatch; it never transfers its own bridge closure into ReleaseQueue.
-P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-1}"
+# P8's public-ABI direct acceptance path keeps the host task queue disabled.
+# One caller submits C8, Stage-A and P8 directly to its current raw stream in
+# FIFO order; device work remains asynchronous.  TQ1 has no public
+# queue-drain/raw-launch ABI and is a separate future product path.
+P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-0}"
 P8_ASCEND_LAUNCH_BLOCKING="${P8_ASCEND_LAUNCH_BLOCKING:-0}"
 # CANN's downloaded source dependencies belong to the stable, exact reference
 # checkout.  ``csrc/third_party`` is ignored by Git: it is neither a compiled
@@ -80,6 +79,79 @@ run_logged() {
     return "$rc"
 }
 
+# A successful C++ shared-library link does not prove that the deployed
+# torch_npu runtime exports every symbol the bridge imported.  In particular,
+# a default NPUStream::stream() call on the pinned 179 runtime imports the
+# private UseStreamResInCurrentThread symbol and fails only at Python import.
+# Check the actual DSO before any runtime Python process can load it.
+#
+# Do not require ldd -r itself to return zero: normal Python extension symbols
+# can be supplied by the embedding interpreter rather than an ELF DT_NEEDED
+# library.  The contract here is narrower and exact: no P8 bridge may import a
+# private torch_npu queue/resource symbol, and no c10_npu/at_npu symbol may be
+# unresolved by the deployed dynamic loader.  ldd -r remains recorded so a new
+# deployment-side loader problem is visible in the bounded log.
+p8_stage_b_direct_abi_gate() {
+    local bridge_so="$1"
+    local log="$2"
+    local ldd_rc=0
+    local nm_rc=0
+
+    if [[ ! -s "$bridge_so" ]]; then
+        printf 'P8_BRIDGE_ABI_FAIL reason=bridge_missing bridge=%s log=%s\n' \
+            "$bridge_so" "$log"
+        return 1
+    fi
+    if ! command -v ldd >/dev/null 2>&1 ||
+       ! command -v nm >/dev/null 2>&1 ||
+       ! command -v c++filt >/dev/null 2>&1; then
+        printf 'P8_BRIDGE_ABI_FAIL reason=elf_tool_missing bridge=%s log=%s\n' \
+            "$bridge_so" "$log"
+        return 1
+    fi
+
+    {
+        printf 'P8_BRIDGE_ABI_SCAN bridge=%s phase=ldd_r\n' "$bridge_so"
+        ldd -r "$bridge_so" 2>&1 | c++filt
+    } >"$log" 2>&1
+    ldd_rc=$?
+
+    {
+        printf 'P8_BRIDGE_ABI_SCAN bridge=%s phase=undefined_dynamic_symbols\n' \
+            "$bridge_so"
+        nm -D --undefined-only "$bridge_so" | c++filt
+    } >>"$log" 2>&1
+    nm_rc=$?
+    if [[ "$nm_rc" -ne 0 ]]; then
+        printf 'P8_BRIDGE_ABI_FAIL reason=nm_scan_failed bridge=%s log=%s\n' \
+            "$bridge_so" "$log"
+        return 1
+    fi
+
+    if grep -Eq \
+        'UseStreamResInCurrentThread|is_core_control_enabled|check_enqueue_need_use|check_dequeue_need_use|OptionsManager::|NPUStream::stream\(\)|NPUStream::isSyncLaunchStream|NPUStream::getRepoStopFlag|OpCommand::RunOpApi' \
+        "$log"; then
+        printf 'P8_BRIDGE_ABI_FAIL reason=private_torch_npu_symbol bridge=%s ldd_r=%s log=%s\n' \
+            "$bridge_so" "$ldd_rc" "$log"
+        grep -E \
+            'UseStreamResInCurrentThread|is_core_control_enabled|check_enqueue_need_use|check_dequeue_need_use|OptionsManager::|NPUStream::stream\(\)|NPUStream::isSyncLaunchStream|NPUStream::getRepoStopFlag|OpCommand::RunOpApi' \
+            "$log" | sed -n '1,32p'
+        return 1
+    fi
+    if grep -Eq 'undefined symbol:.*(c10_npu|at_npu)::' "$log"; then
+        printf 'P8_BRIDGE_ABI_FAIL reason=unresolved_torch_npu_symbol bridge=%s ldd_r=%s log=%s\n' \
+            "$bridge_so" "$ldd_rc" "$log"
+        grep -E 'undefined symbol:.*(c10_npu|at_npu)::' "$log" | sed -n '1,32p'
+        return 1
+    fi
+
+    printf 'P8_BRIDGE_ABI_C10_UNDEFINED bridge=%s symbols_begin\n' "$bridge_so"
+    grep -E '(c10_npu|at_npu)::' "$log" | sed -n '1,48p' || true
+    printf 'P8_BRIDGE_ABI_C10_UNDEFINED bridge=%s symbols_end\n' "$bridge_so"
+    printf 'P8_BRIDGE_ABI_PASS bridge=%s ldd_r=%s log=%s\n' \
+        "$bridge_so" "$ldd_rc" "$log"
+}
+
 is_clean_exact_repo() {
     local label="$1"
     local repo="$2"
@@ -117,11 +189,11 @@ if [[ "$P8_RUNTIME_CASE" != "full" &&
     runner_fail "invalid_runtime_case:${P8_RUNTIME_CASE}"
     exit 2
 fi
-if [[ "$P8_TASK_QUEUE_ENABLE" != "1" ||
+if [[ "$P8_TASK_QUEUE_ENABLE" != "0" ||
       "$P8_ASCEND_LAUNCH_BLOCKING" != "0" ]]; then
-    printf 'P8_DRAINED_DIRECT_HOST_ENV pass=0 task_queue_enable=%s launch_blocking=%s required_task_queue_enable=1 required_launch_blocking=0\n' \
+    printf 'P8_TQ0_DIRECT_HOST_ENV pass=0 task_queue_enable=%s launch_blocking=%s required_task_queue_enable=0 required_launch_blocking=0\n' \
         "$P8_TASK_QUEUE_ENABLE" "$P8_ASCEND_LAUNCH_BLOCKING"
-    runner_fail "unsafe_drained_direct_launch_environment"
+    runner_fail "unsafe_tq0_direct_launch_environment"
     exit 2
 fi
 
@@ -203,10 +275,10 @@ export ASCEND_HOME_PATH
 export ASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH"
 # This must happen before the NPU probe, which is the first Python process to
 # import torch_npu.  Re-export after CANN's environment script so a shell
-# default cannot silently override the drained-direct ownership contract.
+# default cannot silently override the TQ0 direct ownership contract.
 export TASK_QUEUE_ENABLE="$P8_TASK_QUEUE_ENABLE"
 export ASCEND_LAUNCH_BLOCKING="$P8_ASCEND_LAUNCH_BLOCKING"
-printf 'P8_DRAINED_DIRECT_HOST_ENV pass=1 task_queue_enable=%s launch_blocking=%s physical=7 logical=0 queue_order=stream_drain\n' \
+printf 'P8_TQ0_DIRECT_HOST_ENV pass=1 task_queue_enable=%s launch_blocking=%s physical=7 logical=0 queue_order=caller_submission_tq0\n' \
     "$TASK_QUEUE_ENABLE" "$ASCEND_LAUNCH_BLOCKING"
 # The runner owns a three-OPP process (unchanged C8, Stage A, Stage B).  Do
 # not inherit vendor paths or opapi handles from an earlier P3/P7/P8 shell;
@@ -223,14 +295,14 @@ if ! run_logged npu7_probe "$P8_PROBE_LOG" "$P8_PYTHON" -c '
 import os, torch, torch_npu
 requested_queue = int(os.environ["TASK_QUEUE_ENABLE"])
 launch_blocking = os.environ.get("ASCEND_LAUNCH_BLOCKING", "")
-if requested_queue != 1 or launch_blocking not in ("", "0"):
+if requested_queue != 0 or launch_blocking not in ("", "0"):
     raise RuntimeError(
         "unsafe P8 process-start environment: "
         f"TASK_QUEUE_ENABLE={requested_queue} "
         f"ASCEND_LAUNCH_BLOCKING={launch_blocking or '<unset>'}")
 torch.npu.set_device(0)
 value = torch.ones(1, device="npu:0").cpu().item()
-print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s task_queue_requested=%s task_queue_runtime_guard=bridge_cpp_options_manager" % (
+print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s task_queue_requested=%s task_queue_runtime_guard=fresh_process_tq0" % (
     os.environ.get("P8_PHYSICAL_NPU_ID"),
     os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
     torch.npu.get_device_name(0), value, requested_queue))
@@ -498,8 +570,14 @@ if [[ ! -f "$P8_STAGE_B_BRIDGE/nanovllm_p8_forward_owned_executor/__init__.py" ]
     runner_fail "stage_b_bridge_package_missing"
     exit 1
 fi
-if [[ ! -s "$P8_STAGE_B_BRIDGE/nanovllm_p8_forward_owned_executor/_C$P8_SUFFIX" ]]; then
+P8_STAGE_B_BRIDGE_SO="$P8_STAGE_B_BRIDGE/nanovllm_p8_forward_owned_executor/_C$P8_SUFFIX"
+if [[ ! -s "$P8_STAGE_B_BRIDGE_SO" ]]; then
     runner_fail "stage_b_bridge_missing"
+    exit 1
+fi
+if ! p8_stage_b_direct_abi_gate \
+    "$P8_STAGE_B_BRIDGE_SO" "$P8_RUN_ROOT/stage_b_bridge_abi.log"; then
+    runner_fail "stage_b_bridge_private_torch_npu_abi"
     exit 1
 fi
 

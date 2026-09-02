@@ -116,7 +116,7 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         cls.stage_a_bridge = STAGE_A_BRIDGE.read_text(encoding="utf-8")
         cls.op_api_common = OP_API_COMMON.read_text(encoding="utf-8")
 
-    def test_p8_acl_host_lifecycle_is_drained_direct_and_tensor_owned(self) -> None:
+    def test_p8_acl_host_lifecycle_is_tq0_direct_and_tensor_owned(self) -> None:
         """P8 bypasses ReleaseQueue without synchronizing device execution."""
         direct = "EXEC_NPU_CMD_TENSOR_OWNED_DRAINED_DIRECT_ASYNC_ZERO_WORKSPACE("
         typed_direct = (
@@ -147,12 +147,11 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         ]
         for token in (
             "std::make_tuple(__VA_ARGS__)",
-            "inline_npu_stream.stream()",
-            "RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream)",
+            "inline_npu_stream.stream(false)",
+            "RequireP8Tq0DirectAsyncOpApiContract()",
             "P8 owns no CANN stream-resource quota",
-            "inline_npu_stream.getRepoStopFlag()",
             "no public deterministic-state",
-            "RunDrainedCallerThreadHost(std::move(inline_acl_call))",
+            "RunP8Tq0CallerThreadHost(std::move(inline_acl_call))",
             "InitPtaCacheForWorkspace()",
             "ResolveSymbol(\"InitHugeMemThreadLocal\")",
             "ConvertTypes(inline_args_ref...",
@@ -168,8 +167,11 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "c10_npu::CaptureDeterministicSnapshot()",
             "c10_npu::is_core_control_enabled()",
             "c10_npu::UseStreamResInCurrentThread(",
+            "OptionsManager::",
+            "inline_npu_stream.stream()",
+            "inline_npu_stream.getRepoStopFlag()",
+            "inline_npu_stream.isSyncLaunchStream()",
             "aclrtUseStreamResInCurrentThread",
-            "stream(false)",
             "aclrtSynchronizeStream",
             "pybind11::gil_scoped_release",
         ):
@@ -177,8 +179,9 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
 
         # P8 deliberately owns no stream-resource quota or TLS binding.  Its
         # only torch_npu-qualified call in the direct-launch macro is getting
-        # the framework's current stream to drain prior task-queue producers.
-        # Keep this narrow: the generic header still has P7 handoff helpers.
+        # the framework's current stream.  TQ0 makes caller-ordering
+        # authoritative; keep this narrow because the generic header still has
+        # P7 handoff helpers.
         direct_code = self._strip_cpp_comments(direct_macro)
         qualified = set(
             re.findall(r"\b(?:c10_npu|at_npu)(?:::[A-Za-z_]\w*)+", direct_code)
@@ -191,6 +194,9 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "aclrtUseStreamResInCurrentThread",
             "aclrtSetStreamResLimit",
             "aclrtResetStreamResLimit",
+            "OptionsManager::",
+            "isSyncLaunchStream",
+            "getRepoStopFlag",
             "dlsym(",
             "OpenLibraryOnce(",
             "RunOpApi",
@@ -261,41 +267,70 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         self.assertLess(cann_export_index, bridge_index)
         self.assertNotIn("47", self.bridge)
 
-    def test_p8_drained_direct_host_contract_keeps_task_queue_ordering(self) -> None:
-        """P8 drains prior producers but owns its own async ACLNN lifecycle."""
+    def test_p8_tq0_direct_host_contract_keeps_fifo_stream_ordering(self) -> None:
+        """TQ0 keeps direct FIFO submission while P8 owns ACLNN lifecycle."""
         for token in (
-            "RequireDrainedCallerThreadAsyncOpApiContract",
-            "OptionsManager::GetTaskQueueEnable()",
-            "CheckBlockingEnable()",
-            "P8_DRAINED_DIRECT_HOST_GATE",
+            "RequireP8Tq0DirectAsyncOpApiContract",
+            "P8_TQ0_DIRECT_HOST_GATE",
+            "TASK_QUEUE_ENABLE=0",
             "device_launch=async",
-            "RunDrainedCallerThreadHost",
+            "RunP8Tq0CallerThreadHost",
         ):
             self.assertIn(token, self.op_api_common)
         for token in (
-            'P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-1}"',
+            'P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-0}"',
             'P8_ASCEND_LAUNCH_BLOCKING="${P8_ASCEND_LAUNCH_BLOCKING:-0}"',
-            'runner_fail "unsafe_drained_direct_launch_environment"',
+            'runner_fail "unsafe_tq0_direct_launch_environment"',
             'export TASK_QUEUE_ENABLE="$P8_TASK_QUEUE_ENABLE"',
             'export ASCEND_LAUNCH_BLOCKING="$P8_ASCEND_LAUNCH_BLOCKING"',
-            "P8_DRAINED_DIRECT_HOST_ENV pass=1",
-            "task_queue_runtime_guard=bridge_cpp_options_manager",
+            "P8_TQ0_DIRECT_HOST_ENV pass=1",
+            "queue_order=caller_submission_tq0",
+            "task_queue_runtime_guard=fresh_process_tq0",
         ):
             self.assertIn(token, self.runner)
         for source in (self.runner, self.p8_fail_closed_probe):
             self.assertNotIn("torch_npu.npu.get_task_queue_enable()", source)
         for token in (
             "task_queue_requested={requested_task_queue}",
-            "task_queue_runtime_guard=bridge_cpp_options_manager",
-            "OptionsManager at the direct ACLNN launch boundary",
+            "task_queue_runtime_guard=fresh_process_tq0",
+            "_require_tq0_direct_environment",
+            "reason=unsafe_tq0_direct_environment",
         ):
             self.assertIn(token, self.p8_fail_closed_probe)
         direct_gate = self._function_body(
             self.op_api_common,
-            "inline void RequireDrainedCallerThreadAsyncOpApiContract(",
+            "inline void RequireP8Tq0DirectAsyncOpApiContract()",
         )
-        self.assertIn("effective_task_queue && !effective_launch_blocking", direct_gate)
-        self.assertIn("OptionsManager is compiled into this bridge", direct_gate)
+        self.assertIn('std::strcmp(task_queue, "0") == 0', direct_gate)
+        self.assertNotIn("c10_npu::", direct_gate)
+        self.assertNotIn("OptionsManager", direct_gate)
+
+    def test_p8_stage_b_bridge_runs_a_binary_private_abi_gate_before_import(self) -> None:
+        """Link success alone must not hide an import-time torch_npu ABI break."""
+        for token in (
+            "p8_stage_b_direct_abi_gate()",
+            "ldd -r",
+            "nm -D --undefined-only",
+            "P8_BRIDGE_ABI_SCAN",
+            "P8_BRIDGE_ABI_C10_UNDEFINED",
+            "P8_BRIDGE_ABI_PASS",
+            "P8_BRIDGE_ABI_FAIL reason=private_torch_npu_symbol",
+            "P8_BRIDGE_ABI_FAIL reason=unresolved_torch_npu_symbol",
+            "UseStreamResInCurrentThread",
+            "OptionsManager::",
+            "NPUStream::stream\\(\\)",
+            "NPUStream::isSyncLaunchStream",
+            "NPUStream::getRepoStopFlag",
+            "OpCommand::RunOpApi",
+            "undefined symbol:.*(c10_npu|at_npu)::",
+        ):
+            self.assertIn(token, self.runner)
+
+        bridge_build = self.runner.index('stage_b_bridge "$P8_RUN_ROOT/stage_b_bridge.log"')
+        bridge_gate = self.runner.index("if ! p8_stage_b_direct_abi_gate")
+        runtime_pythonpath = self.runner.index('export PYTHONPATH="$P8_KVAF_BUILD/python:')
+        self.assertLess(bridge_build, bridge_gate)
+        self.assertLess(bridge_gate, runtime_pythonpath)
 
     def test_acl_tensor_storage_shape_is_owned_by_the_live_aten_tensor(self) -> None:
         """A deferred ACLNN descriptor must not retain a local shape buffer.
