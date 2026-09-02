@@ -1,0 +1,35 @@
+[
+  {
+    "op": "A5C8ExactSpeculativeResidentGet",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "query", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+      {"name": "key", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+      {"name": "weights", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "query_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "key_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+      {"name": "actual_seq_lengths_key", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+      {"name": "block_table", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+      {"name": "metadata", "param_type": "optional", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "sparse_values", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": [
+      {"name": "query_quant_mode", "type": "int", "default_value": "0"},
+      {"name": "key_quant_mode", "type": "int", "default_value": "0"},
+      {"name": "layout_query", "type": "str", "default_value": "BSND"},
+      {"name": "layout_key", "type": "str", "default_value": "BSND"},
+      {"name": "sparse_count", "type": "int", "default_value": "2048"},
+      {"name": "sparse_mode", "type": "int", "default_value": "3"},
+      {"name": "pre_tokens", "type": "int", "default_value": "9223372036854775807"},
+      {"name": "next_tokens", "type": "int", "default_value": "9223372036854775807"},
+      {"name": "cmp_ratio", "type": "int", "default_value": "1"},
+      {"name": "return_values", "type": "bool", "default_value": "false"},
+      {"name": "stride", "type": "int", "default_value": "1"},
+      {"name": "scale_stride", "type": "int", "default_value": "1"}
+    ]
+  }
+]

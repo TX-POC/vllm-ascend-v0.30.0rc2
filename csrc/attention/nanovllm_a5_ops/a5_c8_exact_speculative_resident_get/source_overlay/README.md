@@ -9,11 +9,18 @@ CANN files. The build helper added with the real implementation must:
 3. reject a source root whose Git head differs from the requested head; and
 4. create a new output directory keyed by both the vLLM and KVAF heads.
 
-The copied target must preserve `ProcessVec1` and `ProcessTopK` byte-for-byte
-except for the one observation hook immediately after the completed score
-reduction and before score GM publication. The hook is allowed to populate a
-CandidateSeed and issue an invocation-local PostOnly. It must not modify
-score UB, score GM, Top-K working storage, or final C8 index ordering.
+`apply_p9_overlay.py` is the checked-in, anchor-checked implementation of
+this boundary.  It runs only after a fresh copy is created and refuses to
+proceed if an upstream source anchor has changed.  Its first closure is
+intentionally compile-disabled: it inserts a no-op score-seam macro after the
+completed `BatchMulWeightAndReduceSum` and before the normal score-GM
+`DataCopyPad`.  It calculates the complete `ProcessTopK` function digest
+before and after transformation and fails if those byte-for-byte contents
+differ.
+
+The active target will replace that no-op with CandidateCompact and the
+invocation-local PostOnly executor in one ABI-complete change.  It must not
+modify score UB, score GM, Top-K working storage, or final C8 index ordering.
 
 The direct-resident target is non-buildable until it has its own KVAF ABI and
 is not allowed to include the retired streaming, private-view, P7, or P8

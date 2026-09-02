@@ -1,0 +1,7 @@
+# Every file consumed by the P9 source-overlay applier is declared here.
+# The builder copies this small input set into a fresh SHA-pair package, then
+# the applier transforms only that copied official C8 source tree.
+apply_p9_overlay.py
+ops.json
+op_host/a5_c8_exact_speculative_resident_host_compat.h
+op_kernel/arch35/a5_c8_exact_speculative_resident_score_seam.h

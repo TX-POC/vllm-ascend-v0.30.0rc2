@@ -7,10 +7,11 @@
 # closure, then overlays only manifest-listed P9 files.  It never reuses a
 # CMake cache, an OPP, or a bridge from another source pair.
 #
-# The currently committed P9 tree intentionally contains only the source/ABI
-# contract, not the final host/kernel overlay.  In that state --stage-only is
-# useful to prove the source closure; a normal build stops with one explicit
-# P9_OVERLAY_MANIFEST diagnostic before invoking CANN.
+# The first committed closure intentionally contains a compile-disabled score
+# seam only.  It proves an exact source-derived C8 target can be staged and
+# built without touching official Top-K.  The active Direct-HCCP ABI is added
+# later as one coherent graph/kernel change, never by turning on a partial
+# source overlay.
 
 set -euo pipefail
 
@@ -26,6 +27,7 @@ CANN_3RD_LIB_PATH="${A5_C8_EXACT_RESIDENT_CANN_3RD_LIB_PATH:-}"
 BUILD_JOBS="${A5_C8_EXACT_RESIDENT_BUILD_JOBS:-4}"
 TARGET_SOC_RAW="${A5_C8_EXACT_RESIDENT_SOC:-ascend950}"
 TARGET_OPERATOR="${A5_C8_EXACT_RESIDENT_OPERATOR:-A5C8ExactSpeculativeResidentGet}"
+SCORE_SEAM_MODE="${A5_C8_EXACT_RESIDENT_SCORE_SEAM:-0}"
 
 MODE="build"
 if [[ "${1:-}" == "--stage-only" ]]; then
@@ -65,6 +67,8 @@ case "${TARGET_SOC_NORMALIZED}" in
 esac
 [[ "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]] || fail "invalid_jobs:value=${BUILD_JOBS}"
 [[ -n "${KVAF_ROOT}" ]] || fail "kvaf_source_root_missing"
+[[ "${SCORE_SEAM_MODE}" == "0" ]] ||
+  fail "active_score_seam_not_staged:value=${SCORE_SEAM_MODE}"
 
 # Do not inherit the historical product selector: it repeatedly selected a
 # different CANN product for isolated A5 OPPs.
@@ -176,41 +180,41 @@ p9_overlay_root=${OVERLAY_ROOT}
 staged_c8_root=${STAGED_C8_ROOT}
 staged_kvaf_root=${STAGED_KVAF_ROOT}
 target_soc=${TARGET_SOC}
+score_seam=compile_disabled
 cann_3rd_lib_path=${CANN_3RD_LIB_PATH:-<stage-only>}
 EOF
 
 printf 'P9_OPP_STAGE source_vllm=%s source_kvaf=%s package=%s staged_c8=%s\n' \
   "${VLLM_HEAD}" "${KVAF_HEAD}" "${PACKAGE_ROOT}" "${STAGED_C8_ROOT}"
 
-if [[ "${MODE}" == "stage" ]]; then
-  printf 'P9_OPP_STAGE_PASS provenance=%s\n' "${PACKAGE_ROOT}/P9_PROVENANCE"
-  exit 0
-fi
-
-# The manifest keeps the actual P9 host/kernel API out of this generic source
-# closure script.  It is a line-oriented list of regular files relative to
-# source_overlay/, copied over the staged official C8 tree.  This avoids
-# inventing an ACLNN signature before the target source exists.
-OVERLAY_MANIFEST="${OVERLAY_ROOT}/P9_OVERLAY_MANIFEST"
+# The manifest is an allow-list for the tiny, checked-in overlay input.  The
+# applier runs against the newly staged *official* C8 tree even for
+# --stage-only, so the stage result proves the real seam and Top-K guard.
+OVERLAY_MANIFEST="${STAGED_OVERLAY_ROOT}/P9_OVERLAY_MANIFEST"
 [[ -f "${OVERLAY_MANIFEST}" ]] ||
-  fail "p9_overlay_manifest_missing:path=${OVERLAY_MANIFEST}:use_stage_only_until_target_sources_exist"
+  fail "p9_overlay_manifest_missing:path=${OVERLAY_MANIFEST}"
 
 OVERLAY_FILES=()
 while IFS= read -r relative_path || [[ -n "${relative_path}" ]]; do
   [[ -z "${relative_path}" || "${relative_path}" == \#* ]] && continue
   [[ "${relative_path}" != /* && "${relative_path}" != *".."* ]] ||
     fail "p9_overlay_manifest_unsafe_path:value=${relative_path}"
-  [[ -f "${OVERLAY_ROOT}/${relative_path}" ]] ||
-    fail "p9_overlay_file_missing:path=${OVERLAY_ROOT}/${relative_path}"
+  [[ -f "${STAGED_OVERLAY_ROOT}/${relative_path}" ]] ||
+    fail "p9_overlay_file_missing:path=${STAGED_OVERLAY_ROOT}/${relative_path}"
   OVERLAY_FILES+=("${relative_path}")
 done < "${OVERLAY_MANIFEST}"
 [[ "${#OVERLAY_FILES[@]}" -gt 0 ]] || fail "p9_overlay_manifest_empty"
 
-for relative_path in "${OVERLAY_FILES[@]}"; do
-  destination="${STAGED_C8_ROOT}/${relative_path}"
-  mkdir -p "$(dirname "${destination}")"
-  install -m 0644 "${OVERLAY_ROOT}/${relative_path}" "${destination}"
-done
+OVERLAY_APPLIER="${STAGED_OVERLAY_ROOT}/apply_p9_overlay.py"
+[[ -f "${OVERLAY_APPLIER}" ]] || fail "p9_overlay_applier_missing:path=${OVERLAY_APPLIER}"
+command -v python3 >/dev/null 2>&1 || fail "python3_missing_for_overlay"
+OVERLAY_RECEIPT="${PACKAGE_ROOT}/P9_OVERLAY_RECEIPT"
+python3 "${OVERLAY_APPLIER}" \
+  --staged-c8-root "${STAGED_C8_ROOT}" \
+  --overlay-root "${STAGED_OVERLAY_ROOT}" \
+  --manifest "${OVERLAY_MANIFEST}" \
+  --operator "${TARGET_OPERATOR}" | tee "${OVERLAY_RECEIPT}"
+cat "${OVERLAY_RECEIPT}" >> "${PACKAGE_ROOT}/P9_PROVENANCE"
 
 [[ -f "${STAGED_C8_ROOT}/ops.json" ]] || fail "p9_overlay_missing_ops_json"
 [[ -d "${STAGED_C8_ROOT}/op_host" && -d "${STAGED_C8_ROOT}/op_kernel" ]] ||
@@ -218,6 +222,12 @@ done
 if grep -RInE '^#[[:space:]]*include[[:space:]]*[<"][^>"]*(a5_streaming_quant_li_get|a5_p7_|a5_p8_|a5_score_receipt)' \
     "${STAGED_C8_ROOT}/op_host" "${STAGED_C8_ROOT}/op_kernel" 2>/dev/null; then
   fail "legacy_p7_p8_streaming_include_after_overlay"
+fi
+
+if [[ "${MODE}" == "stage" ]]; then
+  printf 'P9_OPP_STAGE_PASS provenance=%s overlay_receipt=%s\n' \
+    "${PACKAGE_ROOT}/P9_PROVENANCE" "${OVERLAY_RECEIPT}"
+  exit 0
 fi
 
 # Generate a fresh CANN project.  The generated generic host stub is removed
