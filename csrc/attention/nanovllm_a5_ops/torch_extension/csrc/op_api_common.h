@@ -1837,6 +1837,28 @@ inline void LogOrderedHostDso(
               inline_launch_status == 0,                                       \
               "call " #aclnn_api " failed: ", RecentAclError());            \
           LogOpApiLifecycle(#aclnn_api, "launch_done");                      \
+          /* Test-only ownership bisect.  The normal TQ0 path remains fully  \
+           * asynchronous: it never synchronizes this stream.  When enabled, \
+           * wait here while ACLNN's executor/descriptors and the caller-thread\
+           * PTA/HugeMem lifetime are all still intact.  This separates an    \
+           * in-flight device/ACLNN ownership failure from a later host-side  \
+           * release failure without changing their normal ordering. */       \
+          if (IsEnabledEnvironmentFlag("NANOVLLM_A5_P8_TQ0_SYNC_BISECT")) { \
+            std::fprintf(stderr,                                               \
+                         "P8_TQ0_BISECT sync_begin api=%s\\n",              \
+                         #aclnn_api);                                          \
+            std::fflush(stderr);                                               \
+            const aclError inline_sync_status =                                \
+                aclrtSynchronizeStream(inline_acl_stream);                    \
+            std::fprintf(stderr,                                               \
+                         "P8_TQ0_BISECT sync_end status=%d api=%s\\n",      \
+                         static_cast<int>(inline_sync_status), #aclnn_api);   \
+            std::fflush(stderr);                                               \
+            TORCH_CHECK(                                                       \
+                inline_sync_status == ACL_SUCCESS,                             \
+                #aclnn_api " P8 TQ0 sync bisect failed: ",                  \
+                inline_sync_status, "; ", RecentAclError());                \
+          }                                                                     \
           ReleaseTuple(inline_converted);                                      \
           inline_converted_released = true;                                    \
           LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");          \

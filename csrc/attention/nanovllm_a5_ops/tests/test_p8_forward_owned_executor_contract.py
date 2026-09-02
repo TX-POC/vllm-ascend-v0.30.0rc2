@@ -172,10 +172,23 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "inline_npu_stream.getRepoStopFlag()",
             "inline_npu_stream.isSyncLaunchStream()",
             "aclrtUseStreamResInCurrentThread",
-            "aclrtSynchronizeStream",
             "pybind11::gil_scoped_release",
         ):
             self.assertNotIn(forbidden, direct_macro)
+
+        # The normal TQ0 path is asynchronous.  The sole synchronization is a
+        # deliberately opt-in ownership bisect after ACLNN launch and before
+        # descriptor/TLS release, so it cannot quietly become product behavior.
+        bisect_gate = 'IsEnabledEnvironmentFlag("NANOVLLM_A5_P8_TQ0_SYNC_BISECT")'
+        self.assertIn(bisect_gate, direct_macro)
+        self.assertIn("P8_TQ0_BISECT sync_begin", direct_macro)
+        self.assertIn("P8_TQ0_BISECT sync_end status=%d", direct_macro)
+        self.assertIn("aclrtSynchronizeStream(inline_acl_stream)", direct_macro)
+        launch_done = direct_macro.index('LogOpApiLifecycle(#aclnn_api, "launch_done")')
+        bisect = direct_macro.index(bisect_gate, launch_done)
+        release = direct_macro.index("ReleaseTuple(inline_converted)", bisect)
+        self.assertLess(launch_done, bisect)
+        self.assertLess(bisect, release)
 
         # P8 deliberately owns no stream-resource quota or TLS binding.  Its
         # only torch_npu-qualified call in the direct-launch macro is getting
