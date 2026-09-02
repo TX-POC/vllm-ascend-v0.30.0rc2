@@ -288,6 +288,12 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "task_queue_runtime_guard=fresh_process_tq0",
         ):
             self.assertIn(token, self.runner)
+        # The NPU probe is passed to Python through one shell single-quoted
+        # ``-c`` payload.  A nested single-quoted fallback would terminate
+        # that payload and turn ``<unset>`` into shell input redirection
+        # before the first NPU call.
+        self.assertIn('launch_blocking or "<unset>"', self.runner)
+        self.assertNotIn("launch_blocking or '<unset>'", self.runner)
         for source in (self.runner, self.p8_fail_closed_probe):
             self.assertNotIn("torch_npu.npu.get_task_queue_enable()", source)
         for token in (

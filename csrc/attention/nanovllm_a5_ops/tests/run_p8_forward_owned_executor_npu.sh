@@ -299,7 +299,7 @@ if requested_queue != 0 or launch_blocking not in ("", "0"):
     raise RuntimeError(
         "unsafe P8 process-start environment: "
         f"TASK_QUEUE_ENABLE={requested_queue} "
-        f"ASCEND_LAUNCH_BLOCKING={launch_blocking or '<unset>'}")
+        "ASCEND_LAUNCH_BLOCKING=%s" % (launch_blocking or "<unset>"))
 torch.npu.set_device(0)
 value = torch.ones(1, device="npu:0").cpu().item()
 print("P8_NPU_PROBE physical=%s logical=0 visible=%r device=%s value=%s task_queue_requested=%s task_queue_runtime_guard=fresh_process_tq0" % (
