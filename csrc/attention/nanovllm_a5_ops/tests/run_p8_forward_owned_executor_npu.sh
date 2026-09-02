@@ -7,7 +7,11 @@
 #   P8_REFERENCE_VLLM_ROOT=/path/to/stable-vllm-reference-worktree (optional)
 #   P8_KVAF_ROOT=/path/to/KVAF-kip_demo_cs_native_enqueue
 #   P8_VLLM_EXPECTED_SHA=<exact HEAD>
-#   P8_KVAF_EXPECTED_SHA=<exact HEAD, currently b1209279...>
+#   P8_KVAF_EXPECTED_SHA=<exact clean HEAD of the paired canonical KVAF branch>
+#
+# Do not copy a historical SHA into this file or a launch recipe.  The caller
+# must obtain the paired value from the same clean KVAF worktree after its
+# explicit fetch/fast-forward, then pass that exact value to this runner.
 #
 # Default mode is `npu`, designed for the 179 Docker environment with physical
 # NPU 7 exposed as logical NPU 0.  `P8_RUNNER_MODE=static` is a useful host
