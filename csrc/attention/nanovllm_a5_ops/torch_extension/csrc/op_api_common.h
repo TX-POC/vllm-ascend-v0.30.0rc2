@@ -978,7 +978,8 @@ inline void RequireDrainedCallerThreadAsyncOpApiContract(
 // stream between that drain and this raw ACLNN launch.  This is not a device
 // synchronization; the launch still returns as soon as it is enqueued.
 //
-// P8's graph contract has one Python forward submitter.  Supporting arbitrary
+// P8's current graph contract has no concurrent native or Python producer on
+// this shared stream while the direct host region runs.  Supporting arbitrary
 // concurrent submitters will use a dedicated P8 stream plus explicit event
 // edges, rather than pretending a bridge-local mutex can serialize foreign
 // torch_npu queue producers.
@@ -1741,10 +1742,10 @@ inline void LogOrderedHostDso(
     LogResolvedOpApi(#aclnn_api, inline_workspace_addr_fn,                     \
                      inline_launch_addr_fn);                                   \
     auto inline_npu_stream = c10_npu::getCurrentNPUStream();                   \
+    RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream);           \
     aclrtStream inline_acl_stream = inline_npu_stream.stream();                \
     TORCH_CHECK(inline_acl_stream != nullptr,                                  \
                 #aclnn_api " received a null current ACL stream");            \
-    RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream);           \
     if (c10_npu::is_core_control_enabled()) {                                  \
       /* This is a caller-thread binding, not the old producer/consumer       \
        * handoff.  It preserves a dynamically configured stream quota without\
