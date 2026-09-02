@@ -1,34 +1,35 @@
-// Compile-disabled finalizer tail for the source-derived P9 C8 operator.
+// Active finalizer tail for the source-derived P9 C8 operator.
 //
 // The P9 source overlay appends this macro only after each *official*
-// `indiceOutGm` writeback and its matching `SetFlag<MTE3_V>`.  It provides a
-// deliberately narrow, checkable place for the future Stage-B terminalizer:
-// final Top-K indices are already in GM and the official MTE3->V dependency
-// has already been restored.  The default emits no instructions, touches no
-// graph ABI, and therefore cannot alter the original C8 Top-K algorithm,
-// index writeback, or scheduling.
+// `WaitFlag<V_MTE3>(TOPK_V_MTE3_EVENT)` and before its unchanged
+// `indiceOutGm` writeback.  It provides a deliberately narrow, checkable
+// place for the Stage-B terminalizer while V owns the completed local Top-K
+// buffer.  The original MTE3->V event is neither waited nor re-signaled by
+// P9, so the next untouched official Top-K row keeps its original token.
 
 #ifndef VLLM_ASCEND_A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_H_
 #define VLLM_ASCEND_A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_H_
 
-// Keep the actual terminalizer in the CANN compile closure even while this
-// insertion remains disabled.  That makes domain/API failures deterministic
-// at build time instead of discovering them only in the later ABI enablement.
 #include "a5_c8_exact_speculative_resident_finalizer.h"
 
 #ifndef A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER
-#define A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER 0
+#define A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER 1
 #endif
 
-#if A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER != 0
-#error "The active P9 Stage-B finalizer requires the complete graph ABI."
+#if A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER != 1
+#error "P9 ships only with its complete Stage-B resident-get ABI."
 #endif
 
-// Args deliberately remain unevaluated in the only supported configuration.
-// In particular, this must not make an invalid-row branch observe or modify
-// score/Top-K buffers that official C8 otherwise leaves untouched.
-#define A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_TAIL(...) \
-    do {                                                           \
+// The tail is before the unchanged official sparse-index DMA.  The member
+// method reads `indicesOutLocal_` while its owner is still V, then returns
+// before MTE3 is handed that buffer.  Invalid rows naturally contain the
+// original -1 indices.  The `row` is only the P9 destination-row identity;
+// no output-GM offset or TOPK event is consumed here.
+#define A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_TAIL( \
+    self, row)                                                     \
+    do {                                                          \
+        (self)->P9FinalizeExactTopKRow(                           \
+            static_cast<uint32_t>(row));                           \
     } while (0)
 
 #endif  // VLLM_ASCEND_A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_H_

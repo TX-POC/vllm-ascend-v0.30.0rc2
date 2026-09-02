@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Offline closure test for P9's fresh source-overlay applier.
+"""Offline atomic-overlay gate for the active P9 direct-resident operator.
 
-No CANN toolchain is needed here.  The test exercises the exact operation the
-remote builder performs on a newly copied official C8 source tree and rejects
-any overlay that changes official `ProcessTopK` beyond two controlled,
-compile-disabled Stage-B finalizer tails.
+This suite intentionally runs without CANN.  It takes a fresh copy of the
+official C8 source, applies the checked-in overlay, then proves three things
+before an expensive OPP build is allowed:
+
+* the public schema is exactly P9's 21-input / 6-output ABI;
+* the official score and Top-K implementation are preserved byte-for-byte
+  except for anchored P9 calls at legal boundaries; and
+* all P9 inputs reach the source-derived wrapper, preload, and vector path in
+  one atomic transform.  A partial 9/2 closure is not a valid P9 artifact.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -23,6 +30,40 @@ TARGET_ROOT = OPS_ROOT / "a5_c8_exact_speculative_resident_get"
 OVERLAY_ROOT = TARGET_ROOT / "source_overlay"
 OFFICIAL_C8_ROOT = OPS_ROOT.parent / "vllm_quant_lightning_indexer"
 APPLIER_PATH = OVERLAY_ROOT / "apply_p9_overlay.py"
+
+OFFICIAL_INPUTS = [
+    ("query", "int8"),
+    ("key", "int8"),
+    ("weights", "float"),
+    ("query_dequant_scale", "float"),
+    ("key_dequant_scale", "float"),
+    ("actual_seq_lengths_query", "int32"),
+    ("actual_seq_lengths_key", "int32"),
+    ("block_table", "int32"),
+    ("metadata", "int32"),
+]
+P9_INPUTS = [
+    ("runtime_enable", "int32"),
+    ("resident_threshold", "int32"),
+    ("resident_threshold_valid", "int32"),
+    ("req_pool_entries", "int32"),
+    ("kv_object_map", "int32"),
+    ("kv_object_lens", "int32"),
+    ("persistent_object_slots_snapshot", "int32"),
+    ("canonical_resident_layout", "int32"),
+    ("candidate_source_to_slot", "int32"),
+    ("candidate_slot_cursor", "int32"),
+    ("layer_resident_get_control", "int64"),
+    ("rows_per_entry", "int32"),
+]
+OUTPUTS = [
+    ("sparse_indices", "int32"),
+    ("sparse_values", "float"),
+    ("attention_slots", "int32"),
+    ("terminal_post_stats", "int32"),
+    ("candidate_source_to_slot_ref", "int32"),
+    ("candidate_slot_cursor_ref", "int32"),
+]
 
 
 def load_applier():
@@ -47,6 +88,10 @@ def function_digest(source: str, signature: str) -> str:
     raise AssertionError("unbalanced function body")
 
 
+def tensor_schema(descriptors: list[dict[str, object]]) -> list[tuple[str, str]]:
+    return [(entry["name"], entry["type"][0]) for entry in descriptors]
+
+
 class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
     def test_manifest_is_a_small_closed_overlay_input_set(self) -> None:
         entries = [
@@ -66,7 +111,20 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
         for relative in entries:
             self.assertTrue((OVERLAY_ROOT / relative).is_file(), relative)
 
-    def test_fresh_clone_gets_only_a_disabled_score_observer(self) -> None:
+    def test_ops_schema_is_exact_active_21_input_6_output_abi(self) -> None:
+        ops = json.loads((OVERLAY_ROOT / "ops.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["op"], "A5C8ExactSpeculativeResidentGet")
+        self.assertEqual(tensor_schema(ops[0]["input_desc"]), OFFICIAL_INPUTS + P9_INPUTS)
+        self.assertEqual(tensor_schema(ops[0]["output_desc"]), OUTPUTS)
+        self.assertEqual(len(ops[0]["input_desc"]), 21)
+        self.assertEqual(len(ops[0]["output_desc"]), 6)
+        self.assertNotIn(
+            "resident_packed_output",
+            [entry["name"] for entry in ops[0]["input_desc"] + ops[0]["output_desc"]],
+        )
+
+    def test_fresh_clone_receives_atomic_active_overlay_without_c8_math_delta(self) -> None:
         applier = load_applier()
         original_vector = (
             OFFICIAL_C8_ROOT
@@ -77,29 +135,36 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="p9-overlay-") as temporary:
             staged_root = Path(temporary) / "vllm_quant_lightning_indexer"
             shutil.copytree(OFFICIAL_C8_ROOT, staged_root)
-            rc = applier.main(
-                [
-                    "--staged-c8-root",
-                    str(staged_root),
-                    "--overlay-root",
-                    str(OVERLAY_ROOT),
-                    "--manifest",
-                    str(OVERLAY_ROOT / "P9_OVERLAY_MANIFEST"),
-                    "--operator",
-                    "A5C8ExactSpeculativeResidentGet",
-                ]
-            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = applier.main(
+                    [
+                        "--staged-c8-root",
+                        str(staged_root),
+                        "--overlay-root",
+                        str(OVERLAY_ROOT),
+                        "--manifest",
+                        str(OVERLAY_ROOT / "P9_OVERLAY_MANIFEST"),
+                        "--operator",
+                        "A5C8ExactSpeculativeResidentGet",
+                    ]
+                )
             self.assertEqual(rc, 0)
+            self.assertIn("P9_OVERLAY_APPLY_PASS", output.getvalue())
+            self.assertIn("seam=active_abi", output.getvalue())
+            self.assertNotIn("compile_disabled", output.getvalue())
 
-            staged_vector = (
-                staged_root / "op_kernel/arch35/quant_lightning_indexer_service_vector.h"
-            ).read_text(encoding="utf-8")
+            vector_path = (
+                staged_root
+                / "op_kernel/arch35/quant_lightning_indexer_service_vector.h"
+            )
+            staged_vector = vector_path.read_text(encoding="utf-8")
             staged_topk = applier.function_body(
                 staged_vector, "QLIVector<QLIT>::ProcessTopK"
             )
-            # The two tail snippets are the only allowed ProcessTopK delta.
-            # Removing them must recover every original byte, including the
-            # index-GM writes and MTE3->V flag ordering.
+            # Removing only the two anchored tail calls must recover the
+            # original C8 Top-K function exactly.  In particular, P9 cannot
+            # rewrite score reduction, candidate ordering, or index DMA.
             self.assertEqual(
                 hashlib.sha256(
                     applier.strip_stage_b_finalizer_tails(staged_topk).encode()
@@ -114,77 +179,218 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
             )
             invalid_tail = staged_topk.index(applier._TOPK_INVALID_FINALIZER_TAIL)
             normal_tail = staged_topk.index(applier._TOPK_NORMAL_FINALIZER_TAIL)
-            self.assertTrue(
-                staged_topk[:invalid_tail].endswith(
-                    applier._TOPK_INVALID_WRITEBACK_ANCHOR
+            # Stage B consumes the completed local Top-K indices at the legal
+            # V->MTE3 boundary.  It must run before C8 starts its index DMA;
+            # P9 must neither wait on nor relay TOPK_MTE3_V a second time.
+            for tail_offset in (invalid_tail, normal_tail):
+                self.assertTrue(
+                    staged_topk[:tail_offset]
+                    .rstrip()
+                    .endswith("WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);")
                 )
-            )
-            self.assertTrue(
-                staged_topk[:normal_tail].endswith(
-                    applier._TOPK_NORMAL_WRITEBACK_ANCHOR
+                after_tail = staged_topk[tail_offset:]
+                writeback = after_tail.index("AscendC::DataCopyPad(indiceOutGm")
+                completion = after_tail.index(
+                    "SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);"
                 )
-            )
-            invalid_continue = staged_topk.index(
-                "            continue;", invalid_tail
-            )
-            self.assertLess(invalid_tail, invalid_continue)
+                self.assertGreater(writeback, 0)
+                self.assertGreater(completion, writeback)
+
             reduction = staged_vector.index("vector1::BatchMulWeightAndReduceSum")
-            marker = staged_vector.index(
+            observation = staged_vector.index(
                 "A5_C8_EXACT_SPECULATIVE_RESIDENT_OBSERVE_SCORE_SEAM", reduction
             )
-            publication = staged_vector.index("DataCopyPad(scoreGm", marker)
-            self.assertLess(reduction, marker)
-            self.assertLess(marker, publication)
+            publication = staged_vector.index("DataCopyPad(scoreGm", observation)
+            post = staged_vector.index(
+                "A5_C8_EXACT_SPECULATIVE_RESIDENT_POST_AFTER_SCORE_PUBLICATION",
+                publication,
+            )
+            self.assertLess(reduction, observation)
+            self.assertLess(observation, publication)
+            self.assertLess(publication, post)
             self.assertIn(
-                '#include "a5_c8_exact_speculative_resident_score_seam.h"',
+                "A5_C8_EXACT_SPECULATIVE_RESIDENT_OBSERVE_SCORE_SEAM(\n        this,",
                 staged_vector,
             )
-            staged_seam = (
-                staged_root
-                / "op_kernel/arch35/a5_c8_exact_speculative_resident_score_seam.h"
-            ).read_text(encoding="utf-8")
             self.assertIn(
-                '#include "a5_c8_exact_speculative_resident_stage_b_finalizer.h"',
-                staged_seam,
+                "A5_C8_EXACT_SPECULATIVE_RESIDENT_POST_AFTER_SCORE_PUBLICATION(this)",
+                staged_vector,
+            )
+            self.assertIn("void InitP9Runtime(", staged_vector)
+            self.assertIn("void P9ObserveScoreSeam(", staged_vector)
+            self.assertIn("void P9PostAtScoreBoundary()", staged_vector)
+            self.assertIn("void P9FinalizeExactTopKRow(", staged_vector)
+            # P9 may not consume the official Top-K MTE3->V event a second
+            # time; the tail must use a separately legal, anchored boundary.
+            p9_finalizer = applier.function_body(
+                staged_vector, "QLIVector<QLIT>::P9FinalizeExactTopKRow"
+            )
+            self.assertNotIn(
+                "WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT)",
+                p9_finalizer,
             )
 
-            ops = json.loads((staged_root / "ops.json").read_text(encoding="utf-8"))
-            self.assertEqual(ops[0]["op"], "A5C8ExactSpeculativeResidentGet")
+            wrapper = (
+                staged_root / "op_kernel/a5_c8_exact_speculative_resident_get.cpp"
+            ).read_text(encoding="utf-8")
+            preload = (
+                staged_root
+                / "op_kernel/arch35/quant_lightning_indexer_kernel.h"
+            ).read_text(encoding="utf-8")
+            host_def = (
+                staged_root
+                / "op_host/a5_c8_exact_speculative_resident_get_def.cpp"
+            ).read_text(encoding="utf-8")
+            tiling = (
+                staged_root
+                / "op_host/a5_c8_exact_speculative_resident_get_tiling.cpp"
+            ).read_text(encoding="utf-8")
+            for camel_name in (
+                "runtimeEnable",
+                "residentThreshold",
+                "residentThresholdValid",
+                "reqPoolEntries",
+                "kvObjectMap",
+                "kvObjectLens",
+                "persistentObjectSlotsSnapshot",
+                "canonicalResidentLayout",
+                "candidateSourceToSlot",
+                "candidateSlotCursor",
+                "layerResidentGetControl",
+                "rowsPerEntry",
+                "attentionSlots",
+                "terminalPostStats",
+                "candidateSourceToSlotRef",
+                "candidateSlotCursorRef",
+            ):
+                self.assertIn(camel_name, wrapper)
+            self.assertIn("InitP9Runtime(runtimeEnable", preload)
+            self.assertIn("candidateSourceToSlotRef", preload)
+            self.assertIn("candidateSlotCursorRef", preload)
+
+            # The host schema must compile as a real C++ OpDef.  In
+            # particular, the generic builder receiver is `this->`, whereas
+            # the 950 builder receiver already ends in `.`.  A previous
+            # mechanical expansion emitted `this.Input`, which passed JSON
+            # checks but failed only after the expensive CANN build.
+            self.assertNotIn("this.Input(", host_def)
+            self.assertNotIn("this.Output(", host_def)
+            for token in (
+                'this->Input("runtime_enable")',
+                'this->Output("attention_slots")',
+                'this->Output("candidate_source_to_slot_ref")',
+                'this->Output("candidate_slot_cursor_ref")',
+                'aicore_config_950.Input("runtime_enable")',
+                'aicore_config_950.Output("attention_slots")',
+                'aicore_config_950.Output("candidate_source_to_slot_ref")',
+                'aicore_config_950.Output("candidate_slot_cursor_ref")',
+            ):
+                self.assertIn(token, host_def)
+            self.assertNotIn('AddConfig("ascend910b"', host_def)
+            self.assertNotIn('AddConfig("ascend910_93"', host_def)
+
+            # P9 borrows C8's existing invalid-index scratch.  It must not
+            # run before the official AIV InitBuffers call establishes that
+            # local tensor.  The disabled path is intentionally an official
+            # C8 execution plus one runtime-enable word read: no borrowed UB,
+            # P9 layout GM, or P9 event hand-off is allowed before that gate.
+            preload_init = applier.function_body(
+                preload, "QLIPreload<QLIT>::Init(__gm__"
+            )
+            self.assertLess(
+                preload_init.index("InitBuffers();"),
+                preload_init.index("vectorService.InitP9Runtime("),
+            )
+            self.assertIn(
+                "if ASCEND_IS_AIV {\n"
+                "        vectorService.InitP9Runtime(",
+                preload_init,
+            )
+            p9_runtime = applier.function_body(
+                staged_vector, "QLIVector<QLIT>::InitP9Runtime"
+            )
+            runtime_gate = p9_runtime.index("runtimeEnableGm.GetValue(0U)")
+            scratch_borrow = p9_runtime.index("outInvalidLocal_.GetPhyAddr()")
+            self.assertLess(runtime_gate, scratch_borrow)
+            disabled_prefix = p9_runtime[:runtime_gate]
+            self.assertNotIn("outInvalidLocal_.GetPhyAddr()", disabled_prefix)
+            self.assertNotIn("SetFlag<", disabled_prefix)
+            self.assertNotIn("WaitFlag<", disabled_prefix)
+            self.assertLess(
+                runtime_gate,
+                p9_runtime.index("layoutGm.SetGlobalBuffer"),
+            )
+
+            # Tiling validates all P9 shapes before GetStorageShape() and
+            # carries the exact 21-input ABI's index 14 (`kv_object_lens`).
+            # This makes an ABI mismatch fail during host tiling rather than
+            # at an unchecked device GM access.
+            for token in (
+                "P9_KV_OBJECT_LENS_INDEX",
+                "p9RuntimeEnableStorage == nullptr",
+                "p9ThresholdStorage == nullptr",
+                "p9ThresholdValidStorage == nullptr",
+                "p9LensStorage == nullptr",
+                "p9RuntimeEnable.GetDim(0) != 1",
+                "p9Lens.GetDim(0) != p9RowCount",
+            ):
+                self.assertIn(token, tiling)
+            first_shape_read = tiling.index("p9SparseStorage->GetStorageShape()")
+            self.assertLess(
+                tiling.index("p9SparseStorage == nullptr"), first_shape_read
+            )
+
+            staged_ops = json.loads((staged_root / "ops.json").read_text())
+            self.assertEqual(
+                tensor_schema(staged_ops[0]["input_desc"]), OFFICIAL_INPUTS + P9_INPUTS
+            )
+            self.assertEqual(tensor_schema(staged_ops[0]["output_desc"]), OUTPUTS)
+            self.assertNotIn("resident_packed_output", (staged_root / "ops.json").read_text())
             self.assertTrue(
                 (
                     staged_root
                     / "op_host/a5_c8_exact_speculative_resident_get_def.cpp"
                 ).is_file()
             )
-            self.assertTrue(
-                (
-                    staged_root
-                    / "op_kernel/a5_c8_exact_speculative_resident_get.cpp"
-                ).is_file()
-            )
             self.assertTrue((staged_root / "op_host/err/ops_err.h").is_file())
             self.assertTrue((staged_root / "op_host/log/log.h").is_file())
 
-    def test_finalizer_is_a_disabled_staged_builder_dependency(self) -> None:
+            # The applier must remain one atomic transform.  Keeping these
+            # calls ordered in `main()` prevents a future refactor from
+            # staging an active score seam around a partial 9/2 source tree.
+            main_source = APPLIER_PATH.read_text(encoding="utf-8")
+            main_body = main_source[main_source.index("\ndef main(") :]
+            atomic_steps = (
+                "copy_overlay_input(overlay_root, staged_root)",
+                "inject_kernel_wrapper_abi(staged_root / KERNEL_WRAPPER_RELATIVE)",
+                "inject_preload_abi(staged_root / PRELOAD_RELATIVE)",
+                "inject_vector_runtime(staged_root / VECTOR_RELATIVE)",
+                "inject_tiling_abi(",
+                "inject_host_abi(",
+                "inject_score_seam(staged_root / VECTOR_RELATIVE)",
+                "rename_source_files(staged_root)",
+                "replace_operator_identifiers(staged_root)",
+                "validate_output(staged_root, topk_hash)",
+            )
+            positions = [main_body.index(step) for step in atomic_steps]
+            self.assertEqual(positions, sorted(positions))
+
+    def test_active_headers_reject_compile_disabled_closure(self) -> None:
+        seam = (
+            OVERLAY_ROOT
+            / "op_kernel/arch35/a5_c8_exact_speculative_resident_score_seam.h"
+        ).read_text(encoding="utf-8")
         finalizer = (
             TARGET_ROOT
             / "op_kernel/arch35/a5_c8_exact_speculative_resident_stage_b_finalizer.h"
         ).read_text(encoding="utf-8")
-        builder = (TARGET_ROOT / "build_p9_exact_resident_opp.sh").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            "A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER 0", finalizer
-        )
-        self.assertIn("requires the complete graph ABI", finalizer)
-        self.assertIn("P9_STAGE_B_FINALIZER_HEADER", builder)
-        self.assertIn("P9_FINALIZER_HEADER", builder)
-        self.assertIn(
-            "a5_c8_exact_speculative_resident_stage_b_finalizer.h", builder
-        )
-        self.assertIn(
-            '#include "a5_c8_exact_speculative_resident_finalizer.h"', finalizer
-        )
+        self.assertIn("A5_C8_EXACT_SPECULATIVE_RESIDENT_SCORE_SEAM 1", seam)
+        self.assertIn("A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER 1", finalizer)
+        self.assertNotIn("compile-disabled", seam)
+        self.assertNotIn("compile-disabled", finalizer)
+        self.assertIn("P9ObserveScoreSeam", seam)
+        self.assertIn("P9PostAtScoreBoundary", seam)
+        self.assertIn("P9FinalizeExactTopKRow", finalizer)
 
 
 if __name__ == "__main__":

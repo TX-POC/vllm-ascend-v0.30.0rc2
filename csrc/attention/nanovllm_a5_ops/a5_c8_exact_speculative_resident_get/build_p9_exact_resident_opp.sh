@@ -7,10 +7,10 @@
 # closure, then overlays only manifest-listed P9 files.  It never reuses a
 # CMake cache, an OPP, or a bridge from another source pair.
 #
-# The source overlay keeps score observation disabled until the complete graph
-# ABI is staged, but this builder still compiles the real P9 score-hook and
-# PostOnly/CQ headers in the cloned C8 project.  That catches CANN-domain and
-# KVAF ABI errors before the one atomic graph/kernel enablement change.
+# P9 is built only as one complete atomic closure: source-derived C8 score
+# seam, exact-TopK finalizer, and the graph-visible direct-resident ABI are
+# enabled together.  A marker-only binary is not a useful P9 artifact and is
+# intentionally rejected before CANN is invoked.
 
 set -euo pipefail
 
@@ -26,7 +26,7 @@ CANN_3RD_LIB_PATH="${A5_C8_EXACT_RESIDENT_CANN_3RD_LIB_PATH:-}"
 BUILD_JOBS="${A5_C8_EXACT_RESIDENT_BUILD_JOBS:-4}"
 TARGET_SOC_RAW="${A5_C8_EXACT_RESIDENT_SOC:-ascend950}"
 TARGET_OPERATOR="${A5_C8_EXACT_RESIDENT_OPERATOR:-A5C8ExactSpeculativeResidentGet}"
-SCORE_SEAM_MODE="${A5_C8_EXACT_RESIDENT_SCORE_SEAM:-0}"
+SCORE_SEAM_MODE="${A5_C8_EXACT_RESIDENT_SCORE_SEAM:-1}"
 
 MODE="build"
 if [[ "${1:-}" == "--stage-only" ]]; then
@@ -66,8 +66,8 @@ case "${TARGET_SOC_NORMALIZED}" in
 esac
 [[ "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]] || fail "invalid_jobs:value=${BUILD_JOBS}"
 [[ -n "${KVAF_ROOT}" ]] || fail "kvaf_source_root_missing"
-[[ "${SCORE_SEAM_MODE}" == "0" ]] ||
-  fail "active_score_seam_not_staged:value=${SCORE_SEAM_MODE}"
+[[ "${SCORE_SEAM_MODE}" == "1" ]] ||
+  fail "p9_requires_active_score_seam:value=${SCORE_SEAM_MODE}"
 
 # Do not inherit the historical product selector: it repeatedly selected a
 # different CANN product for isolated A5 OPPs.
@@ -217,8 +217,10 @@ p9_overlay_root=${OVERLAY_ROOT}
 staged_c8_root=${STAGED_C8_ROOT}
 staged_kvaf_root=${STAGED_KVAF_ROOT}
 target_soc=${TARGET_SOC}
-score_seam=compile_disabled
-p9_transport_headers=compiled_for_closure_only
+score_seam=active
+stage_b_finalizer=active
+p9_abi=official9_plus12_inputs_6_outputs
+p9_transport_headers=active_score_seam_stage_b_finalizer
 cann_3rd_lib_path=${CANN_3RD_LIB_PATH:-<stage-only>}
 EOF
 
@@ -253,6 +255,103 @@ python3 "${OVERLAY_APPLIER}" \
   --manifest "${OVERLAY_MANIFEST}" \
   --operator "${TARGET_OPERATOR}" | tee "${OVERLAY_RECEIPT}"
 cat "${OVERLAY_RECEIPT}" >> "${PACKAGE_ROOT}/P9_PROVENANCE"
+grep -Fq 'seam=active_abi' "${OVERLAY_RECEIPT}" ||
+  fail "p9_overlay_receipt_not_active:path=${OVERLAY_RECEIPT}"
+
+# The cloned operator has a deliberately narrow, explicit graph ABI.  Do not
+# accept a pre-P9 9-input closure merely because an OPP package happens to
+# compile: that was the source of stale/marker-only runs in earlier probes.
+# There is intentionally no resident-payload tensor here.  Direct-HCCP gets
+# its destination from the canonical control record; the graph carries the
+# exact selection maps and terminal attention-slot outputs instead.
+validate_active_p9_abi() {
+  local ops_json="$1"
+  python3 - "${ops_json}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    ops = json.load(stream)
+if not isinstance(ops, list) or len(ops) != 1:
+    raise SystemExit("invalid_operator_list")
+op = ops[0]
+if op.get("op") != "A5C8ExactSpeculativeResidentGet":
+    raise SystemExit("operator_name_mismatch")
+inputs = [item.get("name") for item in op.get("input_desc", [])]
+outputs = [item.get("name") for item in op.get("output_desc", [])]
+expected_inputs = [
+    "query", "key", "weights", "query_dequant_scale", "key_dequant_scale",
+    "actual_seq_lengths_query", "actual_seq_lengths_key", "block_table", "metadata",
+    "runtime_enable", "resident_threshold", "resident_threshold_valid",
+    "req_pool_entries", "kv_object_map", "kv_object_lens",
+    "persistent_object_slots_snapshot", "canonical_resident_layout",
+    "candidate_source_to_slot", "candidate_slot_cursor",
+    "layer_resident_get_control", "rows_per_entry",
+]
+expected_outputs = [
+    "sparse_indices", "sparse_values", "attention_slots", "terminal_post_stats",
+    "candidate_source_to_slot_ref", "candidate_slot_cursor_ref",
+]
+if inputs != expected_inputs:
+    raise SystemExit("input_abi_mismatch:actual=" + ",".join(inputs))
+if outputs != expected_outputs:
+    raise SystemExit("output_abi_mismatch:actual=" + ",".join(outputs))
+types = {item.get("name"): tuple(item.get("type", [])) for item in op["input_desc"]}
+for name in ("runtime_enable", "resident_threshold", "resident_threshold_valid",
+             "req_pool_entries", "kv_object_map", "kv_object_lens",
+             "persistent_object_slots_snapshot", "canonical_resident_layout",
+             "candidate_source_to_slot", "candidate_slot_cursor", "rows_per_entry"):
+    if types.get(name) != ("int32",):
+        raise SystemExit("input_type_mismatch:" + name)
+if types.get("layer_resident_get_control") != ("int64",):
+    raise SystemExit("input_type_mismatch:layer_resident_get_control")
+print("P9_ACTIVE_ABI_PASS inputs=21 outputs=6 control=int64_raw layout=gm rows_per_entry=int32")
+PY
+}
+
+if ! validate_active_p9_abi "${STAGED_C8_ROOT}/ops.json"; then
+  fail "p9_active_graph_abi_invalid:path=${STAGED_C8_ROOT}/ops.json"
+fi
+
+# The headers are copied by the overlay, so assert their active defaults from
+# the staged source rather than trusting an ambient compiler -D flag.  The
+# score seam and TopK terminalizer must never be built in different modes.
+grep -Fq '#define A5_C8_EXACT_SPECULATIVE_RESIDENT_SCORE_SEAM 1' \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_score_seam.h" ||
+  fail "p9_active_score_seam_header_missing"
+grep -Fq '#define A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER 1' \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_stage_b_finalizer.h" ||
+  fail "p9_active_stage_b_finalizer_header_missing"
+
+# Check the generated *source wiring*, not merely the JSON.  These anchors
+# cover all active boundaries: CANN wrapper -> QLIPreload -> persistent
+# QLIVector state -> completed score seam -> local Top-K terminalizer.  This
+# is cheap enough to run before msopgen and prevents a mixed package whose
+# schema and kernel were staged from different revisions.
+P9_STAGED_WRAPPER="${STAGED_C8_ROOT}/op_kernel/a5_c8_exact_speculative_resident_get.cpp"
+P9_STAGED_PRELOAD="${STAGED_C8_ROOT}/op_kernel/arch35/quant_lightning_indexer_kernel.h"
+P9_STAGED_VECTOR="${STAGED_C8_ROOT}/op_kernel/arch35/quant_lightning_indexer_service_vector.h"
+P9_STAGED_TILING="${STAGED_C8_ROOT}/op_host/a5_c8_exact_speculative_resident_get_tiling.h"
+for source_anchor in \
+  "${P9_STAGED_WRAPPER}:runtimeEnable" \
+  "${P9_STAGED_WRAPPER}:candidateSourceToSlotRef" \
+  "${P9_STAGED_PRELOAD}:InitP9Runtime(" \
+  "${P9_STAGED_VECTOR}:P9ObserveScoreSeam(" \
+  "${P9_STAGED_VECTOR}:P9PostAtScoreBoundary(" \
+  "${P9_STAGED_VECTOR}:P9FinalizeExactTopKRow(" \
+  "${P9_STAGED_VECTOR}:p9RuntimeActive_" \
+  "${P9_STAGED_TILING}:p9RowCount"; do
+  source_path="${source_anchor%%:*}"
+  source_token="${source_anchor#*:}"
+  [[ -f "${source_path}" ]] ||
+    fail "p9_active_source_missing:path=${source_path}"
+  grep -Fq "${source_token}" "${source_path}" ||
+    fail "p9_active_source_anchor_missing:path=${source_path}:token=${source_token}"
+done
+printf 'P9_ACTIVE_SOURCE_WIRING_PASS wrapper=%s preload=%s vector=%s tiling=%s\n' \
+  "${P9_STAGED_WRAPPER}" "${P9_STAGED_PRELOAD}" \
+  "${P9_STAGED_VECTOR}" "${P9_STAGED_TILING}"
 
 # The overlay itself owns only source renaming and the score-seam anchor.  The
 # builder owns the larger P9 CANN closure, so validate here that the seam will

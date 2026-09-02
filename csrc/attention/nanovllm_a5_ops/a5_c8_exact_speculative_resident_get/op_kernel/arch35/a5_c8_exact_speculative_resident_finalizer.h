@@ -1,8 +1,11 @@
 // P9 Stage-B terminalizer for the source-derived A5 C8 operator.
 //
-// This is deliberately a tail after the official ProcessTopK writeback.  It
-// reads the already-final local Top-2048 indices; it never changes a score,
-// the official Top-K working storage, or the original sparse-index DMA.
+// This is deliberately a tail at the official ProcessTopK local-index
+// boundary.  It reads the already-final local Top-2048 indices after C8's
+// V->MTE3 completion, but before C8 submits its unchanged local-to-GM
+// sparse-index DMA.  It therefore never races MTE3 for `indicesOutLocal_`,
+// never consumes the official MTE3->V token, and leaves C8's original
+// writeback/event chain intact.
 // Its only job is to make the exact Top-K's KV locations concrete in the
 // caller-owned normal-resident allocation before QSFA can read them:
 //
@@ -146,9 +149,11 @@ public:
     }
 
     // `row` is the flattened output row used by both the score seam and the
-    // official indiceOutGm offset.  Call this exactly after that row's
-    // unchanged official DataCopyPad(indiceOutGm, indicesOutLocal_) and its
-    // original MTE3->V acknowledgement.
+    // official indiceOutGm offset.  The source overlay calls this immediately
+    // after C8's unchanged `WaitFlag<V_MTE3>(TOPK_V_MTE3_EVENT)` and before
+    // its unchanged `DataCopyPad(indiceOutGm, indicesOutLocal_)`.  Thus V owns
+    // the source buffer exclusively for the whole finalizer call; after it
+    // returns, official C8 submits its original MTE3 DMA and event signal.
     __aicore__ inline bool FinalizeExactTopKRow(
         uint32_t row, LocalTensor<uint32_t> exact_topk_indices,
         C8ExactSpeculativeResidentScoreHook* score_hook,

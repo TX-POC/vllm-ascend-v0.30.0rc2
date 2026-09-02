@@ -11,11 +11,27 @@
       {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
       {"name": "actual_seq_lengths_key", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
       {"name": "block_table", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
-      {"name": "metadata", "param_type": "optional", "format": ["ND"], "type": ["int32"]}
+      {"name": "metadata", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+      {"name": "runtime_enable", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_threshold", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_threshold_valid", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "persistent_object_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "canonical_resident_layout", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_source_to_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_slot_cursor", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "layer_resident_get_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "rows_per_entry", "param_type": "required", "format": ["ND"], "type": ["int32"]}
     ],
     "output_desc": [
       {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "sparse_values", "param_type": "required", "format": ["ND"], "type": ["float"]}
+      {"name": "sparse_values", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "attention_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "terminal_post_stats", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_source_to_slot_ref", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_slot_cursor_ref", "param_type": "required", "format": ["ND"], "type": ["int32"]}
     ],
     "attr": [
       {"name": "query_quant_mode", "type": "int", "default_value": "0"},

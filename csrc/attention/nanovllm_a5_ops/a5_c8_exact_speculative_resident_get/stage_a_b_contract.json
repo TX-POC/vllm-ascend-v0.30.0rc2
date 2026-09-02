@@ -1,7 +1,43 @@
 {
-  "format": 1,
+  "format": 2,
   "target": "A5C8ExactSpeculativeResidentGet",
-  "abi_status": "target ABI: the current source-derived ops.json intentionally remains the 9-input/2-output official-C8 closure with both P9 macros disabled; this contract is activated only by the atomic host/kernel/bridge ABI change",
+  "abi_status": "active atomic ABI: 21 inputs and 6 outputs; the official C8 inputs 0..8 and outputs 0..1 keep their original order and types, while P9 appends one graph-visible direct-resident contract without a redundant resident-payload pointer",
+  "operator_abi": {
+    "input_count": 21,
+    "output_count": 6,
+    "inputs": [
+      {"index": 0, "name": "query", "dtype": "int8", "role": "official_c8"},
+      {"index": 1, "name": "key", "dtype": "int8", "role": "official_c8"},
+      {"index": 2, "name": "weights", "dtype": "float", "role": "official_c8"},
+      {"index": 3, "name": "query_dequant_scale", "dtype": "float", "role": "official_c8"},
+      {"index": 4, "name": "key_dequant_scale", "dtype": "float", "role": "official_c8"},
+      {"index": 5, "name": "actual_seq_lengths_query", "dtype": "int32", "role": "official_c8"},
+      {"index": 6, "name": "actual_seq_lengths_key", "dtype": "int32", "role": "official_c8"},
+      {"index": 7, "name": "block_table", "dtype": "int32", "role": "official_c8"},
+      {"index": 8, "name": "metadata", "dtype": "int32", "role": "official_c8"},
+      {"index": 9, "name": "runtime_enable", "dtype": "int32", "role": "p9_control"},
+      {"index": 10, "name": "resident_threshold", "dtype": "int32", "role": "p9_control"},
+      {"index": 11, "name": "resident_threshold_valid", "dtype": "int32", "role": "p9_control"},
+      {"index": 12, "name": "req_pool_entries", "dtype": "int32", "role": "p9_mapping"},
+      {"index": 13, "name": "kv_object_map", "dtype": "int32", "role": "p9_mapping"},
+      {"index": 14, "name": "kv_object_lens", "dtype": "int32", "role": "p9_mapping"},
+      {"index": 15, "name": "persistent_object_slots_snapshot", "dtype": "int32", "role": "p9_mapping"},
+      {"index": 16, "name": "canonical_resident_layout", "dtype": "int32", "role": "p9_layout"},
+      {"index": 17, "name": "candidate_source_to_slot", "dtype": "int32", "role": "p9_mutable_alias_input"},
+      {"index": 18, "name": "candidate_slot_cursor", "dtype": "int32", "role": "p9_mutable_alias_input"},
+      {"index": 19, "name": "layer_resident_get_control", "dtype": "int64", "role": "p9_direct_hccp_control"},
+      {"index": 20, "name": "rows_per_entry", "dtype": "int32", "role": "p9_direct_hccp_control"}
+    ],
+    "outputs": [
+      {"index": 0, "name": "sparse_indices", "dtype": "int32", "role": "official_c8"},
+      {"index": 1, "name": "sparse_values", "dtype": "float", "role": "official_c8"},
+      {"index": 2, "name": "attention_slots", "dtype": "int32", "role": "p9_terminal_slots"},
+      {"index": 3, "name": "terminal_post_stats", "dtype": "int32", "role": "p9_terminal_stats"},
+      {"index": 4, "name": "candidate_source_to_slot_ref", "dtype": "int32", "alias_of_input": 17},
+      {"index": 5, "name": "candidate_slot_cursor_ref", "dtype": "int32", "alias_of_input": 18}
+    ],
+    "resident_payload": "not an operator input or output: the caller's normal resident allocation is carried by layer_resident_get_control, and attention_slots is the only terminal payload-facing result"
+  },
   "source_derived_from": {
     "operator": "VllmQuantLightningIndexer",
     "source_root": "csrc/attention/vllm_quant_lightning_indexer",
@@ -11,7 +47,7 @@
       "after": "vector1::BatchMulWeightAndReduceSum",
       "before": "DataCopyPad(scoreGm"
     },
-    "topk_owner": "official ProcessTopK selection and original writeback are unchanged; P9 inserts only compile-disabled tails after each original writeback"
+    "topk_owner": "official ProcessTopK selection and original sparse-index writeback stay unchanged; P9 invokes its terminal direct-resident finalizer after the original V->MTE3 completion and before that unchanged sparse-index writeback, without consuming TOPK_MTE3_V"
   },
   "resource_model": {
     "worker_assignment": "any C8 worker may dynamically acquire an invocation-local queue",
@@ -31,14 +67,15 @@
     "slot_assignment": "one candidate receives one distinct fixed resident slot before PostOnly",
     "maps": {
       "candidate_source_to_slot": "int32[R, S], initialized to -1; written only after the fully published descriptor is accepted by PostOnly",
-      "candidate_slot_cursor": "int32[R], invocation-local monotonic admission cursor; it only prevents duplicate initial posts and is not used for Stage-B reuse"
+      "candidate_slot_cursor": "int32[R], invocation-local monotonic admission cursor; it only prevents duplicate initial posts and is not used for cross-invocation reuse"
     },
-    "cross_wave_slot_invariant": "CandidateCompact never assigns one resident_slot to two initial waves; Stage-B drains every initial wave before it may reuse a non-winner slot for exact recall"
+    "cross_wave_slot_invariant": "CandidateCompact never assigns one resident_slot to two initial waves; Stage-B drains every initial wave before it may reuse a non-winner entry in the same invocation for exact recall"
   },
   "stage_a": {
     "name": "score_scan_candidate_post",
     "inputs": [
-      "official_c8_inputs",
+      "official_c8_inputs_0_to_8",
+      "runtime_enable",
       "resident_threshold",
       "resident_threshold_valid",
       "req_pool_entries",
@@ -48,12 +85,14 @@
       "canonical_resident_layout",
       "candidate_source_to_slot",
       "candidate_slot_cursor",
-      "resident_packed_output",
-      "layer_resident_get_control"
+      "layer_resident_get_control",
+      "rows_per_entry"
     ],
     "outputs": [
       "official_sparse_indices",
-      "official_sparse_values"
+      "official_sparse_values",
+      "candidate_source_to_slot_ref",
+      "candidate_slot_cursor_ref"
     ],
     "invocation_local_workspaces": [
       "candidate_source_to_slot",
@@ -69,8 +108,8 @@
       "candidate_source_to_slot",
       "persistent_object_slots_snapshot",
       "canonical_resident_layout",
-      "resident_packed_output",
-      "layer_resident_get_control"
+      "layer_resident_get_control",
+      "rows_per_entry"
     ],
     "outputs": ["attention_slots", "terminal_post_stats"],
     "winner_resolution_order": [

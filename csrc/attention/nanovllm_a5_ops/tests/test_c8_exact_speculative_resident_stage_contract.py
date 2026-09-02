@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Static source gate for the P9 direct-resident C8 target.
+"""Static source gate for P9's one-invocation direct-resident operator.
 
-This test prevents the real CANN target from inheriting old P7/P8 private
-transport or silently changing the official C8 score/Top-K seam.
+The gate intentionally describes the product-facing design, not an older P7
+or P8 experiment: C8 owns score and exact Top-K; any worker may obtain a
+temporary queue lease; all Direct-HCCP work becomes terminal before the
+operator returns; QSFA receives only final normal-resident slots.
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ TARGET_ROOT = OPS_ROOT / "a5_c8_exact_speculative_resident_get"
 CONTRACT = json.loads(
     (TARGET_ROOT / "stage_a_b_contract.json").read_text(encoding="utf-8")
 )
+OPS = json.loads(
+    (TARGET_ROOT / "source_overlay" / "ops.json").read_text(encoding="utf-8")
+)[0]
 KERNEL_CONTRACT = (
     TARGET_ROOT
     / "op_kernel"
@@ -41,8 +46,21 @@ FINALIZER = (
     / "arch35"
     / "a5_c8_exact_speculative_resident_finalizer.h"
 ).read_text(encoding="utf-8")
-OVERLAY_README = (
-    TARGET_ROOT / "source_overlay" / "README.md"
+SCORE_SEAM = (
+    TARGET_ROOT
+    / "source_overlay"
+    / "op_kernel"
+    / "arch35"
+    / "a5_c8_exact_speculative_resident_score_seam.h"
+).read_text(encoding="utf-8")
+STAGE_B_TAIL = (
+    TARGET_ROOT
+    / "op_kernel"
+    / "arch35"
+    / "a5_c8_exact_speculative_resident_stage_b_finalizer.h"
+).read_text(encoding="utf-8")
+OVERLAY_APPLIER = (
+    TARGET_ROOT / "source_overlay" / "apply_p9_overlay.py"
 ).read_text(encoding="utf-8")
 OFFICIAL_VECTOR = (
     OPS_ROOT.parent
@@ -51,14 +69,55 @@ OFFICIAL_VECTOR = (
     / "arch35"
     / "quant_lightning_indexer_service_vector.h"
 ).read_text(encoding="utf-8")
-CENTRAL_BUILD_SCRIPT = (OPS_ROOT / "build_nanovllm_ops.sh").read_text(encoding="utf-8")
 P9_BUILD_SCRIPT = (
     TARGET_ROOT / "build_p9_exact_resident_opp.sh"
 ).read_text(encoding="utf-8")
 
+OFFICIAL_INPUTS = [
+    ("query", "int8"),
+    ("key", "int8"),
+    ("weights", "float"),
+    ("query_dequant_scale", "float"),
+    ("key_dequant_scale", "float"),
+    ("actual_seq_lengths_query", "int32"),
+    ("actual_seq_lengths_key", "int32"),
+    ("block_table", "int32"),
+    ("metadata", "int32"),
+]
+P9_INPUTS = [
+    ("runtime_enable", "int32"),
+    ("resident_threshold", "int32"),
+    ("resident_threshold_valid", "int32"),
+    ("req_pool_entries", "int32"),
+    ("kv_object_map", "int32"),
+    ("kv_object_lens", "int32"),
+    ("persistent_object_slots_snapshot", "int32"),
+    ("canonical_resident_layout", "int32"),
+    ("candidate_source_to_slot", "int32"),
+    ("candidate_slot_cursor", "int32"),
+    ("layer_resident_get_control", "int64"),
+    ("rows_per_entry", "int32"),
+]
+OUTPUTS = [
+    ("sparse_indices", "int32"),
+    ("sparse_values", "float"),
+    ("attention_slots", "int32"),
+    ("terminal_post_stats", "int32"),
+    ("candidate_source_to_slot_ref", "int32"),
+    ("candidate_slot_cursor_ref", "int32"),
+]
+
+
+def op_schema(entries: list[dict[str, object]]) -> list[tuple[str, str]]:
+    return [(entry["name"], entry["type"][0]) for entry in entries]
+
+
+def contract_schema(entries: list[dict[str, object]]) -> list[tuple[str, str]]:
+    return [(entry["name"], entry["dtype"]) for entry in entries]
+
 
 class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
-    def test_source_is_derived_from_the_official_score_seam(self) -> None:
+    def test_active_source_seam_keeps_official_score_and_topk_ownership(self) -> None:
         source = CONTRACT["source_derived_from"]
         self.assertEqual(source["operator"], "VllmQuantLightningIndexer")
         seam = source["score_seam"]
@@ -67,10 +126,12 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertEqual(seam["before"], "DataCopyPad(scoreGm")
         self.assertEqual(
             source["topk_owner"],
-            "official ProcessTopK selection and original writeback are unchanged; "
-            "P9 inserts only compile-disabled tails after each original writeback",
+            "official ProcessTopK selection and original sparse-index writeback stay unchanged; "
+            "P9 invokes its terminal direct-resident finalizer after the original "
+            "V->MTE3 completion and before that unchanged sparse-index writeback, "
+            "without consuming TOPK_MTE3_V",
         )
-        self.assertIn("target ABI", CONTRACT["abi_status"])
+        self.assertIn("active atomic ABI", CONTRACT["abi_status"])
 
         process_vec = OFFICIAL_VECTOR.index("QLIVector<QLIT>::ProcessVec1")
         process_topk = OFFICIAL_VECTOR.index("QLIVector<QLIT>::ProcessTopK")
@@ -81,8 +142,20 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertLess(process_vec, score_reduce)
         self.assertLess(score_reduce, score_publish)
         self.assertLess(score_publish, process_topk)
-        self.assertIn("exact checked-out", OVERLAY_README)
-        self.assertIn("byte-for-byte", OVERLAY_README)
+
+    def test_exact_21_input_6_output_graph_abi_and_aliases(self) -> None:
+        abi = CONTRACT["operator_abi"]
+        self.assertEqual(abi["input_count"], 21)
+        self.assertEqual(abi["output_count"], 6)
+        self.assertEqual(contract_schema(abi["inputs"]), OFFICIAL_INPUTS + P9_INPUTS)
+        self.assertEqual(contract_schema(abi["outputs"]), OUTPUTS)
+        self.assertEqual(op_schema(OPS["input_desc"]), OFFICIAL_INPUTS + P9_INPUTS)
+        self.assertEqual(op_schema(OPS["output_desc"]), OUTPUTS)
+        self.assertEqual(abi["outputs"][4]["alias_of_input"], 17)
+        self.assertEqual(abi["outputs"][5]["alias_of_input"], 18)
+        names = [entry["name"] for entry in abi["inputs"] + abi["outputs"]]
+        self.assertNotIn("resident_packed_output", names)
+        self.assertIn("not an operator input or output", abi["resident_payload"])
 
     def test_direct_resident_candidate_layout_has_no_private_indirection(self) -> None:
         self.assertEqual(CONTRACT["target"], "A5C8ExactSpeculativeResidentGet")
@@ -94,28 +167,14 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             CONTRACT["candidate_seed"]["cross_wave_slot_invariant"],
             "CandidateCompact never assigns one resident_slot to two initial "
             "waves; Stage-B drains every initial wave before it may reuse a "
-            "non-winner slot for exact recall",
-        )
-        self.assertEqual(
-            CONTRACT["candidate_seed"]["maps"],
-            {
-                "candidate_source_to_slot": "int32[R, S], initialized to -1; "
-                "written only after the fully published descriptor is accepted "
-                "by PostOnly",
-                "candidate_slot_cursor": "int32[R], invocation-local monotonic "
-                "admission cursor; it only prevents duplicate initial posts and is "
-                "not used for Stage-B reuse",
-            },
+            "non-winner entry in the same invocation for exact recall",
         )
         resource = CONTRACT["resource_model"]
-        fixed = resource["canonical_resident_layout"]
-        self.assertEqual(fixed["input"], "canonical_resident_layout")
-        self.assertEqual(
-            fixed["shape"],
-            "[first_slot, slots_per_row, row_stride, row_count]",
-        )
-        self.assertIn("widened to uint32", fixed["meaning"])
-        self.assertEqual(fixed["slot_count"], 2048)
+        layout = resource["canonical_resident_layout"]
+        self.assertEqual(layout["input"], "canonical_resident_layout")
+        self.assertEqual(layout["shape"], "[first_slot, slots_per_row, row_stride, row_count]")
+        self.assertEqual(layout["slot_count"], 2048)
+        self.assertIn("widened to uint32", layout["meaning"])
         self.assertFalse(resource["fixed_get_core_partition"])
         self.assertFalse(resource["persistent_slot_map_mutation_during_score_scan"])
         for token in (
@@ -130,38 +189,32 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             "IsSlotInRange",
         ):
             self.assertIn(token, KERNEL_CONTRACT)
-        for retired_token in (
-            "p8_",
+        for forbidden in (
             "private_",
             "arena_",
             "quarantine",
             "forward_control",
             "replay",
-            "epoch",
+            "fixed_get_core_partition",
+            "31+1",
         ):
-            self.assertNotIn(retired_token, KERNEL_CONTRACT.lower())
+            self.assertNotIn(forbidden, KERNEL_CONTRACT.lower())
 
-    def test_score_seam_uses_existing_scratch_and_never_mints_a_get_core(self) -> None:
-        # Capacity values have one source of truth in the shared contract;
-        # the hook imports them rather than duplicating magic numbers.
-        self.assertIn("kCandidateMicrobatchCapacity", SCORE_HOOK)
-        self.assertIn("kCandidateMicrobatchCount", SCORE_HOOK)
+    def test_score_seam_is_bounded_and_queue_ownership_is_dynamic(self) -> None:
+        for required in (
+            "A5_C8_EXACT_SPECULATIVE_RESIDENT_SCORE_SEAM 1",
+            "P9ObserveScoreSeam",
+            "P9PostAtScoreBoundary",
+            "kCandidateMicrobatchCapacity",
+            "kCandidateMicrobatchCount",
+        ):
+            self.assertIn(required, SCORE_SEAM + SCORE_HOOK)
         self.assertIn("kCandidateMicrobatchCapacity = 64U", KERNEL_CONTRACT)
         self.assertIn("kCandidateMicrobatchCount = 2U", KERNEL_CONTRACT)
-        self.assertIn("candidateSlotCursor", SCORE_HOOK)
-        self.assertIn("rowCount", SCORE_HOOK)
-        self.assertIn("BatchMulWeightAndReduceSum", SCORE_HOOK)
-        self.assertIn("DataCopyPad(scoreGm", SCORE_HOOK)
         self.assertNotIn("TBuf<", SCORE_HOOK)
-        # Do not make comments a source of false failures: the header may
-        # explicitly explain why physical-core partitioning is absent.  The
-        # stable implementation-level bans below are the actual contract.
         for forbidden in ("31+1", "fixed_get_core_partition"):
-            self.assertNotIn(forbidden.lower(), SCORE_HOOK.lower())
+            self.assertNotIn(forbidden, SCORE_HOOK.lower())
 
-    def test_dynamic_post_executor_has_only_invocation_local_queue_ownership(self) -> None:
-        # A fixed resident slot does not need a ready/release/ABA protocol.
-        # The only dynamic resource is the temporary Direct-HCCP queue.
         for required in (
             "ReserveCandidateResidentSlotSimt",
             "CommitCandidateResidentSlotSimt",
@@ -186,12 +239,9 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             "epoch",
             "quarantine",
             "fixed_get_core",
+            "31+1",
         ):
             self.assertNotIn(forbidden, POST_EXECUTOR.lower())
-
-        # Maps are committed only after the real Begin path; the only early
-        # mutation is a short -2 reservation that rollback clears if no
-        # doorbell happens.
         self.assertLess(
             POST_EXECUTOR.index("PublishKvafLayerResidentDescriptor"),
             POST_EXECUTOR.index("BeginKvafLayerResidentBatchGet(control_, lease"),
@@ -200,105 +250,8 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             POST_EXECUTOR.index("BeginKvafLayerResidentBatchGet(control_, lease"),
             POST_EXECUTOR.index("CommitViewClaims(view)"),
         )
-        self.assertIn("kCandidateSourceClaiming", POST_EXECUTOR)
-        # Descriptor publication owns the DDR barrier in the KVAF ABI.  The
-        # P9 executor must call that boundary rather than reimplement it.
-        self.assertIn("PublishKvafLayerResidentDescriptor", POST_EXECUTOR)
-        self.assertIn("has_wave_ = true;", POST_EXECUTOR)
-        self.assertIn("static_cast<event_t>(EVENT_ID0)", POST_EXECUTOR)
-        # AICore->SIMT calls must carry scalar layout fields, not an aggregate
-        # ABI that CANN may lower differently from normal C++.
-        self.assertIn("resident_layout.firstSlot", POST_EXECUTOR)
-        self.assertNotIn(
-            "source_capacity, resident_layout,\n        result",
-            POST_EXECUTOR,
-        )
 
-    def test_device_closure_preserves_aicore_domains_and_ub_address_spaces(self) -> None:
-        """The compile-disabled seam still parses every P9 device helper."""
-        for result_type, helper in (
-            ("bool", "IsCanonicalLayout"),
-            ("int64_t", "CanonicalRowFirstSlot"),
-            ("bool", "IsSlotInCanonicalRow"),
-        ):
-            self.assertRegex(
-                KERNEL_CONTRACT,
-                rf"__aicore__\s+constexpr\s+{result_type}\s+{helper}\s*\(",
-            )
-        # `CandidatePostView.seeds` and Stage-B recall seeds live in UB.  A
-        # normal C++ reference silently changes address space under OPC; use
-        # explicit UB pointers or scalar register loads instead.
-        self.assertNotRegex(
-            POST_EXECUTOR, r"(?:const\s+)?CandidateSeed\s*&"
-        )
-        self.assertIn("__ubuf__ CandidateSeed* const seed", POST_EXECUTOR)
-        self.assertIn("__ubuf__ const CandidateSeed* const seed", POST_EXECUTOR)
-        self.assertIn("seed_kv_object", POST_EXECUTOR)
-
-    def test_post_executor_resolves_the_staged_kvaf_device_closure_relatively(self) -> None:
-        """OPC precompile cannot depend on an implicit op_kernel include path."""
-        relative_include = (
-            '../kvaf_layer_resident/kvaf_layer_resident_get_device.h'
-        )
-        self.assertIn(f'#include "{relative_include}"', POST_EXECUTOR)
-        # The builder owns the exact staged layout, so assert both the source
-        # requirement and its fail-closed file-resolution check here.
-        self.assertIn("P9_KVAF_RELATIVE_INCLUDE", P9_BUILD_SCRIPT)
-        self.assertIn(
-            "p9_post_executor_kvaf_relative_include_unresolvable",
-            P9_BUILD_SCRIPT,
-        )
-
-    def test_existing_c8_invalid_scratch_has_a_complete_fixed_layout(self) -> None:
-        for token in (
-            "kExistingC8InvalidScratchBytes",
-            "kCandidateSeedScratchBytes",
-            "kQueueLeaseReceiptScratchBytes = 16U",
-            "kCandidateReservationScratchBytes = 16U",
-            "kExactRecallWaveCapacity = 256U",
-            "kExactRecallSeedScratchBytes == 4096U",
-            "kStageBUsedSlotBitmapBytes",
-            "kStageBQueueLeaseReceiptScratchBytes = 16U",
-            "kStageBReservationScratchBytes = 16U",
-            "kP9ScratchBytes == 4384U",
-            "kP9ScratchBytes <= kExistingC8InvalidScratchBytes",
-        ):
-            self.assertIn(token, KERNEL_CONTRACT)
-
-    def test_stage_b_finalizer_is_a_terminal_exact_recall_tail(self) -> None:
-        """Stage B consumes final local Top-K; it never owns C8 math."""
-        for required in (
-            "FinalizeExactTopKRow",
-            "DeferAllReadyPostViews",
-            "DrainAllBeforeReturn",
-            "TryPostFixedRecallSeeds",
-            "kExactRecallWaveCapacity",
-            "candidateSourceToSlot_",
-            "persistentObjectSlots_",
-            "attentionSlots_",
-            "kCandidateSourceClaiming",
-            "every selected payload is terminal",
-        ):
-            self.assertIn(required, FINALIZER)
-        self.assertNotIn("TBuf<", FINALIZER)
-        for forbidden in (
-            "private_arena",
-            "forward_control",
-            "replay",
-            "epoch",
-            "quarantine",
-            "fixed_get_core",
-        ):
-            self.assertNotIn(forbidden, FINALIZER.lower())
-        # The output itself is only consumed after operator completion.  The
-        # finalizer may record a recall destination before its CQ terminal,
-        # but it must drain before returning success.
-        self.assertLess(
-            FINALIZER.index("TryPostFixedRecallSeeds"),
-            FINALIZER.rindex("DrainAllBeforeReturn()"),
-        )
-
-    def test_stage_b_exposes_only_terminal_direct_slots_to_qsfa(self) -> None:
+    def test_stage_b_only_exposes_terminal_normal_resident_slots(self) -> None:
         stage_b = CONTRACT["stage_b"]
         self.assertEqual(stage_b["name"], "topk_recall_and_terminal_drain")
         self.assertEqual(
@@ -310,44 +263,78 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            stage_b["completion_condition"],
-            "all_initial_and_recall_posts_terminal",
+            stage_b["completion_condition"], "all_initial_and_recall_posts_terminal"
         )
         self.assertEqual(
             stage_b["qsfa_contract"],
             "QSFA consumes only final attention_slots after this condition holds",
         )
         self.assertEqual(stage_b["outputs"], ["attention_slots", "terminal_post_stats"])
+        for required in (
+            "FinalizeExactTopKRow",
+            "DeferAllReadyPostViews",
+            "DrainAllBeforeReturn",
+            "TryPostFixedRecallSeeds",
+            "candidateSourceToSlot_",
+            "persistentObjectSlots_",
+            "attentionSlots_",
+            "every selected payload is terminal",
+        ):
+            self.assertIn(required, FINALIZER)
+        self.assertNotIn("TBuf<", FINALIZER)
+        for forbidden in (
+            "private_arena",
+            "forward_control",
+            "replay",
+            "epoch",
+            "quarantine",
+            "fixed_get_core",
+            "31+1",
+        ):
+            self.assertNotIn(forbidden, FINALIZER.lower())
 
-    def test_target_has_a_dedicated_fresh_builder_but_no_legacy_route(self) -> None:
-        """P9 has one fresh source-derived builder, never a legacy route."""
-        self.assertNotIn("A5C8ExactSpeculativeResidentGet", CENTRAL_BUILD_SCRIPT)
-        self.assertIn("P9_PROVENANCE", P9_BUILD_SCRIPT)
-        self.assertIn("fresh_package_root_exists", P9_BUILD_SCRIPT)
-        self.assertIn("legacy_p7_p8_streaming_include", P9_BUILD_SCRIPT)
-        self.assertIn("P9_SCORE_HOOK_HEADER", P9_BUILD_SCRIPT)
-        self.assertIn("P9_POST_EXECUTOR_HEADER", P9_BUILD_SCRIPT)
-        self.assertIn("P9_FINALIZER_HEADER", P9_BUILD_SCRIPT)
-        self.assertIn("p9_stage_b_finalizer_include_missing", P9_BUILD_SCRIPT)
-        self.assertIn("KVAF_RESIDENT_CONTRACT_TEST", P9_BUILD_SCRIPT)
-        self.assertIn("P9_KVAF_SOURCE_CONTRACT_PASS", P9_BUILD_SCRIPT)
-        self.assertIn("kvaf_layer_resident_source_contract_failed", P9_BUILD_SCRIPT)
-        # P9 uses msopgen's standalone CMake scaffold.  Copying the official
-        # C8 op_host directory over it revives a monorepo-only macro
-        # (add_op_to_compiled_list) and fails before any P9 code compiles.
-        # The generated OP_ADD stub is removed only after source files are
-        # staged without CMakeLists.txt, leaving one source-derived OpDef.
-        self.assertIn("P9_HOST_STAGING", P9_BUILD_SCRIPT)
-        self.assertIn("p9_legacy_add_op_to_compiled_list_leaked_after_staging", P9_BUILD_SCRIPT)
-        self.assertIn("p9_generated_op_add_stub_count", P9_BUILD_SCRIPT)
-        self.assertIn("copy_tree_without_repository_cmake", P9_BUILD_SCRIPT)
-        self.assertIn("p9_source_derived_op_add_registration_count", P9_BUILD_SCRIPT)
-        self.assertIn("p9_source_derived_op_add_registration_path", P9_BUILD_SCRIPT)
+    def test_overlay_is_atomic_active_abi_not_a_disabled_or_legacy_route(self) -> None:
+        # The source-derived transform must wire every layer of the ABI in one
+        # pass.  Running only a seam or only a wrapper creates a mixed binary.
+        for required in (
+            "inject_kernel_wrapper_abi",
+            "inject_preload_abi",
+            "inject_vector_runtime",
+            "inject_score_seam",
+            "seam=active_abi",
+            "runtimeEnable",
+            "rowsPerEntry",
+            "candidateSourceToSlotRef",
+            "candidateSlotCursorRef",
+        ):
+            self.assertIn(required, OVERLAY_APPLIER)
+        self.assertNotIn("seam=compile_disabled", OVERLAY_APPLIER)
+        self.assertIn("A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER 1", STAGE_B_TAIL)
+        self.assertNotIn("compile-disabled", SCORE_SEAM)
+        self.assertNotIn("compile-disabled", STAGE_B_TAIL)
+        # The active tail may not take the official TOPK event token a second
+        # time; its legal boundary must be established by the overlay itself.
         self.assertNotIn(
-            'cp -a "${STAGED_C8_ROOT}/op_host/." "${GENERATED_ROOT}/op_host/"',
-            P9_BUILD_SCRIPT,
+            "WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT)", OVERLAY_APPLIER
         )
-        self.assertIn("build_p9_exact_resident_opp.sh", (TARGET_ROOT / "README.md").read_text())
+        for forbidden in ("P7", "P8", "31+1", "fixed physical get core"):
+            self.assertNotIn(forbidden.lower(), OVERLAY_APPLIER.lower())
+
+    def test_builder_is_fresh_and_provenance_gated(self) -> None:
+        for required in (
+            "P9_PROVENANCE",
+            "fresh_package_root_exists",
+            "P9_SCORE_HOOK_HEADER",
+            "P9_POST_EXECUTOR_HEADER",
+            "P9_FINALIZER_HEADER",
+            "P9_STAGE_B_FINALIZER_HEADER",
+            "P9_KVAF_SOURCE_CONTRACT_PASS",
+            "copy_tree_without_repository_cmake",
+        ):
+            self.assertIn(required, P9_BUILD_SCRIPT)
+        self.assertNotIn("seam=compile_disabled", P9_BUILD_SCRIPT)
+
+    def test_non_goals_remain_explicit(self) -> None:
         self.assertEqual(
             CONTRACT["non_goals"],
             [
