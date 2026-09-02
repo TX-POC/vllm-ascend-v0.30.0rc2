@@ -152,12 +152,11 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "P8 owns no CANN stream-resource quota",
             "no public deterministic-state",
             "RunP8Tq0CallerThreadHost(std::move(inline_acl_call))",
-            "InitPtaCacheForWorkspace()",
+            "caller_thread_pta_cache_framework_owned",
             "ResolveSymbol(\"InitHugeMemThreadLocal\")",
             "ConvertTypes(inline_args_ref...",
             "inline_workspace_size == 0",
             "ReleaseTuple(inline_converted)",
-            "UnInitPtaCacheForWorkspace(true)",
             "caller_thread_direct_dispatch_done",
         ):
             self.assertIn(token, direct_macro)
@@ -228,6 +227,10 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         self.assertLess(release, cleanup)
         self.assertLess(release, clear)
         self.assertLess(clear, cleanup)
+        # P8's direct caller must follow the upstream ACLNN ownership boundary:
+        # HugeMem TLS is bridge-owned, whereas framework PTA cache TLS is not.
+        self.assertNotIn("InitPtaCacheForWorkspace()", direct_macro)
+        self.assertNotIn("UnInitPtaCacheForWorkspace(", direct_macro)
         self.assertNotIn("auto keepalive = std::make_tuple", self.bridge)
         self.assertNotIn("auto keepalive = std::make_tuple", self.stage_a_bridge)
         stage_a_host = (
@@ -327,6 +330,27 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         self.assertIn('std::strcmp(task_queue, "0") == 0', direct_gate)
         self.assertNotIn("c10_npu::", direct_gate)
         self.assertNotIn("OptionsManager", direct_gate)
+
+    def test_p8_probe_exit_ledger_is_explicitly_diagnostic_only(self) -> None:
+        """A teardown probe may locate a fault but cannot change product flow."""
+        probe = self.p8_fail_closed_probe
+        gate = 'if os.getenv("P8_STAGE_B_EXIT_BISECT") == "1":'
+        self.assertIn(gate, probe)
+        self.assertIn("P8_STAGE_B_PROBE_STEP label=main_return", probe)
+        for token in (
+            "P8_EXIT_BISECT step=outputs_before",
+            "P8_EXIT_BISECT step=outputs_after",
+            "P8_EXIT_BISECT step=before_after",
+            "P8_EXIT_BISECT step=inputs_after",
+            "P8_EXIT_BISECT step=sync_after_locals",
+            "os._exit(0)",
+        ):
+            self.assertIn(token, probe)
+        pass_index = probe.index("P8_STAGE_B_PROBE_PASS")
+        gate_index = probe.index(gate, pass_index)
+        exit_index = probe.index("os._exit(0)", gate_index)
+        self.assertLess(pass_index, gate_index)
+        self.assertLess(gate_index, exit_index)
 
     def test_p8_stage_b_bridge_runs_a_binary_private_abi_gate_before_import(self) -> None:
         """Link success alone must not hide an import-time torch_npu ABI break."""

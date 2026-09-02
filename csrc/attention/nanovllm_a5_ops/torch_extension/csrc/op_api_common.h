@@ -1752,7 +1752,6 @@ inline void LogOrderedHostDso(
     auto inline_acl_call =                                                      \
         [inline_args = std::move(inline_args),                                 \
          inline_npu_stream, inline_acl_stream]() mutable -> int {             \
-      bool inline_pta_cache_active = false;                                    \
       bool inline_huge_mem_active = false;                                     \
       auto inline_init_huge_mem =                                               \
           reinterpret_cast<InitHugeMemThreadLocalFn>(                          \
@@ -1772,10 +1771,6 @@ inline void LogOrderedHostDso(
           }                                                                     \
           inline_huge_mem_active = false;                                      \
         }                                                                       \
-        if (inline_pta_cache_active) {                                         \
-          UnInitPtaCacheForWorkspace(true);                                    \
-          inline_pta_cache_active = false;                                     \
-        }                                                                       \
         LogOpApiLifecycle(#aclnn_api, "caller_thread_tls_uninit");           \
       };                                                                        \
       try {                                                                     \
@@ -1784,11 +1779,13 @@ inline void LogOrderedHostDso(
          * deterministic behavior comes from its graph-visible control and    \
          * state tensors, while this raw launch preserves the existing stream \
          * ordering without mutating process-global framework state. */       \
-        inline_pta_cache_active = InitPtaCacheForWorkspace();                  \
-        LogOpApiLifecycle(                                                      \
-            #aclnn_api,                                                         \
-            inline_pta_cache_active ? "caller_thread_pta_cache_ready"        \
-                                    : "caller_thread_pta_cache_unavailable"); \
+        /* The framework owns PTA cache TLS for a direct TQ0 caller.  The      \
+         * checked-in ACLNN adapter does not manually initialize or tear it     \
+         * down around GetWorkspaceSize.  P8 must follow that ownership rule:   \
+         * a bridge-local UnInitPTACacheThreadLocal can invalidate framework    \
+         * state that still participates in tensor/allocator destruction after  \
+         * this asynchronous launch returns. */                                 \
+        LogOpApiLifecycle(#aclnn_api, "caller_thread_pta_cache_framework_owned"); \
         LogOrderedHostDso(#aclnn_api, inline_workspace_addr_fn,                \
                           inline_launch_addr_fn, inline_init_huge_mem,         \
                           inline_release_huge_mem,                              \

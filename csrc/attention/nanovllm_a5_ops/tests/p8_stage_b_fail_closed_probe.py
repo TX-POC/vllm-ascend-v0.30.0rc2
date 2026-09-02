@@ -25,6 +25,7 @@ internals.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 from pathlib import Path
 import sys
@@ -279,11 +280,33 @@ def main() -> None:
         "c8_import=0 stage_a_import=0 kvaf_import=0",
         flush=True,
     )
+    # This is a diagnostic-only exit ledger.  It never changes product P8
+    # execution: the default path returns normally.  When the explicit gate is
+    # enabled, release the main-frame NPU tensor owners one group at a time.
+    # That distinguishes an alias/storage destruction fault from interpreter or
+    # DSO shutdown without modifying C8, Stage-A, PostOnly, or CQ behavior.
+    if os.getenv("P8_STAGE_B_EXIT_BISECT") == "1":
+        print("P8_EXIT_BISECT step=outputs_before", flush=True)
+        del outputs
+        print("P8_EXIT_BISECT step=outputs_after", flush=True)
+        del before
+        print("P8_EXIT_BISECT step=before_after", flush=True)
+        del inputs
+        print("P8_EXIT_BISECT step=inputs_after", flush=True)
+        collected = gc.collect()
+        print(f"P8_EXIT_BISECT step=gc_after collected={collected}", flush=True)
+        torch.npu.synchronize()
+        print("P8_EXIT_BISECT step=sync_after_locals", flush=True)
+        # Intentional diagnostic process termination after all main-frame
+        # tensors have been released.  It is never on the normal acceptance or
+        # product path, and must not be used as a production crash workaround.
+        os._exit(0)
 
 
 if __name__ == "__main__":
     try:
         main()
+        print("P8_STAGE_B_PROBE_STEP label=main_return", flush=True)
     except Exception as error:
         print(
             "P8_STAGE_B_PROBE_FAIL "
