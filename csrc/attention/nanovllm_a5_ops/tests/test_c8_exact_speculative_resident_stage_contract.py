@@ -304,6 +304,7 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertIn("p9_generated_op_add_stub_count", P9_BUILD_SCRIPT)
         self.assertIn("copy_tree_without_repository_cmake", P9_BUILD_SCRIPT)
         self.assertIn("p9_source_derived_op_add_registration_count", P9_BUILD_SCRIPT)
+        self.assertIn("p9_source_derived_op_add_registration_path", P9_BUILD_SCRIPT)
         self.assertNotIn(
             'cp -a "${STAGED_C8_ROOT}/op_host/." "${GENERATED_ROOT}/op_host/"',
             P9_BUILD_SCRIPT,

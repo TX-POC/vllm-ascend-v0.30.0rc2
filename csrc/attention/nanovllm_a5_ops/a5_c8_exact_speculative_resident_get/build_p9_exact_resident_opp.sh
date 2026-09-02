@@ -353,6 +353,8 @@ mapfile -t OP_ADD_SOURCES < <(
 )
 [[ "${#OP_ADD_SOURCES[@]}" -eq 1 ]] ||
   fail "p9_source_derived_op_add_registration_count:count=${#OP_ADD_SOURCES[@]}:operator=${TARGET_OPERATOR}"
+[[ "${OP_ADD_SOURCES[0]:-}" == "${STAGED_HOST_OPDEF}" ]] ||
+  fail "p9_source_derived_op_add_registration_path:actual=${OP_ADD_SOURCES[0]:-missing}:expected=${STAGED_HOST_OPDEF}"
 printf 'P9_HOST_STAGING cmake=msopgen_preserved source_opdef=%s generated_stub_removed=%s\n' \
   "${STAGED_HOST_OPDEF}" "${GENERATED_OP_ADD_STUBS[0]}"
 
