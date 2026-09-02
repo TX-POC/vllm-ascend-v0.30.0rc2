@@ -28,6 +28,29 @@ P8_OPP_ROOT = Path(
 ).expanduser()
 P8_ACLNN_INCLUDE = P8_OPP_ROOT / "vendors" / "customize" / "op_api" / "include"
 P8_ACLNN_HEADER = P8_ACLNN_INCLUDE / "aclnn_a5_p8_forward_owned_executor.h"
+CANN_ROOT_VALUE = (
+    os.environ.get("ASCEND_HOME_PATH")
+    or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
+    or os.environ.get("CANN_INSTALL_PATH")
+)
+CANN_ROOT = Path(CANN_ROOT_VALUE).expanduser() if CANN_ROOT_VALUE else None
+
+# The generated ACLNN public header includes ``aclnn/acl_meta.h``. That file
+# is supplied by CANN itself, rather than torch_npu's older ACL subset. Check
+# actual candidates so a wrong toolkit root fails clearly before g++ starts.
+CANN_ACLNN_INCLUDE_CANDIDATES = (
+    CANN_ROOT / "aarch64-linux" / "include" if CANN_ROOT else None,
+    CANN_ROOT / "x86_64-linux" / "include" if CANN_ROOT else None,
+    CANN_ROOT / "include" if CANN_ROOT else None,
+)
+CANN_ACLNN_INCLUDE = next(
+    (
+        candidate
+        for candidate in CANN_ACLNN_INCLUDE_CANDIDATES
+        if candidate is not None and (candidate / "aclnn" / "acl_meta.h").is_file()
+    ),
+    None,
+)
 
 # P8's Stage-B bridge is never allowed to infer a workspace ABI from a stale
 # DSO or an ad-hoc tuple.  The runner constructs this OPP in its unique run
@@ -38,6 +61,16 @@ if not P8_ACLNN_HEADER.is_file():
         "P8 requires a freshly generated Stage-B ACLNN header at "
         f"{P8_ACLNN_HEADER}; build the exact P8 Stage-B OPP first and export "
         "NANOVLLM_A5_P8_FORWARD_OWNED_OPP."
+    )
+if CANN_ACLNN_INCLUDE is None:
+    raise RuntimeError(
+        "P8 generated ACLNN header requires aclnn/acl_meta.h, but no CANN "
+        "include root was found. Set ASCEND_HOME_PATH (or "
+        "ASCEND_CANN_PACKAGE_PATH) to the active CANN installation. Tried: "
+        + ", ".join(
+            str(candidate) for candidate in CANN_ACLNN_INCLUDE_CANDIDATES
+            if candidate is not None
+        )
     )
 
 MAX_JOBS = int(
@@ -64,6 +97,7 @@ setup(
             extra_compile_args=[
                 f"-I{TORCH_NPU_ROOT / 'include' / 'third_party' / 'acl' / 'inc'}",
                 f"-I{P8_ACLNN_INCLUDE}",
+                f"-I{CANN_ACLNN_INCLUDE}",
                 f"-I{COMMON_CSRC}",
                 "-D_GNU_SOURCE",
                 "-O3",

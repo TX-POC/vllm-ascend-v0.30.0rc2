@@ -169,6 +169,9 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             "P8_ACLNN_INCLUDE",
             "aclnn_a5_p8_forward_owned_executor.h",
             'f"-I{P8_ACLNN_INCLUDE}"',
+            "CANN_ACLNN_INCLUDE_CANDIDATES",
+            '"aclnn" / "acl_meta.h"',
+            'f"-I{CANN_ACLNN_INCLUDE}"',
             "freshly generated Stage-B ACLNN header",
         ):
             self.assertIn(token, self.p8_setup)
@@ -183,8 +186,10 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         export_index = self.runner.index(
             'export NANOVLLM_A5_P8_FORWARD_OWNED_OPP="$P8_STAGE_B_OPP"'
         )
+        cann_export_index = self.runner.index("export ASCEND_CANN_PACKAGE_PATH")
         bridge_index = self.runner.index('stage_b_bridge "$P8_RUN_ROOT/stage_b_bridge.log"')
         self.assertLess(export_index, bridge_index)
+        self.assertLess(cann_export_index, bridge_index)
         self.assertNotIn("47", self.bridge)
 
     def test_p8_deferred_host_contract_requires_task_queue_before_npu_use(self) -> None:

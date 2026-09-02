@@ -192,6 +192,10 @@ export P8_PHYSICAL_NPU_ID
 export NPU_ID=0
 export DEVICE_ID=0
 source "$ASCEND_HOME_PATH/bin/setenv.bash"
+# Python bridge builds inherit only exported variables. The generated P8
+# ACLNN header includes CANN's aclnn/acl_meta.h, so export this exact root.
+export ASCEND_HOME_PATH
+export ASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH"
 # This must happen before the NPU probe, which is the first Python process to
 # import torch_npu.  Re-export after CANN's environment script so a shell
 # default cannot silently override the deferred-launch ownership contract.
