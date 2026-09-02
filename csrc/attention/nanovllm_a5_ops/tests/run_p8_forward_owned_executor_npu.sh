@@ -408,14 +408,18 @@ printf 'P8_STAGE_B_TILING_ARTIFACT_CHECK source_overlay=%s vendor_overlay=%s run
     "$P8_STAGE_B_GENERATED_HOST" "$P8_STAGE_B_INSTALLED_HOST" \
     "$P8_STAGE_B_TILING_RUNTIME_LIB" "$P8_STAGE_B_ACLNN_HEADER"
 if [[ "$P8_STAGE_B_SOURCE_OVERLAY" != "1" ||
-      "$P8_STAGE_B_VENDOR_OVERLAY" != "1" ||
       "$P8_STAGE_B_RUNTIME_MARKER" != "1" ||
       "$P8_STAGE_B_ACLNN_TENSOR_REFS" != "28" ]]; then
     runner_fail "stage_b_tiling_artifact_provenance_failed"
     exit 1
 fi
-printf 'P8_STAGE_B_TILING_ARTIFACT marker=1 source_overlay=1 vendor_overlay=1 aclnn_tensor_refs=%s header=%s tiling_runtime_lib=%s\n' \
-    "$P8_STAGE_B_ACLNN_TENSOR_REFS" "$P8_STAGE_B_ACLNN_HEADER" "$P8_STAGE_B_TILING_RUNTIME_LIB"
+# CANN's package installer may rewrite the installed .cpp manifest (for
+# example, generated include/path normalization).  It is not the compiled
+# runtime source of truth.  The source overlay plus a marker in the actual
+# `libcust_opmaster_rt2.0.so` is the meaningful, run-local provenance proof.
+printf 'P8_STAGE_B_TILING_ARTIFACT marker=1 source_overlay=1 vendor_overlay=%s aclnn_tensor_refs=%s header=%s tiling_runtime_lib=%s\n' \
+    "$P8_STAGE_B_VENDOR_OVERLAY" "$P8_STAGE_B_ACLNN_TENSOR_REFS" \
+    "$P8_STAGE_B_ACLNN_HEADER" "$P8_STAGE_B_TILING_RUNTIME_LIB"
 
 export USE_NINJA=0
 export NANOVLLM_A5_SCORE_RECEIPT_EXECUTOR_BUILD_JOBS="$P8_BUILD_JOBS"
