@@ -306,7 +306,13 @@ for name in ("runtime_enable", "resident_threshold", "resident_threshold_valid",
         raise SystemExit("input_type_mismatch:" + name)
 if types.get("layer_resident_get_control") != ("int64",):
     raise SystemExit("input_type_mismatch:layer_resident_get_control")
-print("P9_ACTIVE_ABI_PASS inputs=21 outputs=6 control=int64_raw layout=gm rows_per_entry=int32")
+attrs = {item.get("name"): item.get("default_value") for item in op.get("attr", [])}
+if attrs.get("layout_query") != "BSND" or attrs.get("layout_key") != "PA_BSND":
+    raise SystemExit(
+        "layout_default_mismatch:query=%s:key=%s" %
+        (attrs.get("layout_query"), attrs.get("layout_key"))
+    )
+print("P9_ACTIVE_ABI_PASS inputs=21 outputs=6 control=int64_raw layout=BSND/PA_BSND rows_per_entry=int32")
 PY
 }
 
