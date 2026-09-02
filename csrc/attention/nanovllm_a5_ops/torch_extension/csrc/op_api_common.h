@@ -1837,13 +1837,18 @@ inline void LogOrderedHostDso(
               inline_launch_status == 0,                                       \
               "call " #aclnn_api " failed: ", RecentAclError());            \
           LogOpApiLifecycle(#aclnn_api, "launch_done");                      \
-          RecordTensorTupleOnNpuStream(inline_args, inline_npu_stream);        \
-          LogOpApiLifecycle(#aclnn_api, "tensor_lifetime_recorded");         \
           ReleaseTuple(inline_converted);                                      \
           inline_converted_released = true;                                    \
           LogOpApiLifecycle(#aclnn_api, "descriptor_release_done");          \
-          ClearTensorTuple(inline_args);                                       \
-          LogOpApiLifecycle(#aclnn_api, "tensor_keepalive_released");        \
+          /* TQ0 dispatches on this caller thread.  It does not use          \
+           * RunOpApi or torch_npu's delayed ReleaseQueue, so the deferred    \
+           * bridge's recordStream-and-clear workaround does not apply here.  \
+           * P8 graph inputs and returned aliases own the ATen values through \
+           * this graph submission.  Recording every input on the same stream \
+           * adds a second allocator-retirement edge and can corrupt the      \
+           * direct-launch synchronize path.  Keep this direct path free of   \
+           * both ReleaseQueue-only operations. */                             \
+          LogOpApiLifecycle(#aclnn_api, "caller_thread_tensor_lifetime_graph_owned"); \
           inline_cleanup_host_tls();                                            \
           return inline_launch_status;                                         \
         } catch (...) {                                                         \
