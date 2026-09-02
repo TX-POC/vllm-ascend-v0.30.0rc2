@@ -3,7 +3,8 @@
 
 No CANN toolchain is needed here.  The test exercises the exact operation the
 remote builder performs on a newly copied official C8 source tree and rejects
-any overlay that changes `ProcessTopK`.
+any overlay that changes official `ProcessTopK` beyond two controlled,
+compile-disabled Stage-B finalizer tails.
 """
 
 from __future__ import annotations
@@ -93,10 +94,40 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
             staged_vector = (
                 staged_root / "op_kernel/arch35/quant_lightning_indexer_service_vector.h"
             ).read_text(encoding="utf-8")
+            staged_topk = applier.function_body(
+                staged_vector, "QLIVector<QLIT>::ProcessTopK"
+            )
+            # The two tail snippets are the only allowed ProcessTopK delta.
+            # Removing them must recover every original byte, including the
+            # index-GM writes and MTE3->V flag ordering.
             self.assertEqual(
-                function_digest(staged_vector, "QLIVector<QLIT>::ProcessTopK"),
+                hashlib.sha256(
+                    applier.strip_stage_b_finalizer_tails(staged_topk).encode()
+                ).hexdigest(),
                 original_topk,
             )
+            self.assertEqual(
+                staged_topk.count(
+                    "A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_TAIL("
+                ),
+                2,
+            )
+            invalid_tail = staged_topk.index(applier._TOPK_INVALID_FINALIZER_TAIL)
+            normal_tail = staged_topk.index(applier._TOPK_NORMAL_FINALIZER_TAIL)
+            self.assertTrue(
+                staged_topk[:invalid_tail].endswith(
+                    applier._TOPK_INVALID_WRITEBACK_ANCHOR
+                )
+            )
+            self.assertTrue(
+                staged_topk[:normal_tail].endswith(
+                    applier._TOPK_NORMAL_WRITEBACK_ANCHOR
+                )
+            )
+            invalid_continue = staged_topk.index(
+                "            continue;", invalid_tail
+            )
+            self.assertLess(invalid_tail, invalid_continue)
             reduction = staged_vector.index("vector1::BatchMulWeightAndReduceSum")
             marker = staged_vector.index(
                 "A5_C8_EXACT_SPECULATIVE_RESIDENT_OBSERVE_SCORE_SEAM", reduction
@@ -107,6 +138,14 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
             self.assertIn(
                 '#include "a5_c8_exact_speculative_resident_score_seam.h"',
                 staged_vector,
+            )
+            staged_seam = (
+                staged_root
+                / "op_kernel/arch35/a5_c8_exact_speculative_resident_score_seam.h"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                '#include "a5_c8_exact_speculative_resident_stage_b_finalizer.h"',
+                staged_seam,
             )
 
             ops = json.loads((staged_root / "ops.json").read_text(encoding="utf-8"))
@@ -125,6 +164,27 @@ class C8ExactSpeculativeResidentOverlayTest(unittest.TestCase):
             )
             self.assertTrue((staged_root / "op_host/err/ops_err.h").is_file())
             self.assertTrue((staged_root / "op_host/log/log.h").is_file())
+
+    def test_finalizer_is_a_disabled_staged_builder_dependency(self) -> None:
+        finalizer = (
+            TARGET_ROOT
+            / "op_kernel/arch35/a5_c8_exact_speculative_resident_stage_b_finalizer.h"
+        ).read_text(encoding="utf-8")
+        builder = (TARGET_ROOT / "build_p9_exact_resident_opp.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER 0", finalizer
+        )
+        self.assertIn("requires the complete graph ABI", finalizer)
+        self.assertIn("P9_STAGE_B_FINALIZER_HEADER", builder)
+        self.assertIn("P9_FINALIZER_HEADER", builder)
+        self.assertIn(
+            "a5_c8_exact_speculative_resident_stage_b_finalizer.h", builder
+        )
+        self.assertIn(
+            '#include "a5_c8_exact_speculative_resident_finalizer.h"', finalizer
+        )
 
 
 if __name__ == "__main__":

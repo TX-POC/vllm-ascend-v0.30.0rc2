@@ -37,6 +37,32 @@ COMPAT_HEADER_RELATIVE = Path(
 OPS_RELATIVE = Path("ops.json")
 SEAM_INCLUDE = '#include "a5_c8_exact_speculative_resident_score_seam.h"\n'
 SEAM_MARKER = "A5_C8_EXACT_SPECULATIVE_RESIDENT_OBSERVE_SCORE_SEAM("
+FINALIZER_MARKER = "A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_TAIL("
+
+# These are the two exact official writeback paths in ProcessTopK.  The
+# invalid-row path continues after its MTE3->V flag; the normal path closes
+# the row loop.  Keeping the anchors literal makes a source update fail closed
+# instead of accidentally moving the P9 tail before an official writeback.
+_TOPK_WRITEBACK = (
+    "AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + "
+    "(curS1Idx + rowIdx) * topkCount_], "
+    "indicesOutLocal_.ReinterpretCast<int32_t>(), copyOutParams);\n"
+)
+_TOPK_MTE3_V = "SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);"
+_TOPK_INVALID_WRITEBACK_ANCHOR = (
+    "            " + _TOPK_WRITEBACK + "            " + _TOPK_MTE3_V
+)
+_TOPK_NORMAL_WRITEBACK_ANCHOR = (
+    "        " + _TOPK_WRITEBACK + "        " + _TOPK_MTE3_V
+)
+_TOPK_INVALID_FINALIZER_TAIL = (
+    "\n            A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_TAIL(\n"
+    "                info, curS1Idx + rowIdx, validS2Len, 0U);\n"
+)
+_TOPK_NORMAL_FINALIZER_TAIL = (
+    "\n        A5_C8_EXACT_SPECULATIVE_RESIDENT_STAGE_B_FINALIZER_TAIL(\n"
+    "            info, curS1Idx + rowIdx, validS2Len, 1U);\n"
+)
 
 
 class OverlayError(RuntimeError):
@@ -108,6 +134,64 @@ def replace_exactly_once(source: str, old: str, new: str, label: str) -> str:
     if count != 1:
         fail(f"{label}_anchor_count:actual={count}")
     return source.replace(old, new, 1)
+
+
+def strip_stage_b_finalizer_tails(topk: str) -> str:
+    """Remove only the two controlled P9 tail insertions from ProcessTopK.
+
+    The result must be byte-for-byte the official body.  This is stronger
+    than checking an output property: it prevents a future overlay edit from
+    changing an official calculation, writeback, or event order under cover
+    of the compile-disabled finalizer.
+    """
+
+    stripped = topk
+    for label, tail in (
+        ("invalid", _TOPK_INVALID_FINALIZER_TAIL),
+        ("normal", _TOPK_NORMAL_FINALIZER_TAIL),
+    ):
+        count = stripped.count(tail)
+        if count != 1:
+            fail(f"stage_b_finalizer_{label}_tail_count:actual={count}")
+        stripped = stripped.replace(tail, "", 1)
+    return stripped
+
+
+def inject_stage_b_finalizer_tail(source: str, topk_before: str) -> str:
+    """Append a disabled finalizer after each official Top-K GM writeback.
+
+    There is intentionally no insertion inside the Top-K selection/reduction
+    loops.  Both writes and their MTE3->V flags remain literal source text;
+    deleting the two known tail snippets must recover the original function
+    body exactly.
+    """
+
+    source = replace_exactly_once(
+        source,
+        _TOPK_INVALID_WRITEBACK_ANCHOR,
+        _TOPK_INVALID_WRITEBACK_ANCHOR + _TOPK_INVALID_FINALIZER_TAIL,
+        "topk_invalid_writeback",
+    )
+    source = replace_exactly_once(
+        source,
+        _TOPK_NORMAL_WRITEBACK_ANCHOR,
+        _TOPK_NORMAL_WRITEBACK_ANCHOR + _TOPK_NORMAL_FINALIZER_TAIL,
+        "topk_normal_writeback",
+    )
+
+    topk_after = function_body(source, "QLIVector<QLIT>::ProcessTopK")
+    if topk_after.count(FINALIZER_MARKER) != 2:
+        fail(
+            "stage_b_finalizer_marker_count:actual="
+            f"{topk_after.count(FINALIZER_MARKER)}"
+        )
+    if strip_stage_b_finalizer_tails(topk_after) != topk_before:
+        fail(
+            "official_process_topk_changed_outside_finalizer:before="
+            f"{sha256_text(topk_before)}:after="
+            f"{sha256_text(strip_stage_b_finalizer_tails(topk_after))}"
+        )
+    return source
 
 
 def rename_source_files(staged_root: Path) -> None:
@@ -193,12 +277,7 @@ def inject_score_seam(vector_path: Path) -> tuple[str, str]:
     if not (reduction_index < marker_index < publication_index < topk_index):
         fail("score_seam_source_order_invalid")
 
-    topk_after = function_body(source, topk_signature)
-    if topk_before != topk_after:
-        fail(
-            "official_process_topk_changed:before="
-            f"{sha256_text(topk_before)}:after={sha256_text(topk_after)}"
-        )
+    source = inject_stage_b_finalizer_tail(source, topk_before)
     vector_path.write_text(source, encoding="utf-8")
     return sha256_text(topk_before), sha256_text(source)
 
@@ -235,8 +314,11 @@ def validate_output(staged_root: Path, topk_hash: str) -> None:
         fail("staged_score_seam_include_count_invalid")
     if vector.count(SEAM_MARKER) != 1:
         fail("staged_score_seam_marker_count_invalid")
-    if sha256_text(function_body(vector, "QLIVector<QLIT>::ProcessTopK")) != topk_hash:
-        fail("staged_process_topk_digest_changed")
+    topk = function_body(vector, "QLIVector<QLIT>::ProcessTopK")
+    if topk.count(FINALIZER_MARKER) != 2:
+        fail("staged_stage_b_finalizer_marker_count_invalid")
+    if sha256_text(strip_stage_b_finalizer_tails(topk)) != topk_hash:
+        fail("staged_process_topk_digest_changed_outside_finalizer")
 
     ops = json.loads(checked_file(staged_root / OPS_RELATIVE, "staged_ops_json").read_text(encoding="utf-8"))
     if len(ops) != 1 or ops[0].get("op") != P9_OPERATOR:

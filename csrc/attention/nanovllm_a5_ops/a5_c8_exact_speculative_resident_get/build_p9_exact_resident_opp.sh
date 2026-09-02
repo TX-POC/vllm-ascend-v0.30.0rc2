@@ -7,11 +7,10 @@
 # closure, then overlays only manifest-listed P9 files.  It never reuses a
 # CMake cache, an OPP, or a bridge from another source pair.
 #
-# The first committed closure intentionally contains a compile-disabled score
-# seam only.  It proves an exact source-derived C8 target can be staged and
-# built without touching official Top-K.  The active Direct-HCCP ABI is added
-# later as one coherent graph/kernel change, never by turning on a partial
-# source overlay.
+# The source overlay keeps score observation disabled until the complete graph
+# ABI is staged, but this builder still compiles the real P9 score-hook and
+# PostOnly/CQ headers in the cloned C8 project.  That catches CANN-domain and
+# KVAF ABI errors before the one atomic graph/kernel enablement change.
 
 set -euo pipefail
 
@@ -94,6 +93,10 @@ OFFICIAL_C8_ROOT="${VLLM_ROOT}/csrc/attention/vllm_quant_lightning_indexer"
 P9_ROOT="${VLLM_ROOT}/csrc/attention/nanovllm_a5_ops/a5_c8_exact_speculative_resident_get"
 OVERLAY_ROOT="${P9_ROOT}/source_overlay"
 P9_CONTRACT_HEADER="${P9_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_contract.h"
+P9_SCORE_HOOK_HEADER="${P9_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_score_hook.h"
+P9_POST_EXECUTOR_HEADER="${P9_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_post_executor.h"
+P9_FINALIZER_HEADER="${P9_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_finalizer.h"
+P9_STAGE_B_FINALIZER_HEADER="${P9_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_stage_b_finalizer.h"
 KVAF_DEMO_ROOT="${KVAF_ROOT}/access_operator/demo/aiv_batch_get"
 KVAF_RESIDENT_HEADER="${KVAF_DEMO_ROOT}/kernel/kvaf_layer_resident_get_device.h"
 KVAF_DENSE_SOURCE="${KVAF_DEMO_ROOT}/kernel/execute_batch_get_aiv.asc"
@@ -106,6 +109,10 @@ for required in \
   "${OFFICIAL_C8_ROOT}/op_kernel/arch35/quant_lightning_indexer_service_vector.h" \
   "${OFFICIAL_C8_ROOT}/op_host/vllm_quant_lightning_indexer_def.cpp" \
   "${P9_CONTRACT_HEADER}" \
+  "${P9_SCORE_HOOK_HEADER}" \
+  "${P9_POST_EXECUTOR_HEADER}" \
+  "${P9_FINALIZER_HEADER}" \
+  "${P9_STAGE_B_FINALIZER_HEADER}" \
   "${KVAF_RESIDENT_HEADER}" \
   "${KVAF_DENSE_SOURCE}" \
   "${KVAF_ABI_HEADER}" \
@@ -158,6 +165,14 @@ cp -a "${OFFICIAL_C8_ROOT}/." "${STAGED_C8_ROOT}/"
 cp -a "${OVERLAY_ROOT}/." "${STAGED_OVERLAY_ROOT}/"
 install -m 0644 "${P9_CONTRACT_HEADER}" \
   "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_contract.h"
+install -m 0644 "${P9_SCORE_HOOK_HEADER}" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_score_hook.h"
+install -m 0644 "${P9_POST_EXECUTOR_HEADER}" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_post_executor.h"
+install -m 0644 "${P9_FINALIZER_HEADER}" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_finalizer.h"
+install -m 0644 "${P9_STAGE_B_FINALIZER_HEADER}" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_stage_b_finalizer.h"
 install -m 0644 "${KVAF_RESIDENT_HEADER}" \
   "${STAGED_KVAF_ROOT}/kvaf_layer_resident_get_device.h"
 install -m 0644 "${KVAF_DENSE_SOURCE}" \
@@ -181,6 +196,7 @@ staged_c8_root=${STAGED_C8_ROOT}
 staged_kvaf_root=${STAGED_KVAF_ROOT}
 target_soc=${TARGET_SOC}
 score_seam=compile_disabled
+p9_transport_headers=compiled_for_closure_only
 cann_3rd_lib_path=${CANN_3RD_LIB_PATH:-<stage-only>}
 EOF
 
@@ -215,6 +231,32 @@ python3 "${OVERLAY_APPLIER}" \
   --manifest "${OVERLAY_MANIFEST}" \
   --operator "${TARGET_OPERATOR}" | tee "${OVERLAY_RECEIPT}"
 cat "${OVERLAY_RECEIPT}" >> "${PACKAGE_ROOT}/P9_PROVENANCE"
+
+# The overlay itself owns only source renaming and the score-seam anchor.  The
+# builder owns the larger P9 CANN closure, so validate here that the seam will
+# parse the exact staged score hook and executor rather than silently falling
+# back to a marker-only binary.
+for staged_header in \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_contract.h" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_score_hook.h" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_post_executor.h" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_finalizer.h" \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_stage_b_finalizer.h"; do
+  [[ -f "${staged_header}" ]] ||
+    fail "p9_staged_transport_header_missing:path=${staged_header}"
+done
+for included_header in \
+  a5_c8_exact_speculative_resident_contract.h \
+  a5_c8_exact_speculative_resident_score_hook.h \
+  a5_c8_exact_speculative_resident_post_executor.h \
+  a5_c8_exact_speculative_resident_stage_b_finalizer.h; do
+  grep -Fq "#include \"${included_header}\"" \
+    "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_score_seam.h" ||
+    fail "p9_score_seam_transport_include_missing:value=${included_header}"
+done
+grep -Fq '#include "a5_c8_exact_speculative_resident_finalizer.h"' \
+  "${STAGED_C8_ROOT}/op_kernel/arch35/a5_c8_exact_speculative_resident_stage_b_finalizer.h" ||
+  fail "p9_stage_b_finalizer_include_missing"
 
 [[ -f "${STAGED_C8_ROOT}/ops.json" ]] || fail "p9_overlay_missing_ops_json"
 [[ -d "${STAGED_C8_ROOT}/op_host" && -d "${STAGED_C8_ROOT}/op_kernel" ]] ||

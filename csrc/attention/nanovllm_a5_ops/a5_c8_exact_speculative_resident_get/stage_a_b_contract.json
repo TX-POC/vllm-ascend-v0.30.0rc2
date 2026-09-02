@@ -1,6 +1,7 @@
 {
   "format": 1,
   "target": "A5C8ExactSpeculativeResidentGet",
+  "abi_status": "target ABI: the current source-derived ops.json intentionally remains the 9-input/2-output official-C8 closure with both P9 macros disabled; this contract is activated only by the atomic host/kernel/bridge ABI change",
   "source_derived_from": {
     "operator": "VllmQuantLightningIndexer",
     "source_root": "csrc/attention/vllm_quant_lightning_indexer",
@@ -10,25 +11,29 @@
       "after": "vector1::BatchMulWeightAndReduceSum",
       "before": "DataCopyPad(scoreGm"
     },
-    "topk_owner": "official ProcessTopK unchanged"
+    "topk_owner": "official ProcessTopK selection and original writeback are unchanged; P9 inserts only compile-disabled tails after each original writeback"
   },
   "resource_model": {
     "worker_assignment": "any C8 worker may dynamically acquire an invocation-local queue",
     "fixed_get_core_partition": false,
     "persistent_slot_map_mutation_during_score_scan": false,
-    "canonical_resident_range": {
-      "input": "speculative_resident_slots",
+    "canonical_resident_layout": {
+      "input": "canonical_resident_layout",
       "dtype": "int32",
-      "shape": "[R, 2048]",
+      "shape": "[first_slot, slots_per_row, row_stride, row_count]",
       "slot_count": 2048,
-      "meaning": "normal resident output slots reserved per C8 row"
+      "meaning": "caller-reserved normal-resident row-major ranges; all four words are nonnegative int32, slots_per_row must be 2048, and row_count is widened to uint32 only after host validation"
     }
   },
   "candidate_seed": {
     "dtype": "int32",
     "words": ["row", "source", "kv_object", "resident_slot"],
     "slot_assignment": "one candidate receives one distinct fixed resident slot before PostOnly",
-    "cross_wave_slot_invariant": "CandidateCompact never assigns one resident_slot to two initial waves; Stage-B may reuse a non-winner slot only after every initial wave targeting it is terminal"
+    "maps": {
+      "candidate_source_to_slot": "int32[R, S], initialized to -1; written only after the fully published descriptor is accepted by PostOnly",
+      "candidate_slot_cursor": "int32[R], invocation-local monotonic admission cursor; it only prevents duplicate initial posts and is not used for Stage-B reuse"
+    },
+    "cross_wave_slot_invariant": "CandidateCompact never assigns one resident_slot to two initial waves; Stage-B drains every initial wave before it may reuse a non-winner slot for exact recall"
   },
   "stage_a": {
     "name": "score_scan_candidate_post",
@@ -40,16 +45,20 @@
       "kv_object_map",
       "kv_object_lens",
       "persistent_object_slots_snapshot",
-      "speculative_resident_slots",
+      "canonical_resident_layout",
+      "candidate_source_to_slot",
+      "candidate_slot_cursor",
       "resident_packed_output",
       "layer_resident_get_control"
     ],
     "outputs": [
       "official_sparse_indices",
-      "official_sparse_values",
-      "candidate_seeds",
-      "candidate_counts",
-      "initial_post_records"
+      "official_sparse_values"
+    ],
+    "invocation_local_workspaces": [
+      "candidate_source_to_slot",
+      "candidate_slot_cursor",
+      "worker_owned_initial_post_wave"
     ],
     "rule": "observe exact tile scores, compact only cold candidates, and PostOnly to the supplied fixed resident slot without modifying official C8 score or Top-K state"
   },
@@ -57,11 +66,9 @@
     "name": "topk_recall_and_terminal_drain",
     "inputs": [
       "official_sparse_indices",
-      "candidate_seeds",
-      "candidate_counts",
-      "initial_post_records",
+      "candidate_source_to_slot",
       "persistent_object_slots_snapshot",
-      "speculative_resident_slots",
+      "canonical_resident_layout",
       "resident_packed_output",
       "layer_resident_get_control"
     ],
