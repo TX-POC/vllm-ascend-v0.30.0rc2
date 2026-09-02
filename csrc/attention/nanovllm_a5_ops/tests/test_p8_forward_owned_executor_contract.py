@@ -144,6 +144,27 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             source = host.read_text(encoding="utf-8")
             self.assertIn("GetWorkspaceSizes(1)[0] = 0U", source)
 
+    def test_p8_deferred_host_contract_requires_task_queue_before_npu_use(self) -> None:
+        """Deferred descriptor ownership has no safe inline fallback."""
+        for token in (
+            'std::strcmp(task_queue, "1") == 0',
+            'std::strcmp(launch_blocking, "0") == 0',
+            "TASK_QUEUE_ENABLE=1",
+            "ASCEND_LAUNCH_BLOCKING=0",
+            "unsafe inline ",
+            "ACLNN deferred submission",
+        ):
+            self.assertIn(token, self.bridge)
+        for token in (
+            'P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-1}"',
+            'P8_ASCEND_LAUNCH_BLOCKING="${P8_ASCEND_LAUNCH_BLOCKING:-0}"',
+            'runner_fail "unsafe_deferred_launch_environment"',
+            'export TASK_QUEUE_ENABLE="$P8_TASK_QUEUE_ENABLE"',
+            'export ASCEND_LAUNCH_BLOCKING="$P8_ASCEND_LAUNCH_BLOCKING"',
+            "P8_DEFERRED_HOST_ENV pass=1",
+        ):
+            self.assertIn(token, self.runner)
+
     def test_isolated_operator_identity(self) -> None:
         self.assertIn('"op": "A5P8ForwardOwnedExecutor"', self.spec)
         self.assertIn("OP_ADD(A5P8ForwardOwnedExecutor)", self.host)

@@ -31,6 +31,12 @@ P8_PYTHON="${P8_PYTHON:-$(command -v python3 2>/dev/null || true)}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.0}"
 P8_BUILD_JOBS="${P8_BUILD_JOBS:-16}"
 P8_TEST_TIMEOUT="${P8_TEST_TIMEOUT:-300s}"
+# P8's three ACLNN nodes use the consumer-owned deferred launcher.  Make its
+# process-start torch_npu contract explicit before the first Python/NPU use;
+# a non-sync stream alone cannot prevent launch-blocking from executing the
+# consumer inline.
+P8_TASK_QUEUE_ENABLE="${P8_TASK_QUEUE_ENABLE:-1}"
+P8_ASCEND_LAUNCH_BLOCKING="${P8_ASCEND_LAUNCH_BLOCKING:-0}"
 # CANN's downloaded source dependencies belong to the stable, exact reference
 # checkout.  ``csrc/third_party`` is ignored by Git: it is neither a compiled
 # P8 artifact nor a CMake object cache.  Let upstream CANN populate it on the
@@ -99,6 +105,13 @@ fi
 if [[ "$P8_RUNTIME_CASE" != "full" &&
       "$P8_RUNTIME_CASE" != "prepost_control_reject" ]]; then
     runner_fail "invalid_runtime_case:${P8_RUNTIME_CASE}"
+    exit 2
+fi
+if [[ "$P8_TASK_QUEUE_ENABLE" != "1" ||
+      "$P8_ASCEND_LAUNCH_BLOCKING" != "0" ]]; then
+    printf 'P8_DEFERRED_HOST_ENV pass=0 task_queue_enable=%s launch_blocking=%s required_task_queue_enable=1 required_launch_blocking=0\n' \
+        "$P8_TASK_QUEUE_ENABLE" "$P8_ASCEND_LAUNCH_BLOCKING"
+    runner_fail "unsafe_deferred_launch_environment"
     exit 2
 fi
 
@@ -174,6 +187,13 @@ export P8_PHYSICAL_NPU_ID
 export NPU_ID=0
 export DEVICE_ID=0
 source "$ASCEND_HOME_PATH/bin/setenv.bash"
+# This must happen before the NPU probe, which is the first Python process to
+# import torch_npu.  Re-export after CANN's environment script so a shell
+# default cannot silently override the deferred-launch ownership contract.
+export TASK_QUEUE_ENABLE="$P8_TASK_QUEUE_ENABLE"
+export ASCEND_LAUNCH_BLOCKING="$P8_ASCEND_LAUNCH_BLOCKING"
+printf 'P8_DEFERRED_HOST_ENV pass=1 task_queue_enable=%s launch_blocking=%s physical=7 logical=0\n' \
+    "$TASK_QUEUE_ENABLE" "$ASCEND_LAUNCH_BLOCKING"
 # The runner owns a three-OPP process (unchanged C8, Stage A, Stage B).  Do
 # not inherit vendor paths or opapi handles from an earlier P3/P7/P8 shell;
 # each bridge below contributes only its freshly built vendor.  This is the

@@ -199,19 +199,38 @@ void RequireP8DeferredHostContract()
     const char* task_queue = std::getenv("TASK_QUEUE_ENABLE");
     const char* launch_blocking = std::getenv("ASCEND_LAUNCH_BLOCKING");
     const auto stream = c10_npu::getCurrentNPUStream();
-    TORCH_CHECK(!stream.isSyncLaunchStream(),
-                "P8 requires a non-sync launch stream for deferred ACLNN ",
-                "submission; refusing an inline producer-owned launch.");
+    // The deferred macro creates and destroys ACLNN descriptors, executors,
+    // and PTA/HugeMem state in the framework task-queue consumer.  A
+    // non-sync stream alone is not enough to establish that hand-off:
+    // launch-blocking can still force an inline launch, and a disabled task
+    // queue has no consumer-owner contract at all.  Keep this identical to
+    // the already proven P7 ordered-launch precondition, but do not add P7's
+    // long-lived terminal tensor lease here: P8 keeps the 28 input tensors
+    // alive through the ACLNN launch and its device state is owned by the
+    // graph-visible forward arena.
+    const bool task_queue_requested =
+        task_queue != nullptr && std::strcmp(task_queue, "1") == 0;
+    const bool launch_blocking_disabled =
+        launch_blocking == nullptr || std::strcmp(launch_blocking, "0") == 0;
+    const bool sync_launch_stream = stream.isSyncLaunchStream();
+    TORCH_CHECK(task_queue_requested && launch_blocking_disabled &&
+                    !sync_launch_stream,
+                "P8 requires TASK_QUEUE_ENABLE=1 and "
+                "ASCEND_LAUNCH_BLOCKING=0 before torch_npu is initialized, "
+                "plus a non-sync launch stream; refusing an unsafe inline "
+                "ACLNN deferred submission. TASK_QUEUE_ENABLE=",
+                task_queue == nullptr ? "<unset>" : task_queue,
+                " ASCEND_LAUNCH_BLOCKING=",
+                launch_blocking == nullptr ? "<unset>" : launch_blocking,
+                " sync_launch_stream=", sync_launch_stream);
     if (const char* debug = std::getenv("NANOVLLM_A5_OPAPI_DEBUG");
         debug != nullptr && debug[0] != '\0' &&
         !(debug[0] == '0' && debug[1] == '\0')) {
         std::fprintf(
             stderr,
-            "P8_DEFERRED_HOST_GATE task_queue_enable=%s "
-            "launch_blocking=%s sync_launch_stream=0 "
-            "host_lifetime=consumer_owned\n",
-            task_queue == nullptr ? "<unset>" : task_queue,
-            launch_blocking == nullptr ? "<unset>" : launch_blocking);
+            "P8_DEFERRED_HOST_GATE task_queue_enable=1 "
+            "launch_blocking=0 sync_launch_stream=0 "
+            "host_lifetime=consumer_owned\n");
         std::fflush(stderr);
     }
 }
