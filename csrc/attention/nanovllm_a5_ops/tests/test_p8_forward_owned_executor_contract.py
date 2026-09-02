@@ -165,6 +165,17 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.runner)
 
+    def test_runner_can_cut_prepost_before_real_post_without_rebuild(self) -> None:
+        """One fresh assembly may isolate then exercise the valid POST path."""
+        for token in (
+            "prepost_then_full",
+            "run_p8_runtime_case runtime_prepost prepost_control_reject",
+            "run_p8_runtime_case runtime_full full",
+            "P8_RUNNER_FAIL stage=runtime_prepost",
+            "P8_RUNNER_FAIL stage=runtime_full",
+        ):
+            self.assertIn(token, self.runner)
+
     def test_isolated_operator_identity(self) -> None:
         self.assertIn('"op": "A5P8ForwardOwnedExecutor"', self.spec)
         self.assertIn("OP_ADD(A5P8ForwardOwnedExecutor)", self.host)

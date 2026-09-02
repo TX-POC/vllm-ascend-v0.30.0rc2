@@ -53,6 +53,10 @@ P8_REQUIRE_REAL_HCCP="${P8_REQUIRE_REAL_HCCP:-1}"
 # `prepost_control_reject` preserves the full pre-POST graph composition but
 # intentionally corrupts the already-bound control in place.  It therefore
 # cannot claim a validated payload and must not inherit the full-mode gate.
+# `prepost_then_full` runs that cut in its own process and, only after it
+# passes, runs the real Post/CQ path using the same fresh assembly.  It is the
+# shortest valid failure-domain split: no second compilation and no reuse of
+# a prior source/artifact assembly.
 P8_RUNTIME_CASE="${P8_RUNTIME_CASE:-full}"
 
 runner_fail() {
@@ -103,7 +107,8 @@ if [[ "$P8_RUNNER_MODE" != "static" && "$P8_RUNNER_MODE" != "npu" ]]; then
     exit 2
 fi
 if [[ "$P8_RUNTIME_CASE" != "full" &&
-      "$P8_RUNTIME_CASE" != "prepost_control_reject" ]]; then
+      "$P8_RUNTIME_CASE" != "prepost_control_reject" &&
+      "$P8_RUNTIME_CASE" != "prepost_then_full" ]]; then
     runner_fail "invalid_runtime_case:${P8_RUNTIME_CASE}"
     exit 2
 fi
@@ -504,15 +509,32 @@ if ! is_clean_exact_repo vllm_target "$P8_VLLM_ROOT" "$P8_VLLM_EXPECTED_SHA" ||
     runner_fail "source_changed_during_scoped_build"
     exit 1
 fi
-P8_RUNTIME_ARGS=("$P8_RUNTIME_TEST" --device npu:0 --case "$P8_RUNTIME_CASE")
-P8_RUNTIME_ARGS+=(--real-fixture-module "$P8_REAL_FIXTURE_MODULE")
-if [[ "$P8_RUNTIME_CASE" == "full" && "$P8_REQUIRE_REAL_HCCP" == "1" ]]; then
-    P8_RUNTIME_ARGS+=(--require-real-hccp)
-fi
-if ! run_logged runtime "$P8_RUN_ROOT/runtime.log" \
-    timeout -k 30s "$P8_TEST_TIMEOUT" "$P8_PYTHON" "${P8_RUNTIME_ARGS[@]}"; then
-    printf 'P8_RUNNER_FAIL stage=runtime result=%s\n' "$P8_RUN_ROOT"
-    exit 1
+run_p8_runtime_case() {
+    local label="$1"
+    local case_name="$2"
+    local -a args=("$P8_RUNTIME_TEST" --device npu:0 --case "$case_name")
+    args+=(--real-fixture-module "$P8_REAL_FIXTURE_MODULE")
+    if [[ "$case_name" == "full" && "$P8_REQUIRE_REAL_HCCP" == "1" ]]; then
+        args+=(--require-real-hccp)
+    fi
+    run_logged "$label" "$P8_RUN_ROOT/${label}.log" \
+        timeout -k 30s "$P8_TEST_TIMEOUT" "$P8_PYTHON" "${args[@]}"
+}
+
+if [[ "$P8_RUNTIME_CASE" == "prepost_then_full" ]]; then
+    if ! run_p8_runtime_case runtime_prepost prepost_control_reject; then
+        printf 'P8_RUNNER_FAIL stage=runtime_prepost result=%s\n' "$P8_RUN_ROOT"
+        exit 1
+    fi
+    if ! run_p8_runtime_case runtime_full full; then
+        printf 'P8_RUNNER_FAIL stage=runtime_full result=%s\n' "$P8_RUN_ROOT"
+        exit 1
+    fi
+else
+    if ! run_p8_runtime_case runtime "$P8_RUNTIME_CASE"; then
+        printf 'P8_RUNNER_FAIL stage=runtime result=%s\n' "$P8_RUN_ROOT"
+        exit 1
+    fi
 fi
 
 printf 'P8_RUNNER_PASS physical=7 logical=0 kvaf_build=%s stage_a_opp=%s stage_b_opp=%s reference_opp=%s result=%s\n' \
