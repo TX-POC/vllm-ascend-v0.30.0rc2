@@ -365,6 +365,40 @@ if [[ ! -s "$P8_STAGE_B_OPP/vendors/customize/op_api/lib/libcust_opapi.so" ]]; t
     exit 1
 fi
 
+# The P8 Stage-B bridge has a 28-ref ACLNN ABI: its 19 Python returns are
+# same-name mutable references, not an additional C ABI output suffix.  Check
+# the freshly generated header and the installed tiling library before Python
+# imports any custom operator.  This is a deliberately small, run-local
+# provenance guard: it catches a stale or incorrectly assembled host tiler
+# without turning artifact provenance into a persistent database.
+P8_STAGE_B_VENDOR="$P8_STAGE_B_OPP/vendors/customize"
+P8_STAGE_B_GENERATED_HOST="$P8_STAGE_B_BUILD/custom_op/op_host/a5_p8_forward_owned_executor.cpp"
+P8_STAGE_B_INSTALLED_HOST="$P8_STAGE_B_VENDOR/op_impl/ai_core/tbe/customize_impl/dynamic/a5_p8_forward_owned_executor.cpp"
+P8_STAGE_B_TILING_LIB="$P8_STAGE_B_VENDOR/op_impl/ai_core/tbe/op_tiling/liboptiling.so"
+P8_STAGE_B_ACLNN_HEADER="$P8_STAGE_B_VENDOR/op_api/include/aclnn_a5_p8_forward_owned_executor.h"
+if [[ ! -r "$P8_STAGE_B_GENERATED_HOST" ||
+      ! -r "$P8_STAGE_B_INSTALLED_HOST" ||
+      ! -s "$P8_STAGE_B_TILING_LIB" ||
+      ! -r "$P8_STAGE_B_ACLNN_HEADER" ]] ||
+   ! cmp -s "$P8_OPS_ROOT/a5_p8_forward_owned_executor/op_host/a5_p8_forward_owned_executor.cpp" \
+           "$P8_STAGE_B_GENERATED_HOST" ||
+   ! cmp -s "$P8_STAGE_B_GENERATED_HOST" "$P8_STAGE_B_INSTALLED_HOST" ||
+   ! grep -aFq 'P8_TILING_DIAG_REVISION=p8_tiling_diag_v1' "$P8_STAGE_B_TILING_LIB"; then
+    runner_fail "stage_b_tiling_artifact_provenance_failed"
+    exit 1
+fi
+P8_STAGE_B_ACLNN_SIGNATURE="$(sed -n \
+    '/aclnnA5P8ForwardOwnedExecutorGetWorkspaceSize(/,/);/p' \
+    "$P8_STAGE_B_ACLNN_HEADER")"
+P8_STAGE_B_ACLNN_TENSOR_REFS="$(printf '%s\n' "$P8_STAGE_B_ACLNN_SIGNATURE" | \
+    grep -Eo 'aclTensor[[:space:]]*\*' | wc -l | tr -d '[:space:]')"
+if [[ "$P8_STAGE_B_ACLNN_TENSOR_REFS" != "28" ]]; then
+    runner_fail "stage_b_aclnn_ref_abi_invalid:${P8_STAGE_B_ACLNN_TENSOR_REFS}"
+    exit 1
+fi
+printf 'P8_STAGE_B_TILING_ARTIFACT marker=1 source_overlay=1 vendor_overlay=1 aclnn_tensor_refs=%s header=%s tiling_lib=%s\n' \
+    "$P8_STAGE_B_ACLNN_TENSOR_REFS" "$P8_STAGE_B_ACLNN_HEADER" "$P8_STAGE_B_TILING_LIB"
+
 export USE_NINJA=0
 export NANOVLLM_A5_SCORE_RECEIPT_EXECUTOR_BUILD_JOBS="$P8_BUILD_JOBS"
 if ! run_logged stage_a_bridge "$P8_RUN_ROOT/stage_a_bridge.log" \

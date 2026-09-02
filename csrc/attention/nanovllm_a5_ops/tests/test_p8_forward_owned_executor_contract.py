@@ -681,6 +681,43 @@ class P8ForwardOwnedExecutorContractTest(unittest.TestCase):
             self.assertIn(readable_gate, self.runner)
         self.assertNotIn('! -x "$P8_BUILD_SCRIPT"', self.runner)
 
+    def test_stage_b_tiler_reports_its_pre_workspace_rejection_reason(self) -> None:
+        """A workspace-size failure must identify the selected tiler path.
+
+        These messages are diagnostic-only: they do not relax geometry, add
+        Tensor refs, or touch C8/P8 execution ordering.  They turn the next
+        hardware run into a single decisive observation instead of a series
+        of speculative ABI edits.
+        """
+        for token in (
+            "P8_TILING_DIAG_REVISION=p8_tiling_diag_v1",
+            "P8_TILING_ENTER",
+            "P8_TILING_REJECT",
+            "P8_TILING_GEOMETRY",
+            "null_input_shape",
+            "null_input_desc",
+            "input_dtype",
+            "geometry_contract",
+        ):
+            self.assertIn(token, self.host)
+
+    def test_runner_proves_the_fresh_stage_b_tiler_and_28_ref_abi(self) -> None:
+        """Never run Stage-B against a merely existing, stale OPP package."""
+        for token in (
+            "P8_STAGE_B_TILING_ARTIFACT",
+            "stage_b_tiling_artifact_provenance_failed",
+            "stage_b_aclnn_ref_abi_invalid",
+            "P8_TILING_DIAG_REVISION=p8_tiling_diag_v1",
+            "P8_STAGE_B_ACLNN_TENSOR_REFS",
+            "liboptiling.so",
+            "aclnn_a5_p8_forward_owned_executor.h",
+        ):
+            self.assertIn(token, self.runner)
+        # Same-name mutable outputs are CANN Ref descriptors; appending them
+        # would incorrectly turn the proven 28-ref ABI into a 47-ref ABI.
+        self.assertIn('!= "28"', self.runner)
+        self.assertNotIn("P8_STAGE_B_ACLNN_TENSOR_REFS\" != \"47", self.runner)
+
     def test_p8_uses_a_source_owned_lazy_cann_dependency_directory(self) -> None:
         """Dependency downloads are reusable inputs, never stale build outputs."""
         for token in (

@@ -92,6 +92,76 @@ constexpr size_t kAliasInputs[kOutputCount] = {
     kWorkerStats, kCandidateReceiptIdentity, kCandidateStatus,
 };
 
+// This literal is deliberately emitted by every Stage-B tiler diagnostic and
+// is also checked in the freshly packaged liboptiling.so by the P8 runner.
+// It closes the gap between "the source was staged" and "this exact host
+// tiler was installed and selected" without adding a persistent artifact
+// database or changing the P8 ABI.
+constexpr char kP8TilingDiagnosticRevision[] =
+    "P8_TILING_DIAG_REVISION=p8_tiling_diag_v1";
+
+constexpr const char* kInputNames[kInputCount] = {
+    "candidate_seeds", "candidate_counts", "candidate_receipt_identity",
+    "candidate_status", "forward_control", "p8_arena_health",
+    "source_lens", "kv_object_address_domain", "req_pool_entries",
+    "kv_object_map", "kv_object_lens", "kv_object_slots_snapshot",
+    "private_source_to_slot", "private_object_to_slot",
+    "private_ready_table", "private_slot_cursor", "private_packed_output",
+    "fused_get_control", "p8_wave_records", "p8_private_records",
+    "queue_request_source_offsets", "queue_request_object_offsets",
+    "queue_request_output_indices", "queue_request_count",
+    "candidate_cursor", "candidate_cursor_identity", "rows_per_entry",
+    "worker_stats",
+};
+
+void LogP8TilingShape(const gert::Shape* shape)
+{
+    if (shape == nullptr) {
+        std::fprintf(stderr, " storage_rank=<null> storage_dims=<null>");
+        return;
+    }
+    const int64_t rank = shape->GetDimNum();
+    std::fprintf(stderr, " storage_rank=%lld storage_dims=[",
+                 static_cast<long long>(rank));
+    constexpr int64_t kMaxLoggedDims = 8;
+    const int64_t shown = rank < kMaxLoggedDims ? rank : kMaxLoggedDims;
+    for (int64_t dim = 0; dim < shown; ++dim) {
+        std::fprintf(stderr, "%s%lld", dim == 0 ? "" : ",",
+                     static_cast<long long>(shape->GetDim(dim)));
+    }
+    if (rank > shown) {
+        std::fprintf(stderr, ",...");
+    }
+    std::fprintf(stderr, "]");
+}
+
+void LogP8TilingReject(const char* reason, size_t input,
+                       const gert::Shape* shape, int expected_dtype,
+                       int actual_dtype)
+{
+    std::fprintf(stderr,
+                 "P8_TILING_REJECT marker=%s reason=%s input=%zu name=%s "
+                 "expected_dtype=%d actual_dtype=%d",
+                 kP8TilingDiagnosticRevision, reason, input,
+                 input < kInputCount ? kInputNames[input] : "<none>",
+                 expected_dtype, actual_dtype);
+    LogP8TilingShape(shape);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
+void LogP8TilingGeometry(const gert::Shape* const* shapes)
+{
+    for (size_t input = 0U; input < kInputCount; ++input) {
+        std::fprintf(stderr,
+                     "P8_TILING_GEOMETRY marker=%s input=%zu name=%s",
+                     kP8TilingDiagnosticRevision, input, kInputNames[input]);
+        LogP8TilingShape(shapes == nullptr ? nullptr : shapes[input]);
+        std::fprintf(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+
 // P8's workers are dynamic *queue service tasks*, never a permanent Get-core
 // partition.  Keep the host-side launch geometry visible in one compact line:
 // this is the only place that can turn a bounded receipt/queue workload into
@@ -103,9 +173,10 @@ void LogP8Tiling(const char* stage, uint32_t aic, uint32_t aiv,
 {
     std::fprintf(
         stderr,
-        "P8_TILING_%s aic=%u aiv=%u receipts=%u queues=%u private_rows=%u "
+        "P8_TILING_%s marker=%s aic=%u aiv=%u receipts=%u queues=%u private_rows=%u "
         "stats_rows=%u workers=%u block_dim=%u schedule_status=%d\n",
-        stage, aic, aiv, receipts, queues, private_rows, stats_rows,
+        stage, kP8TilingDiagnosticRevision, aic, aiv, receipts, queues,
+        private_rows, stats_rows,
         workers, block_dim, static_cast<int>(schedule_status));
     std::fflush(stderr);
 }
@@ -255,9 +326,17 @@ namespace optiling {
 static ge::graphStatus TilingA5P8ForwardOwnedExecutor(
     gert::TilingContext* context)
 {
-    if (context == nullptr || context->GetPlatformInfo() == nullptr) {
+    if (context == nullptr) {
+        LogP8TilingReject("null_context", kInputCount, nullptr, -1, -1);
         return ge::GRAPH_FAILED;
     }
+    if (context->GetPlatformInfo() == nullptr) {
+        LogP8TilingReject("null_platform", kInputCount, nullptr, -1, -1);
+        return ge::GRAPH_FAILED;
+    }
+    std::fprintf(stderr, "P8_TILING_ENTER marker=%s inputs=%zu platform=1\n",
+                 kP8TilingDiagnosticRevision, kInputCount);
+    std::fflush(stderr);
     const ge::DataType expected[kInputCount] = {
         ge::DT_INT32, ge::DT_INT32, ge::DT_INT64, ge::DT_INT32,
         ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
@@ -268,12 +347,28 @@ static ge::graphStatus TilingA5P8ForwardOwnedExecutor(
         ge::DT_INT32, ge::DT_INT64, ge::DT_INT32, ge::DT_INT64};
     const gert::Shape* shapes[kInputCount] = {};
     for (size_t index = 0U; index < kInputCount; ++index) {
-        if (context->GetInputShape(index) == nullptr ||
-            context->GetInputDesc(index) == nullptr ||
-            context->GetInputDesc(index)->GetDataType() != expected[index]) {
+        const auto* input_shape = context->GetInputShape(index);
+        if (input_shape == nullptr) {
+            LogP8TilingReject("null_input_shape", index, nullptr,
+                              static_cast<int>(expected[index]), -1);
             return ge::GRAPH_FAILED;
         }
-        shapes[index] = &context->GetInputShape(index)->GetStorageShape();
+        const auto* input_desc = context->GetInputDesc(index);
+        if (input_desc == nullptr) {
+            LogP8TilingReject("null_input_desc", index,
+                              &input_shape->GetStorageShape(),
+                              static_cast<int>(expected[index]), -1);
+            return ge::GRAPH_FAILED;
+        }
+        const ge::DataType actual = input_desc->GetDataType();
+        if (actual != expected[index]) {
+            LogP8TilingReject("input_dtype", index,
+                              &input_shape->GetStorageShape(),
+                              static_cast<int>(expected[index]),
+                              static_cast<int>(actual));
+            return ge::GRAPH_FAILED;
+        }
+        shapes[index] = &input_shape->GetStorageShape();
     }
     uint32_t receipts = 0U;
     uint32_t rows = 0U;
@@ -285,6 +380,9 @@ static ge::graphStatus TilingA5P8ForwardOwnedExecutor(
     uint32_t stats_rows = 0U;
     if (!ValidateGeometry(shapes, &receipts, &rows, &sources, &pools,
                           &objects, &queues, &private_rows, &stats_rows)) {
+        LogP8TilingReject("geometry_contract", kInputCount, nullptr, -1,
+                          -1);
+        LogP8TilingGeometry(shapes);
         return ge::GRAPH_FAILED;
     }
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
