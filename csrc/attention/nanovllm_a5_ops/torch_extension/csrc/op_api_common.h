@@ -37,6 +37,7 @@
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUFunctions.h"
 #include "torch_npu/csrc/core/npu/register/OptionsManager.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
@@ -1748,6 +1749,13 @@ inline void LogOrderedHostDso(
     TORCH_CHECK(inline_acl_stream != nullptr,                                  \
                 #aclnn_api " received a null current ACL stream");            \
     RequireDrainedCallerThreadAsyncOpApiContract(inline_npu_stream);           \
+    if (c10_npu::is_core_control_enabled()) {                                  \
+      /* This is a caller-thread binding, not the old producer/consumer       \
+       * handoff.  It preserves a dynamically configured stream quota without\
+       * pinning any P8 work to a physical AIV core. */                         \
+      c10_npu::UseStreamResInCurrentThread(inline_acl_stream);                 \
+      LogOpApiLifecycle(#aclnn_api, "caller_thread_core_res_bound");         \
+    }                                                                           \
     LogOpApiLifecycle(#aclnn_api, "caller_thread_stream_drained");           \
     /* std::make_tuple decays every at::Tensor argument to value ownership. */ \
     auto inline_args = std::make_tuple(__VA_ARGS__);                            \
@@ -1781,6 +1789,13 @@ inline void LogOrderedHostDso(
         LogOpApiLifecycle(#aclnn_api, "caller_thread_tls_uninit");           \
       };                                                                        \
       try {                                                                     \
+        TORCH_CHECK(!inline_npu_stream.getRepoStopFlag(),                      \
+                    #aclnn_api " refused after torch_npu FORCE STOP");        \
+        /* Preserve the public OpCommand deterministic setting before this    \
+         * raw launch.  ApplyDeterministicSnapshot owns its lock; no host     \
+         * queue callback or device synchronization is introduced here. */    \
+        at_npu::native::ApplyDeterministicSnapshot(                            \
+            c10_npu::CaptureDeterministicSnapshot(), true);                   \
         inline_pta_cache_active = InitPtaCacheForWorkspace();                  \
         LogOpApiLifecycle(                                                      \
             #aclnn_api,                                                         \
