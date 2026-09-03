@@ -986,7 +986,18 @@ class A5P10ScoreReceiptForwardResidentKernel {
     (void)FinishClaimedReceipt(receipt);
   }
 
-  __aicore__ inline bool DrainLocalWaves(bool terminal_mode) {
+  // `target_slot_ready` is a local completion witness for a final winner.
+  // It is set only after the wave containing `target_slot` has reached a
+  // successful CQ terminal, Stage B has written resident_ready=READY, and
+  // the DDR publication barrier has executed.  This avoids treating a
+  // same-kernel GM reload as the authority for a completion that this worker
+  // has already observed directly from KVAF.  It is not a shortcut around
+  // readiness: a failed/nonterminal CQ never sets this witness.
+  __aicore__ inline bool DrainLocalWavesForTarget(
+      bool terminal_mode, int32_t target_slot, bool* target_slot_ready) {
+    if (target_slot_ready != nullptr) {
+      *target_slot_ready = false;
+    }
     const uint32_t polls = terminal_mode ? tiling_->boundedDrainPolls : 1U;
     for (uint32_t poll = 0U; poll < polls; ++poll) {
       bool pending = false;
@@ -1006,12 +1017,18 @@ class A5P10ScoreReceiptForwardResidentKernel {
         // A terminal success alone makes a fixed resident slot READY. The
         // current target assumes successful posts, but this guard never
         // fabricates READY on a failed terminal.
+        bool completed_target_slot = false;
         if (success) {
           for (uint32_t seed = 0U; seed < wave->seed_count; ++seed) {
             residentReady_[wave->seeds[seed].resident_slot] =
                 static_cast<int32_t>(A5P10ResidentReadyState::READY);
+            completed_target_slot = completed_target_slot ||
+                wave->seeds[seed].resident_slot == target_slot;
           }
           DataSyncBarrier<MemDsbT::DDR>();
+          if (completed_target_slot && target_slot_ready != nullptr) {
+            *target_slot_ready = true;
+          }
         }
         seedBufferBusy_[wave->buffer_index] = false;
         wave->seed_count = 0U;
@@ -1031,6 +1048,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
       }
     }
     return true;
+  }
+
+  __aicore__ inline bool DrainLocalWaves(bool terminal_mode) {
+    return DrainLocalWavesForTarget(
+        terminal_mode, A5_P10_STAGE_B_UNMAPPED_SLOT, nullptr);
   }
 
   __aicore__ inline bool EnsureFinalWinnerReady(
@@ -1057,7 +1079,16 @@ class A5P10ScoreReceiptForwardResidentKernel {
         }
       }
       // This is terminal-only progress; score scanning never waits for CQ.
-      (void)DrainLocalWaves(true);
+      // A successful terminal for this exact slot is stronger than a second
+      // same-kernel GM read: it proves HCCP completed and this worker has
+      // published READY with a DDR barrier.  The latter GM read remains the
+      // path for a slot completed by another worker.
+      bool local_terminal_ready = false;
+      (void)DrainLocalWavesForTarget(
+          true, seed.resident_slot, &local_terminal_ready);
+      if (local_terminal_ready) {
+        return true;
+      }
     }
     return ReadGmByPassDCache<int32_t>(residentReady_ + seed.resident_slot) ==
         static_cast<int32_t>(A5P10ResidentReadyState::READY);
