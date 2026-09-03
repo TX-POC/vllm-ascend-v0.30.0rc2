@@ -105,6 +105,9 @@ extern "C" __global__ __aicore__ void a5_p10_forward_prepare(
         speculative_slot_cursor_gm.SetValue(0U, 0);
         forward_control_gm.SetValue(
             0U, A5_P10_FORWARD_PREPARE_PRODUCER_OPEN);
+        // P10 Stage B uses word 1 only as a forward-local diagnostic ledger.
+        // It is never a producer scheduling input or a receipt count.
+        forward_control_gm.SetValue(1U, 0);
         forward_control_gm.SetValue(
             5U, A5_P10_FORWARD_PREPARE_FORWARD_INCOMPLETE);
         forward_control_gm.SetValue(7U, 0);

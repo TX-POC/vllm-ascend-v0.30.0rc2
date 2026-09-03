@@ -226,9 +226,9 @@ class P10StageBSourceContractTest(unittest.TestCase):
             self.assertIn(token, self.kernel)
         self.assertNotIn("receiptState_[receipt] =", self.kernel)
 
-    def test_kernel_is_a_real_mixed_device_data_plane_not_a_wrapper(self):
+    def test_kernel_is_an_aiv_only_dynamic_device_executor_not_a_wrapper(self):
         for token in (
-            "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)",
+            "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)",
             "a5_p10_score_receipt_forward_resident",
             "ConsumeExactScoreReceipt", "BeginForwardResidentMicrobatch",
             "DrainForwardResidentMicrobatch", "FinalizeAssignedRows",
@@ -236,6 +236,21 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY",
         ):
             self.assertIn(token, self.kernel)
+        self.assertNotIn("KERNEL_TYPE_MIX_AIC_1_2", self.kernel)
+        self.assertIn("CalcTschBlockDim(", self.definition)
+        self.assertIn("0U, aivCount", self.definition)
+
+    def test_first_failure_diagnostic_is_forward_local_and_non_scheduling(self):
+        for token in (
+            "A5_P10_STAGE_B_DIAGNOSTIC", "INIT_COMMON", "INIT_GEOMETRY",
+            "INIT_KVAF", "INIT_UB", "RECEIPT_TERMINAL", "FINALIZE",
+            "DRAIN", "RecordFirstFailure", "MarkRunning",
+        ):
+            self.assertIn(token, self.abi + self.kernel)
+        self.assertIn("forward_control_gm.SetValue(1U, 0)", (
+            OPS_ROOT / "a5_dsa_c8_exact_speculative_resident"
+            / "p10_forward_bridge" / "op_kernel" / "a5_p10_forward_prepare.cpp"
+        ).read_text())
 
     def test_claiming_race_waits_for_durable_object_slot_not_a_reuse(self):
         self.assertIn("ResolveConcurrentForwardSlot", self.kernel)

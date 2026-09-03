@@ -19,6 +19,24 @@ constexpr int32_t A5_P10_STAGE_B_CLAIMING_SLOT = -2;
 constexpr int32_t A5_P10_STAGE_B_FORWARD_STATE_INCOMPLETE = 0;
 constexpr int32_t A5_P10_STAGE_B_FORWARD_STATE_COMPLETE = 1;
 
+// Word 1 is intentionally not a producer->consumer scheduling input: Stage B
+// always walks the graph-static tiling receiptCapacity rather than waiting for
+// a dynamically published count.  Reuse that otherwise-reserved word as a
+// compact, forward-local fail-closed ledger.  It is reset by ForwardPrepare,
+// written only by Stage B, and never changes C8 scores, Top-K, queue ownership
+// or resident-slot placement.  A negative value is the first terminal local
+// failure observed by any logical Stage-B worker; RUNNING merely proves that
+// Init completed and Process entered.
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_CLEAR = 0;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_RUNNING = 1;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_INIT_COMMON = -101;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_INIT_GEOMETRY = -102;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_INIT_KVAF = -103;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_INIT_UB = -104;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_RECEIPT_TERMINAL = -201;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE = -202;
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_DRAIN = -203;
+
 // A persistent Stage-B companion starts from the same cold-bound mutable
 // tensors as Stage A.  It must not be connected to Stage A through a graph
 // completion edge: it polls receipt_state while this seal remains OPEN.
@@ -29,12 +47,10 @@ enum class A5P10ProducerSealState : int32_t {
 
 enum A5P10StageBControlWord : uint32_t {
   A5_P10_STAGE_B_PRODUCER_SEALED = 0U,
-  // The physical receipt range is the graph-static tiling receiptCapacity.
-  // This word is reserved: a companion executor must not rely on a dynamic
-  // receipt count that Stage A could publish only after it has already begun
-  // producing.  After producer_sealed, FREE means that the corresponding
-  // static receipt slot was never used by this forward.
-  A5_P10_STAGE_B_RESERVED_RECEIPT_RANGE = 1U,
+  // The physical receipt range remains the graph-static tiling
+  // receiptCapacity.  This word is deliberately diagnostic-only; it must not
+  // become a dynamic receipt count or scheduling dependency.
+  A5_P10_STAGE_B_DIAGNOSTIC = 1U,
   A5_P10_STAGE_B_TOPK_PER_ROW = 2U,
   A5_P10_STAGE_B_ROWS_PER_OBJECT = 3U,
   A5_P10_STAGE_B_ACTIVE_ROWS = 4U,

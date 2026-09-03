@@ -36,8 +36,10 @@ not a fictitious in-kernel physical-core policy.
    After all possible slots in its static receipt geometry have either been
    published or left unused, it writes its final static receipt sequence, then
    writes `producer_sealed=SEALED` last. The first Stage-B `READY` claim that
-   atomically observes OPEN latches its nonzero receipt sequence in the second
-   diagnostic word. Only
+   atomically observes OPEN latches its nonzero receipt sequence in its
+   dedicated control field. `forward_control[1]` is reserved for a
+   forward-local Stage-B first-failure diagnostic and is never a scheduling
+   input. Only
    after that seal is `FREE` terminal (an unused slot); `FILLING` or `CLAIMED`
    still requires bounded progress to `DONE`.
 3. A Stage-B worker atomically claims `READY`, performs `ExactScoreScan` and
@@ -83,7 +85,8 @@ The source below is a real ABI and device-wrapper boundary, not a simulated
 transport implementation. `build_stage_b_opp.sh` is the only supported OPP
 route: it creates a fresh `msopgen` package, stages this source plus the exact
 matched KVAF device closure, replaces the generated kernel stub with the
-distinct P10 MIX entry, verifies one `OP_ADD`, and emits `P10_STAGE_PROVENANCE`.
+distinct P10 AIV-only executor entry, verifies one `OP_ADD`, and emits
+`P10_STAGE_PROVENANCE`.
 It never accepts an installed/ambient KVAF header, a pre-existing package, or a
 generic/P8/P9 artifact. `CMakeLists.txt` is manifest-friendly for a CANN
 superproject; it is not an alternative ambient-artifact build route.

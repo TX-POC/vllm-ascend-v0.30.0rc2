@@ -188,11 +188,30 @@ static ge::graphStatus TilingA5P10ScoreReceiptForwardResident(
       *pollQuantum > std::numeric_limits<uint32_t>::max() ||
       *drainPolls > std::numeric_limits<uint32_t>::max()) return ge::GRAPH_FAILED;
   platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
-  const uint32_t aicCount = platform.GetCoreNumAic();
   const uint32_t aivCount = platform.GetCoreNumAiv();
-  if (aicCount == 0U || aivCount < 2U ||
+  if (aivCount < 2U ||
       static_cast<uint64_t>(*workerCount) >= aivCount ||
       static_cast<uint64_t>(*workerLimit) >= aivCount) return ge::GRAPH_FAILED;
+
+  // Stage B is a SIMT/AIV Direct-HCCP executor.  It has no Cube/AIC data
+  // plane, so a MIX_AIC_1_2 launch gives GetBlockIdx() mixed-lane semantics
+  // and can silently drop an executor worker.  AIV_ONLY keeps the logical
+  // worker id exact (0..workerCount-1); it is not a physical-core assignment,
+  // because each worker dynamically leases any queue.
+  const uint32_t blockDim = platform.CalcTschBlockDim(
+      static_cast<uint32_t>(*workerCount), 0U, aivCount);
+  if (blockDim != static_cast<uint32_t>(*workerCount)) {
+    return ge::GRAPH_FAILED;
+  }
+  if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS) {
+    return ge::GRAPH_FAILED;
+  }
+  context->SetBlockDim(blockDim);
+
+  // CANN 9.1 direct ACLNN materializes typed tiling only after its AIV-only
+  // launch geometry is declared.  Keep this order aligned with the proven
+  // Direct-HCCP executor path; otherwise failures surface as opaque launch
+  // behavior rather than a tiling rejection.
   auto* tiling = context->GetTilingData<A5P10ScoreReceiptForwardResidentTilingData>();
   if (tiling == nullptr || context->GetWorkspaceSizes(1) == nullptr) return ge::GRAPH_FAILED;
   tiling->executorWorkerCount = static_cast<uint32_t>(*workerCount);
@@ -213,11 +232,6 @@ static ge::graphStatus TilingA5P10ScoreReceiptForwardResident(
   tiling->boundedDrainPolls = static_cast<uint32_t>(*drainPolls);
   tiling->reserved = 0U;
   context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize();
-  context->SetBlockDim(platform.CalcTschBlockDim(
-      static_cast<uint32_t>(*workerCount) * 2U,
-      static_cast<uint32_t>(*workerCount),
-      static_cast<uint32_t>(*workerCount) * 2U));
-  context->SetScheduleMode(1);
   return ge::GRAPH_SUCCESS;
 }
 }  // namespace optiling

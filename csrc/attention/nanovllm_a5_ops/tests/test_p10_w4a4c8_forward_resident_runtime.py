@@ -398,9 +398,10 @@ def _build_forward_inputs(
         (receipt_capacity, RECEIPT_WORDS), dtype=torch.int64, device=device
     )
     receipt_state = torch.zeros(receipt_capacity, dtype=torch.int32, device=device)
-    # Fields [1..4,6] are cold geometry/cutoff; prepare initializes only
-    # mutable state. A zero score cutoff gives Stage B a real speculative
-    # workload while final recall still guarantees all canonical winners.
+    # Fields [2..4,6] are cold geometry/cutoff.  Word 1 is the Stage-B
+    # diagnostic ledger, reset by prepare; a zero score cutoff gives Stage B
+    # a real speculative workload while final recall still guarantees all
+    # canonical winners.
     forward_control = torch.tensor(
         [0, 0, TOPK, BLOCK_TOKENS, BATCH, 0, 0, 0, 0, 0],
         dtype=torch.int32,
@@ -488,6 +489,64 @@ def _build_forward_inputs(
     return inputs, tensors
 
 
+_STAGE_B_DIAGNOSTIC_NAMES = {
+    0: "clear_or_not_entered",
+    1: "running",
+    -101: "init_common",
+    -102: "init_geometry",
+    -103: "init_kvaf_control",
+    -104: "init_ub",
+    -201: "receipt_terminal",
+    -202: "finalize",
+    -203: "drain",
+}
+
+
+def _emit_terminal_diagnostic(
+    fixture: _ForwardResidentKvaf,
+    tensors: dict[str, Any],
+    forward: list[int],
+) -> None:
+    """Emit one bounded post-event state snapshot when P10 cannot complete.
+
+    This runs only in the NPU acceptance harness after Stage-B's completion
+    event has been observed.  It does not add a product dependency, mutate an
+    operator input, or inspect a second transport path.  The point is to make
+    one failed target run distinguish an executor launch/Init rejection from a
+    receipt, Post/CQ, or final-recall failure.
+    """
+
+    import torch
+
+    receipt = tensors["receipt_state"].detach().cpu()
+    source_slots = tensors["source_to_slot"].detach().cpu()
+    object_slots = tensors["object_to_slot"].detach().cpu()
+    ready = tensors["resident_ready"].detach().cpu()
+    cursor = tensors["speculative_cursor"].detach().cpu()
+    attention = tensors["attention_slots"].detach().cpu()
+    leases = fixture.leases.detach().cpu() if fixture.leases is not None else None
+
+    def count_eq(value: Any, expected: int) -> int:
+        return int(torch.count_nonzero(value == expected).item())
+
+    diagnostic = int(forward[1]) if len(forward) > 1 else 0
+    prefix = [int(value) for value in attention.reshape(-1)[:8].tolist()]
+    lease_values = [] if leases is None else [int(value) for value in leases.tolist()]
+    print(
+        "P10_RUNTIME_TERMINAL_DIAG "
+        f"control={forward} stage_b_diag={diagnostic} "
+        f"stage_b_diag_name={_STAGE_B_DIAGNOSTIC_NAMES.get(diagnostic, 'unknown')} "
+        f"receipt_free={count_eq(receipt, 0)} receipt_filling={count_eq(receipt, 1)} "
+        f"receipt_ready={count_eq(receipt, 2)} receipt_claimed={count_eq(receipt, 3)} "
+        f"receipt_done={count_eq(receipt, 4)} source_mapped={int(torch.count_nonzero(source_slots >= 0).item())} "
+        f"object_mapped={int(torch.count_nonzero(object_slots >= 0).item())} "
+        f"resident_empty={count_eq(ready, 0)} resident_in_flight={count_eq(ready, 1)} "
+        f"resident_ready={count_eq(ready, 2)} speculative_cursor={int(cursor.reshape(-1)[0].item())} "
+        f"queue_leases={lease_values} attention_prefix={prefix}",
+        flush=True,
+    )
+
+
 def _assert_terminal(
     reference: Any,
     fixture: _ForwardResidentKvaf,
@@ -515,6 +574,7 @@ def _assert_terminal(
         raise AssertionError(f"canonical score-source lengths mismatch: {actual_lens.tolist()}")
     forward = tensors["forward_control"].detach().cpu().tolist()
     if int(forward[5]) != 1:
+        _emit_terminal_diagnostic(fixture, tensors, forward)
         raise AssertionError(f"Stage B did not reach forward COMPLETE: control={forward}")
     states = tensors["receipt_state"].detach().cpu()
     if int(torch.count_nonzero(states != 4).item()) != 0:

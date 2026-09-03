@@ -500,6 +500,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         tiling_->activeRowCount == 0U ||
         tiling_->sparseCount != kSparseCount ||
         tiling_->boundedDrainPolls == 0U) {
+      RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_INIT_COMMON);
       return;
     }
 
@@ -542,6 +543,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         static_cast<uint64_t>(recallBand_.base) +
                 static_cast<uint32_t>(recallBand_.capacity) >
             tiling_->residentRowCount) {
+      RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_INIT_GEOMETRY);
       return;
     }
 
@@ -553,6 +555,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         control.queue_leases != reinterpret_cast<uint64_t>(queueLeases_) ||
         control.output != reinterpret_cast<uint64_t>(residentPayload_) ||
         control.output_rows < tiling_->residentRowCount) {
+      RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_INIT_KVAF);
       return;
     }
 
@@ -585,9 +588,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
         leaseResult_ == nullptr || receiptClaim_ == nullptr ||
         receiptDone_ == nullptr ||
         slotClaim_ == nullptr || completion_ == nullptr) {
+      RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_INIT_UB);
       return;
     }
     enabled_ = true;
+    MarkRunning();
   }
 
   __aicore__ inline void Process() {
@@ -620,6 +625,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
           (void)DrainLocalWaves(false);
         }
         if (!owned_receipts_done) {
+          RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_RECEIPT_TERMINAL);
           return;
         }
       }
@@ -631,13 +637,51 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     // Only final exact winners may force transport progress. False-positive
     // speculative rows stay allocated but are never emitted.
-    if (!FinalizeAssignedRows() || !DrainLocalWaves(true)) {
+    if (!FinalizeAssignedRows()) {
+      RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE);
+      return;
+    }
+    if (!DrainLocalWaves(true)) {
+      RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_DRAIN);
       return;
     }
     MarkWorkerComplete();
   }
 
  private:
+  // This is intentionally a tiny diagnostic ledger, not a second lifecycle
+  // protocol.  It uses the existing forward_control[1] word, which no stage
+  // reads for scheduling.  The first negative error wins; a later worker can
+  // only replace the benign RUNNING marker, never erase an earlier failure.
+  __aicore__ inline void MarkRunning() {
+    if (forwardControl_ == nullptr) {
+      return;
+    }
+    (void)AscendC::AtomicCas<uint32_t>(
+        reinterpret_cast<__gm__ uint32_t*>(
+            forwardControl_ + A5_P10_STAGE_B_DIAGNOSTIC),
+        static_cast<uint32_t>(A5_P10_STAGE_B_DIAGNOSTIC_CLEAR),
+        static_cast<uint32_t>(A5_P10_STAGE_B_DIAGNOSTIC_RUNNING));
+  }
+
+  __aicore__ inline void RecordFirstFailure(int32_t code) {
+    if (forwardControl_ == nullptr || code >= 0) {
+      return;
+    }
+    auto* const word = reinterpret_cast<__gm__ uint32_t*>(
+        forwardControl_ + A5_P10_STAGE_B_DIAGNOSTIC);
+    const uint32_t desired = static_cast<uint32_t>(code);
+    // Do not depend on AtomicCas returning the observed value: the AscendC
+    // interface is intentionally used here in the same fire-and-forget form
+    // as the resident-map convergence CAS below.  The two legal benign
+    // predecessors are CLEAR and RUNNING; once a negative code is installed,
+    // neither CAS can overwrite it, so the first failure remains durable.
+    (void)AscendC::AtomicCas<uint32_t>(
+        word, static_cast<uint32_t>(A5_P10_STAGE_B_DIAGNOSTIC_CLEAR), desired);
+    (void)AscendC::AtomicCas<uint32_t>(
+        word, static_cast<uint32_t>(A5_P10_STAGE_B_DIAGNOSTIC_RUNNING), desired);
+  }
+
   __aicore__ inline bool ProducerSealed() const {
     return ReadGmByPassDCache<int32_t>(
                forwardControl_ + A5_P10_STAGE_B_PRODUCER_SEALED) ==
@@ -1250,22 +1294,23 @@ extern "C" __global__ __aicore__ void a5_p10_score_receipt_forward_resident(
   (void)selected_slot_lengths;
   (void)resident_seq_lengths;
   (void)workspace;
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+  // Stage B owns SIMT/AIV scans, queue leases and Direct-HCCP progression;
+  // it has no Cube/AIC branch.  This must be AIV_ONLY so GetBlockIdx() is the
+  // exact logical executor worker id selected by its tiler.
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   REGISTER_TILING_DEFAULT(A5P10ScoreReceiptForwardResidentTilingData);
   GET_TILING_DATA(tiling_data, tiling);
-  if ASCEND_IS_AIV {
-    TPipe pipe;
-    a5_p10_stage_b::A5P10ScoreReceiptForwardResidentKernel op(&pipe,
-                                                               &tiling_data);
-    op.Init(score_surface, receipt_ring, receipt_state, forward_control,
-            active_row_pool_entries, kv_object_map, kv_object_slots_snapshot,
-            kv_object_to_forward_slot, source_to_forward_slot,
-            speculative_slot_band,
-            speculative_slot_cursor, recall_slot_band,
-            canonical_sparse_indices, canonical_score_source_lens,
-            kvaf_forward_resident_control, queue_leases, resident_payload,
-            resident_ready, resident_row_to_qsfa_slot, attention_slots_buffer,
-            selected_slot_lengths_buffer);
-    op.Process();
-  }
+  TPipe pipe;
+  a5_p10_stage_b::A5P10ScoreReceiptForwardResidentKernel op(&pipe,
+                                                             &tiling_data);
+  op.Init(score_surface, receipt_ring, receipt_state, forward_control,
+          active_row_pool_entries, kv_object_map, kv_object_slots_snapshot,
+          kv_object_to_forward_slot, source_to_forward_slot,
+          speculative_slot_band,
+          speculative_slot_cursor, recall_slot_band,
+          canonical_sparse_indices, canonical_score_source_lens,
+          kvaf_forward_resident_control, queue_leases, resident_payload,
+          resident_ready, resident_row_to_qsfa_slot, attention_slots_buffer,
+          selected_slot_lengths_buffer);
+  op.Process();
 }
