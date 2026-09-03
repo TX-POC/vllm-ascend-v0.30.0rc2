@@ -12,10 +12,17 @@ pipeline, not a CPU transport fallback:
 * Stage C consumes unchanged exact C8 Top-K source IDs and guaranteed-recalls
   every unresolved winner before QSFA may read resident slots.
 
-Receipt-ring entries are reusable after Stage B copied their descriptor and
-compact seed list.  Resident slots are not: they are monotonic per-forward
-allocations, so a false-positive speculative payload cannot displace a final
-winner and no cross-forward ABA protocol is needed.
+Receipt-ring entries use the explicit lifecycle
+``FREE -> FILLING -> READY -> CLAIMED -> DONE -> FREE``.  ``DONE`` is
+deliberate: Stage B must first make a durable local copy (or terminally reject
+an invalid descriptor) before an explicit recycle makes the GM ring slot
+available again.  A claimed record is therefore never silently made free.
+
+Resident slots are monotonic per-forward allocations, so a false-positive
+speculative payload cannot displace a final winner and no cross-forward ABA
+protocol is needed.  The bounded HCCP queue is shared by speculative and
+guaranteed-recall posts; final exact winners are admitted while that executor
+is still alive, not after it has drained to terminal.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ class ReceiptState(str, Enum):
     FILLING = "filling"
     READY = "ready"
     CLAIMED = "claimed"
+    DONE = "done"
 
 
 @dataclass(frozen=True)
@@ -92,8 +100,10 @@ class ScoreReceipt:
 class PendingPost:
     """Stage-B-owned descriptor copy accepted by PostOnly but not CQ-drained."""
 
-    receipt: ScoreReceipt
+    queue_id: int
     seeds: tuple[CandidateSeed, ...]
+    path: str
+    receipt: ScoreReceipt | None = None
 
 
 @dataclass(frozen=True)
@@ -145,10 +155,14 @@ class ProtocolStats:
     score_receipts_published: int = 0
     candidates_compacted: int = 0
     candidates_posted: int = 0
+    guaranteed_recall_posted: int = 0
     cq_terminal: int = 0
+    receipts_completed: int = 0
+    receipts_rejected: int = 0
     deferred_ring_full: int = 0
     deferred_seed_capacity: int = 0
     deferred_arena_capacity: int = 0
+    deferred_queue_busy: int = 0
     skipped_persistent: int = 0
     skipped_duplicate: int = 0
     skipped_invalid_object: int = 0
@@ -248,13 +262,21 @@ class ScoreReceiptResidentProtocol:
         workers: int,
         ring_slots_per_worker: int = 2,
         seed_capacity: int = 64,
+        hccp_queue_count: int = 2,
         speculative_slots_per_row: int,
         recall_slots_per_row: int,
     ) -> None:
         if not object_directory:
             raise ValueError("object_directory must contain at least one row")
-        if workers <= 0 or ring_slots_per_worker <= 0 or seed_capacity <= 0:
-            raise ValueError("workers, ring slots, and seed capacity must be positive")
+        if (
+            workers <= 0
+            or ring_slots_per_worker <= 0
+            or seed_capacity <= 0
+            or hccp_queue_count <= 0
+        ):
+            raise ValueError(
+                "workers, ring slots, seed capacity, and HCCP queue count must be positive"
+            )
         self._object_directory = tuple(
             tuple(int(value) for value in row) for row in object_directory
         )
@@ -271,6 +293,8 @@ class ScoreReceiptResidentProtocol:
         # This is Stage B's bounded CandidateCompact microbatch, not Stage A's
         # ring payload capacity.
         self.seed_capacity = int(seed_capacity)
+        # This is a fixed transport-resource pool, not a physical-AIV split.
+        self.hccp_queue_count = int(hccp_queue_count)
         self.arena = ForwardOwnedArena(
             rows=self.rows,
             speculative_capacity=int(speculative_slots_per_row),
@@ -288,7 +312,11 @@ class ScoreReceiptResidentProtocol:
         self._reserved_object_to_ordinal: dict[tuple[int, int], int] = {}
         self._terminal_object_to_ordinal: dict[tuple[int, int], int] = {}
         self._terminal_object_path: dict[tuple[int, int], str] = {}
+        self._free_queue_ids = set(range(self.hccp_queue_count))
         self._pending: list[PendingPost] = []
+        self._recall_backlog: list[CandidateSeed] = []
+        self._admitted_winners: tuple[tuple[int, ...], ...] | None = None
+        self._admitted_persistent: dict[tuple[int, int], int] | None = None
         self._finalized: FinalizedForward | None = None
         self._executor_terminal = False
 
@@ -299,6 +327,24 @@ class ScoreReceiptResidentProtocol:
     @property
     def executor_terminal(self) -> bool:
         return self._executor_terminal
+
+    @property
+    def pending_post_count(self) -> int:
+        """Number of durable PostOnly waves awaiting CQ terminal."""
+
+        return len(self._pending)
+
+    @property
+    def free_queue_count(self) -> int:
+        """Number of HCCP queues currently available to either post path."""
+
+        return len(self._free_queue_ids)
+
+    @property
+    def recall_backlog_count(self) -> int:
+        """Exact-winner Get seeds admitted but awaiting shared-queue capacity."""
+
+        return len(self._recall_backlog)
 
     def receipt_states(self) -> tuple[tuple[ReceiptState, ...], ...]:
         return tuple(
@@ -375,10 +421,17 @@ class ScoreReceiptResidentProtocol:
         for worker_records in self._records:
             for record in worker_records:
                 if record.state is ReceiptState.READY:
-                    if record.receipt is None:
-                        raise ProtocolViolation("READY receipt has no descriptor")
                     record.state = ReceiptState.CLAIMED
-                    return record.receipt
+                    receipt = record.receipt
+                    if receipt is None or not self._receipt_payload_is_valid(receipt):
+                        # Fail closed.  The descriptor cannot become reusable
+                        # until an explicit DONE -> FREE recycle, and it is
+                        # visible in diagnostics rather than being a no-op.
+                        record.receipt = None
+                        record.state = ReceiptState.DONE
+                        self.stats.receipts_rejected += 1
+                        continue
+                    return receipt
         return None
 
     def compact_claimed_receipt(
@@ -438,46 +491,91 @@ class ScoreReceiptResidentProtocol:
 
     def post_compacted_receipt(
         self, receipt: ScoreReceipt, seeds: Sequence[CandidateSeed]
-    ) -> None:
-        """Stage B: copy compacted seeds, issue PostOnly, release ring storage."""
+    ) -> bool:
+        """Try Stage-B PostOnly without bypassing bounded queue ownership.
+
+        ``False`` is bounded-resource backpressure, not a dropped seed.  The
+        receipt remains ``CLAIMED`` and its compacted list remains durable for
+        a later retry after CQ frees any queue.  A successful copy moves the
+        receipt to ``DONE``; only :meth:`recycle_done_receipt` can make it
+        ``FREE``.
+        """
 
         self._ensure_open()
         record = self._record_for(receipt)
         if record.state is not ReceiptState.CLAIMED or record.receipt != receipt:
             raise ProtocolViolation("only the claimed receipt can be posted")
         key = self._receipt_key(receipt)
-        expected = self._compacted.pop(key, None)
+        expected = self._compacted.get(key)
         actual = tuple(seeds)
         if expected is None:
             raise ProtocolViolation("PostOnly requires Stage-B CandidateCompact first")
         if actual != expected:
             raise ProtocolViolation("PostOnly seed list differs from compacted receipt")
-        if actual:
-            # The pending copy owns the seeds after descriptor/ring reuse.
-            self._pending.append(PendingPost(receipt=receipt, seeds=actual))
-            self.stats.candidates_posted += len(actual)
+        if actual and not self._try_post(
+            actual, path="speculative_terminal", receipt=receipt
+        ):
+            return False
+        self._compacted.pop(key)
+        record.state = ReceiptState.DONE
+        self.stats.receipts_completed += 1
+        return True
+
+    def recycle_done_receipt(self, receipt: ScoreReceipt) -> None:
+        """Explicitly recycle a completed Stage-B receipt slot.
+
+        PostOnly owns a private seed copy before this operation.  CQ may still
+        be pending, but ring reuse cannot invalidate that copy.  This split is
+        what makes the ``DONE -> FREE`` transition observable and prevents a
+        CLAIMED record from being silently reused.
+        """
+
+        self._ensure_open()
+        record = self._record_for(receipt)
+        if record.state is not ReceiptState.DONE or record.receipt != receipt:
+            raise ProtocolViolation("only the matching DONE receipt can be recycled")
         record.receipt = None
         record.state = ReceiptState.FREE
+
+    def recycle_done_receipts(self) -> int:
+        """Recycle all completed/rejected ring entries after their terminal copy."""
+
+        self._ensure_open()
+        recycled = 0
+        for worker_records in self._records:
+            for record in worker_records:
+                if record.state is ReceiptState.DONE:
+                    record.receipt = None
+                    record.state = ReceiptState.FREE
+                    recycled += 1
+        return recycled
 
     def drain_cq(self, *, limit: int | None = None) -> int:
         """Make accepted posts terminal under the no-transport-failure model."""
 
         self._ensure_open()
-        count = len(self._pending) if limit is None else int(limit)
-        if count < 0:
+        count = None if limit is None else int(limit)
+        if count is not None and count < 0:
             raise ValueError("CQ drain limit cannot be negative")
         drained = 0
-        while self._pending and drained < count:
+        while self._pending and (count is None or drained < count):
             pending = self._pending.pop(0)
+            if pending.queue_id in self._free_queue_ids:
+                raise ProtocolViolation("CQ terminal observed a queue that was already free")
             for seed in pending.seeds:
                 key = (seed.row, seed.kv_object)
                 expected = self._reserved_object_to_ordinal.get(key)
                 if expected != seed.slot_ordinal:
                     raise ProtocolViolation("terminal post lost its arena reservation")
                 self._terminal_object_to_ordinal[key] = seed.slot_ordinal
-                self._terminal_object_path[key] = "speculative_terminal"
+                self._terminal_object_path[key] = pending.path
                 self.stats.cq_terminal += 1
+            self._free_queue_ids.add(pending.queue_id)
             drained += 1
+            # Exact final recall uses precisely this same queue pool.  A CQ
+            # terminal immediately gives it a chance to make progress without
+            # waiting for speculative executor terminal.
+            self._pump_recall_posts()
         return drained
 
     def mark_producer_done(self, worker: int) -> None:
@@ -500,13 +598,87 @@ class ScoreReceiptResidentProtocol:
             raise ProtocolViolation("executor terminal before CQ drain")
         if self._compacted:
             raise ProtocolViolation("executor terminal before compacted receipt PostOnly")
+        if self._recall_backlog:
+            raise ProtocolViolation("executor terminal before final recall PostOnly")
         if any(
             record.state is not ReceiptState.FREE
             for worker_records in self._records
             for record in worker_records
         ):
             raise ProtocolViolation("executor terminal while a receipt is not free")
+        if self._admitted_winners is None:
+            raise ProtocolViolation("executor terminal before exact winner admission")
+        if not self._all_admitted_winners_terminal():
+            raise ProtocolViolation("executor terminal before final winner CQ drain")
         self._executor_terminal = True
+
+    def admit_final_winners(
+        self,
+        exact_winner_sources: Sequence[Sequence[int]],
+        *,
+        persistent_object_slots: Mapping[tuple[int, int], int] | None = None,
+    ) -> int:
+        """Admit exact winners into the still-live shared PostOnly executor.
+
+        C8's exact Top-K is authoritative.  Objects already reserved by
+        speculation keep their fixed prefix slot and simply wait for their
+        existing PostOnly/CQ path.  Every otherwise-unresolved winner receives
+        a fixed suffix slot and is submitted through the *same* bounded queue
+        pool.  This must happen before executor terminal; ``finalize`` only
+        exposes terminal resident slots to QSFA.
+        """
+
+        self._ensure_open()
+        if self._executor_terminal:
+            raise ProtocolViolation("exact winners cannot be admitted after executor terminal")
+        winners = self._validate_exact_winners(exact_winner_sources)
+        persistent = self._normalize_persistent(persistent_object_slots)
+        if self._admitted_winners is not None:
+            if winners != self._admitted_winners or persistent != self._admitted_persistent:
+                raise ProtocolViolation("exact winner admission differs from prior admission")
+            return 0
+
+        missing: list[tuple[int, int, int]] = []
+        missing_by_row = [0] * self.rows
+        seen_missing: set[tuple[int, int]] = set()
+        for row, row_winners in enumerate(winners):
+            for source in row_winners:
+                if source == -1:
+                    continue
+                obj = self._object_at(row, source)
+                key = (row, obj)
+                if key in persistent or key in self._reserved_object_to_ordinal:
+                    continue
+                if key in seen_missing:
+                    continue
+                seen_missing.add(key)
+                missing.append((row, source, obj))
+                missing_by_row[row] += 1
+        for row, needed in enumerate(missing_by_row):
+            if needed > self.arena.remaining_recall(row):
+                raise ProtocolViolation(
+                    "recall arena is too small for exact winners; no slots were "
+                    f"allocated for row={row} needed={needed} "
+                    f"remaining={self.arena.remaining_recall(row)}"
+                )
+
+        recall_seeds: list[CandidateSeed] = []
+        for row, source, obj in missing:
+            ordinal = self.arena.reserve_recall(row)
+            if ordinal is None:
+                raise ProtocolViolation("recall reservation unexpectedly failed")
+            key = (row, obj)
+            self._reserved_object_to_ordinal[key] = ordinal
+            recall_seeds.append(
+                CandidateSeed(
+                    row=row, source=source, kv_object=obj, slot_ordinal=ordinal
+                )
+            )
+        self._admitted_winners = winners
+        self._admitted_persistent = persistent
+        self._recall_backlog.extend(recall_seeds)
+        self._pump_recall_posts()
+        return len(recall_seeds)
 
     def finalize(
         self,
@@ -514,34 +686,19 @@ class ScoreReceiptResidentProtocol:
         *,
         persistent_object_slots: Mapping[tuple[int, int], int] | None = None,
     ) -> FinalizedForward:
-        """Stage C: exact Top-K is authoritative; recall unresolved winners."""
+        """Expose terminal resident slots after prior exact-winner admission."""
 
         self._ensure_open()
         if not self._executor_terminal:
             raise ProtocolViolation("finalization requires terminal executor drain")
-        persistent = persistent_object_slots or {}
+        persistent = self._normalize_persistent(persistent_object_slots)
         winners = self._validate_exact_winners(exact_winner_sources)
-
-        recall_needed = [0] * self.rows
-        for row, row_winners in enumerate(winners):
-            unresolved_objects: set[int] = set()
-            for source in row_winners:
-                if source == -1:
-                    continue
-                obj = self._object_at(row, source)
-                if (row, obj) in persistent:
-                    continue
-                if (row, obj) in self._terminal_object_to_ordinal:
-                    continue
-                unresolved_objects.add(obj)
-            recall_needed[row] = len(unresolved_objects)
-        for row, needed in enumerate(recall_needed):
-            if needed > self.arena.remaining_recall(row):
-                raise ProtocolViolation(
-                    "recall arena is too small for exact winners; no slots were "
-                    f"allocated for row={row} needed={needed} "
-                    f"remaining={self.arena.remaining_recall(row)}"
-                )
+        if self._admitted_winners is None:
+            raise ProtocolViolation("finalization requires exact winner admission")
+        if winners != self._admitted_winners or persistent != self._admitted_persistent:
+            raise ProtocolViolation("finalization differs from exact winner admission")
+        if not self._all_admitted_winners_terminal():
+            raise ProtocolViolation("finalization requires final winner CQ drain")
 
         placements: list[WinnerPlacement] = []
         attention_slots: list[tuple[int, ...]] = []
@@ -563,17 +720,10 @@ class ScoreReceiptResidentProtocol:
                     object_key = (row, obj)
                     ordinal = self._terminal_object_to_ordinal.get(object_key)
                     if ordinal is None:
-                        ordinal = self.arena.reserve_recall(row)
-                        if ordinal is None:
-                            raise ProtocolViolation("recall reservation unexpectedly failed")
-                        # P10's current product assumption is that a posted
-                        # Get succeeds.  Stage C therefore posts/drains all
-                        # unresolved winners before it exposes QSFA slots.
-                        self._terminal_object_to_ordinal[object_key] = ordinal
-                        self._terminal_object_path[object_key] = "guaranteed_recall"
-                        path = "guaranteed_recall"
-                    else:
-                        path = self._terminal_object_path[object_key]
+                        raise ProtocolViolation(
+                            "final winner has no terminal forward-owned resident slot"
+                        )
+                    path = self._terminal_object_path[object_key]
                     slot_id = self.arena.slot_id(row, ordinal)
                 row_slots.append(slot_id)
                 row_objects.append(obj)
@@ -654,6 +804,99 @@ class ScoreReceiptResidentProtocol:
             self.stats.skipped_duplicate += 1
             return None
         return CandidateSeed(row=row, source=source, kv_object=obj, slot_ordinal=-1)
+
+    def _try_post(
+        self,
+        seeds: Sequence[CandidateSeed],
+        *,
+        path: str,
+        receipt: ScoreReceipt | None = None,
+    ) -> bool:
+        """Own a fixed queue, then make one PostOnly wave durable.
+
+        It intentionally never waits for CQ.  Queue exhaustion retains the
+        caller's seed ownership and reports bounded backpressure.
+        """
+
+        if not seeds:
+            return True
+        if not self._free_queue_ids:
+            self.stats.deferred_queue_busy += len(seeds)
+            return False
+        queue_id = min(self._free_queue_ids)
+        self._free_queue_ids.remove(queue_id)
+        self._pending.append(
+            PendingPost(
+                queue_id=queue_id,
+                seeds=tuple(seeds),
+                path=path,
+                receipt=receipt,
+            )
+        )
+        if path == "speculative_terminal":
+            self.stats.candidates_posted += len(seeds)
+        elif path == "guaranteed_recall":
+            self.stats.guaranteed_recall_posted += len(seeds)
+        else:
+            raise ProtocolViolation("unknown PostOnly path")
+        return True
+
+    def _pump_recall_posts(self) -> int:
+        """Move admitted exact winners through the same bounded queue pool."""
+
+        posted = 0
+        while self._recall_backlog:
+            batch = tuple(self._recall_backlog[: self.seed_capacity])
+            if not self._try_post(batch, path="guaranteed_recall"):
+                break
+            del self._recall_backlog[: len(batch)]
+            posted += len(batch)
+        return posted
+
+    def _all_admitted_winners_terminal(self) -> bool:
+        if self._admitted_winners is None or self._admitted_persistent is None:
+            return False
+        for row, row_winners in enumerate(self._admitted_winners):
+            for source in row_winners:
+                if source == -1:
+                    continue
+                obj = self._object_at(row, source)
+                key = (row, obj)
+                if key not in self._admitted_persistent and key not in self._terminal_object_to_ordinal:
+                    return False
+        return True
+
+    def _normalize_persistent(
+        self, mapping: Mapping[tuple[int, int], int] | None
+    ) -> dict[tuple[int, int], int]:
+        result: dict[tuple[int, int], int] = {}
+        for (row, obj), slot_id in (mapping or {}).items():
+            if not 0 <= int(row) < self.rows or int(obj) < 0 or int(slot_id) < 0:
+                raise ProtocolViolation("persistent resident mapping is invalid")
+            result[(int(row), int(obj))] = int(slot_id)
+        return result
+
+    def _receipt_payload_is_valid(self, receipt: ScoreReceipt) -> bool:
+        """Validate a claimed descriptor before Stage B trusts its score window."""
+
+        descriptor = receipt.descriptor
+        row = int(descriptor.row)
+        if (
+            receipt.worker < 0
+            or receipt.worker >= self.workers
+            or receipt.ring_slot < 0
+            or receipt.ring_slot >= self.ring_slots_per_worker
+            or descriptor.sequence <= 0
+            or descriptor.score_element_bytes != 2
+            or descriptor.score_surface_offset_bytes < 0
+            or descriptor.score_surface_offset_bytes % 2
+            or descriptor.valid_count != len(receipt.score_surface_values)
+            or not 0 <= row < self.rows
+            or descriptor.source_begin < 0
+            or descriptor.source_begin + descriptor.valid_count > len(self._object_directory[row])
+        ):
+            return False
+        return all(0 <= int(score) <= 0xFFFF for score in receipt.score_surface_values)
 
     def _validate_exact_winners(
         self, exact_winner_sources: Sequence[Sequence[int]]

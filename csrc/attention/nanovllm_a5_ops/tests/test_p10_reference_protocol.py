@@ -34,6 +34,7 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         workers: int = 1,
         ring_slots: int = 2,
         seed_capacity: int = 64,
+        queue_count: int = 2,
         speculative_slots: int = 8,
         recall_slots: int = 8,
         active_rows: int | None = None,
@@ -50,6 +51,7 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             workers=workers,
             ring_slots_per_worker=ring_slots,
             seed_capacity=seed_capacity,
+            hccp_queue_count=queue_count,
             speculative_slots_per_row=speculative_slots,
             recall_slots_per_row=recall_slots,
         )
@@ -74,12 +76,14 @@ class P10ReferenceProtocolTest(unittest.TestCase):
     def _drain_all(
         protocol: ScoreReceiptResidentProtocol,
         *,
+        exact_winners: tuple[tuple[int, ...], ...],
         threshold_by_row: dict[int, int] | None = None,
         persistent_object_slots: dict[tuple[int, int], int] | None = None,
     ) -> None:
         thresholds = threshold_by_row or {
             row: 1 for row in range(protocol.active_row_count)
         }
+        claimed: list[tuple[object, tuple[object, ...]]] = []
         while True:
             receipt = protocol.claim_ready_receipt()
             if receipt is None:
@@ -89,7 +93,28 @@ class P10ReferenceProtocolTest(unittest.TestCase):
                 threshold_by_row=thresholds,
                 persistent_object_slots=persistent_object_slots,
             )
-            protocol.post_compacted_receipt(receipt, seeds)
+            claimed.append((receipt, seeds))
+
+        # A bounded queue may leave a descriptor CLAIMED.  CQ progress is the
+        # only way to make retryable capacity available; no receipt is dropped.
+        while claimed:
+            waiting: list[tuple[object, tuple[object, ...]]] = []
+            for receipt, seeds in claimed:
+                if protocol.post_compacted_receipt(receipt, seeds):
+                    protocol.recycle_done_receipt(receipt)
+                else:
+                    waiting.append((receipt, seeds))
+            claimed = waiting
+            if claimed:
+                if protocol.drain_cq(limit=1) != 1:
+                    raise AssertionError("bounded queue made no retry progress")
+
+        # This is intentionally before executor terminal.  Any unresolved
+        # exact winner enters the same bounded PostOnly/CQ path as speculation.
+        protocol.admit_final_winners(
+            exact_winners,
+            persistent_object_slots=persistent_object_slots,
+        )
         protocol.drain_cq()
         for worker in range(protocol.workers):
             protocol.mark_producer_done(worker)
@@ -146,7 +171,7 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         )
 
         without_speculation = self._protocol(speculative_slots=0, recall_slots=4)
-        self._drain_all(without_speculation)
+        self._drain_all(without_speculation, exact_winners=winners)
         no_spec_result = without_speculation.finalize(winners)
 
         with_speculation = self._protocol(speculative_slots=8, recall_slots=4)
@@ -177,7 +202,11 @@ class P10ReferenceProtocolTest(unittest.TestCase):
                 ),
             )
         )
-        self._drain_all(with_speculation, threshold_by_row={0: 60, 1: 60})
+        self._drain_all(
+            with_speculation,
+            exact_winners=winners,
+            threshold_by_row={0: 60, 1: 60},
+        )
         spec_result = with_speculation.finalize(winners)
 
         self.assertEqual(no_spec_result.winner_objects, baseline)
@@ -209,6 +238,8 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertEqual([seed.source for seed in seeds], [0, 1])
         self.assertEqual(protocol.stats.deferred_seed_capacity, 3)
         protocol.post_compacted_receipt(receipt, seeds)
+        protocol.recycle_done_receipt(receipt)
+        protocol.admit_final_winners(((0, 1, 2, 3, 4), (-1,)))
         protocol.drain_cq()
         protocol.mark_producer_done(0)
         protocol.mark_executor_terminal()
@@ -250,6 +281,8 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             claimed, threshold_by_row={0: 1, 1: 1}
         )
         protocol.post_compacted_receipt(claimed, first_seeds)
+        self.assertEqual(protocol.receipt_states(), ((ReceiptState.DONE,),))
+        protocol.recycle_done_receipt(claimed)
         self.assertEqual(protocol.receipt_states(), ((ReceiptState.FREE,),))
 
         second = self._publish(
@@ -286,6 +319,94 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertEqual(protocol.stats.candidates_compacted, 0)
         self.assertEqual(protocol.arena.allocated_slot_ids(), ())
 
+    def test_invalid_claim_is_done_then_explicitly_recycled_not_silently_freed(self) -> None:
+        protocol = self._protocol(ring_slots=1, speculative_slots=1, recall_slots=1)
+        receipt = self._publish(
+            protocol, observations=(ScoreObservation(0, 0, 10),)
+        )
+        assert receipt is not None
+
+        # Model a corrupt published descriptor: the claim CAS has already
+        # moved the slot out of READY before descriptor validation fails.
+        protocol._records[0][0].receipt = None  # pylint: disable=protected-access
+        self.assertIsNone(protocol.claim_ready_receipt())
+        self.assertEqual(protocol.receipt_states(), ((ReceiptState.DONE,),))
+        self.assertEqual(protocol.stats.receipts_rejected, 1)
+
+        self.assertIsNone(
+            self._publish(
+                protocol,
+                tile=1,
+                offset=2,
+                observations=(ScoreObservation(0, 1, 10),),
+            )
+        )
+        protocol.recycle_done_receipts()
+        self.assertEqual(protocol.receipt_states(), ((ReceiptState.FREE,),))
+
+    def test_final_recall_is_admitted_before_terminal_and_shares_bounded_queue(self) -> None:
+        protocol = self._protocol(
+            ring_slots=2,
+            seed_capacity=1,
+            queue_count=1,
+            speculative_slots=2,
+            recall_slots=1,
+        )
+        first = self._publish(
+            protocol, tile=0, observations=(ScoreObservation(0, 0, 10),)
+        )
+        second = self._publish(
+            protocol,
+            tile=1,
+            offset=2,
+            observations=(ScoreObservation(0, 1, 10),),
+        )
+        assert first is not None and second is not None
+
+        first_claim = protocol.claim_ready_receipt()
+        first_seeds = protocol.compact_claimed_receipt(
+            first_claim, threshold_by_row={0: 1, 1: 1}
+        )
+        self.assertTrue(protocol.post_compacted_receipt(first_claim, first_seeds))
+        protocol.recycle_done_receipt(first_claim)
+        self.assertEqual(protocol.pending_post_count, 1)
+        self.assertEqual(protocol.free_queue_count, 0)
+
+        second_claim = protocol.claim_ready_receipt()
+        second_seeds = protocol.compact_claimed_receipt(
+            second_claim, threshold_by_row={0: 1, 1: 1}
+        )
+        self.assertFalse(protocol.post_compacted_receipt(second_claim, second_seeds))
+        self.assertEqual(protocol.receipt_states(), ((ReceiptState.FREE, ReceiptState.CLAIMED),))
+
+        # Object 2 was not speculatively reserved.  Its recall suffix slot is
+        # admitted now, while one speculative CQ is still pending, and waits
+        # on the same one-queue transport pool rather than a separate path.
+        self.assertEqual(protocol.admit_final_winners(((0, 1, 2), (-1,))), 1)
+        self.assertEqual(protocol.recall_backlog_count, 1)
+        self.assertGreaterEqual(protocol.stats.deferred_queue_busy, 2)
+
+        self.assertEqual(protocol.drain_cq(limit=1), 1)
+        self.assertEqual(protocol.recall_backlog_count, 0)
+        self.assertEqual(protocol.pending_post_count, 1)
+        self.assertFalse(protocol.post_compacted_receipt(second_claim, second_seeds))
+
+        self.assertEqual(protocol.drain_cq(limit=1), 1)
+        self.assertTrue(protocol.post_compacted_receipt(second_claim, second_seeds))
+        protocol.recycle_done_receipt(second_claim)
+        self.assertEqual(protocol.drain_cq(limit=1), 1)
+        protocol.mark_producer_done(0)
+        protocol.mark_executor_terminal()
+
+        result = protocol.finalize(((0, 1, 2), (-1,)))
+        self.assertEqual(
+            [placement.path for placement in result.placements if placement.row == 0],
+            ["speculative_terminal", "speculative_terminal", "guaranteed_recall"],
+        )
+        allocated = protocol.arena.allocated_slot_ids()
+        self.assertEqual(len(allocated), len(set(allocated)))
+        self.assertEqual(len(allocated), 3)
+
     def test_finalizer_refuses_until_all_producers_and_cq_work_are_terminal(self) -> None:
         protocol = self._protocol()
         receipt = self._publish(
@@ -297,12 +418,16 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             claimed, threshold_by_row={0: 1, 1: 1}
         )
         protocol.post_compacted_receipt(claimed, seeds)
+        protocol.recycle_done_receipt(claimed)
         protocol.mark_producer_done(0)
         with self.assertRaisesRegex(ProtocolViolation, "CQ drain"):
             protocol.mark_executor_terminal()
         with self.assertRaisesRegex(ProtocolViolation, "terminal executor drain"):
             protocol.finalize(((0,), (-1,)))
         protocol.drain_cq()
+        with self.assertRaisesRegex(ProtocolViolation, "exact winner admission"):
+            protocol.mark_executor_terminal()
+        protocol.admit_final_winners(((0,), (-1,)))
         protocol.mark_executor_terminal()
         result = protocol.finalize(((0,), (-1,)))
         self.assertEqual(result.winner_objects, ((17,), (-1,)))
@@ -325,6 +450,10 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertEqual([seed.source for seed in seeds], [3])
         self.assertEqual(protocol.stats.skipped_persistent, 1)
         protocol.post_compacted_receipt(claimed, seeds)
+        protocol.recycle_done_receipt(claimed)
+        protocol.admit_final_winners(
+            ((2, 3), (-1,)), persistent_object_slots={(0, 31): 700}
+        )
         protocol.drain_cq()
         protocol.mark_producer_done(0)
         protocol.mark_executor_terminal()
@@ -344,13 +473,13 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         )
         self.assertIsNone(receipt)
         self.assertEqual(protocol.stats.candidates_compacted, 0)
-        self._drain_all(protocol)
+        self._drain_all(protocol, exact_winners=((0,), (-1,)))
         result = protocol.finalize(((0,), (-1,)))
         self.assertEqual(result.winner_objects, ((17,), (-1,)))
 
     def test_graph_padded_row_cannot_enter_final_qsfa_mapping(self) -> None:
         protocol = self._protocol(active_rows=1, speculative_slots=2, recall_slots=2)
-        self._drain_all(protocol)
+        self._drain_all(protocol, exact_winners=((0,), (-1,)))
         with self.assertRaisesRegex(ProtocolViolation, "inactive graph-padded row"):
             protocol.finalize(((0,), (0,)))
 
@@ -373,6 +502,8 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertEqual([seed.source for seed in seeds], [0])
         self.assertEqual(protocol.stats.skipped_duplicate, 1)
         protocol.post_compacted_receipt(claimed, seeds)
+        protocol.recycle_done_receipt(claimed)
+        protocol.admit_final_winners(((0, 1),))
         protocol.drain_cq()
         protocol.mark_producer_done(0)
         protocol.mark_executor_terminal()
@@ -390,15 +521,13 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             speculative_slots_per_row=1,
             recall_slots_per_row=1,
         )
-        self._drain_all(protocol)
         with self.assertRaisesRegex(ProtocolViolation, "invalid KV object"):
-            protocol.finalize(((1,),))
+            protocol.admit_final_winners(((1,),))
 
     def test_recall_capacity_is_checked_before_any_recall_slot_is_allocated(self) -> None:
         protocol = self._protocol(speculative_slots=0, recall_slots=1)
-        self._drain_all(protocol)
         with self.assertRaisesRegex(ProtocolViolation, "recall arena is too small"):
-            protocol.finalize(((0, 1), (-1,)))
+            protocol.admit_final_winners(((0, 1), (-1,)))
         self.assertEqual(protocol.arena.allocated_slot_ids(), ())
 
 

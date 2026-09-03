@@ -1,94 +1,47 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "operator": "A5DsaC8ExactSpeculativeResident",
-  "source": {
-    "kind": "product_a5_c8_resolved_clone",
-    "resolved_input": {
-      "environment": "P10_PRODUCT_C8_SOURCE_ROOT",
-      "command_line": "--source-root",
-      "must_be_exact_operator_root": true,
-      "required_before_staging": true
+  "product": {
+    "architecture": "A5_C8_W4A4C8_V1",
+    "runtime_callable": "torch_npu.npu_quant_lightning_indexer",
+    "runtime_fallback_callable": "torch.ops._C_ascend.npu_lightning_indexer_quant",
+    "primary_callable_required": true,
+    "fallback_is_not_a_stage_a_derivation_target": true,
+    "input_abi": {
+      "query": "float8_e4m3fn",
+      "key": "float8_e4m3fn",
+      "weights": "bfloat16",
+      "query_dequant_scale": "float32_scale_metadata",
+      "key_dequant_scale": "float32_scale_metadata",
+      "topk_output": "int32"
     },
-    "families": [
-      {
-        "family": "vllm_quant_lightning_indexer",
-        "operator_symbol": "VllmQuantLightningIndexer",
-        "p10_execution_supported": true,
-        "source_declared_abi": "fp8_qk_fp32_weights_fp32_scales",
-        "required_files": [
-          "op_host/vllm_quant_lightning_indexer_def.cpp",
-          "op_host/vllm_quant_lightning_indexer_tiling.cpp",
-          "op_kernel/vllm_quant_lightning_indexer.cpp",
-          "op_kernel/arch35/quant_lightning_indexer_kernel.h",
-          "op_kernel/arch35/quant_lightning_indexer_service_vector.h"
-        ],
-        "score_seam": {
-          "file": "op_kernel/arch35/quant_lightning_indexer_service_vector.h",
-          "anchor": "BatchMulWeightAndReduceSum"
-        },
-        "final_topk": {
-          "file": "op_kernel/arch35/quant_lightning_indexer_service_vector.h",
-          "anchor": "ProcessTopK"
-        }
-      },
-      {
-        "family": "lightning_indexer_quant",
-        "operator_symbol": "LightningIndexerQuant",
-        "p10_execution_supported": false,
-        "runtime_abi": "family_specific_quantized_abi",
-        "source_declared_abi": "int8_qk_fp16_weights_and_scales",
-        "required_files": [
-          "op_host/lightning_indexer_quant_def.cpp",
-          "op_host/lightning_indexer_quant_tiling.cpp",
-          "op_kernel/lightning_indexer_quant.cpp",
-          "op_kernel/lightning_indexer_quant_kernel.h",
-          "op_kernel/lightning_indexer_quant_service_vector.h"
-        ]
-      }
-    ],
-    "selection": {
-      "must_report_family_root_sha_anchors_and_abi": true,
-      "must_report_the_actual_dsa_frontend_and_registered_operator": true,
-      "must_prove_product_abi_matches_the_source_family_before_staging": true,
-      "ambiguous_or_incomplete_source_fails_closed": true,
-      "unsupported_family_reports_supported_zero": true
-    }
+    "forbidden_product_paths": [
+      "main_dsa_v1_fp32",
+      "torch.ops._C_ascend.npu_vllm_quant_lightning_indexer",
+      "bf16_to_fp32_reference_widening",
+      "generic_vllm_quant_lightning_indexer_source_derivation",
+      "generic_lightning_indexer_quant_source_derivation"
+    ]
   },
-  "product_abi_equivalence_gate": {
-    "reference_callable": "a5_official_c8_reference.npu_vllm_quant_lightning_indexer",
-    "reference_weight_dtype": "float32",
-    "frontend_selection": {
-      "environment": "P10_PRODUCT_C8_FRONTEND",
-      "must_be_explicit": true,
-      "automatic_callable_inference": false
-    },
-    "frontends": [
-      {
-        "name": "dsa_offload_bf16",
-        "product_callable": "torch_npu.npu_quant_lightning_indexer",
-        "product_weight_dtype": "bfloat16",
-        "reference_weight_from_product": "lossless_bfloat16_to_float32_widen"
-      },
-      {
-        "name": "main_dsa_v1_fp32",
-        "product_callable": "torch.ops._C_ascend.npu_vllm_quant_lightning_indexer",
-        "product_metadata_callable": "torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata",
-        "product_weight_dtype": "float32",
-        "reference_weight_from_product": "identity_float32"
-      }
-    ],
-    "must_prove_before_npu_compare": [
-      "selected_product_frontend_source_contract",
-      "reference_source_git_head",
-      "reference_opp_p3_provenance",
-      "reference_bridge_p10_provenance"
-    ],
-    "product_fallback_callable_is_accepted": false,
-    "comparison": "bitwise_sparse_indices_on_identical_fp8_qk_and_frontend_declared_weight_values"
+  "source_derivation": {
+    "kind": "explicit_w4a4c8_runtime_source_only",
+    "environment": "P10_W4A4C8_SOURCE_ROOT",
+    "must_be_exact_operator_source_root": true,
+    "must_match_runtime_primary_callable": true,
+    "must_report_source_git_head_and_opp_provenance": true,
+    "source_unresolved_behavior": "fail_closed_no_stage_a_opp_build",
+    "automatic_generic_source_selection": false,
+    "generic_sources_are_diagnostic_only": true
+  },
+  "math_gate": {
+    "reference": "unmodified_source_matched_w4a4c8_operator",
+    "comparison": "exact_sparse_indices_on_identical_w4a4c8_input_tensors",
+    "fp32_conversion_or_reference": false,
+    "runtime_off_mutated_c8_comparison": false
   },
   "routing": {
     "feature_selection": "outside_operator",
-    "legacy_off_path": "untouched_native_c8_then_legacy_get",
+    "legacy_off_path": "untouched_native_w4a4c8_c8_then_legacy_get",
     "operator_has_runtime_enable_input": false,
     "operator_has_runtime_off_branch": false
   },
@@ -100,8 +53,8 @@
       "may_modify_c8_topk": false,
       "may_read_resident_mapping": false,
       "may_allocate_resident_slot": false,
-      "required_seam": "after_normal_score_dma_and_streaming_score_window_dma_completion",
-      "receipt_payload": "row_source_range_score_surface_offset_score_count_sequence"
+      "required_seam": "after_independent_w4a4c8_score_window_dma_before_original_topk_consumption",
+      "receipt_payload": "row_begin_row_count_source_begin_source_count_row_stride_bytes_score_surface_offset_bytes_score_element_bytes_sequence"
     },
     "executor": {
       "role": "exact_score_scan_candidate_compact_device_direct_hccp_post_and_nonblocking_cq_poll",
@@ -135,6 +88,7 @@
   "implementation_guard": {
     "forbid_legacy_prototype_reuse": true,
     "forbid_p9_p8_references": true,
-    "forbid_runtime_off_control": true
+    "forbid_runtime_off_control": true,
+    "forbid_fp32_product_derivation": true
   }
 }
