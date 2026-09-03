@@ -528,12 +528,21 @@ def _call_p9(op: Any, inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ..
     )
 
 
-def _assert_disabled_gate(
-    reference: tuple[torch.Tensor, torch.Tensor], p9_result: tuple[torch.Tensor, ...], p9: dict[str, torch.Tensor]
+def _assert_disabled_sparse_math(
+    reference: tuple[torch.Tensor, torch.Tensor],
+    p9_result: tuple[torch.Tensor, ...],
 ) -> None:
+    """Compare only C8's public mathematical result.
+
+    The ABI-only control operator deliberately preserves the C8 compute core
+    while leaving P9-only auxiliary outputs unwritten.  This narrow gate lets
+    the same fixture distinguish an ABI/build/launch effect from a score-seam
+    effect without pretending that the control implements resident Get.
+    """
+
     torch.npu.synchronize()
     indices, values = reference
-    target_indices, target_values, slots, stats = p9_result
+    target_indices, target_values, _slots, _stats = p9_result
     if not torch.equal(indices.cpu(), target_indices.cpu()):
         raise AssertionError(
             "runtime_enable=0 changed exact C8 sparse_indices: "
@@ -541,6 +550,18 @@ def _assert_disabled_gate(
         )
     if tuple(target_values.shape) != tuple(values.shape):
         raise AssertionError("runtime_enable=0 changed sparse_values ABI")
+    print(
+        "P9_RUNTIME_DISABLED_MATH runtime_enable=0 exact_sparse=1 "
+        f"reference_sha16={_sha16(indices)} target_sha16={_sha16(target_indices)}",
+        flush=True,
+    )
+
+
+def _assert_disabled_gate(
+    reference: tuple[torch.Tensor, torch.Tensor], p9_result: tuple[torch.Tensor, ...], p9: dict[str, torch.Tensor]
+) -> None:
+    _assert_disabled_sparse_math(reference, p9_result)
+    _target_indices, _target_values, slots, stats = p9_result
     if int(torch.count_nonzero(p9["candidate_source_to_slot"].cpu() >= 0)) != 0:
         raise AssertionError("runtime_enable=0 mutated candidate source slots")
     if int(torch.count_nonzero(p9["candidate_slot_cursor"].cpu())) != 0:
@@ -852,7 +873,7 @@ def _assert_active(
 def _main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--case", choices=("full",), default="full")
+    parser.add_argument("--case", choices=("disabled-math", "full"), default="full")
     args = parser.parse_args()
     if os.environ.get("P9_REQUIRE_REAL_HCCP", "1") != "1":
         _blocked("P9_REQUIRE_REAL_HCCP_must_be_1_for_acceptance")
@@ -872,7 +893,12 @@ def _main() -> int:
 
     disabled_control = torch.zeros(CONTROL_WORDS, dtype=torch.int64, device=device)
     disabled = _p9_inputs(base, device, False, disabled_control)
-    _assert_disabled_gate(reference, _call_p9(target_op, disabled), disabled)
+    disabled_result = _call_p9(target_op, disabled)
+    if args.case == "disabled-math":
+        _assert_disabled_sparse_math(reference, disabled_result)
+        print("P9_RUNTIME_PASS case=disabled-math runtime_enable_0=1", flush=True)
+        return 0
+    _assert_disabled_gate(reference, disabled_result, disabled)
 
     # A captured graph may retain padded execution rows whose pool indices
     # alias a live request.  This must be harmless even when runtime_enable

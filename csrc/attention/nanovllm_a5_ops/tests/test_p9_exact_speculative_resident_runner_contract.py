@@ -29,6 +29,16 @@ class P9ExactSpeculativeResidentRunnerContractTest(unittest.TestCase):
         self.assertNotIn("p8_real_direct_hccp_fixture", RUNTIME)
         self.assertNotIn("streaming_quant_li_get_target_adapter", RUNTIME)
 
+    def test_runtime_has_a_sparse_only_abi_control_gate(self) -> None:
+        """The same-builder control must not be mistaken for resident Get."""
+        for token in (
+            'choices=("disabled-math", "full")',
+            "P9_RUNTIME_DISABLED_MATH",
+            "P9_RUNTIME_PASS case=disabled-math runtime_enable_0=1",
+            "while leaving P9-only auxiliary outputs unwritten",
+        ):
+            self.assertIn(token, RUNTIME)
+
     def test_runtime_uses_explicit_slots_not_an_affine_execution_row_layout(self) -> None:
         self.assertIn("canonical_resident_slots", RUNTIME)
         self.assertIn("torch.empty((rows, TOPK), dtype=torch.int32)", RUNTIME)
