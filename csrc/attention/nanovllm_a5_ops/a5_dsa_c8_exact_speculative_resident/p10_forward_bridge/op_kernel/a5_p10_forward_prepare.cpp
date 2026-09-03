@@ -99,8 +99,9 @@ extern "C" __global__ __aicore__ void a5_p10_forward_prepare(
                  core_index, core_count);
 
     // Mutable control fields are initialized exactly once.  Tiling-owned
-    // geometry/cutoff words [1..4,6] are pre-materialized by the graph and
-    // intentionally survive this reset.
+    // geometry/cutoff words [2..4,6] are pre-materialized by the graph and
+    // intentionally survive this reset; word 1 is Stage B's diagnostic
+    // ledger and is deliberately reset below.
     if (core_index == 0U) {
         speculative_slot_cursor_gm.SetValue(0U, 0);
         forward_control_gm.SetValue(
