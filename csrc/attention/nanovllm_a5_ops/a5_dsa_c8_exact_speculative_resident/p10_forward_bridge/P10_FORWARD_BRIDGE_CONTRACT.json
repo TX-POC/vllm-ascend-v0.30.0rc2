@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "component": "P10ForwardBridge",
+  "scope": "single_w4a4c8_forward",
+  "purpose": "Construct the one forward graph that starts the native exact-score producer and the device-side resident executor from the same cold-bound aliases.",
+  "graph_nodes": {
+    "prepare": {
+      "operator": "A5P10ForwardPrepare",
+      "must_run_before": ["stage_a", "stage_b"],
+      "graph_visible": true,
+      "mutations": {
+        "receipt_state": "FREE",
+        "forward_control.producer_sealed": "OPEN",
+        "kv_object_to_forward_slot": -1,
+        "source_to_forward_slot": -1,
+        "speculative_slot_cursor": 0,
+        "queue_leases": 0,
+        "resident_ready": 0,
+        "producer_seal_sequence": 0,
+        "first_preseal_ready_claim_sequence": 0
+      },
+      "does_not_write": [
+        "receipt_ring",
+        "score_surface",
+        "canonical_sparse_indices",
+        "canonical_score_source_lens",
+        "attention_slots_buffer",
+        "selected_slot_lengths_buffer"
+      ]
+    },
+    "stage_a": {
+      "operator": "A5P10W4A4C8ScoreReceipt",
+      "inputs": 14,
+      "alias_outputs": 6,
+      "role": "native_w4a4c8_exact_score_and_topk_with_score_receipt_publication"
+    },
+    "stage_b": {
+      "operator": "A5P10ScoreReceiptForwardResident",
+      "launch": "companion_device_stream_after_prepare",
+      "inputs": 21,
+      "alias_outputs": 11,
+      "waits_for_stage_a_completion": false,
+      "synchronizes_with_stage_a": "receipt_state_READY_and_producer_sealed_only",
+      "executor_workers": "bounded_logical_tiling_parameter",
+      "physical_aiv_assignment": false,
+      "candidate_submission": "device_only",
+      "resident_row_to_qsfa_slot": "required_cold_bound_int32_resident_row_to_logical_qsfa_slot_translation",
+      "overlap_witness": "first_preseal_ready_claim_sequence_lt_producer_seal_sequence"
+    },
+    "qsfa": {
+      "waits_for": "stage_b_completion_alias",
+      "inputs": ["attention_slots", "resident_seq_lengths"],
+      "does_not_read": [
+        "receipt_ring",
+        "receipt_state",
+        "forward_control",
+        "queue_leases",
+        "resident_ready"
+      ]
+    }
+  },
+  "prohibited_edges": [
+    "stage_a.alias_output_to_stage_b.input",
+    "stage_a_completion_event_to_stage_b_start",
+    "python_candidate_seed_submission",
+    "host_kvaf_batch_get_submission",
+    "fixed_physical_aiv_get_partition"
+  ],
+  "required_edges": [
+    "prepare_to_stage_a",
+    "prepare_to_stage_b",
+    "stage_b_completion_to_qsfa"
+  ],
+  "product_assembly": {
+    "opapi_resolver": "one_fresh_combined_P10_vendor",
+    "operators": [
+      "A5P10ForwardPrepare",
+      "A5P10W4A4C8ScoreReceipt",
+      "A5P10ScoreReceiptForwardResident"
+    ],
+    "forbids": "mixed_independently_built_custom_opapi_libraries"
+  },
+  "public_boundary": {
+    "returns": ["attention_slots", "resident_seq_lengths"],
+    "canonical_topk_is_internal": true,
+    "tail_policy": "stage_b_preserves_the_pre_materialized_non_sparse_tail",
+    "slot_namespace": "Stage_B_translates_fixed_resident_row_to_QSFA_logical_slot_before_writing_attention_slots"
+  },
+  "runtime_status": "source_contract_only_until_the_three_matched_generated_aclnn_headers_and_opapi_packages_are_assembled"
+}

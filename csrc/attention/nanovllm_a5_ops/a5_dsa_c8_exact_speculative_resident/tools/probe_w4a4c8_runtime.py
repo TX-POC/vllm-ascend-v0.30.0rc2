@@ -2,9 +2,9 @@
 """Print compact, fail-closed provenance for the actual A5 W4A4C8 frontend.
 
 This deliberately does *not* allocate a tensor, select a device, launch a
-kernel, build an OPP, or infer an operator source directory.  It is the one
-cheap remote check needed before we derive a Stage-A sibling from the actual
-``torch_npu.npu_quant_lightning_indexer`` implementation.
+kernel, or build an OPP.  It verifies the actual provider ABI and reports
+whether the checked-in W4A4C8 Stage-A numerical source base is present.  A
+native binary is never treated as source code.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import sys
 THIS_DIR = Path(__file__).resolve().parent
 TARGET_ROOT = THIS_DIR.parent
 OPS_ROOT = TARGET_ROOT.parent
+STAGE_A_SOURCE_ROOT = TARGET_ROOT / "stage_a_w4a4c8_score_receipt"
 sys.path.insert(0, str(OPS_ROOT))
 
 from a5_dsa_c8_exact_speculative_resident.product_w4a4c8_abi_gate import (  # noqa: E402
@@ -60,6 +61,29 @@ def _file_sha256(path_value: object | None) -> str:
     except OSError:
         return "<unavailable>"
     return digest.hexdigest()
+
+
+def _stage_a_source_state() -> tuple[int, str]:
+    """Report only a checked-in source base, never infer one from a binary.
+
+    The checked-in Stage-A source has a real isolated build recipe.  It is
+    still fail-closed for runtime selection until that recipe, strict ordered
+    W4A4C8 parity, and the full Stage-B graph proof have passed.  Thus
+    ``source=1`` never claims that an OPP is installed or runnable.
+    """
+
+    required = (
+        STAGE_A_SOURCE_ROOT / "VENDORED.md",
+        STAGE_A_SOURCE_ROOT / "ops.json",
+        STAGE_A_SOURCE_ROOT / "build_stage_a_w4a4c8_score_receipt_opp.sh",
+        STAGE_A_SOURCE_ROOT / "op_host" / "a5_p10_w4a4c8_score_receipt_def.cpp",
+        STAGE_A_SOURCE_ROOT / "op_kernel" / "a5_p10_w4a4c8_score_receipt.cpp",
+        STAGE_A_SOURCE_ROOT / "op_kernel" / "a5_p10_w4a4c8_score_receipt_qli.h",
+        STAGE_A_SOURCE_ROOT / "op_kernel" / "a5_p10_w4a4c8_score_receipt_abi.h",
+    )
+    if not all(path.is_file() for path in required):
+        return 0, "checked_in_score_receipt_source_missing"
+    return 1, "buildable_score_receipt_source_runtime_parity_pending"
 
 
 def main() -> int:
@@ -134,9 +158,15 @@ def main() -> int:
             "reason=primary_runtime_callable_unavailable"
         )
         return 2
+    stage_source, stage_reason = _stage_a_source_state()
+    print(
+        "P10_W4A4C8_STAGE_A_SOURCE "
+        f"source={stage_source} root={_one_line(STAGE_A_SOURCE_ROOT)} "
+        f"state={stage_reason}"
+    )
     print(
         "P10_W4A4C8_STAGE_A ready=0 "
-        "reason=exact_w4a4c8_operator_source_and_opp_provenance_unresolved"
+        f"reason={stage_reason}"
     )
     return 0
 

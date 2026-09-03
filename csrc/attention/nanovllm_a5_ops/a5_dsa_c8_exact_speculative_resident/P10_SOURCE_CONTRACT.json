@@ -24,20 +24,60 @@
     ]
   },
   "source_derivation": {
-    "kind": "explicit_w4a4c8_runtime_source_only",
+    "kind": "explicit_w4a4c8_numerical_sibling_with_runtime_parity_gate",
     "environment": "P10_W4A4C8_SOURCE_ROOT",
-    "must_be_exact_operator_source_root": true,
-    "must_match_runtime_primary_callable": true,
+    "must_be_exact_operator_source_root": false,
+    "source_is_not_runtime_provider_source": true,
+    "must_match_runtime_primary_callable": false,
+    "must_match_runtime_primary_abi": true,
+    "activation_requires_strict_ordered_canonical_sparse_indices_parity": true,
+    "activation_requires_canonical_score_source_lens_parity": true,
     "must_report_source_git_head_and_opp_provenance": true,
-    "source_unresolved_behavior": "fail_closed_no_stage_a_opp_build",
+    "source_unresolved_behavior": "fail_closed_no_stage_a_runtime_activation",
+    "isolated_sibling_build_is_validation_only": true,
     "automatic_generic_source_selection": false,
     "generic_sources_are_diagnostic_only": true
   },
   "math_gate": {
-    "reference": "unmodified_source_matched_w4a4c8_operator",
-    "comparison": "exact_sparse_indices_on_identical_w4a4c8_input_tensors",
+    "reference": "installed_primary_torch_npu_w4a4c8_callable",
+    "comparison": "exact_ordered_sparse_indices_and_score_source_lens_on_identical_w4a4c8_input_tensors",
     "fp32_conversion_or_reference": false,
     "runtime_off_mutated_c8_comparison": false
+  },
+  "stage_a_activation": {
+    "state": "buildable_but_runtime_fail_closed_until_all_required_proofs",
+    "required_proofs": [
+      "w4a4c8_numerical_sibling_source_provenance",
+      "strict_ordered_canonical_topk_and_source_lens_parity",
+      "verified_graph_visible_score_surface_and_receipt_publish"
+    ],
+    "missing_proof_behavior": "fail_closed_no_runtime_activation"
+  },
+  "stage_a_source_base": {
+    "operator": "A5P10W4A4C8ScoreReceipt",
+    "kernel": "a5_p10_w4a4c8_score_receipt",
+    "source_root": "stage_a_w4a4c8_score_receipt",
+    "build_state": "isolated_stage_recipe_requires_exact_source_pair",
+    "inputs": [
+      "query",
+      "key",
+      "weights",
+      "query_dequant_scale",
+      "key_dequant_scale",
+      "actual_seq_lengths_query",
+      "candidate_lens",
+      "block_table"
+    ],
+    "outputs": [
+      "canonical_sparse_indices",
+      "canonical_score_source_lens",
+      "score_surface",
+      "receipt_ring",
+      "receipt_state"
+    ],
+    "canonical_boundary": "direct_QuantLiPhase_ProcessTopK_output_with_no_management_transform",
+    "score_receipt_boundary": "completed_native_score_window_before_ProcessTopK_consumes_that_window",
+    "product_route": "isolated_stage_a_opp_build_permitted_runtime_parity_gated"
   },
   "routing": {
     "feature_selection": "outside_operator",
@@ -53,8 +93,46 @@
       "may_modify_c8_topk": false,
       "may_read_resident_mapping": false,
       "may_allocate_resident_slot": false,
-      "required_seam": "after_independent_w4a4c8_score_window_dma_before_original_topk_consumption",
-      "receipt_payload": "row_begin_row_count_source_begin_source_count_row_stride_bytes_score_surface_offset_bytes_score_element_bytes_sequence"
+      "required_seam": "after_native_ProcessVec1_score_window_completion_before_ProcessTopK_consumes_that_window",
+      "receipt_payload": "row_begin_row_count_source_begin_source_count_row_stride_bytes_score_surface_offset_bytes_score_element_bytes_sequence",
+      "canonical_topk_export": {
+        "source": "unmodified_native_w4a4c8_exact_topk",
+        "outputs": [
+          {
+            "name": "canonical_sparse_indices",
+            "dtype": "int32",
+            "shape": "[batch,1,sparse_count]",
+            "ordering": "native_w4a4c8_sparse_indices_order_preserved_byte_for_byte"
+          },
+          {
+            "name": "canonical_score_source_lens",
+            "dtype": "int32",
+            "shape": "[batch]",
+            "semantics": "native_row_valid_source_length"
+          }
+        ],
+        "independent_from_transport_or_executor_outputs": true,
+        "requires_distinct_storage": true,
+        "must_not_be_reordered_compacted_or_overwritten": true,
+        "must_exist_even_when_no_transport_candidate_is_published": true
+      },
+      "score_receipt_abi": {
+        "score_surface": {
+          "dtype": "uint16",
+          "storage": "caller_owned_graph_visible_gm",
+          "must_not_alias_native_opaque_workspace": true
+        },
+        "receipt_ring": {
+          "dtype": "int64",
+          "shape": "[receipt_capacity,5]",
+          "descriptor": "score_surface_offset_bytes_row_begin_row_count_source_begin_source_count_row_stride_bytes_score_element_bytes_sequence"
+        },
+        "receipt_state": {
+          "dtype": "int32",
+          "states": ["FREE", "FILLING", "READY", "CLAIMED", "DONE"],
+          "publication_order": "score_surface_visible_before_FILLING_to_READY"
+        }
+      }
     },
     "executor": {
       "role": "exact_score_scan_candidate_compact_device_direct_hccp_post_and_nonblocking_cq_poll",
@@ -82,6 +160,33 @@
     "queue_resources": "fixed_pool_dynamic_lease",
     "stage_a_receipts": "bounded_raw_score_descriptor_ring",
     "candidate_microbatches": "two_local_64_seed_buffers_owned_by_stage_b",
+    "resident_slots": {
+      "layout": "fixed_forward_double_band",
+      "capacity_invariant": "spec_band_capacity + active_rows * topk_per_row <= resident_row_count",
+      "spec_band": {
+        "role": "bounded_false_positive_tolerant_speculation",
+        "assignment": "monotonic_per_forward_spec_cursor",
+        "reused_within_forward": false
+      },
+      "recall_band": {
+        "role": "guaranteed_recall_for_exact_winners_without_forward_slot",
+        "topk_per_row": 2048,
+        "assignment": "deterministic_absolute_row_by_active_row_and_topk_rank",
+        "reused_within_forward": false
+      },
+      "source_to_forward_slot": {
+        "dtype": "int32",
+        "initial_value": -1,
+        "meaning": "forward-owned resident row for an admitted source; persistent hits remain unmapped"
+      },
+      "persistent_hits": "keep_existing_resident_slot_and_do_not_consume_forward_band",
+      "false_positive_speculation": "may_physically_remain_in_spec_band_but_is_not_written_to_final_attention_slots",
+      "forbidden": [
+        "all_row_object_canonical_slot_map",
+        "forward_band_slot_release_or_reuse",
+        "p8_arena_or_aba_protocol"
+      ]
+    },
     "fixed_get_cores": false,
     "fixed_li_get_core_partition": false
   },

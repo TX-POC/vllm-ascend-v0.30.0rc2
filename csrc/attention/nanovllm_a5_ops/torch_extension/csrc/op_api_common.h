@@ -211,6 +211,8 @@ inline aclDataType ToAclDataType(at::ScalarType dtype) {
       return ACL_INT8;
     case at::kShort:
       return ACL_INT16;
+    case at::kUInt16:
+      return ACL_UINT16;
     case at::kInt:
       return ACL_INT32;
     case at::kLong:

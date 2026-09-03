@@ -1,0 +1,275 @@
+"""Fail-closed contract for P10's real graph bridge.
+
+The test deliberately checks graph wiring, not numerical output.  Numerical
+truth remains the native W4A4C8 Stage-A path; this gate prevents accidental
+fallback to a host candidate loop, a Stage-A completion dependency, or an
+identity assumption between private resident rows and QSFA slot IDs.
+"""
+
+from __future__ import annotations
+
+import json
+import py_compile
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+OPS_ROOT = Path(__file__).resolve().parents[1]
+ROOT = (
+    OPS_ROOT
+    / "a5_dsa_c8_exact_speculative_resident"
+    / "p10_forward_bridge"
+)
+
+
+class P10ForwardBridgeContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.contract = json.loads((ROOT / "P10_FORWARD_BRIDGE_CONTRACT.json").read_text())
+        cls.prepare_definition = (
+            ROOT / "op_host" / "a5_p10_forward_prepare_def.cpp"
+        ).read_text()
+        cls.prepare_kernel = (
+            ROOT / "op_kernel" / "a5_p10_forward_prepare.cpp"
+        ).read_text()
+        cls.prepare_abi = (
+            ROOT / "op_kernel" / "a5_p10_forward_prepare_abi.h"
+        ).read_text()
+        cls.bridge = (
+            ROOT / "torch_extension" / "csrc" / "p10_forward_bridge.cpp"
+        ).read_text()
+        cls.direct_opapi = (
+            ROOT / "torch_extension" / "csrc" / "p10_direct_opapi.h"
+        ).read_text()
+        cls.graph = (
+            ROOT
+            / "torch_extension"
+            / "nanovllm_p10_forward_bridge"
+            / "p10_forward_graph.py"
+        ).read_text()
+        cls.init = (
+            ROOT
+            / "torch_extension"
+            / "nanovllm_p10_forward_bridge"
+            / "__init__.py"
+        ).read_text()
+        cls.builder = (ROOT / "build_p10_forward_prepare_opp.sh").read_text()
+        cls.setup = (ROOT / "torch_extension" / "p10_forward_bridge_setup.py").read_text()
+        cls.common_opapi = (
+            OPS_ROOT / "torch_extension" / "csrc" / "op_api_common.h"
+        ).read_text()
+
+    def test_prepare_is_a_real_graph_node_with_exact_reset_ownership(self) -> None:
+        prepare = self.contract["graph_nodes"]["prepare"]
+        self.assertTrue(prepare["graph_visible"])
+        self.assertEqual(prepare["operator"], "A5P10ForwardPrepare")
+        for name in (
+            "receipt_state",
+            "forward_control",
+            "kv_object_to_forward_slot",
+            "source_to_forward_slot",
+            "speculative_slot_cursor",
+            "queue_leases",
+            "resident_ready",
+        ):
+            self.assertIn(f'Input("{name}")', self.prepare_definition)
+            self.assertIn(f'Output("{name}_alias")', self.prepare_definition)
+        for token in (
+            "A5_P10_FORWARD_PREPARE_RECEIPT_FREE",
+            "A5_P10_FORWARD_PREPARE_PRODUCER_OPEN",
+            "A5_P10_FORWARD_PREPARE_UNMAPPED_SLOT",
+            "FillShard<A5_P10_FORWARD_PREPARE_UNMAPPED_SLOT>",
+            "FillShard<0>(queue_leases_gm",
+            "FillShard<0>(resident_ready_gm",
+            "speculative_slot_cursor_gm.SetValue(0U, 0)",
+            "A5_P10_FORWARD_PREPARE_PRODUCER_SEAL_SEQUENCE_WORD, 0",
+            "A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD, 0",
+        ):
+            self.assertIn(token, self.prepare_kernel)
+        for forbidden in (
+            "receipt_ring",
+            "score_surface",
+            "canonical_sparse_indices",
+            "attention_slots",
+        ):
+            self.assertNotIn(forbidden, self.prepare_kernel)
+
+    def test_no_fixed_physical_core_model_enters_the_forward_bridge(self) -> None:
+        combined = "\n".join((self.prepare_definition, self.prepare_kernel, self.bridge, self.graph))
+        for forbidden in (
+            "physical_aiv_id",
+            "physical_core",
+            "fixed_get_core",
+            "core_id=",
+            "aiv_id",
+        ):
+            self.assertNotIn(forbidden, combined.lower())
+        self.assertIn("bounded logical", self.prepare_definition.lower())
+        self.assertIn("executor_worker_count", self.bridge)
+        self.assertIn("executor_worker_limit", self.bridge)
+
+    def test_stage_b_uses_current_21_input_mapping_abi(self) -> None:
+        stage_b = self.contract["graph_nodes"]["stage_b"]
+        self.assertEqual(stage_b["inputs"], 21)
+        self.assertEqual(stage_b["alias_outputs"], 11)
+        self.assertIn("resident_row_to_qsfa_slot", self.bridge)
+        self.assertIn("resident_payload.size(0)", self.bridge)
+        self.assertIn("never assumes resident rows are QSFA logical slot IDs", self.bridge)
+        self.assertIn("at::kUInt16", self.bridge)
+        self.assertIn("case at::kUInt16", self.common_opapi)
+        self.assertIn("return ACL_UINT16", self.common_opapi)
+        self.assertIn("aclnnA5P10ScoreReceiptForwardResident", self.bridge)
+
+    def test_graph_has_prepare_fanout_but_no_stage_a_to_stage_b_completion_edge(self) -> None:
+        self.assertIn("_launch_prepare(inputs)", self.graph)
+        self.assertIn("producer_stream.wait_event(prepared)", self.graph)
+        self.assertIn("executor_stream.wait_event(prepared)", self.graph)
+        self.assertIn("_launch_stage_a(inputs)", self.graph)
+        self.assertIn("_launch_stage_b(inputs)", self.graph)
+        self.assertNotIn("stage_a_complete", self.graph)
+        self.assertNotIn("wait_event(stage_a", self.graph)
+        self.assertIn("stage_b_complete = _record_event(executor_stream)", self.graph)
+        self.assertIn("qsfa_stream.wait_event(self.stage_b_complete)", self.graph)
+
+    def test_overlap_witness_is_explicit_and_not_a_normal_forward_wait(self) -> None:
+        self.assertIn("class P10OverlapWitness", self.graph)
+        self.assertIn("producer_seal_sequence", self.graph)
+        self.assertIn("first_preseal_ready_claim_sequence", self.graph)
+        self.assertIn("< self.producer_seal_sequence", self.graph)
+        self.assertIn("read_overlap_witness_after_completion", self.graph)
+        self.assertIn("Product forward code must use :meth:`bind_qsfa`", self.graph)
+        self.assertIn("narrow(0, 8, 2)", self.graph)
+
+    def test_qsfa_boundary_is_only_completed_stage_b_aliases(self) -> None:
+        self.assertEqual(
+            self.contract["graph_nodes"]["qsfa"]["inputs"],
+            ["attention_slots", "resident_seq_lengths"],
+        )
+        self.assertIn("class P10QsfaAliases", self.graph)
+        self.assertIn("attention_slots=self.attention_slots", self.graph)
+        self.assertIn("resident_seq_lengths=self.resident_seq_lengths", self.graph)
+        self.assertNotIn("torch.npu.synchronize", self.graph)
+        self.assertNotIn(".cpu()", self.graph)
+
+    def test_bridge_has_no_python_candidate_or_host_kvaf_submission_path(self) -> None:
+        combined = "\n".join((self.bridge, self.graph, self.direct_opapi))
+        for forbidden in (
+            "batch_get",
+            "kvafadapter",
+            "candidate_seed_submission",
+            "for candidate",
+            "for seed",
+            ".cpu()",
+            "torch.npu.synchronize",
+            "aclrtSynchronizeStream",
+        ):
+            self.assertNotIn(forbidden, combined.lower())
+        self.assertIn('"device_only"', self.bridge.lower())
+
+    def test_bridge_uses_the_p10_direct_stream_launcher_not_a_task_queue(self) -> None:
+        """The bridge owns three coarse graph submissions, never a callback.
+
+        The direct header may mention the historical launcher in comments to
+        document why it is excluded.  Match the call spelling, rather than
+        making a brittle text rule that would force a fake compatibility
+        include into the bridge.
+        """
+
+        self.assertIn('#include "p10_direct_opapi.h"', self.bridge)
+        self.assertNotIn('#include "op_api_common.h"', self.bridge)
+        self.assertEqual(self.bridge.count("P10_EXEC_NPU_CMD_DIRECT("), 3)
+        self.assertNotIn("RunOpApi(", self.direct_opapi)
+        self.assertNotIn("aclrtSynchronizeStream(", self.direct_opapi)
+        for required in (
+            "RequireP10DirectDispatchContract",
+            "TASK_QUEUE_ENABLE",
+            "ASCEND_LAUNCH_BLOCKING",
+            "P10_DIRECT_DISPATCH_CONFIG",
+            "c10_npu::getCurrentNPUStream",
+            "RecordTensorTupleOnNpuStream",
+            "RecordTensorStorageOnNpuStream",
+            "ClearTensorTuple",
+            "NANOVLLM_A5_P10_PRODUCT_OPAPI_LIB",
+        ):
+            self.assertIn(required, self.direct_opapi + self.bridge)
+        self.assertNotIn("InitPtaCacheForWorkspace(", self.direct_opapi)
+        self.assertNotIn("UnInitPtaCacheForWorkspace(", self.direct_opapi)
+
+    def test_direct_dispatch_is_fail_closed_tq0_not_an_implicit_tq1_path(self) -> None:
+        init_before_torch_npu = self.init.index(
+            "_require_p10_direct_dispatch_contract()\n\n_OPAPI"
+        )
+        torch_npu_import = self.init.index("import torch_npu")
+        self.assertLess(init_before_torch_npu, torch_npu_import)
+        for required in (
+            "TASK_QUEUE_ENABLE=0",
+            "ASCEND_LAUNCH_BLOCKING=0",
+            "P10_DIRECT_DISPATCH_BLOCKED",
+            "P10_DIRECT_DISPATCH_CONFIG",
+            "task_queue_fallback=forbidden",
+        ):
+            self.assertIn(required, self.init + self.direct_opapi)
+        self.assertNotIn("fallback_to_tq1", self.init + self.direct_opapi)
+
+    def test_one_exact_product_opapi_is_required(self) -> None:
+        assembly = self.contract["product_assembly"]
+        self.assertEqual(assembly["opapi_resolver"], "one_fresh_combined_P10_vendor")
+        for operator in assembly["operators"]:
+            self.assertIn(operator, self.init + self.bridge + self.contract["product_assembly"]["opapi_resolver"])
+        self.assertIn("NANOVLLM_A5_P10_PRODUCT_OPAPI_LIB", self.init)
+        self.assertIn("NANOVLLM_A5_P10_PRODUCT_OPP_VENDOR", self.init)
+        self.assertIn("same source pair", self.init)
+
+    def test_standalone_prepare_build_is_fail_closed(self) -> None:
+        """Only the combined three-operator product vendor is valid."""
+
+        result = subprocess.run(
+            ["bash", str(ROOT / "build_p10_forward_prepare_opp.sh")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("combined_product_vendor_required", result.stderr)
+        self.assertIn("build_p10_target_assembly.sh", result.stderr)
+
+    def test_build_closure_and_python_adapter_are_syntax_valid(self) -> None:
+        result = subprocess.run(
+            ["bash", "-n", str(ROOT / "build_p10_forward_prepare_opp.sh")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with tempfile.TemporaryDirectory() as temp:
+            py_compile.compile(
+                str(
+                    ROOT
+                    / "torch_extension"
+                    / "nanovllm_p10_forward_bridge"
+                    / "p10_forward_graph.py"
+                ),
+                cfile=str(Path(temp) / "p10_forward_graph.pyc"),
+                doraise=True,
+            )
+        self.assertIn("NpuExtension", self.setup)
+        self.assertIn("p10_direct_opapi.h", self.bridge)
+
+    def test_setup_resolves_shared_opapi_headers_from_nanovllm_ops_root(self) -> None:
+        """A clean P10 bridge build must not depend on a nonexistent sibling.
+
+        ``torch_extension`` is three levels below ``nanovllm_a5_ops`` when
+        counting the path itself, but two ``Path.parents`` hops away.  This
+        catches the off-by-one that otherwise fails only after an expensive
+        remote OPP build reaches the bridge compilation step.
+        """
+
+        self.assertIn("OPS_ROOT = ROOT.parents[2]", self.setup)
+        self.assertNotIn("OPS_ROOT = ROOT.parents[3]", self.setup)
+        self.assertTrue((OPS_ROOT / "torch_extension" / "csrc" / "op_api_common.h").is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

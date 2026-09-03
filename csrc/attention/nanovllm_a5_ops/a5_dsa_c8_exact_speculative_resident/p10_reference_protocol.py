@@ -7,8 +7,8 @@ pipeline, not a CPU transport fallback:
   windows.  It has no threshold, S->O mapping, resident state, CandidateSeed,
   queue, or HCCP knowledge.
 * Stage B claims a descriptor, reads the referenced score surface, performs
-  ExactScoreScan and CandidateCompact, reserves a forward-owned slot, and
-  models PostOnly/CQ completion.
+  ExactScoreScan and CandidateCompact, assigns a forward-owned speculative
+  band row, and models PostOnly/CQ completion.
 * Stage C consumes unchanged exact C8 Top-K source IDs and guaranteed-recalls
   every unresolved winner before QSFA may read resident slots.
 
@@ -18,12 +18,25 @@ deliberate: Stage B must first make a durable local copy (or terminally reject
 an invalid descriptor) before an explicit recycle makes the GM ring slot
 available again.  A claimed record is therefore never silently made free.
 
-Every ``(row, kv_object)`` has an immutable, absolute canonical resident slot
-for the invocation.  Speculative and final-recall posts both use that exact
-slot; there is no speculative/recall cursor, slot allocation, release, reuse,
-or ABA protocol.  The bounded HCCP queue is shared by speculative and
-guaranteed-recall posts; final exact winners are admitted while that executor
-is still alive, not after it has drained to terminal.
+P10 deliberately does **not** allocate one resident row for every possible
+``(row, kv_object)`` pair: that is infeasible for a real KV pool.  Instead one
+forward owns two non-overlapping, fixed bands in the resident buffer:
+
+* ``spec_band[C]`` is assigned monotonically by ``spec_cursor``.  A candidate
+  that gets a speculative row retains it for this forward; it is never
+  recycled.  A false positive may physically remain in that band, but it is
+  absent from the final attention-slot output and is therefore logically
+  unreferenced.
+* ``recall_band[active_rows, K]`` uses the deterministic absolute row for an
+  exact Top-K ``(row, rank)`` that was not already speculatively admitted.
+
+``source_to_forward_slot`` is initialized to ``-1`` and records only the
+forward-owned placement selected for a source (or an object-equivalent source).
+Persistent hits keep their caller-supplied resident rows and never enter
+either forward band.  The required capacity is checked up front:
+``spec_band_capacity + active_rows * topk_per_row <= resident_row_count``.
+There is no release/reuse/ABA protocol because no forward-band row is reused
+within this forward.
 """
 
 from __future__ import annotations
@@ -31,7 +44,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
-from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 
 
@@ -163,6 +175,7 @@ class ProtocolStats:
     receipts_rejected: int = 0
     deferred_ring_full: int = 0
     deferred_seed_capacity: int = 0
+    deferred_spec_band_capacity: int = 0
     deferred_queue_busy: int = 0
     skipped_persistent: int = 0
     skipped_duplicate: int = 0
@@ -190,7 +203,9 @@ class ScoreReceiptResidentProtocol:
         ring_slots_per_worker: int = 2,
         seed_capacity: int = 64,
         hccp_queue_count: int = 2,
-        canonical_resident_slots: Mapping[tuple[int, int], int],
+        speculative_band_capacity: int = 64,
+        topk_per_row: int = 2048,
+        resident_row_count: int | None = None,
     ) -> None:
         if not object_directory:
             raise ValueError("object_directory must contain at least one row")
@@ -199,9 +214,11 @@ class ScoreReceiptResidentProtocol:
             or ring_slots_per_worker <= 0
             or seed_capacity <= 0
             or hccp_queue_count <= 0
+            or speculative_band_capacity < 0
+            or topk_per_row <= 0
         ):
             raise ValueError(
-                "workers, ring slots, seed capacity, and HCCP queue count must be positive"
+                "workers, ring slots, seed capacity, HCCP queue count, and topk must be valid"
             )
         self._object_directory = tuple(
             tuple(int(value) for value in row) for row in object_directory
@@ -209,6 +226,12 @@ class ScoreReceiptResidentProtocol:
         if any(not row for row in self._object_directory):
             raise ValueError("every object-directory row must be non-empty")
         self.rows = len(self._object_directory)
+        self._valid_object_keys = {
+            (row, obj)
+            for row, objects in enumerate(self._object_directory)
+            for obj in objects
+            if obj >= 0
+        }
         self.active_row_count = (
             self.rows if active_row_count is None else int(active_row_count)
         )
@@ -221,9 +244,21 @@ class ScoreReceiptResidentProtocol:
         self.seed_capacity = int(seed_capacity)
         # This is a fixed transport-resource pool, not a physical-AIV split.
         self.hccp_queue_count = int(hccp_queue_count)
-        self._canonical_slot_by_object = MappingProxyType(
-            self._validate_canonical_slots(canonical_resident_slots)
+        self.speculative_band_capacity = int(speculative_band_capacity)
+        self.topk_per_row = int(topk_per_row)
+        self.recall_band_capacity = self.active_row_count * self.topk_per_row
+        self.forward_band_capacity = (
+            self.speculative_band_capacity + self.recall_band_capacity
         )
+        self.resident_row_count = (
+            self.forward_band_capacity
+            if resident_row_count is None
+            else int(resident_row_count)
+        )
+        if self.resident_row_count < self.forward_band_capacity:
+            raise ProtocolViolation(
+                "resident capacity is smaller than fixed speculative plus recall bands"
+            )
         self.stats = ProtocolStats()
         self._records = [
             [_ReceiptRecord() for _ in range(self.ring_slots_per_worker)]
@@ -233,10 +268,16 @@ class ScoreReceiptResidentProtocol:
         self._next_receipt_sequence = 1
         self._compacted: dict[tuple[int, int, int], tuple[CandidateSeed, ...]] = {}
         # The resident payload is object O, while C8 scores source occurrence S.
-        # A scheduled object has exactly one immutable canonical resident row.
-        # The set is per-forward de-duplication only; it never owns allocation
-        # or reclamation semantics.
-        self._scheduled_objects: set[tuple[int, int]] = set()
+        # The forward map begins at -1 for every source and only gains values
+        # from the non-reusable speculative band or deterministic recall band.
+        self._source_to_forward_slot = [
+            [-1 for _ in objects] for objects in self._object_directory
+        ]
+        # Object-level de-duplication is transport-only: two sources naming one
+        # object may point to one already assigned forward row.  It does not
+        # affect exact Top-K source ordering.
+        self._forward_slot_by_object: dict[tuple[int, int], int] = {}
+        self._spec_cursor = 0
         self._terminal_object_path: dict[tuple[int, int], str] = {}
         self._free_queue_ids = set(range(self.hccp_queue_count))
         self._pending: list[PendingPost] = []
@@ -271,6 +312,23 @@ class ScoreReceiptResidentProtocol:
         """Exact-winner Get seeds admitted but awaiting shared-queue capacity."""
 
         return len(self._recall_backlog)
+
+    @property
+    def speculative_cursor(self) -> int:
+        """Number of non-reusable rows consumed from ``spec_band`` this forward."""
+
+        return self._spec_cursor
+
+    def source_to_forward_slots(self) -> tuple[tuple[int, ...], ...]:
+        """Return the graph-visible ``S -> forward resident row`` snapshot.
+
+        ``-1`` means that source has neither a forward speculative placement
+        nor a final-recall placement.  Persistent hits remain outside this
+        table because their established resident rows are intentionally left
+        untouched.
+        """
+
+        return tuple(tuple(values) for values in self._source_to_forward_slot)
 
     def receipt_states(self) -> tuple[tuple[ReceiptState, ...], ...]:
         return tuple(
@@ -370,7 +428,7 @@ class ScoreReceiptResidentProtocol:
         """Stage B: ExactScoreScan + CandidateCompact + resident admission.
 
         This is deliberately the first point that accesses threshold, S->O,
-        resident/persistent state, or dynamic slot allocation.  It never changes
+        resident/persistent state, or forward-band admission.  It never changes
         the descriptor or any original C8 Top-K state.
         """
 
@@ -381,7 +439,7 @@ class ScoreReceiptResidentProtocol:
         key = self._receipt_key(receipt)
         if key in self._compacted:
             raise ProtocolViolation("a claimed score receipt was compacted twice")
-        persistent = persistent_object_slots or {}
+        persistent = self._normalize_persistent(persistent_object_slots)
         seeds: list[CandidateSeed] = []
         row = receipt.descriptor.row
         for offset, score in enumerate(receipt.score_surface_values):
@@ -398,13 +456,14 @@ class ScoreReceiptResidentProtocol:
             if len(seeds) >= self.seed_capacity:
                 self.stats.deferred_seed_capacity += 1
                 continue
-            seed = CandidateSeed(
-                row=candidate.row,
-                source=candidate.source,
-                kv_object=candidate.kv_object,
-                resident_slot=candidate.resident_slot,
-            )
-            self._scheduled_objects.add((seed.row, seed.kv_object))
+            seed = self._admit_speculative_candidate(*candidate)
+            if seed is None:
+                # The forward may run out of speculative rows.  This is
+                # allowed: the exact finalizer deterministically recalls a
+                # true winner into recall_band later.  No speculative row is
+                # recycled or silently borrowed from that band.
+                self.stats.deferred_spec_band_capacity += 1
+                continue
             seeds.append(seed)
             self.stats.candidates_compacted += 1
         compacted = tuple(seeds)
@@ -486,10 +545,10 @@ class ScoreReceiptResidentProtocol:
                 raise ProtocolViolation("CQ terminal observed a queue that was already free")
             for seed in pending.seeds:
                 key = (seed.row, seed.kv_object)
-                expected = self._canonical_slot_by_object.get(key)
+                expected = self._forward_slot_by_object.get(key)
                 if expected != seed.resident_slot:
                     raise ProtocolViolation(
-                        "terminal post differs from the canonical resident slot"
+                        "terminal post differs from its forward resident slot"
                     )
                 self._terminal_object_path[key] = pending.path
                 self.stats.cq_terminal += 1
@@ -544,10 +603,10 @@ class ScoreReceiptResidentProtocol:
         """Admit exact winners into the still-live shared PostOnly executor.
 
         C8's exact Top-K is authoritative.  Objects already scheduled by
-        speculation keep their immutable canonical resident slot and simply
-        wait for their existing PostOnly/CQ path.  Every otherwise-unresolved
-        winner uses its own preassigned canonical slot through the *same*
-        bounded queue pool.  This must happen before executor terminal;
+        speculation keep their immutable speculative-band row and simply wait
+        for their existing PostOnly/CQ path.  Every otherwise-unresolved
+        winner uses its deterministic recall-band ``(row, rank)`` row through
+        the *same* bounded queue pool.  This must happen before executor terminal;
         ``finalize`` only exposes terminal resident slots to QSFA.
         """
 
@@ -561,39 +620,35 @@ class ScoreReceiptResidentProtocol:
                 raise ProtocolViolation("exact winner admission differs from prior admission")
             return 0
 
-        missing: list[tuple[int, int, int]] = []
-        seen_missing: set[tuple[int, int]] = set()
+        missing: list[CandidateSeed] = []
         for row, row_winners in enumerate(winners):
-            for source in row_winners:
+            for rank, source in enumerate(row_winners):
                 if source == -1:
                     continue
                 obj = self._object_at(row, source)
                 key = (row, obj)
-                if key in persistent or key in self._scheduled_objects:
+                if key in persistent:
                     continue
-                if key in seen_missing:
+                existing_slot = self._forward_slot_by_object.get(key)
+                if existing_slot is not None:
+                    self._bind_source_to_forward_slot(row, source, existing_slot)
                     continue
-                seen_missing.add(key)
-                missing.append((row, source, obj))
-
-        recall_seeds: list[CandidateSeed] = []
-        for row, source, obj in missing:
-            key = (row, obj)
-            resident_slot = self._canonical_resident_slot(row, obj)
-            self._scheduled_objects.add(key)
-            recall_seeds.append(
-                CandidateSeed(
-                    row=row,
-                    source=source,
-                    kv_object=obj,
-                    resident_slot=resident_slot,
+                resident_slot = self._recall_resident_slot(row, rank)
+                self._bind_object_to_forward_slot(row, obj, resident_slot)
+                self._bind_source_to_forward_slot(row, source, resident_slot)
+                missing.append(
+                    CandidateSeed(
+                        row=row,
+                        source=source,
+                        kv_object=obj,
+                        resident_slot=resident_slot,
+                    )
                 )
-            )
         self._admitted_winners = winners
         self._admitted_persistent = persistent
-        self._recall_backlog.extend(recall_seeds)
+        self._recall_backlog.extend(missing)
         self._pump_recall_posts()
-        return len(recall_seeds)
+        return len(missing)
 
     def finalize(
         self,
@@ -638,7 +693,12 @@ class ScoreReceiptResidentProtocol:
                             "final winner has no terminal forward-owned resident slot"
                         )
                     path = self._terminal_object_path[object_key]
-                    slot_id = self._canonical_resident_slot(row, obj)
+                    try:
+                        slot_id = self._forward_slot_by_object[object_key]
+                    except KeyError as error:
+                        raise ProtocolViolation(
+                            "final winner has no forward resident-slot mapping"
+                        ) from error
                 row_slots.append(slot_id)
                 row_objects.append(obj)
                 placements.append(
@@ -693,7 +753,7 @@ class ScoreReceiptResidentProtocol:
         observation: ScoreObservation,
         threshold_by_row: Mapping[int, int],
         persistent: Mapping[tuple[int, int], int],
-    ) -> CandidateSeed | None:
+    ) -> tuple[int, int, int] | None:
         row = int(observation.row)
         source = int(observation.source)
         score = int(observation.score)
@@ -714,14 +774,42 @@ class ScoreReceiptResidentProtocol:
             self.stats.skipped_persistent += 1
             return None
         key = (row, obj)
-        if key in self._scheduled_objects:
+        assigned_slot = self._source_to_forward_slot[row][source]
+        if assigned_slot != -1:
             self.stats.skipped_duplicate += 1
             return None
+        assigned_slot = self._forward_slot_by_object.get(key)
+        if assigned_slot is not None:
+            # An equivalent source has already caused (or will cause) the
+            # object transport.  Preserve the source mapping for final exact
+            # resolution, but do not emit a duplicate PostOnly descriptor.
+            self._bind_source_to_forward_slot(row, source, assigned_slot)
+            self.stats.skipped_duplicate += 1
+            return None
+        return (row, source, obj)
+
+    def _admit_speculative_candidate(
+        self, row: int, source: int, obj: int
+    ) -> CandidateSeed | None:
+        """Assign the next monotonic spec-band row, never reusing it.
+
+        The caller has already bounded CandidateCompact.  Consequently an
+        overflow does not create a half-owned source mapping or consume a
+        resident row; a true final winner will instead receive its stable
+        recall-band row.
+        """
+
+        if self._spec_cursor >= self.speculative_band_capacity:
+            return None
+        resident_slot = self._spec_cursor
+        self._spec_cursor += 1
+        self._bind_object_to_forward_slot(row, obj, resident_slot)
+        self._bind_source_to_forward_slot(row, source, resident_slot)
         return CandidateSeed(
             row=row,
             source=source,
             kv_object=obj,
-            resident_slot=self._canonical_resident_slot(row, obj),
+            resident_slot=resident_slot,
         )
 
     def _try_post(
@@ -793,50 +881,43 @@ class ScoreReceiptResidentProtocol:
     ) -> dict[tuple[int, int], int]:
         result: dict[tuple[int, int], int] = {}
         for (row, obj), slot_id in (mapping or {}).items():
-            if not 0 <= int(row) < self.rows or int(obj) < 0 or int(slot_id) < 0:
+            if (
+                not 0 <= int(row) < self.rows
+                or int(obj) < 0
+                or not 0 <= int(slot_id) < self.resident_row_count
+            ):
                 raise ProtocolViolation("persistent resident mapping is invalid")
             key = (int(row), int(obj))
-            canonical_slot = self._canonical_slot_by_object.get(key)
-            if canonical_slot is None or int(slot_id) != canonical_slot:
+            if key not in self._valid_object_keys:
                 raise ProtocolViolation(
-                    "persistent resident mapping differs from the canonical slot"
+                    "persistent resident mapping names an unknown KV object"
                 )
-            result[key] = canonical_slot
+            if int(slot_id) < self.forward_band_capacity:
+                raise ProtocolViolation(
+                    "persistent resident mapping overlaps the forward slot bands"
+                )
+            result[key] = int(slot_id)
         return result
 
-    def _validate_canonical_slots(
-        self, mapping: Mapping[tuple[int, int], int]
-    ) -> dict[tuple[int, int], int]:
-        """Require one immutable absolute resident row for every valid object."""
+    def _bind_source_to_forward_slot(self, row: int, source: int, slot: int) -> None:
+        current = self._source_to_forward_slot[row][source]
+        if current not in (-1, int(slot)):
+            raise ProtocolViolation("a source cannot change forward resident slots")
+        self._source_to_forward_slot[row][source] = int(slot)
 
-        normalized: dict[tuple[int, int], int] = {}
-        for (row, obj), slot_id in mapping.items():
-            key = (int(row), int(obj))
-            if not 0 <= key[0] < self.rows or key[1] < 0 or int(slot_id) < 0:
-                raise ProtocolViolation("canonical resident-slot mapping is invalid")
-            normalized[key] = int(slot_id)
-        required = {
-            (row, obj)
-            for row, objects in enumerate(self._object_directory)
-            for obj in objects
-            if obj >= 0
-        }
-        if set(normalized) != required:
-            missing = sorted(required - set(normalized))
-            extra = sorted(set(normalized) - required)
-            raise ProtocolViolation(
-                "canonical resident-slot mapping must cover exactly every valid "
-                f"object; missing={missing[:3]} extra={extra[:3]}"
-            )
-        if len(set(normalized.values())) != len(normalized):
-            raise ProtocolViolation("canonical resident slots must be injective")
-        return normalized
+    def _bind_object_to_forward_slot(self, row: int, obj: int, slot: int) -> None:
+        key = (int(row), int(obj))
+        current = self._forward_slot_by_object.get(key)
+        if current is not None and current != int(slot):
+            raise ProtocolViolation("a KV object cannot change forward resident slots")
+        self._forward_slot_by_object[key] = int(slot)
 
-    def _canonical_resident_slot(self, row: int, obj: int) -> int:
-        try:
-            return self._canonical_slot_by_object[(int(row), int(obj))]
-        except KeyError as error:
-            raise ProtocolViolation("KV object has no canonical resident slot") from error
+    def _recall_resident_slot(self, row: int, rank: int) -> int:
+        if not 0 <= int(row) < self.active_row_count:
+            raise ProtocolViolation("recall row is outside the active forward")
+        if not 0 <= int(rank) < self.topk_per_row:
+            raise ProtocolViolation("exact Top-K rank exceeds recall-band capacity")
+        return self.speculative_band_capacity + int(row) * self.topk_per_row + int(rank)
 
     def _receipt_payload_is_valid(self, receipt: ScoreReceipt) -> bool:
         """Validate a claimed descriptor before Stage B trusts its score window."""
@@ -868,6 +949,10 @@ class ScoreReceiptResidentProtocol:
         result: list[tuple[int, ...]] = []
         for row, row_winners in enumerate(exact_winner_sources):
             values = tuple(int(source) for source in row_winners)
+            if len(values) > self.topk_per_row:
+                raise ProtocolViolation(
+                    "exact Top-K row exceeds fixed recall-band rank capacity"
+                )
             if row >= self.active_row_count and any(source != -1 for source in values):
                 raise ProtocolViolation(
                     "an inactive graph-padded row cannot have an exact Top-K winner"

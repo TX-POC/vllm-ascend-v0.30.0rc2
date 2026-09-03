@@ -1,0 +1,50 @@
+[
+  {
+    "op": "A5P10ScoreReceiptForwardResident",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "score_surface", "param_type": "required", "format": ["ND"], "type": ["uint16"]},
+      {"name": "receipt_ring", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "receipt_state", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "forward_control", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "active_row_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_map", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_slots_snapshot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_to_forward_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "source_to_forward_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "speculative_slot_band", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "speculative_slot_cursor", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "recall_slot_band", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "canonical_sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "canonical_score_source_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kvaf_forward_resident_control", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "queue_leases", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_payload", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+      {"name": "resident_ready", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_row_to_qsfa_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "attention_slots_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "selected_slot_lengths_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "receipt_state_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "forward_control_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "kv_object_to_forward_slot_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "source_to_forward_slot_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "speculative_slot_cursor_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "queue_leases_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_payload_alias", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+      {"name": "resident_ready_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "attention_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "selected_slot_lengths", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_seq_lengths", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "attr": [
+      {"name": "num_layers", "param_type": "required", "type": "int"},
+      {"name": "layer_id", "param_type": "required", "type": "int"},
+      {"name": "executor_worker_count", "param_type": "required", "type": "int"},
+      {"name": "executor_worker_limit", "param_type": "required", "type": "int"},
+      {"name": "receipt_poll_quantum", "param_type": "required", "type": "int"},
+      {"name": "bounded_drain_polls", "param_type": "required", "type": "int"}
+    ]
+  }
+]

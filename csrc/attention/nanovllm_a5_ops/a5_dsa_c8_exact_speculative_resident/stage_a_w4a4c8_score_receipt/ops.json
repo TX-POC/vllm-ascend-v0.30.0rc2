@@ -1,0 +1,30 @@
+[
+  {
+    "op": "A5P10W4A4C8ScoreReceipt",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "query", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+      {"name": "key", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+      {"name": "weights", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+      {"name": "query_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "key_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "canonical_sparse_indices_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "canonical_score_source_lens_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "score_surface_buffer", "param_type": "required", "format": ["ND"], "type": ["uint16"]},
+      {"name": "receipt_ring_buffer", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "receipt_state_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "forward_control_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "canonical_sparse_indices_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "canonical_score_source_lens_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "score_surface_alias", "param_type": "required", "format": ["ND"], "type": ["uint16"]},
+      {"name": "receipt_ring_alias", "param_type": "required", "format": ["ND"], "type": ["int64"]},
+      {"name": "receipt_state_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "forward_control_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ]
+  }
+]
