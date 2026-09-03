@@ -750,15 +750,18 @@ class A5P10ScoreReceiptForwardResidentKernel {
   }
 
   __aicore__ inline bool ResolveActiveRowMapping(
-      uint32_t row, uint32_t source, A5P10ActiveRowMapping* mapping) const {
+      uint32_t row, uint32_t source, A5P10ActiveRowMapping* mapping,
+      bool require_canonical_source_length) const {
     if (mapping == nullptr || row >= activeRows_ ||
         source >= tiling_->sourceCapacity) {
       return false;
     }
-    const int32_t source_len = ReadGmByPassDCache<int32_t>(
-        canonicalScoreSourceLens_ + row);
-    if (source_len <= 0 || source >= static_cast<uint32_t>(source_len)) {
-      return false;
+    if (require_canonical_source_length) {
+      const int32_t source_len = ReadGmByPassDCache<int32_t>(
+          canonicalScoreSourceLens_ + row);
+      if (source_len <= 0 || source >= static_cast<uint32_t>(source_len)) {
+        return false;
+      }
     }
     const int32_t pool = ReadGmByPassDCache<int32_t>(
         activeRowPoolEntries_ + row);
@@ -938,7 +941,14 @@ class A5P10ScoreReceiptForwardResidentKernel {
           continue;
         }
         A5P10ActiveRowMapping mapping{};
-        if (!ResolveActiveRowMapping(row, source, &mapping) ||
+        // A READY receipt is published only after native C8 has written this
+        // exact score range.  The final `canonicalScoreSourceLens_` is a
+        // post-Top-K output and is intentionally unavailable while C8 is
+        // still scanning.  Using it here suppressed every pre-seal candidate
+        // without protecting correctness; the receipt's bounded source range
+        // is the valid pre-seal authority.  Final Top-K materialization below
+        // still requires the canonical length.
+        if (!ResolveActiveRowMapping(row, source, &mapping, false) ||
             mapping.persistent_slot >= 0) {
           continue;
         }
@@ -1118,6 +1128,22 @@ class A5P10ScoreReceiptForwardResidentKernel {
     return true;
   }
 
+  __aicore__ inline int32_t FinalizeDiagnostic(
+      uint32_t row, uint32_t rank,
+      A5P10StageBFinalizeFailureReason reason) const {
+    const uint64_t ordinal = static_cast<uint64_t>(row) * topkPerRow_ + rank;
+    const uint64_t encoded = ordinal *
+            A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE_DETAIL_STRIDE +
+        static_cast<uint32_t>(reason);
+    // The graph ABI bounds B and K far below this limit.  Keep a generic
+    // fail-closed code if a malformed dynamic input ever defeats that proof.
+    if (encoded > 0x3fffffffULL) {
+      return A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE;
+    }
+    return A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE_DETAIL_BASE -
+        static_cast<int32_t>(encoded);
+  }
+
   __aicore__ inline bool FinalizeAssignedRows() {
     for (uint32_t row = worker_; row < activeRows_;
          row += tiling_->executorWorkerCount) {
@@ -1126,6 +1152,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
       if (selected_length < static_cast<int32_t>(topkPerRow_) ||
           static_cast<uint32_t>(selected_length) >
               tiling_->attentionSlotCapacity) {
+        RecordFirstFailure(FinalizeDiagnostic(
+            row, 0U, A5_P10_STAGE_B_FINALIZE_BAD_SELECTED_LENGTH));
         return false;
       }
       for (uint32_t rank = 0U; rank < topkPerRow_; ++rank) {
@@ -1142,12 +1170,16 @@ class A5P10ScoreReceiptForwardResidentKernel {
         }
         const uint32_t source = static_cast<uint32_t>(source_value);
         A5P10ActiveRowMapping mapping{};
-        if (!ResolveActiveRowMapping(row, source, &mapping)) {
+        if (!ResolveActiveRowMapping(row, source, &mapping, true)) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_ACTIVE_MAPPING));
           return false;
         }
         if (mapping.persistent_slot >= 0) {
           int32_t qsfa_slot = A5_P10_STAGE_B_UNMAPPED_SLOT;
           if (!ResolveQsfaSlot(mapping.persistent_slot, &qsfa_slot)) {
+            RecordFirstFailure(FinalizeDiagnostic(
+                row, rank, A5_P10_STAGE_B_FINALIZE_PERSISTENT_QSFA));
             return false;
           }
           attentionSlots_[attention_offset] = qsfa_slot;
@@ -1167,6 +1199,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
                                                    &newly_claimed)) {
           if (!ResolveConcurrentForwardSlot(source_offset, object_offset,
                                             &resident_slot)) {
+            RecordFirstFailure(FinalizeDiagnostic(
+                row, rank, A5_P10_STAGE_B_FINALIZE_SLOT_CLAIM));
             return false;
           }
         }
@@ -1174,10 +1208,14 @@ class A5P10ScoreReceiptForwardResidentKernel {
                                       static_cast<int32_t>(source),
                                       mapping.kv_object, resident_slot};
         if (!EnsureFinalWinnerReady(seed)) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_WINNER_READY));
           return false;
         }
         int32_t qsfa_slot = A5_P10_STAGE_B_UNMAPPED_SLOT;
         if (!ResolveQsfaSlot(resident_slot, &qsfa_slot)) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_FINAL_QSFA));
           return false;
         }
         attentionSlots_[attention_offset] = qsfa_slot;

@@ -37,6 +37,23 @@ constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_RECEIPT_TERMINAL = -201;
 constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE = -202;
 constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_DRAIN = -203;
 
+// A failed final winner must be actionable from one target run.  Keep the
+// detail in the existing diagnostic ledger rather than adding a mutable
+// tensor or another lifecycle state.  A detailed code is
+// `BASE - (row * K + rank) * STRIDE - reason`; the host acceptance harness
+// decodes it only after the forward has terminally failed.  This word remains
+// diagnostic-only and never participates in C8, queue, or slot scheduling.
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE_DETAIL_BASE = -202000;
+constexpr uint32_t A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE_DETAIL_STRIDE = 8U;
+enum A5P10StageBFinalizeFailureReason : uint32_t {
+  A5_P10_STAGE_B_FINALIZE_BAD_SELECTED_LENGTH = 1U,
+  A5_P10_STAGE_B_FINALIZE_ACTIVE_MAPPING = 2U,
+  A5_P10_STAGE_B_FINALIZE_PERSISTENT_QSFA = 3U,
+  A5_P10_STAGE_B_FINALIZE_SLOT_CLAIM = 4U,
+  A5_P10_STAGE_B_FINALIZE_WINNER_READY = 5U,
+  A5_P10_STAGE_B_FINALIZE_FINAL_QSFA = 6U,
+};
+
 // A persistent Stage-B companion starts from the same cold-bound mutable
 // tensors as Stage A.  It must not be connected to Stage A through a graph
 // completion edge: it polls receipt_state while this seal remains OPEN.

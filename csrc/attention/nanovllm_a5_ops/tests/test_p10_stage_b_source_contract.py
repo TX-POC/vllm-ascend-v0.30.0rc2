@@ -114,6 +114,18 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertNotIn("source_to_kv_object", self.kernel)
         self.assertNotIn("persistent_resident_slots", self.kernel)
 
+    def test_preseal_receipts_do_not_depend_on_a_post_topk_length(self):
+        """A READY score receipt is the pre-seal source-range authority.
+
+        The final canonical source length is written only after C8 completes
+        Top-K; using it to filter an earlier receipt silently removes the
+        speculative side of the target pipeline.
+        """
+        self.assertIn("require_canonical_source_length", self.kernel)
+        self.assertIn("ResolveActiveRowMapping(row, source, &mapping, false)", self.kernel)
+        self.assertIn("ResolveActiveRowMapping(row, source, &mapping, true)", self.kernel)
+        self.assertIn("post-Top-K output", self.kernel)
+
     def test_transport_uses_only_the_verified_forward_resident_abi(self):
         for name in (
             "P10_STAGE_B_KVAF_FORWARD_RESIDENT_DEVICE_HEADER",
@@ -244,7 +256,8 @@ class P10StageBSourceContractTest(unittest.TestCase):
         for token in (
             "A5_P10_STAGE_B_DIAGNOSTIC", "INIT_COMMON", "INIT_GEOMETRY",
             "INIT_KVAF", "INIT_UB", "RECEIPT_TERMINAL", "FINALIZE",
-            "DRAIN", "RecordFirstFailure", "MarkRunning",
+            "DRAIN", "FINALIZE_DETAIL_BASE", "FINALIZE_FINAL_QSFA",
+            "FinalizeDiagnostic", "RecordFirstFailure", "MarkRunning",
         ):
             self.assertIn(token, self.abi + self.kernel)
         self.assertIn("forward_control_gm.SetValue(1U, 0)", (

@@ -501,6 +501,17 @@ _STAGE_B_DIAGNOSTIC_NAMES = {
     -203: "drain",
 }
 
+_STAGE_B_FINALIZE_DETAIL_BASE = -202000
+_STAGE_B_FINALIZE_DETAIL_STRIDE = 8
+_STAGE_B_FINALIZE_DETAIL_NAMES = {
+    1: "bad_selected_length",
+    2: "active_mapping",
+    3: "persistent_qsfa",
+    4: "slot_claim",
+    5: "winner_ready",
+    6: "final_qsfa",
+}
+
 
 def _emit_terminal_diagnostic(
     fixture: _ForwardResidentKvaf,
@@ -519,6 +530,7 @@ def _emit_terminal_diagnostic(
     import torch
 
     receipt = tensors["receipt_state"].detach().cpu()
+    canonical_sparse = tensors["canonical_sparse"].detach().cpu()
     source_slots = tensors["source_to_slot"].detach().cpu()
     object_slots = tensors["object_to_slot"].detach().cpu()
     ready = tensors["resident_ready"].detach().cpu()
@@ -532,6 +544,42 @@ def _emit_terminal_diagnostic(
     diagnostic = int(forward[1]) if len(forward) > 1 else 0
     prefix = [int(value) for value in attention.reshape(-1)[:8].tolist()]
     lease_values = [] if leases is None else [int(value) for value in leases.tolist()]
+    detail = "none"
+    if diagnostic <= _STAGE_B_FINALIZE_DETAIL_BASE - 1:
+        encoded = _STAGE_B_FINALIZE_DETAIL_BASE - diagnostic
+        ordinal, reason = divmod(encoded, _STAGE_B_FINALIZE_DETAIL_STRIDE)
+        row, rank = divmod(ordinal, TOPK)
+        if 0 <= row < canonical_sparse.size(0) and 0 <= rank < TOPK:
+            source = int(canonical_sparse[row, 0, rank].item())
+            source_slot = (
+                int(source_slots[row, source].item())
+                if 0 <= source < source_slots.size(1)
+                else -999
+            )
+            object_slot = (
+                int(object_slots[0, source].item())
+                if 0 <= source < object_slots.size(1)
+                else -999
+            )
+            resident_state = (
+                int(ready[source_slot].item())
+                if 0 <= source_slot < ready.numel()
+                else -999
+            )
+            qsfa_value = (
+                int(tensors["resident_to_qsfa"][source_slot].detach().cpu().item())
+                if 0 <= source_slot < ready.numel()
+                else -999
+            )
+            attention_value = int(attention[row, 0, rank].item())
+            detail = (
+                f"reason={_STAGE_B_FINALIZE_DETAIL_NAMES.get(reason, 'unknown')} "
+                f"row={row} rank={rank} source={source} source_slot={source_slot} "
+                f"object_slot={object_slot} resident_state={resident_state} "
+                f"qsfa_value={qsfa_value} attention_value={attention_value}"
+            )
+        else:
+            detail = f"reason={_STAGE_B_FINALIZE_DETAIL_NAMES.get(reason, 'unknown')} ordinal={ordinal} out_of_fixture_range=1"
     print(
         "P10_RUNTIME_TERMINAL_DIAG "
         f"control={forward} stage_b_diag={diagnostic} "
@@ -542,7 +590,7 @@ def _emit_terminal_diagnostic(
         f"object_mapped={int(torch.count_nonzero(object_slots >= 0).item())} "
         f"resident_empty={count_eq(ready, 0)} resident_in_flight={count_eq(ready, 1)} "
         f"resident_ready={count_eq(ready, 2)} speculative_cursor={int(cursor.reshape(-1)[0].item())} "
-        f"queue_leases={lease_values} attention_prefix={prefix}",
+        f"queue_leases={lease_values} attention_prefix={prefix} finalize_detail={detail}",
         flush=True,
     )
 
