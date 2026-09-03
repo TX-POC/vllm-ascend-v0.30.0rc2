@@ -293,11 +293,23 @@ fi
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
 
-# Stage B deliberately keeps its source implementation under a distinct
-# ``*_kernel.cpp`` name to make its standalone closure unambiguous.  msopgen
-# dispatches by the canonical operator filename, so replace exactly that
-# generated wrapper in the merged package.  Stages A and ForwardPrepare
-# already use their canonical names and are overwritten by the copy above.
+# Source filenames are not necessarily msopgen filenames.  In particular,
+# CANN normalizes the W4/A4/C8 runs in Stage A's CamelCase operator name into
+# ``a5_p10_w4_a4_c8_score_receipt.cpp``.  The checked-in implementation keeps
+# the human-facing, ABI-oriented spelling without separators.  Do not leave
+# both files in the merged tree: CMake would compile the generated placeholder
+# and/or compile the real kernel twice.  Stage B has the analogous deliberately
+# suffixed source filename.  Replace each generated canonical wrapper with its
+# source implementation, then remove the source-only spelling.
+stage_a_generated_kernel="${GENERATED}/op_kernel/a5_p10_w4_a4_c8_score_receipt.cpp"
+stage_a_source_kernel="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt.cpp"
+[[ -f "${stage_a_generated_kernel}" ]] ||
+    fail "generated_stage_a_kernel_stub_missing"
+[[ -f "${stage_a_source_kernel}" ]] ||
+    fail "stage_a_source_kernel_missing_after_copy"
+cp -p "${stage_a_source_kernel}" "${stage_a_generated_kernel}"
+rm -f "${stage_a_source_kernel}"
+
 stage_b_generated_kernel="${GENERATED}/op_kernel/a5_p10_score_receipt_forward_resident.cpp"
 stage_b_source_kernel="${GENERATED}/op_kernel/a5_p10_score_receipt_forward_resident_kernel.cpp"
 [[ -f "${stage_b_generated_kernel}" ]] ||
@@ -308,7 +320,7 @@ cp -p "${stage_b_source_kernel}" "${stage_b_generated_kernel}"
 rm -f "${stage_b_source_kernel}"
 
 declare -a STUBS=(
-    a5_p10_w4a4c8_score_receipt.cpp
+    a5_p10_w4_a4_c8_score_receipt.cpp
     a5_p10_score_receipt_forward_resident.cpp
     a5_p10_forward_prepare.cpp
 )

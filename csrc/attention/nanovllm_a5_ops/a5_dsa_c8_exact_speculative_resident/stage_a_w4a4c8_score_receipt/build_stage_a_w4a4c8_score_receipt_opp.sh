@@ -115,7 +115,19 @@ msopgen gen -i "${OP_DEV}/ops.json" -f aclnn -c "ai_core-${TARGET_SOC}" \
 # the generated stub is safe because GENERATED is freshly created above.
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
-GENERATED_STUB="${GENERATED}/op_host/a5_p10_w4a4c8_score_receipt.cpp"
+# CANN normalizes W4/A4/C8 runs in the CamelCase op name when naming generated
+# host and kernel files.  The source closure intentionally retains its ABI
+# spelling (without inserted separators), so explicitly remap it to CANN's
+# generated canonical filename and delete the source-only spelling.  Keeping
+# both names would compile a placeholder or duplicate the real kernel.
+GENERATED_KERNEL="${GENERATED}/op_kernel/a5_p10_w4_a4_c8_score_receipt.cpp"
+SOURCE_KERNEL="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt.cpp"
+[[ -f "${GENERATED_KERNEL}" ]] || fail "generated_kernel_stub_missing"
+[[ -f "${SOURCE_KERNEL}" ]] || fail "source_kernel_missing_after_stage"
+cp -p "${SOURCE_KERNEL}" "${GENERATED_KERNEL}"
+rm -f "${SOURCE_KERNEL}"
+
+GENERATED_STUB="${GENERATED}/op_host/a5_p10_w4_a4_c8_score_receipt.cpp"
 SOURCE_OPDEF="${GENERATED}/op_host/a5_p10_w4a4c8_score_receipt_def.cpp"
 [[ -f "${GENERATED_STUB}" ]] || fail "generated_host_stub_missing"
 [[ -f "${SOURCE_OPDEF}" ]] || fail "source_opdef_missing_after_stage"

@@ -88,16 +88,25 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
             self.assertIn(token, self.source)
         self.assertNotIn("fresh_package_root_exists", self.source)
 
-    def test_combined_msopgen_project_keeps_its_own_cmake_and_uses_stage_b_kernel(self) -> None:
+    def test_combined_msopgen_project_remaps_normalized_stage_kernels(self) -> None:
         # Repository-level CMake fragments cannot be overlaid on a fresh CANN
-        # scaffold, and Stage B's deliberately suffixed source must replace
-        # the generated canonical dispatch filename.
+        # scaffold.  CANN normalizes W4/A4/C8 in the Stage-A generated filename
+        # while the source closure preserves its ABI spelling; both Stage A and
+        # Stage B must replace the canonical dispatch wrapper and remove the
+        # source-only filename so a placeholder or duplicate cannot compile.
         for token in (
             "copy_unique_tree_without_repository_cmake",
             "repository_host_cmake_leaked_into_msopgen_project",
+            "stage_a_generated_kernel",
+            "stage_a_source_kernel",
+            "generated_stage_a_kernel_stub_missing",
+            "stage_a_source_kernel_missing_after_copy",
+            "a5_p10_w4_a4_c8_score_receipt.cpp",
+            "rm -f \"${stage_a_source_kernel}\"",
             "stage_b_generated_kernel",
             "stage_b_source_kernel",
             "stage_b_source_kernel_missing_after_copy",
+            "rm -f \"${stage_b_source_kernel}\"",
         ):
             self.assertIn(token, self.product_source)
 

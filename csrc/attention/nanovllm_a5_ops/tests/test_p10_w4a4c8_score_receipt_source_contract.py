@@ -60,6 +60,18 @@ class P10W4A4C8ScoreReceiptSourceContractTest(unittest.TestCase):
         self.assertIn("duplicate_or_missing_op_registration", self.build)
         self.assertIn("CANN_3RD_LIB_PATH", self.build)
         self.assertIn("stage_a_must_not_reset_concurrent_receipt_state", self.build)
+        # CANN's source generator normalizes the W4/A4/C8 runs in the
+        # operator name.  The standalone route must replace that generated
+        # kernel with the checked-in source and remove the original spelling,
+        # just like the combined P10 product route.
+        for token in (
+            "a5_p10_w4_a4_c8_score_receipt.cpp",
+            "a5_p10_w4a4c8_score_receipt.cpp",
+            'cp -p "${SOURCE_KERNEL}" "${GENERATED_KERNEL}"',
+            'rm -f "${SOURCE_KERNEL}"',
+            'GENERATED_STUB="${GENERATED}/op_host/a5_p10_w4_a4_c8_score_receipt.cpp"',
+        ):
+            self.assertIn(token, self.build)
 
     def test_operator_abi_is_exact_w4a4c8_graph_alias_abi(self):
         self.assertIn("OP_ADD(A5P10W4A4C8ScoreReceipt)", self.definition)
