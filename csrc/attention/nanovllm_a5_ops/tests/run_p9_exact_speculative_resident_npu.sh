@@ -185,6 +185,10 @@ P9_KVAF_BATCH_GET_KERNEL="$P9_KVAF_BUILD/bin/kvaf_execute_batch_get_kernels.o"
 P9_KVAF_BATCH_PUT_KERNEL="$P9_KVAF_BUILD/bin/kvaf_execute_batch_put_kernels.o"
 [[ -s "$P9_KVAF_BATCH_GET_KERNEL" && -s "$P9_KVAF_BATCH_PUT_KERNEL" && -d "$P9_KVAF_BUILD/python" ]] || \
     runner_blocked "fresh_kvaf_artifacts_missing"
+# The import verifier below reads this path from its clean child environment.
+# Export it before launching Python; exporting it after that verifier would
+# make a successful fresh KVAF build look like an import failure.
+export P9_KVAF_BUILD
 export PYTHONPATH="$P9_KVAF_BUILD/python${PYTHONPATH:+:$PYTHONPATH}"
 if ! run_logged kvaf_import "$P9_RUN_ROOT/kvaf_import.log" "$P9_PYTHON" -c '
 import os, pathlib, kvaf
@@ -198,7 +202,6 @@ if not str(loaded).startswith(str(root)):
     exit 1
 fi
 
-export P9_KVAF_BUILD
 export A5_OFFICIAL_C8_SOURCE_ROOT="$P9_REFERENCE_VLLM_ROOT"
 export A5_OFFICIAL_C8_REFERENCE_ROOT="$P9_REFERENCE_OPP"
 export A5_OFFICIAL_C8_EXPECTED_SOURCE_HEAD="$P9_VLLM_EXPECTED_SHA"

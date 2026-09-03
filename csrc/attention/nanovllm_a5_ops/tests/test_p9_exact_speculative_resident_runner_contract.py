@@ -59,6 +59,14 @@ class P9ExactSpeculativeResidentRunnerContractTest(unittest.TestCase):
         self.assertIn("p9_legacy_compile_disabled_provenance", RUNNER)
         self.assertNotIn("export SOC_VERSION=", RUNNER)
 
+    def test_fresh_kvaf_build_path_is_exported_before_the_clean_import_probe(self) -> None:
+        """The import probe runs in a child process and needs this exact path."""
+        artifact_check = RUNNER.index('runner_blocked "fresh_kvaf_artifacts_missing"')
+        export_path = RUNNER.index("export P9_KVAF_BUILD")
+        import_probe = RUNNER.index("run_logged kvaf_import")
+        self.assertLess(artifact_check, export_path)
+        self.assertLess(export_path, import_probe)
+
     def test_runner_does_not_substitute_a_historical_transport_route(self) -> None:
         self.assertNotIn("p8_real_direct_hccp_fixture", RUNNER)
         self.assertNotIn("a5_p8_forward_owned_executor", RUNNER)
