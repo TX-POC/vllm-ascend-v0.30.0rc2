@@ -123,15 +123,37 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         self.assertIn("aclnnA5P10ScoreReceiptForwardResident", self.bridge)
 
     def test_graph_has_prepare_fanout_but_no_stage_a_to_stage_b_completion_edge(self) -> None:
+        # The default graph is the product overlap route.  A distinct
+        # benchmark-only serial branch is permitted below, but must not alter
+        # the inference default.
+        overlap = self.graph.split('if execution_mode == "overlap":', 1)[1].split(
+            "    else:\n        # Benchmark-only serial reference.", 1
+        )[0]
+        self.assertIn('execution_mode: str = "overlap"', self.graph)
         self.assertIn("_launch_prepare(inputs)", self.graph)
-        self.assertIn("producer_stream.wait_event(prepared)", self.graph)
-        self.assertIn("executor_stream.wait_event(prepared)", self.graph)
-        self.assertIn("_launch_stage_a(inputs)", self.graph)
-        self.assertIn("_launch_stage_b(inputs)", self.graph)
-        self.assertNotIn("stage_a_complete", self.graph)
-        self.assertNotIn("wait_event(stage_a", self.graph)
-        self.assertIn("stage_b_complete = _record_event(executor_stream)", self.graph)
+        self.assertIn("producer_stream.wait_event(prepared)", overlap)
+        self.assertIn("executor_stream.wait_event(prepared)", overlap)
+        self.assertIn("_launch_stage_a(inputs)", overlap)
+        self.assertIn("_launch_stage_b(inputs)", overlap)
+        self.assertNotIn("serial_stage_a_complete", overlap)
+        self.assertNotIn("wait_event(serial_stage_a", overlap)
+        self.assertIn("stage_b_complete = _record_event(executor_stream)", overlap)
         self.assertIn("qsfa_stream.wait_event(self.stage_b_complete)", self.graph)
+
+    def test_serial_reference_is_explicitly_benchmark_only_and_same_operator_path(self) -> None:
+        serial = self.graph.split("# Benchmark-only serial reference.", 1)[1]
+        reference = self.contract["benchmark_only_serial_reference"]
+        self.assertIn("execution_mode == \"overlap\"", self.graph)
+        self.assertIn("serial_stage_a_complete = _record_event(producer_stream)", serial)
+        self.assertIn("executor_stream.wait_event(serial_stage_a_complete)", serial)
+        self.assertIn("_launch_stage_a(inputs)", serial)
+        self.assertIn("_launch_stage_b(inputs)", serial)
+        self.assertIn("No host synchronization occurs", serial)
+        self.assertEqual(
+            reference["sole_added_edge"],
+            "stage_a_completion_event_to_stage_b_start",
+        )
+        self.assertEqual(reference["inference_default"], "overlap")
 
     def test_companion_is_submitted_before_native_c8_without_a_reverse_dependency(self) -> None:
         """Short forwards need the device poller admitted before C8 can seal.

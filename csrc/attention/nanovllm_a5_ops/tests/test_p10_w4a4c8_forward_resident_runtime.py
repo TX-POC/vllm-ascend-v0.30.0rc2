@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import math
 import os
 from pathlib import Path
+import statistics
 import sys
+import time
 import traceback
 from typing import Any
 
@@ -45,6 +48,77 @@ MAX_REQUESTS_PER_WAVE = 64
 
 class P10Blocked(RuntimeError):
     """A missing target-runtime prerequisite, reported without a false pass."""
+
+
+class P10SemanticSignature(tuple):
+    """Rank-ordered P10 result semantics, independent of private slot IDs.
+
+    Speculative admission can legitimately select a different physical
+    resident row in the serial and overlap schedules.  This compact signature
+    instead represents what QSFA can actually consume: exact canonical Top-K,
+    source lengths, selected lengths, non-sparse tail, and rank-ordered KV
+    bytes after logical-QSFA-slot translation.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        canonical_sha16: str,
+        source_lens: tuple[int, ...],
+        selected_lens: tuple[int, ...],
+        tail_sha16: str,
+        ranked_payload_sha16: str,
+    ) -> "P10SemanticSignature":
+        return tuple.__new__(
+            cls,
+            (
+                canonical_sha16,
+                source_lens,
+                selected_lens,
+                tail_sha16,
+                ranked_payload_sha16,
+            ),
+        )
+
+
+class P10TimingSample(tuple):
+    """One complete, already-validated P10 forward timing sample."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        device_us: float,
+        host_us: float,
+        signature: P10SemanticSignature,
+        speculative_slots: int,
+        mapped_sources: int,
+    ) -> "P10TimingSample":
+        return tuple.__new__(
+            cls,
+            (device_us, host_us, signature, speculative_slots, mapped_sources),
+        )
+
+    @property
+    def device_us(self) -> float:
+        return float(self[0])
+
+    @property
+    def host_us(self) -> float:
+        return float(self[1])
+
+    @property
+    def signature(self) -> P10SemanticSignature:
+        return self[2]
+
+    @property
+    def speculative_slots(self) -> int:
+        return int(self[3])
+
+    @property
+    def mapped_sources(self) -> int:
+        return int(self[4])
 
 
 def _blocked(reason: str) -> None:
@@ -600,13 +674,18 @@ def _assert_terminal(
     fixture: _ForwardResidentKvaf,
     tensors: dict[str, Any],
     launch: Any,
-) -> None:
+    *,
+    aliases: Any | None = None,
+    require_preseal_overlap: bool = True,
+    emit_summary: bool = True,
+) -> P10SemanticSignature:
     import torch
 
     # This synchronization is a validation-only observation after the bridge
     # has already inserted Stage-B COMPLETE -> QSFA. It is never a product
     # host dependency.
-    aliases = launch.bind_qsfa()
+    if aliases is None:
+        aliases = launch.bind_qsfa()
     launch.stage_b_complete.synchronize()
     torch.npu.synchronize()
     actual = tensors["canonical_sparse"].detach().cpu()
@@ -651,6 +730,7 @@ def _assert_terminal(
 
     mismatches: list[str] = []
     used_slots: set[int] = set()
+    ranked_payload = hashlib.sha256()
     for rank, source_value in enumerate(expected.reshape(-1).tolist()):
         source = int(source_value)
         slot = int(source_to_slot[0, source])
@@ -699,35 +779,55 @@ def _assert_terminal(
             mismatches.append(f"payload:rank={rank}:source={source}:slot={slot}")
             break
         used_slots.add(slot)
+        ranked_payload.update(payload[slot].contiguous().numpy().tobytes())
     if mismatches:
         raise AssertionError("P10 forward-resident closure mismatch: " + ",".join(mismatches))
     if len(used_slots) != TOPK:
         raise AssertionError(f"final winners alias resident rows: unique={len(used_slots)} expected={TOPK}")
     witness = launch.read_overlap_witness_after_completion()
-    if not witness.overlapped:
+    if require_preseal_overlap:
+        if not witness.overlapped:
+            raise AssertionError(
+                "P10 did not observe receipt consumption before producer seal: "
+                f"producer_seal={witness.producer_seal_sequence} "
+                f"first_preseal_claim={witness.first_preseal_ready_claim_sequence}"
+            )
+    elif (
+        witness.producer_seal_sequence <= 0
+        or witness.first_preseal_ready_claim_sequence != 0
+    ):
         raise AssertionError(
-            "P10 did not observe receipt consumption before producer seal: "
+            "P10 serial reference did not remain Stage-A-before-Stage-B: "
             f"producer_seal={witness.producer_seal_sequence} "
             f"first_preseal_claim={witness.first_preseal_ready_claim_sequence}"
         )
+    signature = P10SemanticSignature(
+        canonical_sha16=_sha16(actual),
+        source_lens=tuple(int(value) for value in actual_lens.tolist()),
+        selected_lens=tuple(int(value) for value in lengths.tolist()),
+        tail_sha16=_sha16(attention[0, 0, TOPK:]),
+        ranked_payload_sha16=ranked_payload.hexdigest()[:16],
+    )
     fixture.terminal = True
-    print(
-        "P10_RUNTIME_PARITY "
-        f"canonical_topk=1 score_source_lens=1 sha16={_sha16(actual)}",
-        flush=True,
-    )
-    print(
-        "P10_RUNTIME_HCCP "
-        f"final_winners={TOPK} resident_ready=1 payload=1 queue_leases_zero=1 unique_slots={len(used_slots)}",
-        flush=True,
-    )
-    print(
-        "P10_RUNTIME_QSFA "
-        f"stage_b_to_qsfa_event=1 nonidentity_resident_translation=1 tail_preserved=1 "
-        f"preseal_overlap=1 producer_seal={witness.producer_seal_sequence} "
-        f"first_preseal_claim={witness.first_preseal_ready_claim_sequence}",
-        flush=True,
-    )
+    if emit_summary:
+        print(
+            "P10_RUNTIME_PARITY "
+            f"canonical_topk=1 score_source_lens=1 sha16={_sha16(actual)}",
+            flush=True,
+        )
+        print(
+            "P10_RUNTIME_HCCP "
+            f"final_winners={TOPK} resident_ready=1 payload=1 queue_leases_zero=1 unique_slots={len(used_slots)}",
+            flush=True,
+        )
+        print(
+            "P10_RUNTIME_QSFA "
+            f"stage_b_to_qsfa_event=1 nonidentity_resident_translation=1 tail_preserved=1 "
+            f"preseal_overlap={int(witness.overlapped)} producer_seal={witness.producer_seal_sequence} "
+            f"first_preseal_claim={witness.first_preseal_ready_claim_sequence}",
+            flush=True,
+        )
+    return signature
 
 
 def _verify_runtime_provenance() -> None:
@@ -759,7 +859,15 @@ def _verify_runtime_provenance() -> None:
     )
 
 
-def _main() -> int:
+def _load_product_runtime() -> tuple[Any, Any]:
+    """Resolve the one source-keyed product bridge before any P10 work.
+
+    Both the normal acceptance case and the paired performance case pass
+    through this exact function.  That keeps the comparison honest: there is
+    no second bridge, no separately resolved Stage A, and no host-side Get
+    baseline hidden behind the benchmark label.
+    """
+
     _verify_runtime_provenance()
     device = _require_logical_npu()
     bridge_root = _require_directory("P10_PRODUCT_BRIDGE_PYTHON")
@@ -783,6 +891,320 @@ def _main() -> int:
         ) from error
     from nanovllm_p10_forward_bridge.p10_forward_graph import launch_p10_forward
 
+    return device, launch_p10_forward
+
+
+def _positive_environment_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise P10Blocked(f"invalid_{name.lower()}:{raw}") from error
+    if value <= 0:
+        _blocked(f"invalid_{name.lower()}:{raw}")
+    return value
+
+
+def _immutable_input_digests(base: dict[str, Any]) -> dict[str, str]:
+    """Return a bounded identity check for the product's read-only W4A4C8 ABI."""
+
+    return {
+        name: _sha16(base[name])
+        for name in (
+            "query",
+            "key",
+            "weights",
+            "query_dequant_scale",
+            "key_dequant_scale",
+            "actual_seq_lengths_query",
+            "candidate_lens",
+            "block_table",
+        )
+    }
+
+
+def _require_immutable_inputs(
+    before: dict[str, str], base: dict[str, Any], *, context: str
+) -> None:
+    after = _immutable_input_digests(base)
+    changed = [name for name, digest in before.items() if after.get(name) != digest]
+    if changed:
+        raise AssertionError(
+            "W4A4C8 product input mutated during "
+            f"{context}:" + ",".join(changed)
+        )
+
+
+def _percentile(samples: list[float], percentile: float) -> float:
+    """Linear percentile with deterministic behavior for the short A5 run."""
+
+    if not samples:
+        raise ValueError("percentile requires at least one sample")
+    ordered = sorted(samples)
+    index = (len(ordered) - 1) * percentile / 100.0
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return float(ordered[lower])
+    fraction = index - lower
+    return float(ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction)
+
+
+def _emit_perf_result(operation: str, values: list[float], *, warmup: int, metric: str) -> None:
+    print(
+        "PERF_RESULT "
+        f"operation={operation} samples={len(values)} warmup_excluded={warmup} "
+        f"metric={metric} mean_us={statistics.mean(values):.3f} "
+        f"p50_us={_percentile(values, 50.0):.3f} "
+        f"p90_us={_percentile(values, 90.0):.3f} "
+        f"p99_us={_percentile(values, 99.0):.3f}",
+        flush=True,
+    )
+
+
+def _reset_benchmark_destination(fixture: _ForwardResidentKvaf, producer_stream: Any) -> None:
+    """Equalize the only persistent writable payload outside either timing interval.
+
+    The Direct-HCCP control/table stay cold-bound throughout the paired run;
+    that is intentional product setup.  The resident payload itself is
+    cleared only after the preceding forward reached terminal state and its
+    queue lease was proven zero.  It prevents an old row from being mistaken
+    for a newly transferred winner if a future regression skips a copy.
+    """
+
+    import torch
+
+    if fixture.resident_payload is None:
+        raise AssertionError("P10 benchmark destination is not cold-bound")
+    with torch.npu.stream(producer_stream):
+        fixture.resident_payload.zero_()
+    torch.npu.synchronize()
+
+
+def _run_timed_forward(
+    *,
+    mode: str,
+    device: Any,
+    base: dict[str, Any],
+    reference: Any,
+    fixture: _ForwardResidentKvaf,
+    launch_p10_forward: Any,
+    immutable_digests: dict[str, str],
+) -> P10TimingSample:
+    """Run one fully terminal P10 forward with an exact device-side boundary.
+
+    The compared interval begins on the producer stream immediately before
+    ``ForwardPrepare`` and ends on that same stream after it has waited for
+    Stage B's completion event.  It therefore includes native W4A4C8 score,
+    receipt consumption, PostOnly/CQ drain, final recall, and the precise
+    Stage-B -> QSFA readiness edge.  Allocation, cold binding, destination
+    reset, host validation, and teardown are deliberately outside the timed
+    interval for both modes.
+    """
+
+    import torch
+
+    if mode not in ("serial", "overlap"):
+        raise ValueError(f"unsupported P10 benchmark mode: {mode}")
+
+    # The runner exposes one logical device only.  Use the active provider
+    # stream rather than a version-specific ``device=`` overload, matching
+    # the cold KVAF bind path above.
+    producer = torch.npu.current_stream()
+    executor = torch.npu.Stream(device=device)
+    _reset_benchmark_destination(fixture, producer)
+    fixture.terminal = False
+    inputs, tensors = _build_forward_inputs(device, base, fixture)
+
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    host_start_ns = time.perf_counter_ns()
+    with torch.npu.stream(producer):
+        start.record()
+    launch = launch_p10_forward(
+        inputs,
+        producer_stream=producer,
+        executor_stream=executor,
+        execution_mode=mode,
+    )
+    aliases = launch.bind_qsfa(producer)
+    with torch.npu.stream(producer):
+        end.record()
+    end.synchronize()
+    host_us = (time.perf_counter_ns() - host_start_ns) / 1000.0
+    device_us = start.elapsed_time(end) * 1000.0
+
+    signature = _assert_terminal(
+        reference,
+        fixture,
+        tensors,
+        launch,
+        aliases=aliases,
+        require_preseal_overlap=(mode == "overlap"),
+        emit_summary=False,
+    )
+    _require_immutable_inputs(immutable_digests, base, context=f"P10 {mode} run")
+    speculative_slots = int(
+        tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
+    )
+    mapped_sources = int(
+        torch.count_nonzero(tensors["source_to_slot"].detach().cpu() >= 0).item()
+    )
+    return P10TimingSample(
+        device_us=device_us,
+        host_us=host_us,
+        signature=signature,
+        speculative_slots=speculative_slots,
+        mapped_sources=mapped_sources,
+    )
+
+
+def _run_benchmark() -> int:
+    """Compare serial and overlapped P10 using the identical product route.
+
+    This is intentionally a B=1, 4,096-token acceptance geometry: it proves
+    that the first production-shaped forward has an exact serial reference
+    before a later capacity/saturation sweep changes batch geometry.  It is
+    not a claim that the numbers characterize a fully saturated decode batch.
+    """
+
+    warmup = _positive_environment_int("P10_PERF_WARMUP", 1)
+    iterations = _positive_environment_int("P10_PERF_ITERS", 5)
+    device, launch_p10_forward = _load_product_runtime()
+    base = _build_w4a4c8_inputs(device)
+    immutable_digests = _immutable_input_digests(base)
+    reference = _reference_w4a4c8(base)
+    _require_immutable_inputs(immutable_digests, base, context="product oracle")
+    fixture = _ForwardResidentKvaf(device)
+    samples: dict[str, list[P10TimingSample]] = {"serial": [], "overlap": []}
+
+    try:
+        fixture.bind()
+        # Warm both modes once, then alternate order in measured trials.  The
+        # alternation prevents Direct-HCCP and cache warm state from always
+        # favouring whichever mode happens to run second.
+        for iteration in range(warmup):
+            for mode in (("serial", "overlap") if iteration % 2 == 0 else ("overlap", "serial")):
+                _run_timed_forward(
+                    mode=mode,
+                    device=device,
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    launch_p10_forward=launch_p10_forward,
+                    immutable_digests=immutable_digests,
+                )
+        print(
+            "P10_PERF_WARMUP "
+            f"pairs={warmup} serial_terminal=1 overlap_preseal=1",
+            flush=True,
+        )
+
+        for iteration in range(iterations):
+            order = ("serial", "overlap") if iteration % 2 == 0 else ("overlap", "serial")
+            for mode in order:
+                sample = _run_timed_forward(
+                    mode=mode,
+                    device=device,
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    launch_p10_forward=launch_p10_forward,
+                    immutable_digests=immutable_digests,
+                )
+                samples[mode].append(sample)
+                print(
+                    "P10_PERF_SAMPLE "
+                    f"iteration={iteration} mode={mode} device_us={sample.device_us:.3f} "
+                    f"host_us={sample.host_us:.3f} speculative_slots={sample.speculative_slots} "
+                    f"mapped_sources={sample.mapped_sources}",
+                    flush=True,
+                )
+    finally:
+        fixture.close()
+
+    serial_signatures = [sample.signature for sample in samples["serial"]]
+    overlap_signatures = [sample.signature for sample in samples["overlap"]]
+    if not serial_signatures or not overlap_signatures:
+        raise AssertionError("P10 benchmark produced no paired timing samples")
+    expected_signature = serial_signatures[0]
+    if any(signature != expected_signature for signature in serial_signatures):
+        raise AssertionError("P10 serial benchmark semantics varied between samples")
+    if any(signature != expected_signature for signature in overlap_signatures):
+        raise AssertionError("P10 serial/overlap semantic signature mismatch")
+
+    serial_device = [sample.device_us for sample in samples["serial"]]
+    overlap_device = [sample.device_us for sample in samples["overlap"]]
+    serial_host = [sample.host_us for sample in samples["serial"]]
+    overlap_host = [sample.host_us for sample in samples["overlap"]]
+    _emit_perf_result(
+        "p10_w4a4c8_forward_resident_serial",
+        serial_device,
+        warmup=warmup,
+        metric="npu_event_forward_prepare_to_qsfa_ready",
+    )
+    _emit_perf_result(
+        "p10_w4a4c8_forward_resident_overlap",
+        overlap_device,
+        warmup=warmup,
+        metric="npu_event_forward_prepare_to_qsfa_ready",
+    )
+    _emit_perf_result(
+        "p10_w4a4c8_forward_resident_serial_host_diagnostic",
+        serial_host,
+        warmup=warmup,
+        metric="host_submit_to_terminal_diagnostic",
+    )
+    _emit_perf_result(
+        "p10_w4a4c8_forward_resident_overlap_host_diagnostic",
+        overlap_host,
+        warmup=warmup,
+        metric="host_submit_to_terminal_diagnostic",
+    )
+
+    serial_p50 = _percentile(serial_device, 50.0)
+    overlap_p50 = _percentile(overlap_device, 50.0)
+    serial_p90 = _percentile(serial_device, 90.0)
+    overlap_p90 = _percentile(overlap_device, 90.0)
+    saved_p50 = serial_p50 - overlap_p50
+    saved_p90 = serial_p90 - overlap_p90
+    print(
+        "P10_PERF_EQ "
+        "product_w4a4c8_oracle=1 canonical_topk=1 score_source_lens=1 "
+        "ranked_resident_payload=1 qsfa_lengths_and_tail=1 "
+        "serial_terminal_after_seal=1 overlap_preseal_claim=1",
+        flush=True,
+    )
+    print(
+        "P10_PERF_RESULT "
+        f"serial_p50_us={serial_p50:.3f} overlap_p50_us={overlap_p50:.3f} "
+        f"saved_p50_us={saved_p50:.3f} "
+        f"saved_p50_pct={100.0 * saved_p50 / serial_p50:.3f} "
+        f"serial_p90_us={serial_p90:.3f} overlap_p90_us={overlap_p90:.3f} "
+        f"saved_p90_us={saved_p90:.3f} "
+        f"saved_p90_pct={100.0 * saved_p90 / serial_p90:.3f}",
+        flush=True,
+    )
+    for mode in ("serial", "overlap"):
+        speculative = [sample.speculative_slots for sample in samples[mode]]
+        mapped = [sample.mapped_sources for sample in samples[mode]]
+        print(
+            "P10_PERF_WORK "
+            f"mode={mode} speculative_slots_min={min(speculative)} "
+            f"speculative_slots_max={max(speculative)} mapped_sources_min={min(mapped)} "
+            f"mapped_sources_max={max(mapped)}",
+            flush=True,
+        )
+    print(
+        "P10_RUNTIME_PASS "
+        "route=w4a4c8_score_receipt_direct_hccp_qsfa benchmark=serial_vs_overlap",
+        flush=True,
+    )
+    return 0
+
+
+def _run_acceptance() -> int:
+    device, launch_p10_forward = _load_product_runtime()
     base = _build_w4a4c8_inputs(device)
     reference = _reference_w4a4c8(base)
     fixture = _ForwardResidentKvaf(device)
@@ -795,6 +1217,16 @@ def _main() -> int:
         fixture.close()
     print("P10_RUNTIME_PASS route=w4a4c8_score_receipt_direct_hccp_qsfa", flush=True)
     return 0
+
+
+def _main() -> int:
+    runtime_case = os.environ.get("P10_RUNTIME_CASE", "acceptance")
+    if runtime_case == "acceptance":
+        return _run_acceptance()
+    if runtime_case == "benchmark":
+        return _run_benchmark()
+    _blocked(f"invalid_p10_runtime_case:{runtime_case}")
+    raise AssertionError("unreachable")
 
 
 if __name__ == "__main__":

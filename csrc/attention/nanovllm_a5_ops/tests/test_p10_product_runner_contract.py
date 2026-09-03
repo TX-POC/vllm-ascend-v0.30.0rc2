@@ -62,6 +62,19 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.runner.index("ASCEND_LAUNCH_BLOCKING=0"), self.runner.index(probe)
         )
 
+    def test_runner_forwards_only_the_two_explicit_runtime_cases(self) -> None:
+        """Benchmarking must not select a second product artifact or route."""
+
+        for token in (
+            'runtime_case="${P10_RUNTIME_CASE:-acceptance}"',
+            "acceptance|benchmark",
+            "invalid_runtime_case:${runtime_case}",
+            "runtime_case=%s",
+            'P10_RUNTIME_CASE="${runtime_case}" "${python_bin}" "${runtime_fixture}"',
+            "label=forward_resident_runtime case=%s status=0",
+        ):
+            self.assertIn(token, self.runner)
+
     def test_runner_builds_the_complete_sha_keyed_bridge_package(self) -> None:
         """A native .so alone would create a namespace package at runtime.
 
@@ -123,6 +136,24 @@ class P10ProductRunnerContractTest(unittest.TestCase):
     def test_fixture_rejects_a_namespace_bridge_before_operator_execution(self) -> None:
         self.assertIn('getattr(module, "__file__", None)', self.fixture)
         self.assertIn('"product_bridge_package_file_missing"', self.fixture)
+
+    def test_benchmark_keeps_one_product_route_and_a_qsfa_terminal_boundary(self) -> None:
+        """The latency comparison must not quietly degrade into host Get timing."""
+
+        for token in (
+            'P10_RUNTIME_CASE", "acceptance")',
+            'if runtime_case == "benchmark"',
+            'execution_mode=mode',
+            "launch.bind_qsfa(producer)",
+            "end.synchronize()",
+            "require_preseal_overlap=(mode == \"overlap\")",
+            "fixture.resident_payload.zero_()",
+            "P10_PERF_EQ ",
+            "p10_w4a4c8_forward_resident_serial",
+            "p10_w4a4c8_forward_resident_overlap",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertNotIn("runtime.batch_get(", self.fixture)
 
 
 if __name__ == "__main__":

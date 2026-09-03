@@ -15,6 +15,7 @@ set -euo pipefail
 this_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 mode="${P10_RUNNER_MODE:-npu}"
+runtime_case="${P10_RUNTIME_CASE:-acceptance}"
 build_jobs="${P10_BUILD_JOBS:-8}"
 
 fail() {
@@ -53,6 +54,10 @@ require_exact_clean_source() {
 case "${mode}" in
     static|npu) ;;
     *) fail "invalid_runner_mode:${mode}" ;;
+esac
+case "${runtime_case}" in
+    acceptance|benchmark) ;;
+    *) fail "invalid_runtime_case:${runtime_case}" ;;
 esac
 [[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]] || fail "invalid_build_jobs:${build_jobs}"
 [[ -z "${SOC_VERSION:-}" ]] || fail "legacy_SOC_VERSION_must_be_unset"
@@ -98,8 +103,9 @@ for test_file in "${static_tests[@]}"; do
     [[ -r "${test_file}" ]] || fail "static_contract_missing:path=${test_file}"
 done
 
-printf 'P10_RUNNER_CONFIG mode=%s product=combined_forward_prepare_stage_a_stage_b physical=%s logical=%s build_jobs=%s\n' \
-    "${mode}" "${P10_PHYSICAL_NPU_ID:-<not-required-in-static>}" \
+printf 'P10_RUNNER_CONFIG mode=%s runtime_case=%s product=combined_forward_prepare_stage_a_stage_b physical=%s logical=%s build_jobs=%s\n' \
+    "${mode}" "${runtime_case}" \
+    "${P10_PHYSICAL_NPU_ID:-<not-required-in-static>}" \
     "${P10_LOGICAL_NPU_ID:-0}" "${build_jobs}"
 
 ( cd "${vllm_root}" && "${python_bin}" -m unittest \
@@ -331,6 +337,7 @@ export P10_LOGICAL_NPU_ID=0
 export P10_VLLM_EXPECTED_SHA
 export P10_KVAF_EXPECTED_SHA
 
-"${python_bin}" "${runtime_fixture}"
-printf 'P10_RUNNER_STEP label=forward_resident_runtime status=0\n'
-printf 'P10_RUNNER_PASS mode=npu product_route=combined_w4a4c8_prepare_score_receipt_resident_qsfa\n'
+P10_RUNTIME_CASE="${runtime_case}" "${python_bin}" "${runtime_fixture}"
+printf 'P10_RUNNER_STEP label=forward_resident_runtime case=%s status=0\n' "${runtime_case}"
+printf 'P10_RUNNER_PASS mode=npu runtime_case=%s product_route=combined_w4a4c8_prepare_score_receipt_resident_qsfa\n' \
+    "${runtime_case}"

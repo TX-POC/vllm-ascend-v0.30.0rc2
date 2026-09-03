@@ -231,6 +231,7 @@ def launch_p10_forward(
     *,
     producer_stream: Any | None = None,
     executor_stream: Any | None = None,
+    execution_mode: str = "overlap",
 ) -> P10ForwardLaunch:
     """Build the P10 product graph without a host candidate submission path.
 
@@ -239,6 +240,14 @@ def launch_p10_forward(
     logical companion stream is allocated for the resident executor.  Both
     wait only for the graph-visible preparation event.  Stage B's device-side
     receipt protocol is the only producer/executor synchronization mechanism.
+
+    ``execution_mode="overlap"`` is the only product path.  The explicit
+    ``"serial"`` mode exists solely for the P10 acceptance benchmark: it uses
+    the same three product operators, inputs, Direct-HCCP control, and QSFA
+    boundary, but adds exactly one Stage-A-complete event before Stage B.  It
+    is therefore a valid same-workload reference, rather than a host-Get or
+    separately computed C8 baseline.  Inference callers must leave the
+    default unchanged.
     """
 
     if not inputs.query.device.type.startswith("privateuseone") and \
@@ -249,6 +258,11 @@ def launch_p10_forward(
         producer_stream = torch.npu.current_stream(device=inputs.query.device)
     if executor_stream is None:
         executor_stream = _make_companion_stream(inputs.query)
+    if execution_mode not in ("overlap", "serial"):
+        raise ValueError(
+            "P10 execution_mode must be 'overlap' or benchmark-only 'serial', "
+            f"got {execution_mode!r}"
+        )
 
     # Prepare executes as a real custom operator in the graph.  The event is
     # the only precondition shared by the two concurrent successors.
@@ -256,20 +270,36 @@ def launch_p10_forward(
         _launch_prepare(inputs)
         prepared = _record_event(producer_stream)
 
-    # Enqueue the persistent consumer first.  This does not make Stage A wait
-    # for Stage B and it does not reserve a physical AIV: it only ensures that
-    # the device-side receipt poller has been admitted before the first native
-    # score tile can become READY.  In particular, do not reverse these two
-    # independent submissions for a short forward, or C8 may seal before the
-    # companion is ever scheduled and eliminate all useful overlap.
-    with torch.npu.stream(executor_stream):
-        executor_stream.wait_event(prepared)
-        _launch_stage_b(inputs)
-        stage_b_complete = _record_event(executor_stream)
+    if execution_mode == "overlap":
+        # Enqueue the persistent consumer first.  This does not make Stage A
+        # wait for Stage B and it does not reserve a physical AIV: it only
+        # ensures that the device-side receipt poller has been admitted before
+        # the first native score tile can become READY.  In particular, do not
+        # reverse these two independent submissions for a short forward, or
+        # C8 may seal before the companion is ever scheduled and eliminate all
+        # useful overlap.
+        with torch.npu.stream(executor_stream):
+            executor_stream.wait_event(prepared)
+            _launch_stage_b(inputs)
+            stage_b_complete = _record_event(executor_stream)
 
-    with torch.npu.stream(producer_stream):
-        producer_stream.wait_event(prepared)
-        _launch_stage_a(inputs)
+        with torch.npu.stream(producer_stream):
+            producer_stream.wait_event(prepared)
+            _launch_stage_a(inputs)
+    else:
+        # Benchmark-only serial reference.  No host synchronization occurs:
+        # the sole added edge is native C8 completion -> the unchanged Stage-B
+        # Direct-HCCP executor.  This preserves every input/output alias and
+        # makes a serial timing comparison meaningful.
+        with torch.npu.stream(producer_stream):
+            producer_stream.wait_event(prepared)
+            _launch_stage_a(inputs)
+            serial_stage_a_complete = _record_event(producer_stream)
+
+        with torch.npu.stream(executor_stream):
+            executor_stream.wait_event(serial_stage_a_complete)
+            _launch_stage_b(inputs)
+            stage_b_complete = _record_event(executor_stream)
 
     return P10ForwardLaunch(
         attention_slots=inputs.attention_slots_buffer,

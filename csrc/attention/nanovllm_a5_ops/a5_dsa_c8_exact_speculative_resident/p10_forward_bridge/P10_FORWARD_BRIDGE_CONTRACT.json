@@ -72,6 +72,12 @@
     "prepare_to_stage_b",
     "stage_b_completion_to_qsfa"
   ],
+  "benchmark_only_serial_reference": {
+    "purpose": "same_product_operator_math_and_latency_baseline",
+    "sole_added_edge": "stage_a_completion_event_to_stage_b_start",
+    "host_synchronization": false,
+    "inference_default": "overlap"
+  },
   "product_assembly": {
     "opapi_resolver": "one_fresh_combined_P10_vendor",
     "operators": [
