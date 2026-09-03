@@ -101,6 +101,27 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.product_source)
 
+    def test_combined_msopgen_selection_is_noninteractive_and_appends_nodes(self) -> None:
+        # P10 has three graph nodes in one JSON array.  Every generation must
+        # name its operator explicitly; otherwise msopgen asks on stdin which
+        # operator to generate and remote non-interactive builds hang.  The
+        # second and third node must append to the first scaffold rather than
+        # create separate vendor packages.
+        for token in (
+            'A5P10W4A4C8ScoreReceipt',
+            'A5P10ScoreReceiptForwardResident',
+            'A5P10ForwardPrepare',
+            '-op "${op}"',
+            'if (( index > 0 )); then',
+            'msopgen_args+=(-m 1)',
+            'P10_PRODUCT_MSOPGEN op=%s merge=%s interactive=0',
+            'msopgen "${msopgen_args[@]}"',
+        ):
+            self.assertIn(token, self.product_source)
+        self.assertNotIn(
+            'msopgen gen -i "${OP_DEV}/ops.json"', self.product_source
+        )
+
     def test_stage_a_cannot_reinitialize_receipts_after_concurrent_launch(self) -> None:
         for token in (
             "require_forward_preinit_boundary",

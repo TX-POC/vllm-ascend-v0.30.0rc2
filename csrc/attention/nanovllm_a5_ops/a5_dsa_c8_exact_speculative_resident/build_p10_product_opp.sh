@@ -252,8 +252,38 @@ cp -p "${KVAF_DEMO_ROOT}/include/direct_hccp_abi.h" \
 printf 'P10_PRODUCT_BUILD_SOURCE vllm=%s kvaf=%s package=%s output=%s target=%s jobs=%s\n' \
     "${VLLM_HEAD}" "${KVAF_HEAD}" "${PACKAGE_ROOT}" "${OUTPUT_ROOT}" "${TARGET_SOC}" "${BUILD_JOBS}"
 
-msopgen gen -i "${OP_DEV}/ops.json" -f aclnn -c "ai_core-${TARGET_SOC}" \
-    -lan cpp -out "${GENERATED}"
+# ``ops.json`` intentionally contains all three graph nodes.  Omitting
+# ``-op`` makes msopgen enter an interactive selector whenever it sees that
+# array, which is invalid for a non-interactive remote build and can spin on
+# EOF under a piped log.  Generate the first node as a fresh project, then
+# append each remaining node to that same project.  CANN documents ``-m 1``
+# as append-to-existing-project mode; together with ``-op`` this preserves
+# one CMake scaffold and one vendor while making the selection deterministic.
+declare -a OP_NAMES=(
+    A5P10W4A4C8ScoreReceipt
+    A5P10ScoreReceiptForwardResident
+    A5P10ForwardPrepare
+)
+for index in "${!OP_NAMES[@]}"; do
+    op="${OP_NAMES[${index}]}"
+    msopgen_args=(
+        gen
+        -i "${OP_DEV}/ops.json"
+        -f aclnn
+        -c "ai_core-${TARGET_SOC}"
+        -lan cpp
+        -op "${op}"
+        -out "${GENERATED}"
+    )
+    merge=0
+    if (( index > 0 )); then
+        msopgen_args+=(-m 1)
+        merge=1
+    fi
+    printf 'P10_PRODUCT_MSOPGEN op=%s merge=%s interactive=0\n' \
+        "${op}" "${merge}"
+    msopgen "${msopgen_args[@]}"
+done
 
 generated_host_cmake="${GENERATED}/op_host/CMakeLists.txt"
 [[ -f "${generated_host_cmake}" ]] || fail "generated_host_cmake_missing"
@@ -277,11 +307,6 @@ stage_b_source_kernel="${GENERATED}/op_kernel/a5_p10_score_receipt_forward_resid
 cp -p "${stage_b_source_kernel}" "${stage_b_generated_kernel}"
 rm -f "${stage_b_source_kernel}"
 
-declare -a OP_NAMES=(
-    A5P10W4A4C8ScoreReceipt
-    A5P10ScoreReceiptForwardResident
-    A5P10ForwardPrepare
-)
 declare -a STUBS=(
     a5_p10_w4a4c8_score_receipt.cpp
     a5_p10_score_receipt_forward_resident.cpp
