@@ -230,9 +230,12 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
     return;
   }
 
-  // The row is unique to this canonical object claim. EMPTY means it is
-  // assigned but has not crossed the irreversible PostOnly boundary.
-  resident_ready[selected] = static_cast<int32_t>(A5P10ResidentReadyState::EMPTY);
+  // ForwardPrepare initializes the full fixed resident table to EMPTY before
+  // either companion starts, and a row is never recycled in this forward.
+  // Do not rewrite EMPTY here: an ordinary SIMT store could leave a dirty
+  // cache line which races the later AICore bypass publication of IN_FLIGHT
+  // or READY.  The claim CASes below are the durable admission transition;
+  // the AICore PostOnly boundary publishes IN_FLIGHT.
   AscendC::Simt::ThreadFence();
   if (asc_atomic_cas(kv_object_to_forward_slot + object_offset,
                      A5_P10_STAGE_B_CLAIMING_SLOT, selected) !=
@@ -892,8 +895,14 @@ class A5P10ScoreReceiptForwardResidentKernel {
     // Begin returned successfully, so descriptors are durable and the fixed
     // rows may now be observed as in-flight by final recall.
     for (uint32_t index = 0U; index < seed_count; ++index) {
-      residentReady_[wave->seeds[index].resident_slot] =
-          static_cast<int32_t>(A5P10ResidentReadyState::IN_FLIGHT);
+      // `resident_ready` crosses the AICore -> SIMT/host/QSFA boundary.  A
+      // normal AICore GM store may remain only in DCache while a later
+      // uncached consumer observes the old EMPTY value.  Publish the state
+      // through the same bypass path used for the Direct-HCCP descriptor; the
+      // following DSB orders it after the successful PostOnly boundary.
+      WriteGmByPassDCache<int32_t>(
+          residentReady_ + wave->seeds[index].resident_slot,
+          static_cast<int32_t>(A5P10ResidentReadyState::IN_FLIGHT));
     }
     DataSyncBarrier<MemDsbT::DDR>();
     seedBufferBusy_[buffer_index] = true;
@@ -1020,8 +1029,13 @@ class A5P10ScoreReceiptForwardResidentKernel {
         bool completed_target_slot = false;
         if (success) {
           for (uint32_t seed = 0U; seed < wave->seed_count; ++seed) {
-            residentReady_[wave->seeds[seed].resident_slot] =
-                static_cast<int32_t>(A5P10ResidentReadyState::READY);
+            // CQ terminal is the release point for this fixed resident row.
+            // It must be visible outside this AICore's DCache before either a
+            // local target proof or the forward COMPLETE publication can let
+            // QSFA consume the row.
+            WriteGmByPassDCache<int32_t>(
+                residentReady_ + wave->seeds[seed].resident_slot,
+                static_cast<int32_t>(A5P10ResidentReadyState::READY));
             completed_target_slot = completed_target_slot ||
                 wave->seeds[seed].resident_slot == target_slot;
           }
@@ -1196,7 +1210,9 @@ class A5P10ScoreReceiptForwardResidentKernel {
             tiling_->attentionSlotCapacity + rank;
         if (source_value < 0 || static_cast<uint32_t>(source_value) >=
                                     tiling_->sourceCapacity) {
-          attentionSlots_[attention_offset] = A5_P10_STAGE_B_UNMAPPED_SLOT;
+          WriteGmByPassDCache<int32_t>(
+              attentionSlots_ + attention_offset,
+              A5_P10_STAGE_B_UNMAPPED_SLOT);
           continue;
         }
         const uint32_t source = static_cast<uint32_t>(source_value);
@@ -1213,7 +1229,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
                 row, rank, A5_P10_STAGE_B_FINALIZE_PERSISTENT_QSFA));
             return false;
           }
-          attentionSlots_[attention_offset] = qsfa_slot;
+          WriteGmByPassDCache<int32_t>(attentionSlots_ + attention_offset,
+                                        qsfa_slot);
           continue;
         }
         const uint64_t source_offset = static_cast<uint64_t>(row) *
@@ -1249,7 +1266,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
               row, rank, A5_P10_STAGE_B_FINALIZE_FINAL_QSFA));
           return false;
         }
-        attentionSlots_[attention_offset] = qsfa_slot;
+        WriteGmByPassDCache<int32_t>(attentionSlots_ + attention_offset,
+                                      qsfa_slot);
       }
       // [K,K+tail) remains the caller's native tail materialization. The
       // selected length is retained verbatim for the existing QSFA ABI.
@@ -1270,8 +1288,12 @@ class A5P10ScoreReceiptForwardResidentKernel {
     wait_flag(PIPE_V, PIPE_S, simtEvent_);
     if (completion_->is_last != 0U) {
       DataSyncBarrier<MemDsbT::DDR>();
-      forwardControl_[A5_P10_STAGE_B_FORWARD_STATE] =
-          A5_P10_STAGE_B_FORWARD_STATE_COMPLETE;
+      // COMPLETE is the final release flag for the Stage-B -> QSFA graph
+      // edge.  It must not become visible before the bypass-published ready
+      // map and attention-slot prefix are globally ordered.
+      WriteGmByPassDCache<int32_t>(
+          forwardControl_ + A5_P10_STAGE_B_FORWARD_STATE,
+          A5_P10_STAGE_B_FORWARD_STATE_COMPLETE);
       DataSyncBarrier<MemDsbT::DDR>();
     }
   }

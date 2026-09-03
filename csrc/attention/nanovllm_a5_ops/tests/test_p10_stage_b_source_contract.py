@@ -238,21 +238,36 @@ class P10StageBSourceContractTest(unittest.TestCase):
             self.assertIn(token, self.kernel)
         self.assertNotIn("receiptState_[receipt] =", self.kernel)
 
-    def test_final_winner_uses_its_own_successful_cq_terminal_as_ready_proof(self):
-        """A local CQ terminal is stronger than a same-kernel GM reread.
+    def test_cq_terminal_publishes_ready_and_qsfa_prefix_outside_aicore_dcache(self):
+        """The local CQ proof cannot bypass the durable graph-visible state.
 
-        Stage B still publishes `resident_ready=READY` before returning this
-        proof, so QSFA observes the normal durable table.  This only closes
-        the narrow race where the worker that just retired a wave reads an
-        older GM view while deciding whether its own final winner is ready.
+        A CQ terminal makes a row READY locally, but the next consumer may be
+        SIMT, another AIV, or QSFA.  Therefore the IN_FLIGHT -> READY and
+        attention-prefix publications must use uncached GM writes before the
+        final COMPLETE release flag.  This specifically covers the first
+        recall wave after the 64-entry speculative band.
         """
         for token in (
             "target_slot_ready", "completed_target_slot",
             "successful CQ terminal", "local_terminal_ready",
             "DrainLocalWavesForTarget(\n          true, seed.resident_slot, &local_terminal_ready)",
-            "resident_ready=READY", "DataSyncBarrier<MemDsbT::DDR>()",
+            "resident_ready=READY", "WriteGmByPassDCache<int32_t>",
+            "A5P10ResidentReadyState::IN_FLIGHT",
+            "A5P10ResidentReadyState::READY",
+            "A5_P10_STAGE_B_FORWARD_STATE_COMPLETE",
+            "DataSyncBarrier<MemDsbT::DDR>()",
         ):
             self.assertIn(token, self.kernel)
+        self.assertNotIn(
+            "residentReady_[wave->seeds[index].resident_slot] =",
+            self.kernel,
+        )
+        self.assertNotIn(
+            "residentReady_[wave->seeds[seed].resident_slot] =",
+            self.kernel,
+        )
+        self.assertNotIn("resident_ready[selected] =", self.kernel)
+        self.assertIn("ForwardPrepare initializes the full fixed resident table", self.kernel)
 
     def test_kernel_is_an_aiv_only_dynamic_device_executor_not_a_wrapper(self):
         for token in (
