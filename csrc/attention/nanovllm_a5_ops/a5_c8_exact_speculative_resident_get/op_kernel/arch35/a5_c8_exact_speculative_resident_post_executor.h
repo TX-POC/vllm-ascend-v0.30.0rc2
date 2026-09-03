@@ -48,6 +48,8 @@ using kvaf_layer_resident_get::TryRetireKvafLayerResidentBatchGet;
 using vllm_ascend::a5_c8_exact_speculative_resident::CanonicalResidentSlotTable;
 using vllm_ascend::a5_c8_exact_speculative_resident::IsCanonicalResidentSlotTableValid;
 using vllm_ascend::a5_c8_exact_speculative_resident::LoadCanonicalResidentLogicalSlot;
+using vllm_ascend::a5_c8_exact_speculative_resident::SimtIsCanonicalResidentSlotTableValid;
+using vllm_ascend::a5_c8_exact_speculative_resident::SimtLoadCanonicalResidentLogicalSlot;
 using vllm_ascend::a5_c8_exact_speculative_resident::kExactRecallWaveCapacity;
 
 constexpr int32_t kCandidateSourceClaiming = -2;
@@ -86,7 +88,7 @@ inline void ReserveCandidateResidentSlotSimt(
     if (candidate_source_to_slot == nullptr || candidate_slot_cursor == nullptr ||
         req_pool_entries == nullptr || result == nullptr || source_capacity == 0U ||
         row >= row_count || source >= source_capacity ||
-        !IsCanonicalResidentSlotTableValid(canonical_slots)) {
+        !SimtIsCanonicalResidentSlotTableValid(canonical_slots)) {
         return;
     }
 
@@ -118,7 +120,7 @@ inline void ReserveCandidateResidentSlotSimt(
                              kCandidateSourceUnmapped);
         return;
     }
-    const int32_t logical_slot = LoadCanonicalResidentLogicalSlot(
+    const int32_t logical_slot = SimtLoadCanonicalResidentLogicalSlot(
         canonical_slots, static_cast<uint32_t>(pool_row), local_slot);
     // Admission has already proved the complete canonical slot table is
     // disjoint from persistent_object_slots_snapshot.  Do not rescan that

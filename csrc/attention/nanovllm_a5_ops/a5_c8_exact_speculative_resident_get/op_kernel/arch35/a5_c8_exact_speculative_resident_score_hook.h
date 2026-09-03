@@ -336,7 +336,18 @@ public:
                     ++deferredCandidates_;
                     continue;
                 }
-                batch.seeds[count++] = seed;
+                // AscendC does not permit the implicit C++ copy-assignment
+                // operator to target an aggregate in __ubuf__ address space:
+                // that operator is generated for local memory.  Write the
+                // fixed four-word ABI explicitly instead.  `count` advances
+                // only after the whole seed is materialized, so a later
+                // hand-off can never observe a partially initialized entry.
+                __ubuf__ CandidateSeed* const destination = batch.seeds + count;
+                destination->row = seed.row;
+                destination->source = seed.source;
+                destination->kvObject = seed.kvObject;
+                destination->residentSlotOrdinal = seed.residentSlotOrdinal;
+                ++count;
             }
         }
         batch.count = count;

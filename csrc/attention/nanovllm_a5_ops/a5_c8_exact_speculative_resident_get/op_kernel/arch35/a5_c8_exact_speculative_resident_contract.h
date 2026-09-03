@@ -127,6 +127,29 @@ __aicore__ inline int32_t LoadCanonicalResidentLogicalSlot(
                            kCanonicalResidentSlotCount + ordinal];
 }
 
+// SIMT VF services are a separate callable domain from the surrounding
+// AICore graph code.  AscendC rejects a call from `__simt_vf__` to either of
+// the AICore helpers above, even when the function is inline.  Keep explicit
+// semantic siblings instead of changing the AICore helpers' annotation: the
+// finalizer and score seam still call the AICore versions directly.
+__simt_callee__ inline bool SimtIsCanonicalResidentSlotTableValid(
+    const CanonicalResidentSlotTable table)
+{
+    return table.slots != nullptr && table.poolCount != 0U;
+}
+
+__simt_callee__ inline int32_t SimtLoadCanonicalResidentLogicalSlot(
+    const CanonicalResidentSlotTable table, const uint32_t pool_row,
+    const uint32_t ordinal)
+{
+    if (!SimtIsCanonicalResidentSlotTableValid(table) ||
+        pool_row >= table.poolCount || ordinal >= kCanonicalResidentSlotCount) {
+        return -1;
+    }
+    return table.slots[static_cast<uint64_t>(pool_row) *
+                           kCanonicalResidentSlotCount + ordinal];
+}
+
 static_assert(sizeof(CandidateSeed) == kCandidateSeedWords * sizeof(int32_t),
               "CandidateSeed must remain four int32 words.");
 static_assert(kCandidateSeedScratchBytes == 2048U,

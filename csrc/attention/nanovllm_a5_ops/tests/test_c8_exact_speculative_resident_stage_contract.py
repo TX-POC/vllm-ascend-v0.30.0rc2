@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import unittest
 
 
@@ -264,6 +265,57 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
         self.assertNotIn("IsPersistentLogicalSlot", POST_EXECUTOR)
         self.assertNotIn("IsPersistentLogicalSlot", FINALIZER)
         self.assertNotIn("FindCanonicalOrdinal", FINALIZER)
+
+    def test_simt_reservation_uses_its_own_slot_table_helpers(self) -> None:
+        """A SIMT VF service must never call an AICore-only inline helper."""
+        for signature in (
+            "__aicore__ inline bool IsCanonicalResidentSlotTableValid",
+            "__aicore__ inline int32_t LoadCanonicalResidentLogicalSlot",
+            "__simt_callee__ inline bool SimtIsCanonicalResidentSlotTableValid",
+            "__simt_callee__ inline int32_t SimtLoadCanonicalResidentLogicalSlot",
+        ):
+            self.assertIn(signature, KERNEL_CONTRACT)
+
+        simt_loader_start = KERNEL_CONTRACT.index(
+            "__simt_callee__ inline int32_t SimtLoadCanonicalResidentLogicalSlot"
+        )
+        simt_loader = KERNEL_CONTRACT[
+            simt_loader_start : KERNEL_CONTRACT.index("static_assert", simt_loader_start)
+        ]
+        self.assertIn("SimtIsCanonicalResidentSlotTableValid(table)", simt_loader)
+
+        reservation_start = POST_EXECUTOR.index(
+            "inline void ReserveCandidateResidentSlotSimt"
+        )
+        reservation_end = POST_EXECUTOR.index(
+            "__simt_vf__ __aicore__ LAUNCH_BOUND(1)", reservation_start + 1
+        )
+        reservation = POST_EXECUTOR[reservation_start:reservation_end]
+        self.assertIn("SimtIsCanonicalResidentSlotTableValid(canonical_slots)", reservation)
+        self.assertIn("SimtLoadCanonicalResidentLogicalSlot(", reservation)
+
+        # Keep this source gate about code rather than comments.  The
+        # compiler error is specifically a call from `__simt_vf__` to the
+        # original `__aicore__` helpers, so reject both forms in the SIMT
+        # loader and reservation bodies before an expensive OPP build.
+        forbidden = re.compile(
+            r"(?<![A-Za-z0-9_])(?:IsCanonicalResidentSlotTableValid|"
+            r"LoadCanonicalResidentLogicalSlot)\s*\("
+        )
+        for body in (simt_loader, reservation):
+            code = re.sub(r"//[^\n]*|/\*.*?\*/", "", body, flags=re.DOTALL)
+            self.assertIsNone(forbidden.search(code))
+
+    def test_score_hook_uses_scalar_stores_for_ub_candidate_seeds(self) -> None:
+        """AscendC cannot invoke CandidateSeed's implicit copy op in __ubuf__."""
+        self.assertNotIn("batch.seeds[count++] = seed;", SCORE_HOOK)
+        destination = "__ubuf__ CandidateSeed* const destination = batch.seeds + count;"
+        self.assertIn(destination, SCORE_HOOK)
+        start = SCORE_HOOK.index(destination)
+        stores = SCORE_HOOK[start : start + 700]
+        for field in ("row", "source", "kvObject", "residentSlotOrdinal"):
+            self.assertIn(f"destination->{field} = seed.{field};", stores)
+        self.assertLess(stores.index("destination->residentSlotOrdinal"), stores.index("++count;"))
 
     def test_execution_row_mapping_and_graph_padding_gate_are_explicit(self) -> None:
         """P9 separates logical QSFA slots from execution-row physical rows."""
