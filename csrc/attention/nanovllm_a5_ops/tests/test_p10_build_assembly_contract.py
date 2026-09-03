@@ -109,6 +109,8 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
             "stage_a_op_file_source_missing",
             "stage_a_op_file_entry_mismatch",
             "P10_PRODUCT_STAGE_A_OPFILE_GATE op_file=%s source=1 entry=1",
+            "stage_a_invalid_constexpr_domain_guard",
+            "P10_PRODUCT_STAGE_A_DOMAIN_GATE constexpr_guards=clean",
             "stage_b_generated_kernel",
             "stage_b_source_kernel",
             "stage_b_source_kernel_missing_after_copy",

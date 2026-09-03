@@ -115,6 +115,16 @@ msopgen gen -i "${OP_DEV}/ops.json" -f aclnn -c "ai_core-${TARGET_SOC}" \
 # the generated stub is safe because GENERATED is freshly created above.
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
+# CANN's ASCEND_IS_AIC/AIV macros are `if constexpr` conditions.  Do not let
+# a Boolean `&&` composition reach the expensive compiler, where it would
+# prevent both mixed-domain object files from being produced.
+DOMAIN_SOURCE="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt_qli.h"
+[[ -s "${DOMAIN_SOURCE}" ]] || fail "stage_a_domain_source_missing"
+if grep -Eq 'ASCEND_IS_AI[CV][[:space:]]*&&|&&[[:space:]]*ASCEND_IS_AI[CV]' \
+  "${DOMAIN_SOURCE}"; then
+  fail "stage_a_invalid_constexpr_domain_guard"
+fi
+printf 'P10_STAGE_A_DOMAIN_GATE constexpr_guards=clean\n'
 # CANN normalizes W4/A4/C8 runs in the CamelCase op name when naming generated
 # host and kernel files.  The checked-in filename is an authoring spelling;
 # remap it to CANN's canonical filename and delete that authoring-only name.

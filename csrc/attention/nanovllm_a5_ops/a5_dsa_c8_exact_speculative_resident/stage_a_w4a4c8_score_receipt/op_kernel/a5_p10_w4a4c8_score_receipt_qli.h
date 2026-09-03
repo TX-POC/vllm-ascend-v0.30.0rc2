@@ -136,14 +136,22 @@ public:
                 break;
             }
         }
-        if (hasActiveRow && ASCEND_IS_AIV) {
-            vectorService_.AllocEventID();
-            CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
-                ConstInfo::CROSS_VC_EVENT);
-            CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
-                ConstInfo::CROSS_VC_EVENT + 1U);
-        } else if (hasActiveRow) {
-            matmulService_.AllocEventID();
+        // ASCEND_IS_AIV expands to an `if constexpr` condition rather than a
+        // Boolean expression.  Keep the runtime row predicate inside each
+        // compile-time domain branch: AIV owns vector/event setup and AIC
+        // owns Cube setup, exactly as the native C8 mixed-kernel protocol.
+        if ASCEND_IS_AIV {
+            if (hasActiveRow) {
+                vectorService_.AllocEventID();
+                CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
+                    ConstInfo::CROSS_VC_EVENT);
+                CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
+                    ConstInfo::CROSS_VC_EVENT + 1U);
+            }
+        } else {
+            if (hasActiveRow) {
+                matmulService_.AllocEventID();
+            }
         }
 
         uint32_t globalLoop = 0;
@@ -221,20 +229,26 @@ public:
             if ASCEND_IS_AIC {
                 CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                     REQUEST_DONE_EVENT);
-            } else if ((subBlockIdx_ & 1U) == 0U) {
-                CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
-                    REQUEST_DONE_EVENT);
+            } else {
+                if ((subBlockIdx_ & 1U) == 0U) {
+                    CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
+                        REQUEST_DONE_EVENT);
+                }
             }
         }
 
-        if (hasActiveRow && ASCEND_IS_AIV) {
-            vectorService_.FreeEventID();
-        } else if (hasActiveRow) {
-            matmulService_.FreeEventID();
-            CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                ConstInfo::CROSS_VC_EVENT);
-            CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                ConstInfo::CROSS_VC_EVENT + 1U);
+        if ASCEND_IS_AIV {
+            if (hasActiveRow) {
+                vectorService_.FreeEventID();
+            }
+        } else {
+            if (hasActiveRow) {
+                matmulService_.FreeEventID();
+                CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+                    ConstInfo::CROSS_VC_EVENT);
+                CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+                    ConstInfo::CROSS_VC_EVENT + 1U);
+            }
         }
 
         // This is a one-time terminal barrier, copied from the established
@@ -243,8 +257,10 @@ public:
         // the dedicated forward-control word so independently launched
         // Stage-B workers know that no further READY record can appear.
         SyncAll<false>();
-        if ASCEND_IS_AIV && subBlockIdx_ == 0U {
-            vectorService_.WriteProducerSealed();
+        if ASCEND_IS_AIV {
+            if (subBlockIdx_ == 0U) {
+                vectorService_.WriteProducerSealed();
+            }
         }
     }
 

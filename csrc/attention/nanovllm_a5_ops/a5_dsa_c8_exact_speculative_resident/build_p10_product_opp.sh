@@ -316,6 +316,18 @@ cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
 printf 'P10_PRODUCT_POSTGEN_PHASE phase=source_overlay_complete\n'
 
+# CANN's ASCEND_IS_AIC/AIV macros expand to `if constexpr` conditions, not
+# ordinary Boolean operands.  Reject accidental `&&` composition before the
+# expensive AscendC compile so it cannot degrade into a misleading FATBIN
+# linker failure after no AIC/AIV object was emitted.
+stage_a_domain_source="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt_qli.h"
+[[ -s "${stage_a_domain_source}" ]] || fail "stage_a_domain_source_missing"
+if grep -Eq 'ASCEND_IS_AI[CV][[:space:]]*&&|&&[[:space:]]*ASCEND_IS_AI[CV]' \
+    "${stage_a_domain_source}"; then
+    fail "stage_a_invalid_constexpr_domain_guard"
+fi
+printf 'P10_PRODUCT_STAGE_A_DOMAIN_GATE constexpr_guards=clean\n'
+
 # Source filenames are not necessarily msopgen filenames.  In particular,
 # CANN normalizes the W4/A4/C8 run in Stage A's CamelCase operator name into
 # ``a5_p10_w4_a4_c8_score_receipt.cpp``.  The checked-in filename is only an

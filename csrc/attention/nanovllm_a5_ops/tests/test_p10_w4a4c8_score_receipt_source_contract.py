@@ -71,6 +71,8 @@ class P10W4A4C8ScoreReceiptSourceContractTest(unittest.TestCase):
             'rm -f "${SOURCE_KERNEL}"',
             "CANONICAL_OP_FILE=\"a5_p10_w4_a4_c8_score_receipt\"",
             "P10_STAGE_A_OPFILE_GATE op_file=%s source=1 entry=1",
+            "P10_STAGE_A_DOMAIN_GATE constexpr_guards=clean",
+            "canonical_op_file_entry_mismatch",
             'GENERATED_STUB="${GENERATED}/op_host/a5_p10_w4_a4_c8_score_receipt.cpp"',
         ):
             self.assertIn(token, self.build)
@@ -151,6 +153,20 @@ class P10W4A4C8ScoreReceiptSourceContractTest(unittest.TestCase):
         self.assertLess(seam, publish)
         self.assertLess(publish, legacy_event)
         self.assertIn("ProcessTopK(const QLICommon::RunInfo &info)", self.vector)
+
+    def test_mixed_core_guards_use_cann_constexpr_syntax(self):
+        # ASCEND_IS_AIC/AIV expands to `constexpr(...)`; it is valid only as
+        # `if ASCEND_IS_*`, never as a Boolean operand.  The latter fails in
+        # both the AIC and AIV compile passes and later looks like a linker
+        # problem because neither object is emitted.
+        self.assertNotIn("&& ASCEND_IS_AIV", self.qli)
+        self.assertNotIn("ASCEND_IS_AIV &&", self.qli)
+        self.assertNotIn("&& ASCEND_IS_AIC", self.qli)
+        self.assertNotIn("ASCEND_IS_AIC &&", self.qli)
+        self.assertIn("if ASCEND_IS_AIV {\n            if (hasActiveRow)",
+                      self.qli)
+        self.assertIn("if ASCEND_IS_AIV {\n            if (subBlockIdx_ == 0U)",
+                      self.qli)
 
     def test_receipt_publication_is_ordered_and_stage_a_does_not_reset_it(self):
         for state in ("FREE", "FILLING", "READY", "CLAIMED", "DONE"):
