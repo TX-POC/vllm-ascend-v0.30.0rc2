@@ -227,15 +227,28 @@ bridge_temp="${package_root}/bridge/temp"
 mkdir -p "${bridge_python}" "${bridge_temp}"
 (
     cd "${bridge_root}/torch_extension"
+    # ``build_ext`` only places the native module in --build-lib.  The P10
+    # package itself also owns the graph adapter and its __init__.py; without
+    # this explicit step Python sees a namespace package (__file__ is None)
+    # and provenance cannot establish that the imported bridge is this exact
+    # SHA-keyed product package.
+    "${python_bin}" p10_forward_bridge_setup.py build_py \
+        --build-lib "${bridge_python}"
     USE_NINJA=0 \
     NANOVLLM_A5_P10_FORWARD_BRIDGE_BUILD_JOBS="${build_jobs}" \
     "${python_bin}" p10_forward_bridge_setup.py build_ext --force \
         --build-lib "${bridge_python}" --build-temp "${bridge_temp}"
 )
-bridge_count="$(find "${bridge_python}/nanovllm_p10_forward_bridge" -maxdepth 1 -type f -name '_C*.so' -print 2>/dev/null | wc -l | tr -d ' ')"
+bridge_package="${bridge_python}/nanovllm_p10_forward_bridge"
+bridge_init="${bridge_package}/__init__.py"
+bridge_graph="${bridge_package}/p10_forward_graph.py"
+[[ -s "${bridge_init}" && -s "${bridge_graph}" ]] ||
+    fail "bridge_python_package_incomplete:init=$([[ -s "${bridge_init}" ]] && echo 1 || echo 0):graph=$([[ -s "${bridge_graph}" ]] && echo 1 || echo 0)"
+bridge_count="$(find "${bridge_package}" -maxdepth 1 -type f -name '_C*.so' -print 2>/dev/null | wc -l | tr -d ' ')"
 [[ "${bridge_count}" == "1" ]] || fail "bridge_artifact_count_invalid:count=${bridge_count}"
-bridge_so="$(find "${bridge_python}/nanovllm_p10_forward_bridge" -maxdepth 1 -type f -name '_C*.so' -print -quit)"
-printf 'P10_BRIDGE_PROVENANCE bridge=%s sha256=%s\n' \
+bridge_so="$(find "${bridge_package}" -maxdepth 1 -type f -name '_C*.so' -print -quit)"
+printf 'P10_BRIDGE_PROVENANCE package=%s init=%s graph=%s bridge=%s sha256=%s\n' \
+    "${bridge_package}" "${bridge_init}" "${bridge_graph}" \
     "${bridge_so}" "$(hash_file "${bridge_so}")"
 printf 'P10_RUNNER_STEP label=forward_bridge status=0\n'
 

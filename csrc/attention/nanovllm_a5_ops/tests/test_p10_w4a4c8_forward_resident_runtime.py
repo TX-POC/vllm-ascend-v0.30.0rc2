@@ -634,7 +634,10 @@ def _main() -> int:
         _blocked("opapi_vendor_relationship_invalid")
 
     module = importlib.import_module("nanovllm_p10_forward_bridge")
-    module_file = Path(str(module.__file__)).resolve()
+    module_file_text = getattr(module, "__file__", None)
+    if not module_file_text:
+        _blocked("product_bridge_package_file_missing")
+    module_file = Path(module_file_text).resolve()
     try:
         module_file.relative_to(bridge_root)
     except ValueError as error:

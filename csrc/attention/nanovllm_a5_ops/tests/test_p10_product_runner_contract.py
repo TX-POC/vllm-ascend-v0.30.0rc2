@@ -62,6 +62,25 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.runner.index("ASCEND_LAUNCH_BLOCKING=0"), self.runner.index(probe)
         )
 
+    def test_runner_builds_the_complete_sha_keyed_bridge_package(self) -> None:
+        """A native .so alone would create a namespace package at runtime.
+
+        ``build_ext`` does not copy the pure-Python graph adapter.  Require a
+        separate ``build_py`` and fail closed unless the adapter, package
+        marker, and exactly one native extension all share the product root.
+        """
+
+        for token in (
+            'p10_forward_bridge_setup.py build_py',
+            'bridge_package="${bridge_python}/nanovllm_p10_forward_bridge"',
+            'bridge_init="${bridge_package}/__init__.py"',
+            'bridge_graph="${bridge_package}/p10_forward_graph.py"',
+            'bridge_python_package_incomplete',
+            'bridge_artifact_count_invalid',
+            'P10_BRIDGE_PROVENANCE package=%s init=%s graph=%s bridge=%s',
+        ):
+            self.assertIn(token, self.runner)
+
     def test_fixture_is_real_w4a4c8_direct_hccp_and_qsfa_closure(self) -> None:
         for token in (
             "torch.float8_e4m3fn",
@@ -81,6 +100,10 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertNotIn("runtime.batch_get(", self.fixture)
         self.assertNotIn("P8_", self.fixture)
         self.assertNotIn("P9_", self.fixture)
+
+    def test_fixture_rejects_a_namespace_bridge_before_operator_execution(self) -> None:
+        self.assertIn('getattr(module, "__file__", None)', self.fixture)
+        self.assertIn('"product_bridge_package_file_missing"', self.fixture)
 
 
 if __name__ == "__main__":
