@@ -238,20 +238,37 @@ if ! run_logged p9_target_opp "$P9_RUN_ROOT/p9_target_opp.log" bash "$P9_BUILD_S
     printf 'P9_RUNNER_FAIL stage=p9_target_opp result=%s\n' "$P9_RUN_ROOT"
     exit 1
 fi
-mapfile -t P9_PROVENANCE_FILES < <(find "$P9_TARGET_PACKAGE_PARENT" -type f -name P9_PROVENANCE -print | sort)
-[[ "${#P9_PROVENANCE_FILES[@]}" -eq 1 ]] || runner_blocked "p9_provenance_ambiguous"
-P9_TARGET_PACKAGE="$(dirname "${P9_PROVENANCE_FILES[0]}")"
-P9_TARGET_OPAPI="$P9_TARGET_PACKAGE/opp/vendors/customize/op_api/lib/libcust_opapi.so"
+# The source package deliberately retains its build receipt at
+# <package>/P9_PROVENANCE, then copies the same receipt beside the installed
+# vendor OpAPI.  Select the one direct fresh package directory by its exact
+# SHA-pair tag, then prove the vendor receipt next to the loaded OpAPI is an
+# unmodified copy of that package receipt.
+P9_PACKAGE_TAG="p9_exact_resident_v${P9_VLLM_EXPECTED_SHA:0:12}_k${P9_KVAF_EXPECTED_SHA:0:12}_*"
+mapfile -t P9_TARGET_PACKAGES < <(
+    find "$P9_TARGET_PACKAGE_PARENT" -mindepth 1 -maxdepth 1 -type d \
+        -name "$P9_PACKAGE_TAG" -print | sort
+)
+[[ "${#P9_TARGET_PACKAGES[@]}" -eq 1 ]] || \
+    runner_blocked "p9_package_root_ambiguous"
+P9_TARGET_PACKAGE="${P9_TARGET_PACKAGES[0]}"
+P9_PACKAGE_PROVENANCE="$P9_TARGET_PACKAGE/P9_PROVENANCE"
+P9_VENDOR_ROOT="$P9_TARGET_PACKAGE/opp/vendors/customize"
+P9_VENDOR_PROVENANCE="$P9_VENDOR_ROOT/P9_PROVENANCE"
+[[ -f "$P9_PACKAGE_PROVENANCE" && -f "$P9_VENDOR_PROVENANCE" ]] || \
+    runner_blocked "p9_provenance_missing"
+cmp -s "$P9_PACKAGE_PROVENANCE" "$P9_VENDOR_PROVENANCE" || \
+    runner_blocked "p9_provenance_copy_mismatch"
+P9_TARGET_OPAPI="$P9_VENDOR_ROOT/op_api/lib/libcust_opapi.so"
 [[ -s "$P9_TARGET_OPAPI" ]] || runner_blocked "p9_target_opapi_missing"
-grep -Fxq "vllm_source_head=$P9_VLLM_EXPECTED_SHA" "${P9_PROVENANCE_FILES[0]}" || runner_blocked "p9_vllm_provenance_mismatch"
-grep -Fxq "kvaf_source_head=$P9_KVAF_EXPECTED_SHA" "${P9_PROVENANCE_FILES[0]}" || runner_blocked "p9_kvaf_provenance_mismatch"
+grep -Fxq "vllm_source_head=$P9_VLLM_EXPECTED_SHA" "$P9_VENDOR_PROVENANCE" || runner_blocked "p9_vllm_provenance_mismatch"
+grep -Fxq "kvaf_source_head=$P9_KVAF_EXPECTED_SHA" "$P9_VENDOR_PROVENANCE" || runner_blocked "p9_kvaf_provenance_mismatch"
 # A pre-23-input package predates the separate logical-slot / execution-row
 # physical-block mapping and is not a valid P9 target artifact.  Do not let a
 # merely existing libcust_opapi.so silently exercise an old ABI.
-grep -Fxq 'p9_abi=official9_plus14_inputs_6_outputs' "${P9_PROVENANCE_FILES[0]}" || runner_blocked "p9_abi_provenance_mismatch"
-grep -Fxq 'score_seam=active' "${P9_PROVENANCE_FILES[0]}" || runner_blocked "p9_score_seam_not_active"
-grep -Fxq 'stage_b_finalizer=active' "${P9_PROVENANCE_FILES[0]}" || runner_blocked "p9_terminal_finalizer_not_active"
-if grep -Eq '(^|=)(compile_disabled|disabled)(:|$)|score_seam=(0|disabled)' "${P9_PROVENANCE_FILES[0]}"; then
+grep -Fxq 'p9_abi=official9_plus14_inputs_6_outputs' "$P9_VENDOR_PROVENANCE" || runner_blocked "p9_abi_provenance_mismatch"
+grep -Fxq 'score_seam=active' "$P9_VENDOR_PROVENANCE" || runner_blocked "p9_score_seam_not_active"
+grep -Fxq 'stage_b_finalizer=active' "$P9_VENDOR_PROVENANCE" || runner_blocked "p9_terminal_finalizer_not_active"
+if grep -Eq '(^|=)(compile_disabled|disabled)(:|$)|score_seam=(0|disabled)' "$P9_VENDOR_PROVENANCE"; then
     runner_blocked "p9_legacy_compile_disabled_provenance"
 fi
 printf 'P9_OPP_PROVENANCE package=%s opapi=%s score_seam=active\n' "$P9_TARGET_PACKAGE" "$P9_TARGET_OPAPI"

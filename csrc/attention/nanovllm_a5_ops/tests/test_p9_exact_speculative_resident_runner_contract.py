@@ -67,6 +67,31 @@ class P9ExactSpeculativeResidentRunnerContractTest(unittest.TestCase):
         self.assertLess(artifact_check, export_path)
         self.assertLess(export_path, import_probe)
 
+    def test_runner_selects_the_installed_p9_receipt_not_the_source_copy(self) -> None:
+        """A fresh P9 package intentionally has source and installed receipts.
+
+        The installed receipt is the one adjacent to the OpAPI actually loaded
+        by the bridge.  It must match the retained source receipt exactly; a
+        generic recursive filename search would make this legitimate pair look
+        ambiguous and, worse, would not bind provenance to the loaded library.
+        """
+        self.assertNotIn(
+            'find "$P9_TARGET_PACKAGE_PARENT" -type f -name P9_PROVENANCE',
+            RUNNER,
+        )
+        for token in (
+            "P9_PACKAGE_TAG=",
+            "-mindepth 1 -maxdepth 1 -type d",
+            'runner_blocked "p9_package_root_ambiguous"',
+            "P9_PACKAGE_PROVENANCE",
+            "P9_VENDOR_PROVENANCE",
+            'runner_blocked "p9_provenance_missing"',
+            'runner_blocked "p9_provenance_copy_mismatch"',
+            'cmp -s "$P9_PACKAGE_PROVENANCE" "$P9_VENDOR_PROVENANCE"',
+            "P9_VENDOR_ROOT/op_api/lib/libcust_opapi.so",
+        ):
+            self.assertIn(token, RUNNER)
+
     def test_runner_does_not_substitute_a_historical_transport_route(self) -> None:
         self.assertNotIn("p8_real_direct_hccp_fixture", RUNNER)
         self.assertNotIn("a5_p8_forward_owned_executor", RUNNER)
