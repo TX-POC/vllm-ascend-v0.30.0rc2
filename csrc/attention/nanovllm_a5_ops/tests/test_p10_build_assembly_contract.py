@@ -124,12 +124,33 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
             'if (( index > 0 )); then',
             'msopgen_args+=(-m 1)',
             'P10_PRODUCT_MSOPGEN op=%s merge=%s interactive=0',
+            'P10_PRODUCT_MSOPGEN_RESULT op=%s merge=%s status=%s generated_node_ready=%s',
+            'msopgen_failed:operator=${op}:merge=${merge}:status=${msopgen_rc}',
+            'P10_PRODUCT_POSTGEN_PHASE phase=msopgen_complete nodes=%s',
             'msopgen "${msopgen_args[@]}"',
         ):
             self.assertIn(token, self.product_source)
         self.assertNotIn(
             'msopgen gen -i "${OP_DEV}/ops.json"', self.product_source
         )
+
+    def test_post_generation_registration_gate_is_explicit_and_uses_valid_ere(self) -> None:
+        # A previous total-registration probe used an over-escaped literal
+        # parenthesis inside single quotes.  GNU grep returned rc=2 while its
+        # stderr was redirected, and pipefail made the remote product builder
+        # terminate without a P10_PRODUCT_BUILD_FAIL marker.  The aggregate
+        # gate must use the valid ERE spelling and turn an absent match into
+        # the explicit registration failure below.
+        for token in (
+            "P10_PRODUCT_POSTGEN_PHASE phase=source_overlay_complete",
+            "P10_PRODUCT_POSTGEN_PHASE phase=kernel_remap_complete",
+            "P10_PRODUCT_REGISTRATION_GATE operators=%s registrations=%s",
+            "combined_registration_total_invalid:count=${total_registrations}",
+            "grep -REc 'OP_ADD[[:space:]]*\\('",
+            "grep -REc \"${regex}\"",
+        ):
+            self.assertIn(token, self.product_source)
+        self.assertNotIn("grep -REh 'OP_ADD[[:space:]]*\\\\('", self.product_source)
 
     def test_stage_a_cannot_reinitialize_receipts_after_concurrent_launch(self) -> None:
         for token in (

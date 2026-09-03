@@ -264,8 +264,14 @@ declare -a OP_NAMES=(
     A5P10ScoreReceiptForwardResident
     A5P10ForwardPrepare
 )
+declare -a OP_STEMS=(
+    a5_p10_w4_a4_c8_score_receipt
+    a5_p10_score_receipt_forward_resident
+    a5_p10_forward_prepare
+)
 for index in "${!OP_NAMES[@]}"; do
     op="${OP_NAMES[${index}]}"
+    stem="${OP_STEMS[${index}]}"
     msopgen_args=(
         gen
         -i "${OP_DEV}/ops.json"
@@ -282,8 +288,24 @@ for index in "${!OP_NAMES[@]}"; do
     fi
     printf 'P10_PRODUCT_MSOPGEN op=%s merge=%s interactive=0\n' \
         "${op}" "${merge}"
-    msopgen "${msopgen_args[@]}"
+    if msopgen "${msopgen_args[@]}"; then
+        msopgen_rc=0
+    else
+        msopgen_rc=$?
+    fi
+    generated_node_ready=0
+    if [[ -s "${GENERATED}/op_host/${stem}.cpp" &&
+          -s "${GENERATED}/op_kernel/${stem}.cpp" &&
+          -s "${GENERATED}/op_kernel/${stem}_tiling.h" ]]; then
+        generated_node_ready=1
+    fi
+    printf 'P10_PRODUCT_MSOPGEN_RESULT op=%s merge=%s status=%s generated_node_ready=%s\n' \
+        "${op}" "${merge}" "${msopgen_rc}" "${generated_node_ready}"
+    [[ "${msopgen_rc}" -eq 0 && "${generated_node_ready}" -eq 1 ]] ||
+        fail "msopgen_failed:operator=${op}:merge=${merge}:status=${msopgen_rc}:generated_node_ready=${generated_node_ready}"
 done
+printf 'P10_PRODUCT_POSTGEN_PHASE phase=msopgen_complete nodes=%s\n' \
+    "${#OP_NAMES[@]}"
 
 generated_host_cmake="${GENERATED}/op_host/CMakeLists.txt"
 [[ -f "${generated_host_cmake}" ]] || fail "generated_host_cmake_missing"
@@ -292,6 +314,7 @@ if grep -Fq 'add_op_to_compiled_list' "${generated_host_cmake}"; then
 fi
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
+printf 'P10_PRODUCT_POSTGEN_PHASE phase=source_overlay_complete\n'
 
 # Source filenames are not necessarily msopgen filenames.  In particular,
 # CANN normalizes the W4/A4/C8 runs in Stage A's CamelCase operator name into
@@ -318,6 +341,7 @@ stage_b_source_kernel="${GENERATED}/op_kernel/a5_p10_score_receipt_forward_resid
     fail "stage_b_source_kernel_missing_after_copy"
 cp -p "${stage_b_source_kernel}" "${stage_b_generated_kernel}"
 rm -f "${stage_b_source_kernel}"
+printf 'P10_PRODUCT_POSTGEN_PHASE phase=kernel_remap_complete\n'
 
 declare -a STUBS=(
     a5_p10_w4_a4_c8_score_receipt.cpp
@@ -345,12 +369,14 @@ for index in 0 1 2; do
 done
 for op in "${OP_NAMES[@]}"; do
     regex="OP_ADD[[:space:]]*\\([[:space:]]*${op}[[:space:]]*\\)"
-    count="$(grep -REc "${regex}" "${GENERATED}/op_host" --include='*.cpp' --include='*.cc' --include='*.cxx' 2>/dev/null | awk -F: '{sum += $NF} END {print sum + 0}')"
+    count="$({ grep -REc "${regex}" "${GENERATED}/op_host" --include='*.cpp' --include='*.cc' --include='*.cxx' 2>/dev/null || true; } | awk -F: '{sum += $NF} END {print sum + 0}')"
     [[ "${count}" -eq 1 ]] || fail "combined_registration_invalid:operator=${op}:count=${count}"
 done
-total_registrations="$(grep -REh 'OP_ADD[[:space:]]*\\(' "${GENERATED}/op_host" --include='*.cpp' --include='*.cc' --include='*.cxx' 2>/dev/null | wc -l | tr -d ' ')"
+total_registrations="$({ grep -REc 'OP_ADD[[:space:]]*\(' "${GENERATED}/op_host" --include='*.cpp' --include='*.cc' --include='*.cxx' 2>/dev/null || true; } | awk -F: '{sum += $NF} END {print sum + 0}')"
 [[ "${total_registrations}" -eq 3 ]] ||
     fail "combined_registration_total_invalid:count=${total_registrations}"
+printf 'P10_PRODUCT_REGISTRATION_GATE operators=%s registrations=%s\n' \
+    "${#OP_NAMES[@]}" "${total_registrations}"
 
 if ! (
     cd "${GENERATED}"
