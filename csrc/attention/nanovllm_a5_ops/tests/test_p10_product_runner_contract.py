@@ -62,12 +62,12 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.runner.index("ASCEND_LAUNCH_BLOCKING=0"), self.runner.index(probe)
         )
 
-    def test_runner_forwards_only_the_two_explicit_runtime_cases(self) -> None:
+    def test_runner_forwards_only_the_three_explicit_runtime_cases(self) -> None:
         """Benchmarking must not select a second product artifact or route."""
 
         for token in (
             'runtime_case="${P10_RUNTIME_CASE:-acceptance}"',
-            "acceptance|benchmark",
+            "acceptance|benchmark|graph_benchmark",
             "invalid_runtime_case:${runtime_case}",
             "runtime_case=%s",
             'P10_RUNTIME_CASE="${runtime_case}" "${python_bin}" "${runtime_fixture}"',
@@ -153,6 +153,23 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "p10_w4a4c8_forward_resident_overlap",
         ):
             self.assertIn(token, self.fixture)
+        self.assertNotIn("runtime.batch_get(", self.fixture)
+
+    def test_graph_benchmark_replays_the_same_product_route_against_eager_serial(self) -> None:
+        """ACLGraph timing is replay-only and cannot hide capture or a second ABI."""
+
+        for token in (
+            'if runtime_case == "graph_benchmark"',
+            "capture_p10_forward_graph",
+            "P10_GRAPH_PERF_EQ ",
+            "P10_GRAPH_PERF_RESULT ",
+            "p10_w4a4c8_forward_resident_eager_serial",
+            "p10_w4a4c8_forward_resident_graph_serial",
+            "p10_w4a4c8_forward_resident_graph_overlap",
+            "aclgraph_segments=3",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertIn("graph_benchmark", self.runner)
         self.assertNotIn("runtime.batch_get(", self.fixture)
 
     def test_benchmark_hashes_fp8_storage_without_a_numpy_float8_conversion(self) -> None:

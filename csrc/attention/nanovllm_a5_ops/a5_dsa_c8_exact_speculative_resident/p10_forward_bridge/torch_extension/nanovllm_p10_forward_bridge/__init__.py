@@ -63,6 +63,16 @@ import torch  # noqa: E402,F401
 import torch_npu  # noqa: E402,F401
 
 from . import _C  # noqa: E402,F401
-from .p10_forward_graph import P10ForwardLaunch, launch_p10_forward  # noqa: E402,F401
+from .p10_forward_graph import (  # noqa: E402,F401
+    P10ForwardGraph,
+    P10ForwardLaunch,
+    capture_p10_forward_graph,
+    launch_p10_forward,
+)
 
-__all__ = ["P10ForwardLaunch", "launch_p10_forward"]
+__all__ = [
+    "P10ForwardGraph",
+    "P10ForwardLaunch",
+    "capture_p10_forward_graph",
+    "launch_p10_forward",
+]

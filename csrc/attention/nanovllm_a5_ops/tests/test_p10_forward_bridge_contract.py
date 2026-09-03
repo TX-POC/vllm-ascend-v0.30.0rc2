@@ -126,7 +126,8 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         # The default graph is the product overlap route.  A distinct
         # benchmark-only serial branch is permitted below, but must not alter
         # the inference default.
-        overlap = self.graph.split('if execution_mode == "overlap":', 1)[1].split(
+        eager = self.graph.split("def launch_p10_forward(", 1)[1]
+        overlap = eager.split('if execution_mode == "overlap":', 1)[1].split(
             "    else:\n        # Benchmark-only serial reference.", 1
         )[0]
         self.assertIn('execution_mode: str = "overlap"', self.graph)
@@ -141,7 +142,8 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         self.assertIn("qsfa_stream.wait_event(self.stage_b_complete)", self.graph)
 
     def test_serial_reference_is_explicitly_benchmark_only_and_same_operator_path(self) -> None:
-        serial = self.graph.split("# Benchmark-only serial reference.", 1)[1]
+        eager = self.graph.split("def launch_p10_forward(", 1)[1]
+        serial = eager.split("# Benchmark-only serial reference.", 1)[1]
         reference = self.contract["benchmark_only_serial_reference"]
         self.assertIn("execution_mode == \"overlap\"", self.graph)
         self.assertIn("serial_stage_a_complete = _record_event(producer_stream)", serial)
@@ -162,8 +164,9 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         into a Stage-B completion edge that stalls the mathematical C8 path.
         """
 
-        stage_b_submit = self.graph.index("_launch_stage_b(inputs)")
-        stage_a_submit = self.graph.index("_launch_stage_a(inputs)")
+        eager = self.graph.split("def launch_p10_forward(", 1)[1]
+        stage_b_submit = eager.index("_launch_stage_b(inputs)")
+        stage_a_submit = eager.index("_launch_stage_a(inputs)")
         self.assertLess(stage_b_submit, stage_a_submit)
         self.assertIn("submission-order admission rule", self.graph)
         self.assertNotIn("wait_event(stage_b", self.graph)
@@ -171,6 +174,51 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             self.contract["graph_nodes"]["stage_b"]["submission_order"],
             "stage_b_before_stage_a_after_common_prepare",
         )
+
+    def test_aclgraph_mode_captures_all_three_product_nodes_and_replays_overlap(self) -> None:
+        """Graph mode must not silently capture only the producer stream.
+
+        Ascend captures the current stream, so P10 owns one graph segment for
+        prepare, native W4A4C8 score, and the Direct-HCCP executor.  Replays
+        use device events between segments; a host wait or an eager fallback
+        would invalidate the latency comparison.
+        """
+
+        self.assertIn("class P10ForwardGraph", self.graph)
+        self.assertEqual(self.graph.count("torch.npu.NPUGraph()"), 3)
+        capture = self.graph.split("class P10ForwardGraph", 1)[1].split(
+            "    def replay(", 1
+        )[0]
+        replay = self.graph.split("    def replay(", 1)[1].split(
+            "\ndef _record_event", 1
+        )[0]
+        self.assertEqual(capture.count("torch.npu.graph("), 3)
+        self.assertIn("with torch.npu.stream(producer_stream), torch.npu.graph(", capture)
+        self.assertIn("with torch.npu.stream(executor_stream), torch.npu.graph(", capture)
+        self.assertIn("P10_GRAPH_CAPTURE_FAILED", capture)
+        self.assertIn("nested_aclgraph_capture_forbidden", capture)
+        self.assertNotIn("synchronize()", replay)
+        overlap = replay.split('if self._execution_mode == "overlap":', 1)[1].split(
+            "        else:", 1
+        )[0]
+        self.assertLess(
+            overlap.index("self._stage_b_graph.replay()"),
+            overlap.index("self._stage_a_graph.replay()"),
+        )
+        self.assertIn("self._executor_stream.wait_event(prepared)", overlap)
+        self.assertIn("self._producer_stream.wait_event(prepared)", overlap)
+        self.assertNotIn("wait_event(stage_b", overlap)
+        for token in (
+            "tensor_static_alias_mismatch",
+            "scalar_tiling_mismatch",
+            "capture_p10_forward_graph",
+        ):
+            self.assertIn(token, self.graph)
+        for exported in (
+            "P10ForwardGraph",
+            "capture_p10_forward_graph",
+        ):
+            self.assertIn(exported, self.init)
 
     def test_overlap_witness_is_explicit_and_not_a_normal_forward_wait(self) -> None:
         self.assertIn("class P10OverlapWitness", self.graph)

@@ -905,6 +905,22 @@ def _load_product_runtime() -> tuple[Any, Any]:
     return device, launch_p10_forward
 
 
+def _load_graph_product_runtime() -> tuple[Any, Any, Any]:
+    """Resolve the public ACLGraph adapter from the same product bridge.
+
+    This deliberately layers on top of :func:`_load_product_runtime`: graph
+    replay is not allowed to import a second bridge, a separately built C8
+    OPP, or a host Get path just to make capture easier.
+    """
+
+    device, launch_p10_forward = _load_product_runtime()
+    module = importlib.import_module("nanovllm_p10_forward_bridge")
+    capture_p10_forward_graph = getattr(module, "capture_p10_forward_graph", None)
+    if not callable(capture_p10_forward_graph):
+        _blocked("product_bridge_aclgraph_adapter_missing")
+    return device, launch_p10_forward, capture_p10_forward_graph
+
+
 def _positive_environment_int(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default))
     try:
@@ -1070,6 +1086,79 @@ def _run_timed_forward(
     )
 
 
+def _run_timed_graph_forward(
+    *,
+    mode: str,
+    base: dict[str, Any],
+    reference: Any,
+    fixture: _ForwardResidentKvaf,
+    graph: Any,
+    inputs: Any,
+    tensors: dict[str, Any],
+    producer_stream: Any,
+    immutable_digests: dict[str, str],
+) -> P10TimingSample:
+    """Time one ACLGraph replay through the identical P10 terminal boundary.
+
+    Capture has already completed before this function is called.  The timer
+    therefore measures only graph replay through the Stage-B -> QSFA event,
+    directly comparable with :func:`_run_timed_forward`.  The host waits only
+    after the end event to collect a validation result; it is not part of the
+    forward dependency graph.
+    """
+
+    import torch
+
+    if mode not in ("serial", "overlap"):
+        raise ValueError(f"unsupported P10 ACLGraph benchmark mode: {mode}")
+    if getattr(graph, "execution_mode", None) != mode:
+        raise AssertionError(
+            "P10 ACLGraph benchmark mode mismatch: "
+            f"graph={getattr(graph, 'execution_mode', None)!r} requested={mode!r}"
+        )
+
+    _reset_benchmark_destination(fixture, producer_stream)
+    fixture.terminal = False
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    host_start_ns = time.perf_counter_ns()
+    with torch.npu.stream(producer_stream):
+        start.record()
+    launch = graph.replay(inputs)
+    aliases = launch.bind_qsfa(producer_stream)
+    with torch.npu.stream(producer_stream):
+        end.record()
+    end.synchronize()
+    host_us = (time.perf_counter_ns() - host_start_ns) / 1000.0
+    device_us = start.elapsed_time(end) * 1000.0
+
+    signature = _assert_terminal(
+        reference,
+        fixture,
+        tensors,
+        launch,
+        aliases=aliases,
+        require_preseal_overlap=(mode == "overlap"),
+        emit_summary=False,
+    )
+    _require_immutable_inputs(
+        immutable_digests, base, context=f"P10 ACLGraph {mode} replay"
+    )
+    speculative_slots = int(
+        tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
+    )
+    mapped_sources = int(
+        torch.count_nonzero(tensors["source_to_slot"].detach().cpu() >= 0).item()
+    )
+    return P10TimingSample(
+        device_us=device_us,
+        host_us=host_us,
+        signature=signature,
+        speculative_slots=speculative_slots,
+        mapped_sources=mapped_sources,
+    )
+
+
 def _run_benchmark() -> int:
     """Compare serial and overlapped P10 using the identical product route.
 
@@ -1214,6 +1303,226 @@ def _run_benchmark() -> int:
     return 0
 
 
+def _run_graph_benchmark() -> int:
+    """Compare eager and ACLGraph replay on the exact P10 product closure.
+
+    The only baseline difference is launch form and the one explicit
+    Stage-A-complete edge in serial mode.  All four cases use the same
+    W4A4C8 inputs, resident mappings, Direct-HCCP control, terminal recall,
+    and QSFA aliases.  Capture is performed before warmup and is deliberately
+    excluded from timing: steady-state inference replays an already captured
+    graph rather than recapturing each forward.
+    """
+
+    import torch
+
+    warmup = _positive_environment_int("P10_PERF_WARMUP", 1)
+    iterations = _positive_environment_int("P10_PERF_ITERS", 5)
+    device, launch_p10_forward, capture_p10_forward_graph = _load_graph_product_runtime()
+    base = _build_w4a4c8_inputs(device)
+    immutable_digests = _immutable_input_digests(base)
+    reference = _reference_w4a4c8(base)
+    _require_immutable_inputs(immutable_digests, base, context="product oracle")
+    fixture = _ForwardResidentKvaf(device)
+    cases = (
+        "eager_serial",
+        "eager_overlap",
+        "graph_serial",
+        "graph_overlap",
+    )
+    samples: dict[str, list[P10TimingSample]] = {case: [] for case in cases}
+
+    try:
+        fixture.bind()
+
+        # Each ACLGraph owns persistent, logical streams.  These are not an
+        # AIV partition: both streams submit the normal dynamic P10 workers.
+        # Separate input/output aliases are required because graph replay is
+        # intentionally fail-closed on any captured-address drift.
+        serial_producer = torch.npu.Stream(device=device)
+        serial_executor = torch.npu.Stream(device=device)
+        serial_inputs, serial_tensors = _build_forward_inputs(device, base, fixture)
+        graph_serial = capture_p10_forward_graph(
+            serial_inputs,
+            producer_stream=serial_producer,
+            executor_stream=serial_executor,
+            execution_mode="serial",
+        )
+
+        overlap_producer = torch.npu.Stream(device=device)
+        overlap_executor = torch.npu.Stream(device=device)
+        overlap_inputs, overlap_tensors = _build_forward_inputs(device, base, fixture)
+        graph_overlap = capture_p10_forward_graph(
+            overlap_inputs,
+            producer_stream=overlap_producer,
+            executor_stream=overlap_executor,
+            execution_mode="overlap",
+        )
+        print(
+            "P10_GRAPH_CAPTURE "
+            "segments=3 eager_fallback=0 graph_serial=1 graph_overlap=1 "
+            "static_alias_gate=1",
+            flush=True,
+        )
+
+        def run_case(case: str) -> P10TimingSample:
+            if case == "eager_serial":
+                return _run_timed_forward(
+                    mode="serial",
+                    device=device,
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    launch_p10_forward=launch_p10_forward,
+                    immutable_digests=immutable_digests,
+                )
+            if case == "eager_overlap":
+                return _run_timed_forward(
+                    mode="overlap",
+                    device=device,
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    launch_p10_forward=launch_p10_forward,
+                    immutable_digests=immutable_digests,
+                )
+            if case == "graph_serial":
+                return _run_timed_graph_forward(
+                    mode="serial",
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    graph=graph_serial,
+                    inputs=serial_inputs,
+                    tensors=serial_tensors,
+                    producer_stream=serial_producer,
+                    immutable_digests=immutable_digests,
+                )
+            if case == "graph_overlap":
+                return _run_timed_graph_forward(
+                    mode="overlap",
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    graph=graph_overlap,
+                    inputs=overlap_inputs,
+                    tensors=overlap_tensors,
+                    producer_stream=overlap_producer,
+                    immutable_digests=immutable_digests,
+                )
+            raise AssertionError(f"unknown P10 graph benchmark case: {case}")
+
+        # Rotate every round so queue/cache state cannot consistently favor
+        # either eager or graph replay, or serial versus overlap.
+        for iteration in range(warmup):
+            order = cases[iteration % len(cases):] + cases[:iteration % len(cases)]
+            for case in order:
+                run_case(case)
+        print(
+            "P10_GRAPH_WARMUP "
+            f"rounds={warmup} cases={','.join(cases)} terminal=1",
+            flush=True,
+        )
+
+        for iteration in range(iterations):
+            order = cases[iteration % len(cases):] + cases[:iteration % len(cases)]
+            for case in order:
+                sample = run_case(case)
+                samples[case].append(sample)
+                print(
+                    "P10_GRAPH_PERF_SAMPLE "
+                    f"iteration={iteration} case={case} device_us={sample.device_us:.3f} "
+                    f"host_us={sample.host_us:.3f} speculative_slots={sample.speculative_slots} "
+                    f"mapped_sources={sample.mapped_sources}",
+                    flush=True,
+                )
+    finally:
+        fixture.close()
+
+    expected_signature = samples["eager_serial"][0].signature if samples["eager_serial"] else None
+    if expected_signature is None or any(not samples[case] for case in cases):
+        raise AssertionError("P10 ACLGraph benchmark produced incomplete timing samples")
+    for case in cases:
+        if any(sample.signature != expected_signature for sample in samples[case]):
+            raise AssertionError(
+                "P10 ACLGraph semantic signature mismatch: "
+                f"case={case} expected={expected_signature!r}"
+            )
+
+    device_values = {case: [sample.device_us for sample in samples[case]] for case in cases}
+    host_values = {case: [sample.host_us for sample in samples[case]] for case in cases}
+    for case, operation in (
+        ("eager_serial", "p10_w4a4c8_forward_resident_eager_serial"),
+        ("eager_overlap", "p10_w4a4c8_forward_resident_eager_overlap"),
+        ("graph_serial", "p10_w4a4c8_forward_resident_graph_serial"),
+        ("graph_overlap", "p10_w4a4c8_forward_resident_graph_overlap"),
+    ):
+        _emit_perf_result(
+            operation,
+            device_values[case],
+            warmup=warmup,
+            metric="npu_event_forward_prepare_to_qsfa_ready",
+        )
+        _emit_perf_result(
+            f"{operation}_host_diagnostic",
+            host_values[case],
+            warmup=warmup,
+            metric="host_submit_to_terminal_diagnostic",
+        )
+
+    p50 = {case: _percentile(device_values[case], 50.0) for case in cases}
+    p90 = {case: _percentile(device_values[case], 90.0) for case in cases}
+    eager_serial_p50 = p50["eager_serial"]
+    eager_serial_p90 = p90["eager_serial"]
+    overlap_speculative = [
+        sample.speculative_slots for sample in samples["graph_overlap"]
+    ]
+    print(
+        "P10_GRAPH_PERF_EQ "
+        "product_w4a4c8_oracle=1 canonical_topk=1 score_source_lens=1 "
+        "ranked_resident_payload=1 qsfa_lengths_and_tail=1 "
+        "eager_serial_terminal=1 graph_serial_terminal=1 "
+        "graph_overlap_preseal_claim=1 aclgraph_segments=3 eager_fallback=0",
+        flush=True,
+    )
+    print(
+        "P10_GRAPH_PERF_RESULT "
+        f"eager_serial_p50_us={eager_serial_p50:.3f} "
+        f"eager_overlap_p50_us={p50['eager_overlap']:.3f} "
+        f"graph_serial_p50_us={p50['graph_serial']:.3f} "
+        f"graph_overlap_p50_us={p50['graph_overlap']:.3f} "
+        f"graph_overlap_saved_vs_eager_serial_p50_us={eager_serial_p50 - p50['graph_overlap']:.3f} "
+        f"graph_overlap_saved_vs_eager_serial_p50_pct={100.0 * (eager_serial_p50 - p50['graph_overlap']) / eager_serial_p50:.3f} "
+        f"eager_serial_p90_us={eager_serial_p90:.3f} "
+        f"graph_overlap_p90_us={p90['graph_overlap']:.3f} "
+        f"graph_overlap_saved_vs_eager_serial_p90_us={eager_serial_p90 - p90['graph_overlap']:.3f}",
+        flush=True,
+    )
+    for case in cases:
+        speculative = [sample.speculative_slots for sample in samples[case]]
+        mapped = [sample.mapped_sources for sample in samples[case]]
+        print(
+            "P10_GRAPH_PERF_WORK "
+            f"case={case} speculative_slots_min={min(speculative)} "
+            f"speculative_slots_max={max(speculative)} mapped_sources_min={min(mapped)} "
+            f"mapped_sources_max={max(mapped)}",
+            flush=True,
+        )
+    if min(overlap_speculative) == 0:
+        print(
+            "P10_GRAPH_PERF_INCONCLUSIVE "
+            "reason=graph_overlap_has_no_speculative_slots_do_not_claim_hccp_hiding_gain",
+            flush=True,
+        )
+    print(
+        "P10_RUNTIME_PASS "
+        "route=w4a4c8_score_receipt_direct_hccp_qsfa_aclgraph "
+        "benchmark=eager_serial_vs_eager_overlap_vs_graph_serial_vs_graph_overlap",
+        flush=True,
+    )
+    return 0
+
+
 def _run_acceptance() -> int:
     device, launch_p10_forward = _load_product_runtime()
     base = _build_w4a4c8_inputs(device)
@@ -1236,6 +1545,8 @@ def _main() -> int:
         return _run_acceptance()
     if runtime_case == "benchmark":
         return _run_benchmark()
+    if runtime_case == "graph_benchmark":
+        return _run_graph_benchmark()
     _blocked(f"invalid_p10_runtime_case:{runtime_case}")
     raise AssertionError("unreachable")
 

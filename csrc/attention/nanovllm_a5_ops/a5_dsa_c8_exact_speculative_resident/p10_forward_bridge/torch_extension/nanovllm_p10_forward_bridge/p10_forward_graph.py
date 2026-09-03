@@ -1,7 +1,18 @@
-"""P10's graph-level W4A4C8 producer/executor launch policy.
+"""P10's W4A4C8 producer/executor launch and ACLGraph replay policy.
 
-This is deliberately a graph adapter, not a candidate scheduler.  It enqueues
-three device operators only:
+This module deliberately separates two meanings of "graph":
+
+* :func:`launch_p10_forward` builds P10's *device dependency graph* on normal
+  NPU streams.  That is the eager product route.
+* :class:`P10ForwardGraph` captures the same three launches as three ACLGraph
+  segments and replays them with the same device events.  It is the actual
+  ``torch.npu.NPUGraph`` route.
+
+The split is necessary because an Ascend ``NPUGraph`` captures work submitted
+to its current stream.  Capturing the eager multi-stream implementation in a
+single ``torch.npu.graph`` context would silently omit the companion executor.
+The graph-mode route therefore captures one graph per stream-local operator,
+then uses ordinary device events *between replays*:
 
 ``prepare -> {resident executor, native score producer} -> QSFA``.
 
@@ -149,6 +160,292 @@ class P10ForwardLaunch:
         )
 
 
+# Every tensor below participates in one of the three ACLNN graph nodes.  A
+# replay must retain its original storage address, shape and stride.  Captured
+# graph inputs are deliberately cold-bound: P10's graph ABI contains no host
+# copies or dynamic candidate submissions that could repair an alias mismatch.
+_GRAPH_TENSOR_FIELDS = (
+    "query",
+    "key",
+    "weights",
+    "query_dequant_scale",
+    "key_dequant_scale",
+    "actual_seq_lengths_query",
+    "candidate_lens",
+    "block_table",
+    "canonical_sparse_indices",
+    "canonical_score_source_lens",
+    "score_surface",
+    "receipt_ring",
+    "receipt_state",
+    "forward_control",
+    "active_row_pool_entries",
+    "kv_object_map",
+    "kv_object_slots_snapshot",
+    "kv_object_to_forward_slot",
+    "source_to_forward_slot",
+    "speculative_slot_band",
+    "speculative_slot_cursor",
+    "recall_slot_band",
+    "kvaf_forward_resident_control",
+    "queue_leases",
+    "resident_payload",
+    "resident_ready",
+    "resident_row_to_qsfa_slot",
+    "attention_slots_buffer",
+    "selected_slot_lengths_buffer",
+)
+
+_GRAPH_SCALAR_FIELDS = (
+    "num_layers",
+    "layer_id",
+    "executor_worker_count",
+    "executor_worker_limit",
+    "receipt_poll_quantum",
+    "bounded_drain_polls",
+)
+
+
+def _require_npu_inputs(inputs: P10ForwardInputs) -> None:
+    if not inputs.query.device.type.startswith("privateuseone") and \
+            inputs.query.device.type != "npu":
+        raise RuntimeError("P10 forward graph requires an NPU query tensor")
+
+
+def _tensor_graph_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
+    """Return the ABI-relevant static identity of one captured tensor.
+
+    ``data_ptr`` alone is insufficient for an as-strided view.  The captured
+    ACLNN descriptor also depends on the logical shape and stride, so replay
+    rejects either kind of drift before it can execute a stale graph.
+    """
+
+    return (
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.device),
+    )
+
+
+@dataclass(frozen=True)
+class _P10GraphInputSignature:
+    tensors: tuple[tuple[str, tuple[Any, ...]], ...]
+    scalars: tuple[tuple[str, int], ...]
+
+    @classmethod
+    def from_inputs(cls, inputs: P10ForwardInputs) -> "_P10GraphInputSignature":
+        return cls(
+            tensors=tuple(
+                (name, _tensor_graph_identity(getattr(inputs, name)))
+                for name in _GRAPH_TENSOR_FIELDS
+            ),
+            scalars=tuple(
+                (name, int(getattr(inputs, name))) for name in _GRAPH_SCALAR_FIELDS
+            ),
+        )
+
+    def mismatch_reason(self, inputs: P10ForwardInputs) -> str | None:
+        replay = _P10GraphInputSignature.from_inputs(inputs)
+        for (name, expected), (_, actual) in zip(self.tensors, replay.tensors):
+            if expected != actual:
+                return f"tensor_static_alias_mismatch:{name}"
+        for (name, expected), (_, actual) in zip(self.scalars, replay.scalars):
+            if expected != actual:
+                return f"scalar_tiling_mismatch:{name}"
+        return None
+
+
+class P10ForwardGraph:
+    """Capture and replay P10's fixed-address, two-stream forward pipeline.
+
+    An Ascend :class:`torch.npu.NPUGraph` captures only its current stream.
+    P10 consequently uses three independently captured graph segments:
+
+    * ``prepare_graph`` on the producer stream;
+    * ``stage_a_graph`` on that same producer stream;
+    * ``stage_b_graph`` on the companion executor stream.
+
+    During replay, the prepare graph records one device event.  The executor
+    graph is submitted first after that event, then the native W4A4C8 graph is
+    submitted on the producer stream.  This preserves the eager route's
+    admission order and its absence of a Stage-A-complete -> Stage-B edge.
+    Capture is intentionally one-time and may synchronize.  ``replay`` never
+    synchronizes the host, allocates a new stream, or launches a Python Get.
+    """
+
+    def __init__(
+        self,
+        *,
+        signature: _P10GraphInputSignature,
+        execution_mode: str,
+        prepare_graph: Any,
+        stage_a_graph: Any,
+        stage_b_graph: Any,
+        producer_stream: Any,
+        executor_stream: Any,
+        forward_control: torch.Tensor,
+        attention_slots: torch.Tensor,
+        resident_seq_lengths: torch.Tensor,
+    ) -> None:
+        self._signature = signature
+        self._execution_mode = execution_mode
+        self._prepare_graph = prepare_graph
+        self._stage_a_graph = stage_a_graph
+        self._stage_b_graph = stage_b_graph
+        self._producer_stream = producer_stream
+        self._executor_stream = executor_stream
+        self._forward_control = forward_control
+        self._attention_slots = attention_slots
+        self._resident_seq_lengths = resident_seq_lengths
+
+    @property
+    def execution_mode(self) -> str:
+        return self._execution_mode
+
+    @classmethod
+    def capture(
+        cls,
+        inputs: P10ForwardInputs,
+        *,
+        producer_stream: Any | None = None,
+        executor_stream: Any | None = None,
+        graph_pool: Any | None = None,
+        execution_mode: str = "overlap",
+    ) -> "P10ForwardGraph":
+        """Perform a one-time capture of the exact P10 product operators.
+
+        The capture sequence is deliberately serial only while *constructing*
+        graphs: Stage B's capture must observe a valid canonical C8 output.
+        This has no bearing on replay, where the overlap topology below is
+        restored.  The initial serial warm-up also forces lazy ACLNN/OPP
+        setup outside capture, so a capture failure cannot silently become an
+        eager fallback.
+        """
+
+        _require_npu_inputs(inputs)
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError(
+                "P10_GRAPH_CAPTURE_BLOCKED:nested_aclgraph_capture_forbidden"
+            )
+        if execution_mode not in ("overlap", "serial"):
+            raise ValueError(
+                "P10 graph execution_mode must be 'overlap' or benchmark-only "
+                f"'serial', got {execution_mode!r}"
+            )
+
+        # NPU graphs cannot be captured on the default stream.  The dedicated
+        # streams remain owned by this graph object and are reused on every
+        # replay; they are logical streams, never a physical-AIV partition.
+        if producer_stream is None:
+            producer_stream = _make_companion_stream(inputs.query)
+        if executor_stream is None:
+            executor_stream = _make_companion_stream(inputs.query)
+        if execution_mode == "overlap" and producer_stream == executor_stream:
+            raise RuntimeError(
+                "P10_GRAPH_CAPTURE_BLOCKED:overlap_requires_distinct_logical_streams"
+            )
+        if graph_pool is None:
+            graph_pool = torch.npu.graph_pool_handle()
+
+        # Warm the exact three-product-operator closure before capture.  The
+        # completion event is synchronized only here, never on graph replay.
+        warmup = launch_p10_forward(
+            inputs,
+            producer_stream=producer_stream,
+            executor_stream=executor_stream,
+            execution_mode="serial",
+        )
+        warmup.stage_b_complete.synchronize()
+
+        try:
+            prepare_graph = torch.npu.NPUGraph()
+            with torch.npu.stream(producer_stream), torch.npu.graph(
+                prepare_graph, pool=graph_pool, stream=producer_stream
+            ):
+                _launch_prepare(inputs)
+
+            stage_a_graph = torch.npu.NPUGraph()
+            with torch.npu.stream(producer_stream), torch.npu.graph(
+                stage_a_graph, pool=graph_pool, stream=producer_stream
+            ):
+                _launch_stage_a(inputs)
+
+            # Stage-A's capture invocation produced the canonical tensors that
+            # Stage-B's capture invocation reads.  This wait is capture-only;
+            # no equivalent wait exists in the replay topology.
+            producer_stream.synchronize()
+
+            stage_b_graph = torch.npu.NPUGraph()
+            with torch.npu.stream(executor_stream), torch.npu.graph(
+                stage_b_graph, pool=graph_pool, stream=executor_stream
+            ):
+                _launch_stage_b(inputs)
+            executor_stream.synchronize()
+        except Exception as error:  # noqa: BLE001 -- preserve exact CANN error.
+            raise RuntimeError(
+                "P10_GRAPH_CAPTURE_FAILED: "
+                f"execution_mode={execution_mode} type={type(error).__name__} text={error}"
+            ) from error
+
+        return cls(
+            signature=_P10GraphInputSignature.from_inputs(inputs),
+            execution_mode=execution_mode,
+            prepare_graph=prepare_graph,
+            stage_a_graph=stage_a_graph,
+            stage_b_graph=stage_b_graph,
+            producer_stream=producer_stream,
+            executor_stream=executor_stream,
+            forward_control=inputs.forward_control,
+            attention_slots=inputs.attention_slots_buffer,
+            resident_seq_lengths=inputs.selected_slot_lengths_buffer,
+        )
+
+    def replay(self, inputs: P10ForwardInputs) -> P10ForwardLaunch:
+        """Replay the captured product graph without a host completion wait."""
+
+        mismatch = self._signature.mismatch_reason(inputs)
+        if mismatch is not None:
+            raise RuntimeError(f"P10_GRAPH_REPLAY_BLOCKED:{mismatch}")
+
+        with torch.npu.stream(self._producer_stream):
+            self._prepare_graph.replay()
+            prepared = _record_event(self._producer_stream)
+
+        if self._execution_mode == "overlap":
+            # Preserve device-executor admission before the producer, without
+            # introducing the forbidden Stage-A completion dependency.
+            with torch.npu.stream(self._executor_stream):
+                self._executor_stream.wait_event(prepared)
+                self._stage_b_graph.replay()
+                stage_b_complete = _record_event(self._executor_stream)
+            with torch.npu.stream(self._producer_stream):
+                self._producer_stream.wait_event(prepared)
+                self._stage_a_graph.replay()
+        else:
+            # The graph-mode baseline differs by exactly the same one device
+            # edge as eager serial: Stage A completion gates Stage B.
+            with torch.npu.stream(self._producer_stream):
+                self._producer_stream.wait_event(prepared)
+                self._stage_a_graph.replay()
+                stage_a_complete = _record_event(self._producer_stream)
+            with torch.npu.stream(self._executor_stream):
+                self._executor_stream.wait_event(stage_a_complete)
+                self._stage_b_graph.replay()
+                stage_b_complete = _record_event(self._executor_stream)
+
+        return P10ForwardLaunch(
+            attention_slots=self._attention_slots,
+            resident_seq_lengths=self._resident_seq_lengths,
+            stage_b_complete=stage_b_complete,
+            producer_stream=self._producer_stream,
+            executor_stream=self._executor_stream,
+            forward_control=self._forward_control,
+        )
+
+
 def _record_event(stream: Any) -> Any:
     event = torch.npu.Event(enable_timing=False)
     event.record(stream)
@@ -250,9 +547,7 @@ def launch_p10_forward(
     default unchanged.
     """
 
-    if not inputs.query.device.type.startswith("privateuseone") and \
-            inputs.query.device.type != "npu":
-        raise RuntimeError("P10 forward graph requires an NPU query tensor")
+    _require_npu_inputs(inputs)
 
     if producer_stream is None:
         producer_stream = torch.npu.current_stream(device=inputs.query.device)
@@ -308,4 +603,29 @@ def launch_p10_forward(
         producer_stream=producer_stream,
         executor_stream=executor_stream,
         forward_control=inputs.forward_control,
+    )
+
+
+def capture_p10_forward_graph(
+    inputs: P10ForwardInputs,
+    *,
+    producer_stream: Any | None = None,
+    executor_stream: Any | None = None,
+    graph_pool: Any | None = None,
+    execution_mode: str = "overlap",
+) -> P10ForwardGraph:
+    """Capture the P10 product route for later ACLGraph replay.
+
+    This explicit factory keeps graph capture out of the eager product path.
+    Callers that are already inside vLLM's outer ACLGraph must construct this
+    object at graph-setup time, then call :meth:`P10ForwardGraph.replay` at
+    replay time; nested capture is rejected rather than falling back to eager.
+    """
+
+    return P10ForwardGraph.capture(
+        inputs,
+        producer_stream=producer_stream,
+        executor_stream=executor_stream,
+        graph_pool=graph_pool,
+        execution_mode=execution_mode,
     )

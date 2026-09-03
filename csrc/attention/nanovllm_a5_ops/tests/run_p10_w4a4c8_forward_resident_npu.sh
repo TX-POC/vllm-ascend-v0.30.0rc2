@@ -56,7 +56,7 @@ case "${mode}" in
     *) fail "invalid_runner_mode:${mode}" ;;
 esac
 case "${runtime_case}" in
-    acceptance|benchmark) ;;
+    acceptance|benchmark|graph_benchmark) ;;
     *) fail "invalid_runtime_case:${runtime_case}" ;;
 esac
 [[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]] || fail "invalid_build_jobs:${build_jobs}"
