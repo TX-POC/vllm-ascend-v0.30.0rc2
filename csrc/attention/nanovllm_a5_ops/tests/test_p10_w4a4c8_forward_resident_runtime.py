@@ -667,6 +667,35 @@ def _assert_terminal(
             mismatches.append(f"qsfa_translation:rank={rank}:slot={slot}")
             break
         if not torch.equal(payload[slot], fixture.expected_row(source)):
+            # One bounded CPU-side diagnostic after the product graph has
+            # completed.  It adds no device synchronization or work and
+            # distinguishes a bad WQE offset, a stale source row, and an
+            # inbound-DMA/cache-visibility failure in one rerun.
+            actual_payload = payload[slot].contiguous()
+            expected_payload = fixture.expected_row(source).contiguous()
+            byte_diff = actual_payload != expected_payload
+            first_byte = int(torch.nonzero(byte_diff, as_tuple=False)[0].item())
+            candidate_match = {
+                candidate: int(
+                    torch.equal(actual_payload, fixture.expected_row(candidate))
+                )
+                for candidate in (0, 1, 2)
+            }
+            print(
+                "P10_RUNTIME_PAYLOAD_DIAG "
+                f"rank={rank} source={source} slot={slot} "
+                f"actual_sha16={_sha16(actual_payload)} "
+                f"expected_sha16={_sha16(expected_payload)} "
+                f"mismatch_bytes={int(torch.count_nonzero(byte_diff).item())} "
+                f"first_byte={first_byte} "
+                f"actual_first16={actual_payload[:16].tolist()} "
+                f"expected_first16={expected_payload[:16].tolist()} "
+                f"match_source0={candidate_match[0]} "
+                f"match_source1={candidate_match[1]} "
+                f"match_source2={candidate_match[2]} "
+                f"all_zero={int(torch.count_nonzero(actual_payload).item()) == 0}",
+                flush=True,
+            )
             mismatches.append(f"payload:rank={rank}:source={source}:slot={slot}")
             break
         used_slots.add(slot)
