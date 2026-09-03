@@ -133,6 +133,23 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         self.assertIn("stage_b_complete = _record_event(executor_stream)", self.graph)
         self.assertIn("qsfa_stream.wait_event(self.stage_b_complete)", self.graph)
 
+    def test_companion_is_submitted_before_native_c8_without_a_reverse_dependency(self) -> None:
+        """Short forwards need the device poller admitted before C8 can seal.
+
+        This is deliberately host submission order only.  It must never turn
+        into a Stage-B completion edge that stalls the mathematical C8 path.
+        """
+
+        stage_b_submit = self.graph.index("_launch_stage_b(inputs)")
+        stage_a_submit = self.graph.index("_launch_stage_a(inputs)")
+        self.assertLess(stage_b_submit, stage_a_submit)
+        self.assertIn("submission-order admission rule", self.graph)
+        self.assertNotIn("wait_event(stage_b", self.graph)
+        self.assertEqual(
+            self.contract["graph_nodes"]["stage_b"]["submission_order"],
+            "stage_b_before_stage_a_after_common_prepare",
+        )
+
     def test_overlap_witness_is_explicit_and_not_a_normal_forward_wait(self) -> None:
         self.assertIn("class P10OverlapWitness", self.graph)
         self.assertIn("producer_seal_sequence", self.graph)

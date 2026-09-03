@@ -3,12 +3,16 @@
 This is deliberately a graph adapter, not a candidate scheduler.  It enqueues
 three device operators only:
 
-``prepare -> {native score producer, resident executor} -> QSFA``.
+``prepare -> {resident executor, native score producer} -> QSFA``.
 
-The braces are intentional.  Stage B is launched on a companion device stream
-after the common prepare event; it does *not* wait for native C8 to finish.
-It polls the device-owned receipt protocol while C8 continues producing.  No
-candidate is copied to Python, and no host KVAF request is issued here.
+The braces are intentional.  After the common prepare event, the host enqueues
+the resident executor on its companion stream *before* it enqueues native C8
+on the producer stream.  This is a submission-order admission rule, not a
+Stage-B-to-Stage-A dependency: Stage B polls the device-owned receipt protocol
+while C8 continues producing, and C8 never waits for Stage B.  It matters for
+short decode forwards, where submitting C8 first can let it seal before the
+companion launch reaches an AIV.  No candidate is copied to Python, and no
+host KVAF request is issued here.
 """
 
 from __future__ import annotations
@@ -252,14 +256,20 @@ def launch_p10_forward(
         _launch_prepare(inputs)
         prepared = _record_event(producer_stream)
 
-    with torch.npu.stream(producer_stream):
-        producer_stream.wait_event(prepared)
-        _launch_stage_a(inputs)
-
+    # Enqueue the persistent consumer first.  This does not make Stage A wait
+    # for Stage B and it does not reserve a physical AIV: it only ensures that
+    # the device-side receipt poller has been admitted before the first native
+    # score tile can become READY.  In particular, do not reverse these two
+    # independent submissions for a short forward, or C8 may seal before the
+    # companion is ever scheduled and eliminate all useful overlap.
     with torch.npu.stream(executor_stream):
         executor_stream.wait_event(prepared)
         _launch_stage_b(inputs)
         stage_b_complete = _record_event(executor_stream)
+
+    with torch.npu.stream(producer_stream):
+        producer_stream.wait_event(prepared)
+        _launch_stage_a(inputs)
 
     return P10ForwardLaunch(
         attention_slots=inputs.attention_slots_buffer,

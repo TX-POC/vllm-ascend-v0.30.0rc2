@@ -37,6 +37,7 @@
     "stage_b": {
       "operator": "A5P10ScoreReceiptForwardResident",
       "launch": "companion_device_stream_after_prepare",
+      "submission_order": "stage_b_before_stage_a_after_common_prepare",
       "inputs": 21,
       "alias_outputs": 11,
       "waits_for_stage_a_completion": false,
