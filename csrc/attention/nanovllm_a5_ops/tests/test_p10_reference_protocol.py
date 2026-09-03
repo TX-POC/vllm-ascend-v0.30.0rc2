@@ -3,7 +3,7 @@
 The suite intentionally has no torch, CANN, C8, or KVAF dependency.  It proves
 the Stage-A/Stage-B boundary before an expensive custom OPP build is allowed:
 Stage A publishes raw exact-score descriptors; Stage B alone scans, compacts,
-maps S->O, allocates the fixed forward arena, and posts.
+maps S->O, selects immutable canonical resident rows, and posts.
 """
 
 from __future__ import annotations
@@ -35,8 +35,6 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         ring_slots: int = 2,
         seed_capacity: int = 64,
         queue_count: int = 2,
-        speculative_slots: int = 8,
-        recall_slots: int = 8,
         active_rows: int | None = None,
     ) -> ScoreReceiptResidentProtocol:
         # Deliberately non-identity S -> O conversion makes it impossible for
@@ -45,6 +43,11 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             (17, 4, 31, 8, 22, 10, 41, 6),
             (103, 99, 87, 75, 63, 51, 39, 27),
         )
+        canonical_slots = {
+            (row, obj): row * 100 + source
+            for row, objects in enumerate(directory)
+            for source, obj in enumerate(objects)
+        }
         return ScoreReceiptResidentProtocol(
             object_directory=directory,
             active_row_count=active_rows,
@@ -52,8 +55,7 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             ring_slots_per_worker=ring_slots,
             seed_capacity=seed_capacity,
             hccp_queue_count=queue_count,
-            speculative_slots_per_row=speculative_slots,
-            recall_slots_per_row=recall_slots,
+            canonical_resident_slots=canonical_slots,
         )
 
     @staticmethod
@@ -121,7 +123,7 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         protocol.mark_executor_terminal()
 
     def test_stage_a_publishes_a_raw_descriptor_without_stage_b_policy_inputs(self):
-        protocol = self._protocol(speculative_slots=2, recall_slots=2)
+        protocol = self._protocol()
         receipt = self._publish(
             protocol,
             tile=11,
@@ -140,7 +142,6 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertEqual(receipt.descriptor.score_element_bytes, 2)
         self.assertEqual(receipt.score_surface_values, (73, 71))
         self.assertEqual(protocol.stats.candidates_compacted, 0)
-        self.assertEqual(protocol.arena.allocated_slot_ids(), ())
 
         publish_parameters = inspect.signature(
             protocol.publish_exact_score_window
@@ -170,11 +171,11 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             winners,
         )
 
-        without_speculation = self._protocol(speculative_slots=0, recall_slots=4)
+        without_speculation = self._protocol()
         self._drain_all(without_speculation, exact_winners=winners)
         no_spec_result = without_speculation.finalize(winners)
 
-        with_speculation = self._protocol(speculative_slots=8, recall_slots=4)
+        with_speculation = self._protocol()
         self.assertIsNotNone(
             self._publish(
                 with_speculation,
@@ -211,7 +212,9 @@ class P10ReferenceProtocolTest(unittest.TestCase):
 
         self.assertEqual(no_spec_result.winner_objects, baseline)
         self.assertEqual(spec_result.winner_objects, baseline)
-        self.assertNotEqual(no_spec_result.attention_slots, spec_result.attention_slots)
+        # Transport timing/path cannot change the canonical resident rows seen
+        # by downstream QSFA.
+        self.assertEqual(no_spec_result.attention_slots, spec_result.attention_slots)
         self.assertEqual(
             summarize_paths(spec_result),
             {"speculative_terminal": 4, "guaranteed_recall": 4},
@@ -220,8 +223,6 @@ class P10ReferenceProtocolTest(unittest.TestCase):
     def test_stage_b_seed_overflow_is_recalled_without_resident_slot_reuse(self) -> None:
         protocol = self._protocol(
             seed_capacity=2,
-            speculative_slots=2,
-            recall_slots=5,
         )
         receipt = self._publish(
             protocol,
@@ -257,16 +258,11 @@ class P10ReferenceProtocolTest(unittest.TestCase):
                 "guaranteed_recall",
             ],
         )
-        allocated = protocol.arena.allocated_slot_ids()
-        self.assertEqual(len(allocated), len(set(allocated)))
-        self.assertEqual(len(allocated), 5)
 
     def test_ring_reuses_only_after_stage_b_copies_the_descriptor(self) -> None:
         protocol = self._protocol(
             ring_slots=1,
             seed_capacity=1,
-            speculative_slots=2,
-            recall_slots=2,
         )
         first = self._publish(
             protocol,
@@ -294,16 +290,15 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertIsNotNone(second)
         assert second is not None
         self.assertEqual(first.ring_slot, second.ring_slot)
-        self.assertEqual(first_seeds[0].slot_ordinal, 0)
+        self.assertEqual(first_seeds[0].resident_slot, 0)
         second_claim = protocol.claim_ready_receipt()
         second_seeds = protocol.compact_claimed_receipt(
             second_claim, threshold_by_row={0: 1, 1: 1}
         )
-        self.assertEqual(second_seeds[0].slot_ordinal, 1)
-        self.assertEqual(len(protocol.arena.allocated_slot_ids()), 2)
+        self.assertEqual(second_seeds[0].resident_slot, 1)
 
     def test_ring_full_defers_raw_windows_without_scanning_or_slot_allocation(self) -> None:
-        protocol = self._protocol(ring_slots=1, speculative_slots=2, recall_slots=2)
+        protocol = self._protocol(ring_slots=1)
         first = self._publish(
             protocol, observations=(ScoreObservation(0, 0, 10),)
         )
@@ -317,10 +312,9 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertIsNone(second)
         self.assertEqual(protocol.stats.deferred_ring_full, 1)
         self.assertEqual(protocol.stats.candidates_compacted, 0)
-        self.assertEqual(protocol.arena.allocated_slot_ids(), ())
 
     def test_invalid_claim_is_done_then_explicitly_recycled_not_silently_freed(self) -> None:
-        protocol = self._protocol(ring_slots=1, speculative_slots=1, recall_slots=1)
+        protocol = self._protocol(ring_slots=1)
         receipt = self._publish(
             protocol, observations=(ScoreObservation(0, 0, 10),)
         )
@@ -349,8 +343,6 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             ring_slots=2,
             seed_capacity=1,
             queue_count=1,
-            speculative_slots=2,
-            recall_slots=1,
         )
         first = self._publish(
             protocol, tile=0, observations=(ScoreObservation(0, 0, 10),)
@@ -379,9 +371,9 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertFalse(protocol.post_compacted_receipt(second_claim, second_seeds))
         self.assertEqual(protocol.receipt_states(), ((ReceiptState.FREE, ReceiptState.CLAIMED),))
 
-        # Object 2 was not speculatively reserved.  Its recall suffix slot is
-        # admitted now, while one speculative CQ is still pending, and waits
-        # on the same one-queue transport pool rather than a separate path.
+        # Object 2 was not speculatively scheduled.  Its canonical resident
+        # row is admitted now, while one speculative CQ is still pending, and
+        # waits on the same one-queue transport pool rather than a new path.
         self.assertEqual(protocol.admit_final_winners(((0, 1, 2), (-1,))), 1)
         self.assertEqual(protocol.recall_backlog_count, 1)
         self.assertGreaterEqual(protocol.stats.deferred_queue_busy, 2)
@@ -403,9 +395,6 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             [placement.path for placement in result.placements if placement.row == 0],
             ["speculative_terminal", "speculative_terminal", "guaranteed_recall"],
         )
-        allocated = protocol.arena.allocated_slot_ids()
-        self.assertEqual(len(allocated), len(set(allocated)))
-        self.assertEqual(len(allocated), 3)
 
     def test_finalizer_refuses_until_all_producers_and_cq_work_are_terminal(self) -> None:
         protocol = self._protocol()
@@ -433,7 +422,7 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertEqual(result.winner_objects, ((17,), (-1,)))
 
     def test_persistent_hit_is_filtered_only_by_stage_b_not_stage_a(self) -> None:
-        protocol = self._protocol(speculative_slots=2, recall_slots=2)
+        protocol = self._protocol()
         receipt = self._publish(
             protocol,
             tile=3,
@@ -445,29 +434,29 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         seeds = protocol.compact_claimed_receipt(
             claimed,
             threshold_by_row={0: 1, 1: 1},
-            persistent_object_slots={(0, 31): 700},
+            persistent_object_slots={(0, 31): 2},
         )
         self.assertEqual([seed.source for seed in seeds], [3])
         self.assertEqual(protocol.stats.skipped_persistent, 1)
         protocol.post_compacted_receipt(claimed, seeds)
         protocol.recycle_done_receipt(claimed)
         protocol.admit_final_winners(
-            ((2, 3), (-1,)), persistent_object_slots={(0, 31): 700}
+            ((2, 3), (-1,)), persistent_object_slots={(0, 31): 2}
         )
         protocol.drain_cq()
         protocol.mark_producer_done(0)
         protocol.mark_executor_terminal()
         result = protocol.finalize(
-            ((2, 3), (-1,)), persistent_object_slots={(0, 31): 700}
+            ((2, 3), (-1,)), persistent_object_slots={(0, 31): 2}
         )
-        self.assertEqual(result.attention_slots[0], (700, 0))
+        self.assertEqual(result.attention_slots[0], (2, 3))
         self.assertEqual(
             [placement.path for placement in result.placements],
             ["persistent", "speculative_terminal"],
         )
 
     def test_graph_padding_is_not_a_candidate_producer(self) -> None:
-        protocol = self._protocol(active_rows=1, speculative_slots=2, recall_slots=2)
+        protocol = self._protocol(active_rows=1)
         receipt = self._publish(
             protocol, observations=(ScoreObservation(1, 0, 99),)
         )
@@ -478,19 +467,18 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         self.assertEqual(result.winner_objects, ((17,), (-1,)))
 
     def test_graph_padded_row_cannot_enter_final_qsfa_mapping(self) -> None:
-        protocol = self._protocol(active_rows=1, speculative_slots=2, recall_slots=2)
+        protocol = self._protocol(active_rows=1)
         self._drain_all(protocol, exact_winners=((0,), (-1,)))
         with self.assertRaisesRegex(ProtocolViolation, "inactive graph-padded row"):
             protocol.finalize(((0,), (0,)))
 
-    def test_one_kv_object_has_one_forward_owned_slot_even_with_two_sources(self) -> None:
+    def test_one_kv_object_has_one_canonical_slot_even_with_two_sources(self) -> None:
         protocol = ScoreReceiptResidentProtocol(
             object_directory=((41, 41, 99),),
             workers=1,
             ring_slots_per_worker=1,
             seed_capacity=4,
-            speculative_slots_per_row=1,
-            recall_slots_per_row=1,
+            canonical_resident_slots={(0, 41): 500, (0, 99): 501},
         )
         receipt = self._publish(
             protocol,
@@ -509,7 +497,7 @@ class P10ReferenceProtocolTest(unittest.TestCase):
         protocol.mark_executor_terminal()
         result = protocol.finalize(((0, 1),))
         self.assertEqual(result.winner_objects, ((41, 41),))
-        self.assertEqual(result.attention_slots, ((0, 0),))
+        self.assertEqual(result.attention_slots, ((500, 500),))
         self.assertEqual(summarize_paths(result), {"speculative_terminal": 2})
 
     def test_exact_winner_cannot_name_an_invalid_kv_object(self) -> None:
@@ -518,17 +506,41 @@ class P10ReferenceProtocolTest(unittest.TestCase):
             workers=1,
             ring_slots_per_worker=1,
             seed_capacity=1,
-            speculative_slots_per_row=1,
-            recall_slots_per_row=1,
+            canonical_resident_slots={(0, 17): 42},
         )
         with self.assertRaisesRegex(ProtocolViolation, "invalid KV object"):
             protocol.admit_final_winners(((1,),))
 
-    def test_recall_capacity_is_checked_before_any_recall_slot_is_allocated(self) -> None:
-        protocol = self._protocol(speculative_slots=0, recall_slots=1)
-        with self.assertRaisesRegex(ProtocolViolation, "recall arena is too small"):
-            protocol.admit_final_winners(((0, 1), (-1,)))
-        self.assertEqual(protocol.arena.allocated_slot_ids(), ())
+    def test_speculative_and_final_recall_use_the_same_canonical_slot(self) -> None:
+        winners = ((2,), (-1,))
+
+        speculative = self._protocol()
+        receipt = self._publish(
+            speculative,
+            observations=(ScoreObservation(0, 2, 99),),
+        )
+        assert receipt is not None
+        self._drain_all(
+            speculative,
+            exact_winners=winners,
+            threshold_by_row={0: 1, 1: 1},
+        )
+        speculative_result = speculative.finalize(winners)
+
+        recall = self._protocol()
+        self._drain_all(recall, exact_winners=winners)
+        recall_result = recall.finalize(winners)
+
+        self.assertEqual(speculative_result.attention_slots, ((2,), (-1,)))
+        self.assertEqual(recall_result.attention_slots, ((2,), (-1,)))
+        self.assertEqual(
+            [placement.path for placement in speculative_result.placements],
+            ["speculative_terminal"],
+        )
+        self.assertEqual(
+            [placement.path for placement in recall_result.placements],
+            ["guaranteed_recall"],
+        )
 
 
 if __name__ == "__main__":

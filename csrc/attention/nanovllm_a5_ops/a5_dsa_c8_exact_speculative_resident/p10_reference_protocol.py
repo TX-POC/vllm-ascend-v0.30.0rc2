@@ -18,9 +18,10 @@ deliberate: Stage B must first make a durable local copy (or terminally reject
 an invalid descriptor) before an explicit recycle makes the GM ring slot
 available again.  A claimed record is therefore never silently made free.
 
-Resident slots are monotonic per-forward allocations, so a false-positive
-speculative payload cannot displace a final winner and no cross-forward ABA
-protocol is needed.  The bounded HCCP queue is shared by speculative and
+Every ``(row, kv_object)`` has an immutable, absolute canonical resident slot
+for the invocation.  Speculative and final-recall posts both use that exact
+slot; there is no speculative/recall cursor, slot allocation, release, reuse,
+or ABA protocol.  The bounded HCCP queue is shared by speculative and
 guaranteed-recall posts; final exact winners are admitted while that executor
 is still alive, not after it has drained to terminal.
 """
@@ -28,8 +29,9 @@ is still alive, not after it has drained to terminal.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 
 
@@ -77,12 +79,12 @@ class ScoreReceiptDescriptor:
 
 @dataclass(frozen=True)
 class CandidateSeed:
-    """Stage-B output: ``[row, source, kv_object, slot_ordinal]``."""
+    """Stage-B output: ``[row, source, kv_object, resident_slot]``."""
 
     row: int
     source: int
     kv_object: int
-    slot_ordinal: int
+    resident_slot: int
 
 
 @dataclass(frozen=True)
@@ -161,7 +163,6 @@ class ProtocolStats:
     receipts_rejected: int = 0
     deferred_ring_full: int = 0
     deferred_seed_capacity: int = 0
-    deferred_arena_capacity: int = 0
     deferred_queue_busy: int = 0
     skipped_persistent: int = 0
     skipped_duplicate: int = 0
@@ -177,80 +178,6 @@ class _ReceiptRecord:
     receipt: ScoreReceipt | None = None
 
 
-@dataclass
-class ForwardOwnedArena:
-    """Per-forward fixed ``S + K`` resident layout without slot release.
-
-    Score-time speculation consumes only the prefix.  Final guaranteed recall
-    consumes only the suffix.  This is a memory-capacity partition, not an
-    AIV/core partition and not an arena-reuse lifecycle.
-    """
-
-    rows: int
-    speculative_capacity: int
-    recall_capacity: int
-    _speculative_cursor: list[int] = field(init=False, repr=False)
-    _recall_cursor: list[int] = field(init=False, repr=False)
-    _allocated: set[tuple[int, int]] = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        if self.rows <= 0:
-            raise ValueError("rows must be positive")
-        if self.speculative_capacity < 0 or self.recall_capacity < 0:
-            raise ValueError("arena capacities cannot be negative")
-        self._speculative_cursor = [0] * self.rows
-        self._recall_cursor = [0] * self.rows
-        self._allocated = set()
-
-    @property
-    def slots_per_row(self) -> int:
-        return self.speculative_capacity + self.recall_capacity
-
-    def slot_id(self, row: int, ordinal: int) -> int:
-        self._check_row(row)
-        if ordinal < 0 or ordinal >= self.slots_per_row:
-            raise ProtocolViolation("slot ordinal is outside the forward arena")
-        return row * self.slots_per_row + ordinal
-
-    def reserve_speculative(self, row: int) -> int | None:
-        self._check_row(row)
-        cursor = self._speculative_cursor[row]
-        if cursor >= self.speculative_capacity:
-            return None
-        self._speculative_cursor[row] = cursor + 1
-        self._mark_allocated(row, cursor)
-        return cursor
-
-    def reserve_recall(self, row: int) -> int | None:
-        self._check_row(row)
-        cursor = self._recall_cursor[row]
-        if cursor >= self.recall_capacity:
-            return None
-        self._recall_cursor[row] = cursor + 1
-        ordinal = self.speculative_capacity + cursor
-        self._mark_allocated(row, ordinal)
-        return ordinal
-
-    def remaining_recall(self, row: int) -> int:
-        self._check_row(row)
-        return self.recall_capacity - self._recall_cursor[row]
-
-    def allocated_slot_ids(self) -> tuple[int, ...]:
-        return tuple(
-            self.slot_id(row, ordinal) for row, ordinal in sorted(self._allocated)
-        )
-
-    def _mark_allocated(self, row: int, ordinal: int) -> None:
-        key = (row, ordinal)
-        if key in self._allocated:
-            raise ProtocolViolation("forward-owned arena attempted slot reuse")
-        self._allocated.add(key)
-
-    def _check_row(self, row: int) -> None:
-        if not 0 <= row < self.rows:
-            raise ProtocolViolation("row is outside the forward arena")
-
-
 class ScoreReceiptResidentProtocol:
     """Reference state machine for one forward-owned streaming invocation."""
 
@@ -263,8 +190,7 @@ class ScoreReceiptResidentProtocol:
         ring_slots_per_worker: int = 2,
         seed_capacity: int = 64,
         hccp_queue_count: int = 2,
-        speculative_slots_per_row: int,
-        recall_slots_per_row: int,
+        canonical_resident_slots: Mapping[tuple[int, int], int],
     ) -> None:
         if not object_directory:
             raise ValueError("object_directory must contain at least one row")
@@ -295,10 +221,8 @@ class ScoreReceiptResidentProtocol:
         self.seed_capacity = int(seed_capacity)
         # This is a fixed transport-resource pool, not a physical-AIV split.
         self.hccp_queue_count = int(hccp_queue_count)
-        self.arena = ForwardOwnedArena(
-            rows=self.rows,
-            speculative_capacity=int(speculative_slots_per_row),
-            recall_capacity=int(recall_slots_per_row),
+        self._canonical_slot_by_object = MappingProxyType(
+            self._validate_canonical_slots(canonical_resident_slots)
         )
         self.stats = ProtocolStats()
         self._records = [
@@ -309,8 +233,10 @@ class ScoreReceiptResidentProtocol:
         self._next_receipt_sequence = 1
         self._compacted: dict[tuple[int, int, int], tuple[CandidateSeed, ...]] = {}
         # The resident payload is object O, while C8 scores source occurrence S.
-        self._reserved_object_to_ordinal: dict[tuple[int, int], int] = {}
-        self._terminal_object_to_ordinal: dict[tuple[int, int], int] = {}
+        # A scheduled object has exactly one immutable canonical resident row.
+        # The set is per-forward de-duplication only; it never owns allocation
+        # or reclamation semantics.
+        self._scheduled_objects: set[tuple[int, int]] = set()
         self._terminal_object_path: dict[tuple[int, int], str] = {}
         self._free_queue_ids = set(range(self.hccp_queue_count))
         self._pending: list[PendingPost] = []
@@ -364,7 +290,7 @@ class ScoreReceiptResidentProtocol:
         """Stage A: publish a raw completed score-window descriptor.
 
         Crucially, this method accepts no threshold, object map, resident map,
-        or arena.  The model's observations are the values addressed by the
+        or resident slot.  The model's observations are the values addressed by the
         formal score surface; production Stage A publishes only the descriptor
         after its independent score-DMA completion edge.
         """
@@ -444,7 +370,7 @@ class ScoreReceiptResidentProtocol:
         """Stage B: ExactScoreScan + CandidateCompact + resident admission.
 
         This is deliberately the first point that accesses threshold, S->O,
-        resident/persistent state, or forward arena capacity.  It never changes
+        resident/persistent state, or dynamic slot allocation.  It never changes
         the descriptor or any original C8 Top-K state.
         """
 
@@ -472,17 +398,13 @@ class ScoreReceiptResidentProtocol:
             if len(seeds) >= self.seed_capacity:
                 self.stats.deferred_seed_capacity += 1
                 continue
-            ordinal = self.arena.reserve_speculative(candidate.row)
-            if ordinal is None:
-                self.stats.deferred_arena_capacity += 1
-                continue
             seed = CandidateSeed(
                 row=candidate.row,
                 source=candidate.source,
                 kv_object=candidate.kv_object,
-                slot_ordinal=ordinal,
+                resident_slot=candidate.resident_slot,
             )
-            self._reserved_object_to_ordinal[(seed.row, seed.kv_object)] = ordinal
+            self._scheduled_objects.add((seed.row, seed.kv_object))
             seeds.append(seed)
             self.stats.candidates_compacted += 1
         compacted = tuple(seeds)
@@ -564,10 +486,11 @@ class ScoreReceiptResidentProtocol:
                 raise ProtocolViolation("CQ terminal observed a queue that was already free")
             for seed in pending.seeds:
                 key = (seed.row, seed.kv_object)
-                expected = self._reserved_object_to_ordinal.get(key)
-                if expected != seed.slot_ordinal:
-                    raise ProtocolViolation("terminal post lost its arena reservation")
-                self._terminal_object_to_ordinal[key] = seed.slot_ordinal
+                expected = self._canonical_slot_by_object.get(key)
+                if expected != seed.resident_slot:
+                    raise ProtocolViolation(
+                        "terminal post differs from the canonical resident slot"
+                    )
                 self._terminal_object_path[key] = pending.path
                 self.stats.cq_terminal += 1
             self._free_queue_ids.add(pending.queue_id)
@@ -620,12 +543,12 @@ class ScoreReceiptResidentProtocol:
     ) -> int:
         """Admit exact winners into the still-live shared PostOnly executor.
 
-        C8's exact Top-K is authoritative.  Objects already reserved by
-        speculation keep their fixed prefix slot and simply wait for their
-        existing PostOnly/CQ path.  Every otherwise-unresolved winner receives
-        a fixed suffix slot and is submitted through the *same* bounded queue
-        pool.  This must happen before executor terminal; ``finalize`` only
-        exposes terminal resident slots to QSFA.
+        C8's exact Top-K is authoritative.  Objects already scheduled by
+        speculation keep their immutable canonical resident slot and simply
+        wait for their existing PostOnly/CQ path.  Every otherwise-unresolved
+        winner uses its own preassigned canonical slot through the *same*
+        bounded queue pool.  This must happen before executor terminal;
+        ``finalize`` only exposes terminal resident slots to QSFA.
         """
 
         self._ensure_open()
@@ -639,7 +562,6 @@ class ScoreReceiptResidentProtocol:
             return 0
 
         missing: list[tuple[int, int, int]] = []
-        missing_by_row = [0] * self.rows
         seen_missing: set[tuple[int, int]] = set()
         for row, row_winners in enumerate(winners):
             for source in row_winners:
@@ -647,31 +569,24 @@ class ScoreReceiptResidentProtocol:
                     continue
                 obj = self._object_at(row, source)
                 key = (row, obj)
-                if key in persistent or key in self._reserved_object_to_ordinal:
+                if key in persistent or key in self._scheduled_objects:
                     continue
                 if key in seen_missing:
                     continue
                 seen_missing.add(key)
                 missing.append((row, source, obj))
-                missing_by_row[row] += 1
-        for row, needed in enumerate(missing_by_row):
-            if needed > self.arena.remaining_recall(row):
-                raise ProtocolViolation(
-                    "recall arena is too small for exact winners; no slots were "
-                    f"allocated for row={row} needed={needed} "
-                    f"remaining={self.arena.remaining_recall(row)}"
-                )
 
         recall_seeds: list[CandidateSeed] = []
         for row, source, obj in missing:
-            ordinal = self.arena.reserve_recall(row)
-            if ordinal is None:
-                raise ProtocolViolation("recall reservation unexpectedly failed")
             key = (row, obj)
-            self._reserved_object_to_ordinal[key] = ordinal
+            resident_slot = self._canonical_resident_slot(row, obj)
+            self._scheduled_objects.add(key)
             recall_seeds.append(
                 CandidateSeed(
-                    row=row, source=source, kv_object=obj, slot_ordinal=ordinal
+                    row=row,
+                    source=source,
+                    kv_object=obj,
+                    resident_slot=resident_slot,
                 )
             )
         self._admitted_winners = winners
@@ -718,13 +633,12 @@ class ScoreReceiptResidentProtocol:
                     path = "persistent"
                 else:
                     object_key = (row, obj)
-                    ordinal = self._terminal_object_to_ordinal.get(object_key)
-                    if ordinal is None:
+                    if object_key not in self._terminal_object_path:
                         raise ProtocolViolation(
                             "final winner has no terminal forward-owned resident slot"
                         )
                     path = self._terminal_object_path[object_key]
-                    slot_id = self.arena.slot_id(row, ordinal)
+                    slot_id = self._canonical_resident_slot(row, obj)
                 row_slots.append(slot_id)
                 row_objects.append(obj)
                 placements.append(
@@ -800,10 +714,15 @@ class ScoreReceiptResidentProtocol:
             self.stats.skipped_persistent += 1
             return None
         key = (row, obj)
-        if key in self._reserved_object_to_ordinal:
+        if key in self._scheduled_objects:
             self.stats.skipped_duplicate += 1
             return None
-        return CandidateSeed(row=row, source=source, kv_object=obj, slot_ordinal=-1)
+        return CandidateSeed(
+            row=row,
+            source=source,
+            kv_object=obj,
+            resident_slot=self._canonical_resident_slot(row, obj),
+        )
 
     def _try_post(
         self,
@@ -862,7 +781,10 @@ class ScoreReceiptResidentProtocol:
                     continue
                 obj = self._object_at(row, source)
                 key = (row, obj)
-                if key not in self._admitted_persistent and key not in self._terminal_object_to_ordinal:
+                if (
+                    key not in self._admitted_persistent
+                    and key not in self._terminal_object_path
+                ):
                     return False
         return True
 
@@ -873,8 +795,48 @@ class ScoreReceiptResidentProtocol:
         for (row, obj), slot_id in (mapping or {}).items():
             if not 0 <= int(row) < self.rows or int(obj) < 0 or int(slot_id) < 0:
                 raise ProtocolViolation("persistent resident mapping is invalid")
-            result[(int(row), int(obj))] = int(slot_id)
+            key = (int(row), int(obj))
+            canonical_slot = self._canonical_slot_by_object.get(key)
+            if canonical_slot is None or int(slot_id) != canonical_slot:
+                raise ProtocolViolation(
+                    "persistent resident mapping differs from the canonical slot"
+                )
+            result[key] = canonical_slot
         return result
+
+    def _validate_canonical_slots(
+        self, mapping: Mapping[tuple[int, int], int]
+    ) -> dict[tuple[int, int], int]:
+        """Require one immutable absolute resident row for every valid object."""
+
+        normalized: dict[tuple[int, int], int] = {}
+        for (row, obj), slot_id in mapping.items():
+            key = (int(row), int(obj))
+            if not 0 <= key[0] < self.rows or key[1] < 0 or int(slot_id) < 0:
+                raise ProtocolViolation("canonical resident-slot mapping is invalid")
+            normalized[key] = int(slot_id)
+        required = {
+            (row, obj)
+            for row, objects in enumerate(self._object_directory)
+            for obj in objects
+            if obj >= 0
+        }
+        if set(normalized) != required:
+            missing = sorted(required - set(normalized))
+            extra = sorted(set(normalized) - required)
+            raise ProtocolViolation(
+                "canonical resident-slot mapping must cover exactly every valid "
+                f"object; missing={missing[:3]} extra={extra[:3]}"
+            )
+        if len(set(normalized.values())) != len(normalized):
+            raise ProtocolViolation("canonical resident slots must be injective")
+        return normalized
+
+    def _canonical_resident_slot(self, row: int, obj: int) -> int:
+        try:
+            return self._canonical_slot_by_object[(int(row), int(obj))]
+        except KeyError as error:
+            raise ProtocolViolation("KV object has no canonical resident slot") from error
 
     def _receipt_payload_is_valid(self, receipt: ScoreReceipt) -> bool:
         """Validate a claimed descriptor before Stage B trusts its score window."""
@@ -902,7 +864,7 @@ class ScoreReceiptResidentProtocol:
         self, exact_winner_sources: Sequence[Sequence[int]]
     ) -> tuple[tuple[int, ...], ...]:
         if len(exact_winner_sources) != self.rows:
-            raise ProtocolViolation("exact Top-K rows do not match the forward arena")
+            raise ProtocolViolation("exact Top-K rows do not match the invocation")
         result: list[tuple[int, ...]] = []
         for row, row_winners in enumerate(exact_winner_sources):
             values = tuple(int(source) for source in row_winners)
