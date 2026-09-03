@@ -29,8 +29,20 @@ class P9DirectLaunchContractTest(unittest.TestCase):
         self.assertIn("LaunchP9CallerThreadDirectAsync", BRIDGE)
         self.assertIn("RequireP9CallerThreadDirectAsyncContract", BRIDGE)
         self.assertIn("P9_DIRECT_ASYNC_STAGE", BRIDGE)
-        self.assertNotIn("EXEC_NPU_CMD_ORDERED", BRIDGE)
-        self.assertNotIn("RunOpApi", BRIDGE)
+        self.assertIn("P9UseOrderedLaunchBisection", BRIDGE)
+        self.assertIn("P9_ORDERED_LAUNCH_BISECT", BRIDGE)
+        self.assertIn("if (P9UseOrderedLaunchBisection())", BRIDGE)
+        self.assertIn("EXEC_NPU_CMD_ORDERED(", BRIDGE)
+        direct_call = BRIDGE.rindex("LaunchP9CallerThreadDirectAsync(")
+        self.assertLess(
+            BRIDGE.index("if (P9UseOrderedLaunchBisection())"),
+            direct_call,
+        )
+        # The ordered path is an opt-in diagnostic only.  Normal P9 launches
+        # retain the direct caller-thread implementation and never implicitly
+        # cross into RunOpApi.
+        self.assertIn('std::getenv("P9_FORCE_ORDERED_LAUNCH")', BRIDGE)
+        self.assertIn('std::strcmp(value, "1") == 0', BRIDGE)
 
     def test_nonzero_workspace_uses_its_creating_stream_before_cleanup(
         self,

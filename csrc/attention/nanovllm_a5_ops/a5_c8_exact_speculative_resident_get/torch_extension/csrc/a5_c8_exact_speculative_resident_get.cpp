@@ -81,6 +81,28 @@ void RequireP9CallerThreadDirectAsyncContract()
     std::fflush(stderr);
 }
 
+// This is deliberately a one-purpose diagnostic switch, not a product
+// fallback.  The P9 device operator is source-derived from C8, while the
+// reference bridge uses torch_npu's ordered host launcher.  When an exact-C8
+// comparison fails before P9 has posted any transport work, selecting this
+// path lets one bridge-only rebuild distinguish host launch ordering from the
+// compiled P9 C8 closure.  Production keeps the direct caller-thread route.
+bool P9UseOrderedLaunchBisection()
+{
+    const char* value = std::getenv("P9_FORCE_ORDERED_LAUNCH");
+    if (value == nullptr || std::strcmp(value, "0") == 0 ||
+        std::strcmp(value, "") == 0) {
+        return false;
+    }
+    TORCH_CHECK(std::strcmp(value, "1") == 0,
+                "P9_FORCE_ORDERED_LAUNCH must be 0 or 1, got ", value);
+    std::fprintf(stderr,
+                 "P9_ORDERED_LAUNCH_BISECT enabled=1 "
+                 "scope=disabled_c8_math_only\n");
+    std::fflush(stderr);
+    return true;
+}
+
 void LogP9DirectAsyncStage(const char* api, const char* stage,
                            uint64_t workspace_bytes = 0)
 {
@@ -541,21 +563,43 @@ PublicResult AllocateAndLaunch(
         "aclnnA5C8ExactSpeculativeResidentGetGetWorkspaceSize");
     static void* launch_addr_fn = nanovllm_a5_opapi::ResolveSymbol(
         "aclnnA5C8ExactSpeculativeResidentGet");
-    LaunchP9CallerThreadDirectAsync(
-        "aclnnA5C8ExactSpeculativeResidentGet", workspace_addr_fn,
-        launch_addr_fn, query, std::move(keepalive), query, key_arg, weights,
-        query_scale, key_scale, actual_query_lengths, actual_key_lengths,
-        block_table, metadata, runtime_enable, resident_threshold,
-        resident_threshold_valid, req_pool_entries, kv_object_map,
-        kv_object_lens, persistent_object_slots_snapshot,
-        canonical_resident_slots, candidate_source_to_slot,
-        candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
-        resident_block_table, active_row_count,
-        query_quant_mode, key_quant_mode, layout_query_ptr, layout_key_ptr,
-        sparse_count, sparse_mode, pre_tokens, next_tokens, cmp_ratio,
-        return_values, stride, scale_stride, sparse_indices, sparse_values,
-        attention_slots, terminal_post_stats, candidate_source_to_slot,
-        candidate_slot_cursor);
+    if (P9UseOrderedLaunchBisection()) {
+        // Keep this exact argument order in lock-step with the production
+        // direct path below.  It is used only to localize a disabled C8 math
+        // mismatch; it must never become an implicit host-side P9 execution
+        // path because the production design owns Get/CQ on the device.
+        EXEC_NPU_CMD_ORDERED(
+            aclnnA5C8ExactSpeculativeResidentGet, keepalive,
+            query, key_arg, weights, query_scale, key_scale,
+            actual_query_lengths, actual_key_lengths, block_table, metadata,
+            runtime_enable, resident_threshold, resident_threshold_valid,
+            req_pool_entries, kv_object_map, kv_object_lens,
+            persistent_object_slots_snapshot, canonical_resident_slots,
+            candidate_source_to_slot, candidate_slot_cursor,
+            layer_resident_get_control, rows_per_entry, resident_block_table,
+            active_row_count, query_quant_mode, key_quant_mode,
+            layout_query_ptr, layout_key_ptr, sparse_count, sparse_mode,
+            pre_tokens, next_tokens, cmp_ratio, return_values, stride,
+            scale_stride, sparse_indices, sparse_values, attention_slots,
+            terminal_post_stats, candidate_source_to_slot,
+            candidate_slot_cursor);
+    } else {
+        LaunchP9CallerThreadDirectAsync(
+            "aclnnA5C8ExactSpeculativeResidentGet", workspace_addr_fn,
+            launch_addr_fn, query, std::move(keepalive), query, key_arg,
+            weights, query_scale, key_scale, actual_query_lengths,
+            actual_key_lengths, block_table, metadata, runtime_enable,
+            resident_threshold, resident_threshold_valid, req_pool_entries,
+            kv_object_map, kv_object_lens, persistent_object_slots_snapshot,
+            canonical_resident_slots, candidate_source_to_slot,
+            candidate_slot_cursor, layer_resident_get_control, rows_per_entry,
+            resident_block_table, active_row_count, query_quant_mode,
+            key_quant_mode, layout_query_ptr, layout_key_ptr, sparse_count,
+            sparse_mode, pre_tokens, next_tokens, cmp_ratio, return_values,
+            stride, scale_stride, sparse_indices, sparse_values,
+            attention_slots, terminal_post_stats, candidate_source_to_slot,
+            candidate_slot_cursor);
+    }
     return std::make_tuple(sparse_indices, sparse_values, attention_slots,
                            terminal_post_stats);
 }
