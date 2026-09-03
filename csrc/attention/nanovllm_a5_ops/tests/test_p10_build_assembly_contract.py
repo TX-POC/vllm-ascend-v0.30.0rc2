@@ -91,11 +91,11 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
     def test_combined_msopgen_project_remaps_normalized_stage_kernels(self) -> None:
         # Repository-level CMake fragments cannot be overlaid on a fresh CANN
         # scaffold.  CANN normalizes W4/A4/C8 in the Stage-A generated filename
-        # while the source closure preserves its ABI spelling.  The remapped
-        # canonical file and the source OpDef's opFile.value must agree; both
-        # Stage A and Stage B then replace the generated dispatch wrapper and
-        # remove the source-only filename so a placeholder/duplicate cannot
-        # compile.
+        # while the source closure keeps an authoring spelling.  The remapped
+        # canonical file, source OpDef's opFile.value, and __global__ entry
+        # must agree; both Stage A and Stage B then replace the generated
+        # dispatch wrapper and remove the source-only filename so a
+        # placeholder/duplicate cannot compile.
         for token in (
             "copy_unique_tree_without_repository_cmake",
             "repository_host_cmake_leaked_into_msopgen_project",
@@ -107,7 +107,8 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
             "rm -f \"${stage_a_source_kernel}\"",
             "stage_a_op_file_config_mismatch",
             "stage_a_op_file_source_missing",
-            "P10_PRODUCT_STAGE_A_OPFILE_GATE op_file=%s source=1",
+            "stage_a_op_file_entry_mismatch",
+            "P10_PRODUCT_STAGE_A_OPFILE_GATE op_file=%s source=1 entry=1",
             "stage_b_generated_kernel",
             "stage_b_source_kernel",
             "stage_b_source_kernel_missing_after_copy",

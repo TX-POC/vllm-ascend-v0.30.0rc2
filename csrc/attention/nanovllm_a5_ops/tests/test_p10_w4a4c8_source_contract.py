@@ -180,7 +180,7 @@ class P10W4A4C8SourceContractTest(unittest.TestCase):
 
         source_base = self.contract["stage_a_source_base"]
         self.assertEqual(source_base["operator"], "A5P10W4A4C8ScoreReceipt")
-        self.assertEqual(source_base["kernel"], "a5_p10_w4a4c8_score_receipt")
+        self.assertEqual(source_base["kernel"], "a5_p10_w4_a4_c8_score_receipt")
         self.assertEqual(source_base["source_root"], "stage_a_w4a4c8_score_receipt")
         self.assertEqual(
             source_base["build_state"],

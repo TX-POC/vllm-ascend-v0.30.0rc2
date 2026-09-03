@@ -317,13 +317,12 @@ cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
 printf 'P10_PRODUCT_POSTGEN_PHASE phase=source_overlay_complete\n'
 
 # Source filenames are not necessarily msopgen filenames.  In particular,
-# CANN normalizes the W4/A4/C8 runs in Stage A's CamelCase operator name into
-# ``a5_p10_w4_a4_c8_score_receipt.cpp``.  The checked-in implementation keeps
-# the human-facing, ABI-oriented spelling without separators.  Do not leave
-# both files in the merged tree: CMake would compile the generated placeholder
-# and/or compile the real kernel twice.  Stage B has the analogous deliberately
-# suffixed source filename.  Replace each generated canonical wrapper with its
-# source implementation, then remove the source-only spelling.
+# CANN normalizes the W4/A4/C8 run in Stage A's CamelCase operator name into
+# ``a5_p10_w4_a4_c8_score_receipt.cpp``.  The checked-in filename is only an
+# authoring spelling.  Replace the generated wrapper with that implementation
+# and remove the authoring-only filename, so CANN sees one canonical filename,
+# opFile.value, and __global__ entry identity.  Stage B has the analogous
+# deliberately suffixed source filename.
 stage_a_generated_kernel="${GENERATED}/op_kernel/a5_p10_w4_a4_c8_score_receipt.cpp"
 stage_a_source_kernel="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt.cpp"
 [[ -f "${stage_a_generated_kernel}" ]] ||
@@ -343,9 +342,12 @@ grep -Fq ".ExtendCfgInfo(\"opFile.value\", \"${stage_a_op_file}\")" \
     "${stage_a_opdef}" || fail "stage_a_op_file_config_mismatch"
 [[ -s "${GENERATED}/op_kernel/${stage_a_op_file}.cpp" ]] ||
     fail "stage_a_op_file_source_missing"
+grep -Fq "void ${stage_a_op_file}(" \
+    "${GENERATED}/op_kernel/${stage_a_op_file}.cpp" ||
+    fail "stage_a_op_file_entry_mismatch"
 [[ ! -e "${stage_a_source_kernel}" ]] ||
     fail "stage_a_source_only_kernel_not_removed"
-printf 'P10_PRODUCT_STAGE_A_OPFILE_GATE op_file=%s source=1\n' \
+printf 'P10_PRODUCT_STAGE_A_OPFILE_GATE op_file=%s source=1 entry=1\n' \
     "${stage_a_op_file}"
 
 stage_b_generated_kernel="${GENERATED}/op_kernel/a5_p10_score_receipt_forward_resident.cpp"

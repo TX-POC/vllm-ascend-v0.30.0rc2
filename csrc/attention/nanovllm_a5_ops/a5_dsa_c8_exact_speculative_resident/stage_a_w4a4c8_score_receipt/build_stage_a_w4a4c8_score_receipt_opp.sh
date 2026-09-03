@@ -116,10 +116,10 @@ msopgen gen -i "${OP_DEV}/ops.json" -f aclnn -c "ai_core-${TARGET_SOC}" \
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
 # CANN normalizes W4/A4/C8 runs in the CamelCase op name when naming generated
-# host and kernel files.  The source closure intentionally retains its ABI
-# spelling (without inserted separators), so explicitly remap it to CANN's
-# generated canonical filename and delete the source-only spelling.  Keeping
-# both names would compile a placeholder or duplicate the real kernel.
+# host and kernel files.  The checked-in filename is an authoring spelling;
+# remap it to CANN's canonical filename and delete that authoring-only name.
+# The OpDef and __global__ entry are gated against the same canonical identity
+# before the expensive CANN build begins.
 GENERATED_KERNEL="${GENERATED}/op_kernel/a5_p10_w4_a4_c8_score_receipt.cpp"
 SOURCE_KERNEL="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt.cpp"
 [[ -f "${GENERATED_KERNEL}" ]] || fail "generated_kernel_stub_missing"
@@ -137,8 +137,11 @@ grep -Fq ".ExtendCfgInfo(\"opFile.value\", \"${CANONICAL_OP_FILE}\")" \
   fail "canonical_op_file_config_mismatch"
 [[ -s "${GENERATED}/op_kernel/${CANONICAL_OP_FILE}.cpp" ]] ||
   fail "canonical_op_file_source_missing"
+grep -Fq "void ${CANONICAL_OP_FILE}(" \
+  "${GENERATED}/op_kernel/${CANONICAL_OP_FILE}.cpp" ||
+  fail "canonical_op_file_entry_mismatch"
 [[ ! -e "${SOURCE_KERNEL}" ]] || fail "source_only_kernel_not_removed"
-printf 'P10_STAGE_A_OPFILE_GATE op_file=%s source=1\n' "${CANONICAL_OP_FILE}"
+printf 'P10_STAGE_A_OPFILE_GATE op_file=%s source=1 entry=1\n' "${CANONICAL_OP_FILE}"
 
 GENERATED_STUB="${GENERATED}/op_host/a5_p10_w4_a4_c8_score_receipt.cpp"
 SOURCE_OPDEF="${GENERATED}/op_host/a5_p10_w4a4c8_score_receipt_def.cpp"

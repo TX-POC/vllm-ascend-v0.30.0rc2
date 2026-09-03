@@ -55,7 +55,7 @@
   },
   "stage_a_source_base": {
     "operator": "A5P10W4A4C8ScoreReceipt",
-    "kernel": "a5_p10_w4a4c8_score_receipt",
+    "kernel": "a5_p10_w4_a4_c8_score_receipt",
     "source_root": "stage_a_w4a4c8_score_receipt",
     "build_state": "isolated_stage_recipe_requires_exact_source_pair",
     "inputs": [

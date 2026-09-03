@@ -12,7 +12,11 @@
 
 using namespace AscendC;
 
-extern "C" __global__ __aicore__ void a5_p10_w4a4c8_score_receipt(
+// The authoring filename keeps the compact W4A4C8 spelling, while CANN
+// derives the generated implementation identity from the OpType:
+// A5P10W4A4C8ScoreReceipt -> a5_p10_w4_a4_c8_score_receipt.  The generated
+// filename and its __global__ entry must use that same canonical identity.
+extern "C" __global__ __aicore__ void a5_p10_w4_a4_c8_score_receipt(
     GM_ADDR query, GM_ADDR key, GM_ADDR weights,
     GM_ADDR query_dequant_scale, GM_ADDR key_dequant_scale,
     GM_ADDR actual_seq_lengths_query, GM_ADDR candidate_lens,
