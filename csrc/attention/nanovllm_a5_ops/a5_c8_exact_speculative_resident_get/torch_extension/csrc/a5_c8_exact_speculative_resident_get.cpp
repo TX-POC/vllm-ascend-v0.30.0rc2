@@ -156,8 +156,15 @@ void LaunchP9CallerThreadDirectAsync(
         LogP9DirectAsyncStage(api_name, "host_descriptor_begin");
 
         uint64_t workspace_size = 0;
+        // ConvertTypes accepts lvalue references so it can retain the exact
+        // pointer ABI expected by the ACLNN workspace query.  Address-of
+        // expressions are prvalues in C++, therefore name these pointers as
+        // the shared bridge helper does before passing them through.
+        uint64_t* workspace_size_ptr = &workspace_size;
         aclOpExecutor* executor = nullptr;
-        auto converted = ConvertTypes(args..., &workspace_size, &executor);
+        aclOpExecutor** executor_ptr = &executor;
+        auto converted = ConvertTypes(
+            args..., workspace_size_ptr, executor_ptr);
         bool converted_released = false;
         try {
             LogConvertedDescriptorSet(api_name, converted);

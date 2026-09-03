@@ -141,6 +141,13 @@ class A5C8ExactSpeculativeResidentBridgeContractTest(unittest.TestCase):
         self.assertEqual(attrs["layout_query"], "BSND")
         self.assertEqual(attrs["layout_key"], "PA_BSND")
 
+    def test_direct_launcher_passes_named_workspace_and_executor_pointers(self) -> None:
+        """ConvertTypes takes lvalue references, never address-expression temporaries."""
+        self.assertIn("uint64_t* workspace_size_ptr = &workspace_size;", BRIDGE)
+        self.assertIn("aclOpExecutor** executor_ptr = &executor;", BRIDGE)
+        self.assertIn("args..., workspace_size_ptr, executor_ptr", BRIDGE)
+        self.assertNotIn("ConvertTypes(args..., &workspace_size, &executor)", BRIDGE)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
