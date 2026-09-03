@@ -17,11 +17,99 @@
 
 #include "op_api_common.h"
 
+#include <unordered_map>
+
 // P10 deliberately has no TQ1 fallback. A raw ACLNN caller-stream launch
 // bypasses torch_npu's task queue, so framework-order ownership is proven only
 // with task queue disabled before the process imports torch_npu. The product
 // runner emits the same compact receipt before it starts Python; this repeated
 // C++ gate prevents an embedded caller from silently changing that contract.
+
+namespace nanovllm_a5_opapi {
+
+// Raw aclmdlRI capture records an ACLNN launch and the address of its
+// workspace, but it does not participate in torch_npu's NPUGraph allocator
+// pool.  The workspace returned by at::empty() must therefore outlive the raw
+// graph that replays it.  This small registry gives each captured P10 segment
+// an explicit owner.  Eager calls retain their existing short-lived workspace
+// behavior; only an active raw-graph scope holds an extra Tensor reference.
+//
+// The token is intentionally process-local and is not a device-side forward
+// state.  It cannot affect C8 math, Direct-HCCP queue ownership, or resident
+// slots.  It only closes the host allocator lifetime of addresses embedded in
+// a captured ACL graph.
+struct P10GraphWorkspaceRegistry {
+  std::mutex mutex;
+  uint64_t next_token{1};
+  std::unordered_map<uint64_t, std::vector<at::Tensor>> workspaces;
+};
+
+inline P10GraphWorkspaceRegistry& GetP10GraphWorkspaceRegistry() {
+  static P10GraphWorkspaceRegistry registry;
+  return registry;
+}
+
+inline uint64_t& ActiveP10GraphWorkspaceToken() {
+  static thread_local uint64_t token = 0;
+  return token;
+}
+
+inline uint64_t BeginP10GraphWorkspaceCapture() {
+  uint64_t& active = ActiveP10GraphWorkspaceToken();
+  TORCH_CHECK(active == 0,
+              "P10 graph workspace capture is already active on this thread");
+  auto& registry = GetP10GraphWorkspaceRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  uint64_t token = registry.next_token++;
+  if (token == 0) {
+    token = registry.next_token++;
+  }
+  registry.workspaces.emplace(token, std::vector<at::Tensor>{});
+  active = token;
+  return token;
+}
+
+inline int64_t EndP10GraphWorkspaceCapture(uint64_t token) {
+  uint64_t& active = ActiveP10GraphWorkspaceToken();
+  TORCH_CHECK(token != 0 && active == token,
+              "P10 graph workspace capture token does not own this thread");
+  auto& registry = GetP10GraphWorkspaceRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  const auto found = registry.workspaces.find(token);
+  TORCH_CHECK(found != registry.workspaces.end(),
+              "P10 graph workspace capture token is unknown");
+  active = 0;
+  return static_cast<int64_t>(found->second.size());
+}
+
+inline void RetainP10GraphWorkspace(const at::Tensor& workspace) {
+  const uint64_t token = ActiveP10GraphWorkspaceToken();
+  if (token == 0 || !workspace.defined()) {
+    return;
+  }
+  auto& registry = GetP10GraphWorkspaceRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  const auto found = registry.workspaces.find(token);
+  TORCH_CHECK(found != registry.workspaces.end(),
+              "P10 graph workspace capture token disappeared during launch");
+  found->second.emplace_back(workspace);
+}
+
+inline void ReleaseP10GraphWorkspaceCapture(uint64_t token) {
+  if (token == 0) {
+    return;
+  }
+  uint64_t& active = ActiveP10GraphWorkspaceToken();
+  if (active == token) {
+    active = 0;
+  }
+  auto& registry = GetP10GraphWorkspaceRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  registry.workspaces.erase(token);
+}
+
+}  // namespace nanovllm_a5_opapi
+
 inline void RequireP10DirectDispatchContract()
 {
     const char* task_queue = std::getenv("TASK_QUEUE_ENABLE");
@@ -115,6 +203,7 @@ inline void RequireP10DirectDispatchContract()
                     "call " #aclnn_api " failed: ", RecentAclError());      \
         RecordTensorTupleOnNpuStream(p10_keepalive, p10_stream);               \
         RecordTensorStorageOnNpuStream(p10_workspace, p10_stream);             \
+        RetainP10GraphWorkspace(p10_workspace);                                \
         ReleaseTuple(p10_converted);                                           \
         p10_converted_released = true;                                         \
         ClearTensorTuple(p10_keepalive);                                       \

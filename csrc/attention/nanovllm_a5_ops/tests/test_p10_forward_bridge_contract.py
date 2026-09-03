@@ -176,25 +176,32 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         )
 
     def test_aclgraph_mode_captures_all_three_product_nodes_and_replays_overlap(self) -> None:
-        """Graph mode must not silently capture only the producer stream.
+        """Graph mode must own direct ACLNN capture, not a torch wrapper.
 
-        Ascend captures the current stream, so P10 owns one graph segment for
-        prepare, native W4A4C8 score, and the Direct-HCCP executor.  Replays
-        use device events between segments; a host wait or an eager fallback
-        would invalidate the latency comparison.
+        P10 bypasses torch_npu's task queue and issues raw ACLNN calls. A
+        ``torch.npu.NPUGraph`` can return successfully without retaining those
+        calls, leaving capture-time control state but no replayed HCCP DMA.
+        The graph owner must therefore be KVAF's raw ``aclmdlRI`` adapter, one
+        segment per stream-local P10 node. Replays use device events between
+        segments; a host wait or eager fallback would invalidate the latency
+        comparison.
         """
 
         self.assertIn("class P10ForwardGraph", self.graph)
-        self.assertEqual(self.graph.count("torch.npu.NPUGraph()"), 3)
+        self.assertNotIn("torch.npu.NPUGraph()", self.graph)
+        self.assertIn("_require_raw_acl_graph_type", self.graph)
+        self.assertIn('getattr(kvaf, "AclGraph", None)', self.graph)
+        self.assertIn("aclmdlRI", self.graph)
         capture = self.graph.split("class P10ForwardGraph", 1)[1].split(
             "    def replay(", 1
         )[0]
         replay = self.graph.split("    def replay(", 1)[1].split(
             "\ndef _record_event", 1
         )[0]
-        self.assertEqual(capture.count("torch.npu.graph("), 3)
-        self.assertIn("with torch.npu.stream(producer_stream), torch.npu.graph(", capture)
-        self.assertIn("with torch.npu.stream(executor_stream), torch.npu.graph(", capture)
+        self.assertEqual(capture.count("_capture_raw_acl_segment("), 3)
+        self.assertIn("raw_graph.capture_begin(stream)", self.graph)
+        self.assertIn("raw_graph.capture_end()", self.graph)
+        self.assertIn("raw_graph.reset()", self.graph)
         self.assertIn("P10_GRAPH_CAPTURE_FAILED", capture)
         self.assertIn("nested_aclgraph_capture_forbidden", capture)
         self.assertNotIn("synchronize()", replay)
@@ -202,8 +209,8 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             "        else:", 1
         )[0]
         self.assertLess(
-            overlap.index("self._stage_b_graph.replay()"),
-            overlap.index("self._stage_a_graph.replay()"),
+            overlap.index("self._stage_b_graph.replay(self._executor_stream)"),
+            overlap.index("self._stage_a_graph.replay(self._producer_stream)"),
         )
         self.assertIn("self._executor_stream.wait_event(prepared)", overlap)
         self.assertIn("self._producer_stream.wait_event(prepared)", overlap)
@@ -219,6 +226,29 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             "capture_p10_forward_graph",
         ):
             self.assertIn(exported, self.init)
+
+    def test_raw_graph_workspace_is_owned_until_the_graph_is_destroyed(self) -> None:
+        """A captured ACLNN workspace cannot be freed between capture/replay."""
+
+        for token in (
+            "BeginP10GraphWorkspaceCapture",
+            "EndP10GraphWorkspaceCapture",
+            "RetainP10GraphWorkspace",
+            "ReleaseP10GraphWorkspaceCapture",
+            "RetainP10GraphWorkspace(p10_workspace)",
+            "begin_graph_workspace_capture",
+            "end_graph_workspace_capture",
+            "release_graph_workspace_capture",
+        ):
+            self.assertIn(token, self.direct_opapi + self.bridge + self.graph)
+        self.assertIn("workspace_tokens", self.graph)
+        self.assertIn("Destroy raw graphs before releasing their captured workspaces", self.graph)
+        self.assertLess(
+            self.graph.index("graph.reset()", self.graph.index("def close(")),
+            self.graph.index(
+                "release_graph_workspace_capture", self.graph.index("def close(")
+            ),
+        )
 
     def test_overlap_witness_is_explicit_and_not_a_normal_forward_wait(self) -> None:
         self.assertIn("class P10OverlapWitness", self.graph)

@@ -343,6 +343,32 @@ void LaunchStageB(
         selected_slot_lengths);
 }
 
+// Raw aclmdlRI graphs record the ACLNN workspace address used at capture.  A
+// graph segment therefore owns one explicit workspace-retention scope from
+// capture through graph destruction.  These helpers are deliberately not a
+// forward control path: they carry no device tensors and cannot affect P10's
+// C8/receipt/Direct-HCCP math.  They only prevent the host allocator from
+// recycling a captured workspace address before the raw graph is reset.
+int64_t BeginGraphWorkspaceCapture()
+{
+    return static_cast<int64_t>(
+        nanovllm_a5_opapi::BeginP10GraphWorkspaceCapture());
+}
+
+int64_t EndGraphWorkspaceCapture(int64_t token)
+{
+    TORCH_CHECK(token > 0, "P10 graph workspace token must be positive");
+    return nanovllm_a5_opapi::EndP10GraphWorkspaceCapture(
+        static_cast<uint64_t>(token));
+}
+
+void ReleaseGraphWorkspaceCapture(int64_t token)
+{
+    TORCH_CHECK(token > 0, "P10 graph workspace token must be positive");
+    nanovllm_a5_opapi::ReleaseP10GraphWorkspaceCapture(
+        static_cast<uint64_t>(token));
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -353,6 +379,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "Enqueue native W4A4C8 score receipt production on the current stream.");
     m.def("launch_stage_b", &LaunchStageB,
           "Enqueue the P10 companion resident executor on the current stream.");
+    m.def("begin_graph_workspace_capture", &BeginGraphWorkspaceCapture,
+          "Begin one raw ACLGraph workspace-retention scope.");
+    m.def("end_graph_workspace_capture", &EndGraphWorkspaceCapture,
+          "Seal one raw ACLGraph workspace-retention scope and return its buffer count.");
+    m.def("release_graph_workspace_capture", &ReleaseGraphWorkspaceCapture,
+          "Release a sealed raw ACLGraph workspace-retention scope after graph reset.");
     m.def("abi_summary", [] {
         pybind11::dict value;
         value["prepare_inputs"] = kPrepareInputCount;

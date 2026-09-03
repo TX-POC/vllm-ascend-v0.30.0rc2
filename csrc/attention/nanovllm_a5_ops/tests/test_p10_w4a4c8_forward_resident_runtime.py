@@ -1331,6 +1331,8 @@ def _run_graph_benchmark() -> int:
         "graph_overlap",
     )
     samples: dict[str, list[P10TimingSample]] = {case: [] for case in cases}
+    graph_serial: Any | None = None
+    graph_overlap: Any | None = None
 
     try:
         fixture.bind()
@@ -1360,8 +1362,10 @@ def _run_graph_benchmark() -> int:
         )
         print(
             "P10_GRAPH_CAPTURE "
-            "segments=3 eager_fallback=0 graph_serial=1 graph_overlap=1 "
-            "static_alias_gate=1",
+            "segments=3 backend=aclmdlRI_raw_direct_aclnn eager_fallback=0 "
+            "graph_serial=1 graph_overlap=1 static_alias_gate=1 "
+            f"workspace_buffers_serial={sum(graph_serial.workspace_counts)} "
+            f"workspace_buffers_overlap={sum(graph_overlap.workspace_counts)}",
             flush=True,
         )
 
@@ -1437,7 +1441,15 @@ def _run_graph_benchmark() -> int:
                     flush=True,
                 )
     finally:
-        fixture.close()
+        try:
+            # Raw ACL graphs retain their ACLNN workspaces explicitly. Tear
+            # them down only after each timed sample synchronized Stage B's
+            # terminal event, and always before KVAF releases Direct-HCCP.
+            for graph in (graph_overlap, graph_serial):
+                if graph is not None:
+                    graph.close()
+        finally:
+            fixture.close()
 
     expected_signature = samples["eager_serial"][0].signature if samples["eager_serial"] else None
     if expected_signature is None or any(not samples[case] for case in cases):

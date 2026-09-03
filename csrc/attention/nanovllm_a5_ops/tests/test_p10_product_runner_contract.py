@@ -156,7 +156,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertNotIn("runtime.batch_get(", self.fixture)
 
     def test_graph_benchmark_replays_the_same_product_route_against_eager_serial(self) -> None:
-        """ACLGraph timing is replay-only and cannot hide capture or a second ABI."""
+        """Raw ACLGraph timing is replay-only and cannot hide a second ABI."""
 
         for token in (
             'if runtime_case == "graph_benchmark"',
@@ -167,6 +167,9 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "p10_w4a4c8_forward_resident_graph_serial",
             "p10_w4a4c8_forward_resident_graph_overlap",
             "aclgraph_segments=3",
+            "backend=aclmdlRI_raw_direct_aclnn",
+            "workspace_buffers_serial=",
+            "workspace_buffers_overlap=",
         ):
             self.assertIn(token, self.fixture)
         self.assertIn("graph_benchmark", self.runner)

@@ -4,15 +4,16 @@ This module deliberately separates two meanings of "graph":
 
 * :func:`launch_p10_forward` builds P10's *device dependency graph* on normal
   NPU streams.  That is the eager product route.
-* :class:`P10ForwardGraph` captures the same three launches as three ACLGraph
-  segments and replays them with the same device events.  It is the actual
-  ``torch.npu.NPUGraph`` route.
+* :class:`P10ForwardGraph` captures the same three launches as three raw
+  ``aclmdlRI`` ACLGraph segments and replays them with the same device events.
+  This is the actual graph route for P10's direct ACLNN calls.
 
-The split is necessary because an Ascend ``NPUGraph`` captures work submitted
-to its current stream.  Capturing the eager multi-stream implementation in a
-single ``torch.npu.graph`` context would silently omit the companion executor.
-The graph-mode route therefore captures one graph per stream-local operator,
-then uses ordinary device events *between replays*:
+The split is necessary because P10 submits raw ACLNN calls directly on its
+caller-selected stream.  ``torch.npu.NPUGraph`` is not the capture owner for
+such calls and can produce a syntactically valid replay that omits those raw
+nodes.  The graph-mode route therefore uses KVAF's verified raw ``aclmdlRI``
+owner once per stream-local operator, then uses ordinary device events
+*between replays*:
 
 ``prepare -> {resident executor, native score producer} -> QSFA``.
 
@@ -258,11 +259,87 @@ class _P10GraphInputSignature:
         return None
 
 
+def _require_raw_acl_graph_type() -> Any:
+    """Return KVAF's raw ACL graph owner or fail before capture.
+
+    P10's bridge deliberately calls ACLNN directly on the current CANN stream.
+    Capturing those calls through ``torch.npu.NPUGraph`` is not equivalent to
+    capturing the raw stream: the wrapper can retain no graph nodes even when
+    it returns a graph object successfully. KVAF's ``AclGraph`` is the
+    already-validated ``aclmdlRI`` owner for KVAF's Direct-HCCP data plane and
+    is built from the same exact product KVAF source as P10's device ABI.
+    """
+
+    try:
+        import kvaf
+    except Exception as error:  # noqa: BLE001 -- retain the useful import cause.
+        raise RuntimeError(
+            "P10_GRAPH_CAPTURE_BLOCKED:kvaf_aclgraph_import_failed:"
+            f"{type(error).__name__}:{error}"
+        ) from error
+    graph_type = getattr(kvaf, "AclGraph", None)
+    if graph_type is None:
+        raise RuntimeError(
+            "P10_GRAPH_CAPTURE_BLOCKED:kvaf_aclgraph_missing; rebuild the "
+            "exact P10 KVAF source with the AIV graph binding enabled"
+        )
+    return graph_type
+
+
+def _capture_raw_acl_segment(
+    *,
+    graph_type: Any,
+    stream: Any,
+    submit: Any,
+    label: str,
+) -> tuple[Any, int, int]:
+    """Capture one direct ACLNN segment with a graph-owned workspace scope.
+
+    ``aclnn*`` records the workspace address in raw ``aclmdlRI`` capture. The
+    C++ bridge retains each workspace under the returned token until this graph
+    segment is reset. Without that retention, a normal local ``at::Tensor``
+    destructor may recycle the address before replay and make an apparently
+    terminal Direct-HCCP forward leave its resident payload untouched.
+    """
+
+    raw_graph = graph_type()
+    workspace_token = int(_C.begin_graph_workspace_capture())
+    capture_active = False
+    workspace_sealed = False
+    try:
+        with torch.npu.stream(stream):
+            raw_graph.capture_begin(stream)
+            capture_active = True
+            submit()
+            raw_graph.capture_end()
+            capture_active = False
+        workspace_count = int(_C.end_graph_workspace_capture(workspace_token))
+        workspace_sealed = True
+        return raw_graph, workspace_token, workspace_count
+    except Exception as error:  # noqa: BLE001 -- preserve exact CANN failure.
+        if capture_active:
+            try:
+                raw_graph.capture_end()
+            except Exception:  # noqa: BLE001 -- original error is authoritative.
+                pass
+        try:
+            raw_graph.reset()
+        except Exception:  # noqa: BLE001 -- original error is authoritative.
+            pass
+        if not workspace_sealed:
+            _C.release_graph_workspace_capture(workspace_token)
+        raise RuntimeError(
+            "P10_GRAPH_CAPTURE_FAILED: "
+            f"segment={label} type={type(error).__name__} text={error}"
+        ) from error
+
+
 class P10ForwardGraph:
     """Capture and replay P10's fixed-address, two-stream forward pipeline.
 
-    An Ascend :class:`torch.npu.NPUGraph` captures only its current stream.
-    P10 consequently uses three independently captured graph segments:
+    P10's C++ bridge bypasses torch_npu's task queue and submits ACLNN directly
+    on the current CANN stream. It consequently uses KVAF's raw ``aclmdlRI``
+    graph owner for three independently captured segments:
 
     * ``prepare_graph`` on the producer stream;
     * ``stage_a_graph`` on that same producer stream;
@@ -289,6 +366,8 @@ class P10ForwardGraph:
         forward_control: torch.Tensor,
         attention_slots: torch.Tensor,
         resident_seq_lengths: torch.Tensor,
+        workspace_tokens: tuple[int, int, int],
+        workspace_counts: tuple[int, int, int],
     ) -> None:
         self._signature = signature
         self._execution_mode = execution_mode
@@ -300,10 +379,19 @@ class P10ForwardGraph:
         self._forward_control = forward_control
         self._attention_slots = attention_slots
         self._resident_seq_lengths = resident_seq_lengths
+        self._workspace_tokens = workspace_tokens
+        self._workspace_counts = workspace_counts
+        self._closed = False
 
     @property
     def execution_mode(self) -> str:
         return self._execution_mode
+
+    @property
+    def workspace_counts(self) -> tuple[int, int, int]:
+        """Captured workspace buffers for prepare, score, and executor."""
+
+        return self._workspace_counts
 
     @classmethod
     def capture(
@@ -347,8 +435,12 @@ class P10ForwardGraph:
             raise RuntimeError(
                 "P10_GRAPH_CAPTURE_BLOCKED:overlap_requires_distinct_logical_streams"
             )
-        if graph_pool is None:
-            graph_pool = torch.npu.graph_pool_handle()
+        if graph_pool is not None:
+            raise RuntimeError(
+                "P10_GRAPH_CAPTURE_BLOCKED:torch_graph_pool_is_not_valid_for_"
+                "raw_direct_aclnn_capture"
+            )
+        raw_graph_type = _require_raw_acl_graph_type()
 
         # Warm the exact three-product-operator closure before capture.  The
         # completion event is synchronized only here, never on graph replay.
@@ -360,35 +452,57 @@ class P10ForwardGraph:
         )
         warmup.stage_b_complete.synchronize()
 
+        prepare_graph = None
+        stage_a_graph = None
+        stage_b_graph = None
+        workspace_tokens: list[int] = []
+        workspace_counts: list[int] = []
         try:
-            prepare_graph = torch.npu.NPUGraph()
-            with torch.npu.stream(producer_stream), torch.npu.graph(
-                prepare_graph, pool=graph_pool, stream=producer_stream
-            ):
-                _launch_prepare(inputs)
+            prepare_graph, token, count = _capture_raw_acl_segment(
+                graph_type=raw_graph_type,
+                stream=producer_stream,
+                submit=lambda: _launch_prepare(inputs),
+                label="prepare",
+            )
+            workspace_tokens.append(token)
+            workspace_counts.append(count)
 
-            stage_a_graph = torch.npu.NPUGraph()
-            with torch.npu.stream(producer_stream), torch.npu.graph(
-                stage_a_graph, pool=graph_pool, stream=producer_stream
-            ):
-                _launch_stage_a(inputs)
+            stage_a_graph, token, count = _capture_raw_acl_segment(
+                graph_type=raw_graph_type,
+                stream=producer_stream,
+                submit=lambda: _launch_stage_a(inputs),
+                label="stage_a",
+            )
+            workspace_tokens.append(token)
+            workspace_counts.append(count)
 
             # Stage-A's capture invocation produced the canonical tensors that
-            # Stage-B's capture invocation reads.  This wait is capture-only;
+            # Stage-B's capture invocation reads. This wait is capture-only;
             # no equivalent wait exists in the replay topology.
             producer_stream.synchronize()
 
-            stage_b_graph = torch.npu.NPUGraph()
-            with torch.npu.stream(executor_stream), torch.npu.graph(
-                stage_b_graph, pool=graph_pool, stream=executor_stream
-            ):
-                _launch_stage_b(inputs)
+            stage_b_graph, token, count = _capture_raw_acl_segment(
+                graph_type=raw_graph_type,
+                stream=executor_stream,
+                submit=lambda: _launch_stage_b(inputs),
+                label="stage_b",
+            )
+            workspace_tokens.append(token)
+            workspace_counts.append(count)
             executor_stream.synchronize()
-        except Exception as error:  # noqa: BLE001 -- preserve exact CANN error.
-            raise RuntimeError(
-                "P10_GRAPH_CAPTURE_FAILED: "
-                f"execution_mode={execution_mode} type={type(error).__name__} text={error}"
-            ) from error
+        except Exception:
+            for graph in (stage_b_graph, stage_a_graph, prepare_graph):
+                if graph is not None:
+                    try:
+                        graph.reset()
+                    except Exception:  # noqa: BLE001 -- capture error wins.
+                        pass
+            for token in workspace_tokens:
+                _C.release_graph_workspace_capture(token)
+            raise
+
+        if len(workspace_tokens) != 3 or len(workspace_counts) != 3:
+            raise RuntimeError("P10_GRAPH_CAPTURE_FAILED:incomplete_raw_segments")
 
         return cls(
             signature=_P10GraphInputSignature.from_inputs(inputs),
@@ -401,17 +515,21 @@ class P10ForwardGraph:
             forward_control=inputs.forward_control,
             attention_slots=inputs.attention_slots_buffer,
             resident_seq_lengths=inputs.selected_slot_lengths_buffer,
+            workspace_tokens=tuple(workspace_tokens),
+            workspace_counts=tuple(workspace_counts),
         )
 
     def replay(self, inputs: P10ForwardInputs) -> P10ForwardLaunch:
         """Replay the captured product graph without a host completion wait."""
 
+        if self._closed:
+            raise RuntimeError("P10_GRAPH_REPLAY_BLOCKED:graph_is_closed")
         mismatch = self._signature.mismatch_reason(inputs)
         if mismatch is not None:
             raise RuntimeError(f"P10_GRAPH_REPLAY_BLOCKED:{mismatch}")
 
         with torch.npu.stream(self._producer_stream):
-            self._prepare_graph.replay()
+            self._prepare_graph.replay(self._producer_stream)
             prepared = _record_event(self._producer_stream)
 
         if self._execution_mode == "overlap":
@@ -419,21 +537,21 @@ class P10ForwardGraph:
             # introducing the forbidden Stage-A completion dependency.
             with torch.npu.stream(self._executor_stream):
                 self._executor_stream.wait_event(prepared)
-                self._stage_b_graph.replay()
+                self._stage_b_graph.replay(self._executor_stream)
                 stage_b_complete = _record_event(self._executor_stream)
             with torch.npu.stream(self._producer_stream):
                 self._producer_stream.wait_event(prepared)
-                self._stage_a_graph.replay()
+                self._stage_a_graph.replay(self._producer_stream)
         else:
             # The graph-mode baseline differs by exactly the same one device
             # edge as eager serial: Stage A completion gates Stage B.
             with torch.npu.stream(self._producer_stream):
                 self._producer_stream.wait_event(prepared)
-                self._stage_a_graph.replay()
+                self._stage_a_graph.replay(self._producer_stream)
                 stage_a_complete = _record_event(self._producer_stream)
             with torch.npu.stream(self._executor_stream):
                 self._executor_stream.wait_event(stage_a_complete)
-                self._stage_b_graph.replay()
+                self._stage_b_graph.replay(self._executor_stream)
                 stage_b_complete = _record_event(self._executor_stream)
 
         return P10ForwardLaunch(
@@ -444,6 +562,41 @@ class P10ForwardGraph:
             executor_stream=self._executor_stream,
             forward_control=self._forward_control,
         )
+
+    def close(self) -> None:
+        """Destroy raw graphs before releasing their captured workspaces.
+
+        Call this only after the last ``stage_b_complete`` event has reached
+        terminal completion. ``_run_graph_benchmark`` does so in its finalizer;
+        normal inference keeps the object alive for its graph-cache lifetime.
+        """
+
+        if self._closed:
+            return
+        errors: list[str] = []
+        for label, graph in (
+            ("stage_b", self._stage_b_graph),
+            ("stage_a", self._stage_a_graph),
+            ("prepare", self._prepare_graph),
+        ):
+            try:
+                graph.reset()
+            except Exception as error:  # noqa: BLE001 -- release all scopes.
+                errors.append(f"{label}:{type(error).__name__}:{error}")
+        for token in self._workspace_tokens:
+            try:
+                _C.release_graph_workspace_capture(token)
+            except Exception as error:  # noqa: BLE001 -- report after cleanup.
+                errors.append(f"workspace:{type(error).__name__}:{error}")
+        self._closed = True
+        if errors:
+            raise RuntimeError("P10_GRAPH_CLOSE_FAILED:" + ";".join(errors))
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _record_event(stream: Any) -> Any:
