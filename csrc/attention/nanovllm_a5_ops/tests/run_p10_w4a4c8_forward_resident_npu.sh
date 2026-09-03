@@ -165,6 +165,30 @@ print(
 PY
 printf 'P10_RUNNER_STEP label=npu_probe status=0\n'
 
+# The benchmark's immutable W4A4C8-input gate hashes raw FP8 storage.  NumPy
+# cannot materialize Float8_e4m3fn directly, so prove its uint8 dtype view
+# works before compiling any P10 artifact.  This is a capability preflight,
+# not a numerical fallback or a conversion of the product Q/K tensors.
+"${python_bin}" - <<'PY'
+import hashlib
+import torch
+
+value = torch.tensor([1.0, -2.0], dtype=torch.float8_e4m3fn).contiguous()
+raw = value.reshape(-1).view(torch.uint8)
+if raw.dtype != torch.uint8 or raw.numel() != value.numel():
+    raise RuntimeError(
+        f"invalid_fp8_raw_view:dtype={raw.dtype}:raw_numel={raw.numel()}:"
+        f"fp8_numel={value.numel()}"
+    )
+digest = hashlib.sha256(raw.numpy().tobytes()).hexdigest()[:16]
+print(
+    "P10_FLOAT8_RAW_HASH_PROBE "
+    f"pass=1 fp8_dtype={value.dtype} raw_dtype={raw.dtype} bytes={raw.numel()} "
+    f"sha16={digest}"
+)
+PY
+printf 'P10_RUNNER_STEP label=fp8_raw_hash_probe status=0\n'
+
 cann_cache="${P10_CANN_3RD_LIB_PATH:-${vllm_root}/csrc/third_party}"
 for cache_file in \
     "${cann_cache}/makeself/makeself.sh" \

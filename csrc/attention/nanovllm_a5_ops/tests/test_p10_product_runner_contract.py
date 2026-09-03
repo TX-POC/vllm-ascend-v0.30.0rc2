@@ -155,6 +155,15 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.assertIn(token, self.fixture)
         self.assertNotIn("runtime.batch_get(", self.fixture)
 
+    def test_benchmark_hashes_fp8_storage_without_a_numpy_float8_conversion(self) -> None:
+        """The input-immutability gate must work for the real FP8 Q/K ABI."""
+
+        self.assertIn("raw_bytes = tensor.view(torch.uint8)", self.fixture)
+        self.assertIn("raw_bytes.numpy().tobytes()", self.fixture)
+        self.assertNotIn("return hashlib.sha256(tensor.numpy().tobytes())", self.fixture)
+        self.assertIn("P10_FLOAT8_RAW_HASH_PROBE", self.runner)
+        self.assertIn("value.reshape(-1).view(torch.uint8)", self.runner)
+
 
 if __name__ == "__main__":
     unittest.main()

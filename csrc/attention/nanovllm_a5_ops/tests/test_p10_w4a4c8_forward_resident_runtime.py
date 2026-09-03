@@ -126,8 +126,19 @@ def _blocked(reason: str) -> None:
 
 
 def _sha16(value: Any) -> str:
-    tensor = value.detach().cpu().contiguous()
-    return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:16]
+    """Hash the tensor's storage bytes without converting its product dtype.
+
+    NumPy has no ``Float8_e4m3fn`` scalar type, so ``tensor.numpy()`` rejects
+    the exact W4A4C8 Q/K tensors used by this fixture.  A dtype *view* to
+    uint8 is a one-to-one storage reinterpretation, not a quantization or
+    numerical cast: it preserves the FP8 bits that the product operator sees.
+    """
+
+    import torch
+
+    tensor = value.detach().cpu().contiguous().reshape(-1)
+    raw_bytes = tensor.view(torch.uint8)
+    return hashlib.sha256(raw_bytes.numpy().tobytes()).hexdigest()[:16]
 
 
 def _require_file(environment: str) -> Path:
