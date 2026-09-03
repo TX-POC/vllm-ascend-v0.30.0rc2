@@ -175,10 +175,21 @@ if [[ ! -r "${cann_cache}/protobuf/protobuf-all-25.1.tar.gz" &&
     fail "cann_third_party_cache_incomplete:need=protobuf"
 fi
 
-# Keep all generated P10 artifacts under a source-SHA keyed package root.  A
-# source change therefore cannot silently pick up a prior OPP or bridge.
-package_parent="${P10_PACKAGE_PARENT:-${ops_root}/build-p10-product}"
-package_root="${P10_PRODUCT_PACKAGE_ROOT:-${package_parent}/p10_v${P10_VLLM_EXPECTED_SHA:0:12}_k${P10_KVAF_EXPECTED_SHA:0:12}}"
+# Keep all generated P10 artifacts under the exact source tree and a
+# source-SHA keyed package root.  Do not permit an inherited interactive-shell
+# override to redirect this run into a package made for a prior revision: that
+# would either reuse stale code or waste a full OPP build before failing its
+# manifest check.
+package_parent="${ops_root}/build-p10-product"
+package_root="${package_parent}/p10_v${P10_VLLM_EXPECTED_SHA:0:12}_k${P10_KVAF_EXPECTED_SHA:0:12}"
+if [[ -n "${P10_PACKAGE_PARENT:-}" && "${P10_PACKAGE_PARENT}" != "${package_parent}" ]]; then
+    printf 'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PACKAGE_PARENT supplied=%s canonical=%s\n' \
+        "${P10_PACKAGE_PARENT}" "${package_parent}"
+fi
+if [[ -n "${P10_PRODUCT_PACKAGE_ROOT:-}" && "${P10_PRODUCT_PACKAGE_ROOT}" != "${package_root}" ]]; then
+    printf 'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PRODUCT_PACKAGE_ROOT supplied=%s canonical=%s\n' \
+        "${P10_PRODUCT_PACKAGE_ROOT}" "${package_root}"
+fi
 mkdir -p "${package_parent}"
 case "${package_root}" in
     "${package_parent}"/*) ;;
@@ -255,7 +266,14 @@ printf 'P10_RUNNER_STEP label=forward_bridge status=0\n'
 # KVAF is a separate repository, but it is still part of the exact product
 # pair.  Reconfigure the one SHA-keyed build directory before incremental
 # build; this is intentionally not a vLLM-Ascend rebuild.
-kvaf_build="${P10_KVAF_BUILD:-${kvaf_root}/build-p10-v${P10_VLLM_EXPECTED_SHA:0:12}-k${P10_KVAF_EXPECTED_SHA:0:12}}"
+# As with the combined OPP package, a forward must not inherit a build tree
+# selected by an earlier shell.  The path itself is provenance, so derive it
+# solely from the exact source pair and reconfigure it below.
+kvaf_build="${kvaf_root}/build-p10-v${P10_VLLM_EXPECTED_SHA:0:12}-k${P10_KVAF_EXPECTED_SHA:0:12}"
+if [[ -n "${P10_KVAF_BUILD:-}" && "${P10_KVAF_BUILD}" != "${kvaf_build}" ]]; then
+    printf 'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_KVAF_BUILD supplied=%s canonical=%s\n' \
+        "${P10_KVAF_BUILD}" "${kvaf_build}"
+fi
 pybind_dir="$("${python_bin}" -m pybind11 --cmakedir 2>/dev/null || true)"
 [[ -n "${pybind_dir}" && -d "${pybind_dir}" ]] || fail "pybind11_cmakedir_unavailable"
 cmake -S "${kvaf_root}" -B "${kvaf_build}" \

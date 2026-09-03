@@ -81,6 +81,25 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.runner)
 
+    def test_runner_ignores_stale_interactive_build_root_overrides(self) -> None:
+        """Artifact roots are derived from the exact source pair, not a shell.
+
+        A prior P10 command can leave an old package/build path exported.  It
+        must not redirect the next source pair into an old product directory.
+        """
+
+        for token in (
+            'package_parent="${ops_root}/build-p10-product"',
+            'package_root="${package_parent}/p10_v${P10_VLLM_EXPECTED_SHA:0:12}_k${P10_KVAF_EXPECTED_SHA:0:12}"',
+            'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PACKAGE_PARENT',
+            'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PRODUCT_PACKAGE_ROOT',
+            'kvaf_build="${kvaf_root}/build-p10-v${P10_VLLM_EXPECTED_SHA:0:12}-k${P10_KVAF_EXPECTED_SHA:0:12}"',
+            'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_KVAF_BUILD',
+        ):
+            self.assertIn(token, self.runner)
+        self.assertNotIn('package_root="${P10_PRODUCT_PACKAGE_ROOT:-', self.runner)
+        self.assertNotIn('kvaf_build="${P10_KVAF_BUILD:-', self.runner)
+
     def test_fixture_is_real_w4a4c8_direct_hccp_and_qsfa_closure(self) -> None:
         for token in (
             "torch.float8_e4m3fn",
