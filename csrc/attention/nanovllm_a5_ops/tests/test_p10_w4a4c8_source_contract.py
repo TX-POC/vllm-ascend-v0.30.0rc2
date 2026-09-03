@@ -97,6 +97,8 @@ class P10W4A4C8SourceContractTest(unittest.TestCase):
         probe = PROBE_PATH.read_text()
         runner = RUNNER_PATH.read_text()
         self.assertIn("P10_W4A4C8_STAGE_A ready=0", probe)
+        self.assertIn("P10_W4A4C8_PROVIDER_BINARY", probe)
+        self.assertIn("source_derivation_permitted=0", probe)
         self.assertIn("source_and_opp_provenance_unresolved", probe)
         self.assertIn("stage_a_build=disabled", runner)
         for forbidden in (

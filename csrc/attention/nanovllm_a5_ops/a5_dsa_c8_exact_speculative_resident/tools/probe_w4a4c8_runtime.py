@@ -10,6 +10,7 @@ cheap remote check needed before we derive a Stage-A sibling from the actual
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -41,6 +42,24 @@ def _callable_info(owner: object | None, attribute: str) -> tuple[int, str]:
     module = getattr(value, "__module__", "<native>")
     name = getattr(value, "__qualname__", getattr(value, "__name__", "<native>"))
     return 1, _one_line(f"{module}.{name}")
+
+
+def _file_sha256(path_value: object | None) -> str:
+    """Return binary provenance without treating a binary as source code."""
+
+    if not path_value:
+        return "<unavailable>"
+    path = Path(str(path_value))
+    if not path.is_file():
+        return "<unavailable>"
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return "<unavailable>"
+    return digest.hexdigest()
 
 
 def main() -> int:
@@ -94,6 +113,14 @@ def main() -> int:
         f"torch={_one_line(getattr(torch, '__version__', None))} "
         f"torch_npu={_one_line(getattr(torch_npu, '__version__', None))} "
         f"torch_npu_file={_one_line(getattr(torch_npu, '__file__', None))}"
+    )
+    native_module = getattr(torch_npu, "_C", None)
+    native_module_file = getattr(native_module, "__file__", None)
+    print(
+        "P10_W4A4C8_PROVIDER_BINARY "
+        f"module_file={_one_line(native_module_file)} "
+        f"sha256={_file_sha256(native_module_file)} "
+        "source_derivation_permitted=0"
     )
     print(
         "P10_W4A4C8_OPP_ENV "
