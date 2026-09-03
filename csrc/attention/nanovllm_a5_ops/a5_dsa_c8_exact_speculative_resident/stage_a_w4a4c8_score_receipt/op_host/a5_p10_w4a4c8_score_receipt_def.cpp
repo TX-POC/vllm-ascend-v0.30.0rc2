@@ -342,7 +342,10 @@ class A5P10W4A4C8ScoreReceipt : public OpDef {
             .NeedCheckSupportFlag(false)
             .PrecisionReduceFlag(true)
             .ExtendCfgInfo("aclnnSupport.value", "support_aclnn")
-            .ExtendCfgInfo("opFile.value", "a5_p10_w4a4c8_score_receipt")
+            // CANN derives this normalized stem from the operator name.  It
+            // must name the generated/remapped kernel source exactly; the
+            // checked-in source filename is only an authoring spelling.
+            .ExtendCfgInfo("opFile.value", "a5_p10_w4_a4_c8_score_receipt")
             .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
         this->AICore()
             .SetTiling(optiling::TilingA5P10W4A4C8ScoreReceipt)

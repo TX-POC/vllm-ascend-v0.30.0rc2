@@ -333,6 +333,21 @@ stage_a_source_kernel="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt.cpp"
 cp -p "${stage_a_source_kernel}" "${stage_a_generated_kernel}"
 rm -f "${stage_a_source_kernel}"
 
+# ``opFile.value`` is consumed later by CANN's kernel compiler, independently
+# of the generated CMake target name.  Fail before the expensive CMake build
+# unless it names the one canonical remapped source file exactly.
+stage_a_opdef="${GENERATED}/op_host/a5_p10_w4a4c8_score_receipt_def.cpp"
+stage_a_op_file="a5_p10_w4_a4_c8_score_receipt"
+[[ -s "${stage_a_opdef}" ]] || fail "stage_a_opdef_missing_after_copy"
+grep -Fq ".ExtendCfgInfo(\"opFile.value\", \"${stage_a_op_file}\")" \
+    "${stage_a_opdef}" || fail "stage_a_op_file_config_mismatch"
+[[ -s "${GENERATED}/op_kernel/${stage_a_op_file}.cpp" ]] ||
+    fail "stage_a_op_file_source_missing"
+[[ ! -e "${stage_a_source_kernel}" ]] ||
+    fail "stage_a_source_only_kernel_not_removed"
+printf 'P10_PRODUCT_STAGE_A_OPFILE_GATE op_file=%s source=1\n' \
+    "${stage_a_op_file}"
+
 stage_b_generated_kernel="${GENERATED}/op_kernel/a5_p10_score_receipt_forward_resident.cpp"
 stage_b_source_kernel="${GENERATED}/op_kernel/a5_p10_score_receipt_forward_resident_kernel.cpp"
 [[ -f "${stage_b_generated_kernel}" ]] ||

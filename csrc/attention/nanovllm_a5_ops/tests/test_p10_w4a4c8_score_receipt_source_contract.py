@@ -69,12 +69,22 @@ class P10W4A4C8ScoreReceiptSourceContractTest(unittest.TestCase):
             "a5_p10_w4a4c8_score_receipt.cpp",
             'cp -p "${SOURCE_KERNEL}" "${GENERATED_KERNEL}"',
             'rm -f "${SOURCE_KERNEL}"',
+            "CANONICAL_OP_FILE=\"a5_p10_w4_a4_c8_score_receipt\"",
+            "P10_STAGE_A_OPFILE_GATE op_file=%s source=1",
             'GENERATED_STUB="${GENERATED}/op_host/a5_p10_w4_a4_c8_score_receipt.cpp"',
         ):
             self.assertIn(token, self.build)
 
     def test_operator_abi_is_exact_w4a4c8_graph_alias_abi(self):
         self.assertIn("OP_ADD(A5P10W4A4C8ScoreReceipt)", self.definition)
+        self.assertIn(
+            'ExtendCfgInfo("opFile.value", "a5_p10_w4_a4_c8_score_receipt")',
+            self.definition,
+        )
+        self.assertNotIn(
+            'ExtendCfgInfo("opFile.value", "a5_p10_w4a4c8_score_receipt")',
+            self.definition,
+        )
         for dtype in ("DT_FLOAT8_E4M3FN", "DT_BF16", "DT_FLOAT"):
             self.assertIn(dtype, self.definition)
         for name in (

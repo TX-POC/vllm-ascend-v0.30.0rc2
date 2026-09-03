@@ -127,6 +127,19 @@ SOURCE_KERNEL="${GENERATED}/op_kernel/a5_p10_w4a4c8_score_receipt.cpp"
 cp -p "${SOURCE_KERNEL}" "${GENERATED_KERNEL}"
 rm -f "${SOURCE_KERNEL}"
 
+# CANN's later kernel compiler resolves the implementation from
+# ``opFile.value`` rather than from the source-tree authoring filename.  Keep
+# the config and the remapped canonical file inseparable, so a bad mapping is
+# rejected before the expensive CMake/AscendC phase.
+CANONICAL_OP_FILE="a5_p10_w4_a4_c8_score_receipt"
+grep -Fq ".ExtendCfgInfo(\"opFile.value\", \"${CANONICAL_OP_FILE}\")" \
+  "${GENERATED}/op_host/a5_p10_w4a4c8_score_receipt_def.cpp" ||
+  fail "canonical_op_file_config_mismatch"
+[[ -s "${GENERATED}/op_kernel/${CANONICAL_OP_FILE}.cpp" ]] ||
+  fail "canonical_op_file_source_missing"
+[[ ! -e "${SOURCE_KERNEL}" ]] || fail "source_only_kernel_not_removed"
+printf 'P10_STAGE_A_OPFILE_GATE op_file=%s source=1\n' "${CANONICAL_OP_FILE}"
+
 GENERATED_STUB="${GENERATED}/op_host/a5_p10_w4_a4_c8_score_receipt.cpp"
 SOURCE_OPDEF="${GENERATED}/op_host/a5_p10_w4a4c8_score_receipt_def.cpp"
 [[ -f "${GENERATED_STUB}" ]] || fail "generated_host_stub_missing"
