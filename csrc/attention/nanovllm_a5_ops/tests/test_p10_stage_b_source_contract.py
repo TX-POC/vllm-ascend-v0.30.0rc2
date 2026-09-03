@@ -243,6 +243,29 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("does not retry/recycle a slot", self.kernel)
         self.assertIn("if (!ResolveConcurrentForwardSlot", self.kernel)
 
+    def test_aicore_metadata_access_respects_cann_address_spaces(self):
+        """Prevent a recurrence of the Stage-B-only 950DT compile failure.
+
+        The transport/lifecycle design is unchanged here: this gate only
+        constrains how that design crosses GM and VECCALC UB address spaces.
+        """
+        self.assertIn("__gm__ int64_t* receipt_ring", self.kernel)
+        self.assertNotIn("__gm__ const int64_t* receipt_ring", self.kernel)
+        self.assertNotIn(
+            "const A5P10ForwardResidentSeed& seed = seeds[index]",
+            self.kernel,
+        )
+        self.assertNotIn(
+            "localSeeds_[buffer_index][seed_count++] = {", self.kernel
+        )
+        self.assertNotIn("localSeeds_[buffer_index][0] = seed;", self.kernel)
+        self.assertIn("AscendC::AtomicCas<uint32_t>", self.kernel)
+        self.assertIn("reinterpret_cast<__gm__ uint32_t*>", self.kernel)
+        self.assertNotIn(
+            "asc_atomic_cas(sourceToForwardSlot_ + source_offset",
+            self.kernel,
+        )
+
     def test_host_has_real_tiler_infer_and_distinct_registration(self):
         for token in (
             "TilingA5P10ScoreReceiptForwardResident",

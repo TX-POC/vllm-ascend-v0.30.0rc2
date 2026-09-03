@@ -286,7 +286,7 @@ inline void MarkWorkerCompleteSimtService(__gm__ int32_t* progress_word,
 }
 
 __aicore__ inline bool LoadReceiptDescriptor(
-    __gm__ const int64_t* receipt_ring, uint32_t receipt,
+    __gm__ int64_t* receipt_ring, uint32_t receipt,
     A5P10ScoreReceiptDescriptor* descriptor) {
   if (receipt_ring == nullptr || descriptor == nullptr) {
     return false;
@@ -357,11 +357,15 @@ __aicore__ inline bool BeginForwardResidentMicrobatch(
       kvaf_forward_resident_get::LoadKvafForwardResidentQueueTemplate(
           control, lease, &descriptor);
   for (uint32_t index = 0U; descriptor_ready && index < seed_count; ++index) {
-    const A5P10ForwardResidentSeed& seed = seeds[index];
-    descriptor_ready = seed.kv_object >= 0 && seed.resident_slot >= 0 &&
+    // `seeds` lives in VECCALC UB.  AscendC does not permit binding an
+    // ordinary C++ reference to a __ubuf__ object, so materialize only the
+    // two descriptor fields needed by the PostOnly ABI as AIC scalar values.
+    const int32_t kv_object = seeds[index].kv_object;
+    const int32_t resident_slot = seeds[index].resident_slot;
+    descriptor_ready = kv_object >= 0 && resident_slot >= 0 &&
         kvaf_forward_resident_get::AppendKvafForwardResidentRequest(
-            control, &descriptor, static_cast<uint32_t>(seed.kv_object),
-            rows_per_object, seed.resident_slot);
+            control, &descriptor, static_cast<uint32_t>(kv_object),
+            rows_per_object, resident_slot);
   }
   if (!descriptor_ready) {
     (void)kvaf_forward_resident_get::ReturnKvafForwardResidentUnpostedQueueFromAicore(
@@ -905,9 +909,15 @@ class A5P10ScoreReceiptForwardResidentKernel {
                                   &newly_claimed) || !newly_claimed) {
           continue;
         }
-        localSeeds_[buffer_index][seed_count++] = {
-            static_cast<int32_t>(row), static_cast<int32_t>(source),
-            mapping.kv_object, resident_slot};
+        // Aggregate/struct copies into __ubuf__ are not a supported AscendC
+        // address-space operation.  Keep the 16-byte seed ABI, but issue its
+        // four scalar UB stores explicitly.
+        localSeeds_[buffer_index][seed_count].row = static_cast<int32_t>(row);
+        localSeeds_[buffer_index][seed_count].source =
+            static_cast<int32_t>(source);
+        localSeeds_[buffer_index][seed_count].kv_object = mapping.kv_object;
+        localSeeds_[buffer_index][seed_count].resident_slot = resident_slot;
+        ++seed_count;
         if (seed_count == A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
           FlushSpeculativeSeeds(buffer_index, seed_count);
           buffer_index = FindFreeSeedBuffer();
@@ -984,7 +994,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
       if (state == static_cast<int32_t>(A5P10ResidentReadyState::EMPTY)) {
         const uint32_t buffer_index = FindFreeSeedBuffer();
         if (buffer_index != kNoBuffer) {
-          localSeeds_[buffer_index][0] = seed;
+          // See the scalar UB-store rule in ConsumeExactScoreReceipt().
+          localSeeds_[buffer_index][0].row = seed.row;
+          localSeeds_[buffer_index][0].source = seed.source;
+          localSeeds_[buffer_index][0].kv_object = seed.kv_object;
+          localSeeds_[buffer_index][0].resident_slot = seed.resident_slot;
           (void)StartMicrobatch(buffer_index, 1U);
         }
       }
@@ -1017,8 +1031,16 @@ class A5P10ScoreReceiptForwardResidentKernel {
       const int32_t object_value = ReadGmByPassDCache<int32_t>(
           kvObjectToForwardSlot_ + object_offset);
       if (object_value >= 0) {
-        (void)asc_atomic_cas(sourceToForwardSlot_ + source_offset,
-                             A5_P10_STAGE_B_CLAIMING_SLOT, object_value);
+        // This is AICore code, whereas asc_atomic_cas is a SIMT-only GM
+        // primitive.  On Ascend 950 scalar AIC AtomicCas supports uint32_t;
+        // the signed slot states are stable two's-complement bit patterns and
+        // the map is naturally four-byte aligned.  This is cache convergence
+        // only: the positive object map was already published by the winner.
+        (void)AscendC::AtomicCas<uint32_t>(
+            reinterpret_cast<__gm__ uint32_t*>(
+                sourceToForwardSlot_ + source_offset),
+            static_cast<uint32_t>(A5_P10_STAGE_B_CLAIMING_SLOT),
+            static_cast<uint32_t>(object_value));
         *resident_slot = object_value;
         return true;
       }
