@@ -63,7 +63,12 @@ constexpr uint32_t kStageBReservationScratchBytes = 16U;
 constexpr uint32_t kP9ScratchBytes = kStageBReservationScratchOffset +
     kStageBReservationScratchBytes;
 
-constexpr bool IsP9ExistingScratchLayoutValid(const uint32_t bytes)
+// This is called from the injected QLIVector AIV path with a runtime
+// `topkCount_` value.  A plain constexpr function is not emitted into the
+// AscendC AICore callable domain, so device linking leaves an unresolved
+// symbol.  Match the other AICore helpers below: this keeps the same pure
+// comparison while making the body available in every AIV compilation unit.
+__aicore__ inline bool IsP9ExistingScratchLayoutValid(const uint32_t bytes)
 {
     return bytes >= kP9ScratchBytes;
 }

@@ -317,6 +317,13 @@ class C8ExactSpeculativeResidentStageContractTest(unittest.TestCase):
             self.assertIn(f"destination->{field} = seed.{field};", stores)
         self.assertLess(stores.index("destination->residentSlotOrdinal"), stores.index("++count;"))
 
+    def test_existing_scratch_gate_is_an_aicore_inline_helper(self) -> None:
+        """The runtime C8 AIV path must not leave this helper to device link."""
+        self.assertIn(
+            "__aicore__ inline bool IsP9ExistingScratchLayoutValid",
+            KERNEL_CONTRACT,
+        )
+
     def test_execution_row_mapping_and_graph_padding_gate_are_explicit(self) -> None:
         """P9 separates logical QSFA slots from execution-row physical rows."""
         for required in (
