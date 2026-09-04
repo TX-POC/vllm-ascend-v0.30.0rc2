@@ -78,12 +78,15 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
     def test_reuse_requires_manifest_and_exactly_one_hashed_combined_opapi(self) -> None:
         for token in (
             "P10_ASSEMBLY_REUSE_PASS",
+            "P10_ASSEMBLY_QUARANTINE",
             "manifest_has_exact_input",
             "assembly_state=complete",
             "combined_product_opapi_missing",
             "product_opapi_sha256",
             "A5P10ForwardPrepare,A5P10W4A4C8ScoreReceipt,A5P10ScoreReceiptForwardResident",
             "artifact_reuse=manifest_and_opapi_hash_only",
+            "P10_ASSEMBLY_INVALID_PACKAGE_POLICY",
+            "invalid_package_quarantine_failed",
         ):
             self.assertIn(token, self.source)
         self.assertNotIn("fresh_package_root_exists", self.source)
@@ -296,6 +299,37 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
             )
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertIn("P10_ASSEMBLY_REUSE_PASS", second.stdout)
+
+            # A source-SHA-keyed directory may be left half-built if CANN or
+            # the remote session dies.  Its existence must never masquerade
+            # as a reusable artifact, but it must also not require a manual
+            # destructive cleanup before the exact source pair can rebuild.
+            packages = [
+                path
+                for path in package_parent.iterdir()
+                if path.is_dir() and ".invalid." not in path.name
+            ]
+            self.assertEqual(len(packages), 1)
+            (packages[0] / "P10_ASSEMBLY_PROVENANCE").write_text(
+                "truncated-by-interrupted-build\n"
+            )
+            recovered = subprocess.run(
+                ["bash", str(SCRIPT)],
+                check=False,
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertEqual(
+                recovered.returncode, 0, recovered.stdout + recovered.stderr
+            )
+            self.assertIn("P10_ASSEMBLY_QUARANTINE", recovered.stdout)
+            self.assertIn("P10_ASSEMBLY_STAGE_ONLY_PASS", recovered.stdout)
+            quarantined = list(package_parent.glob("*.invalid.*"))
+            self.assertEqual(len(quarantined), 1)
+            self.assertTrue(
+                (packages[0] / "P10_ASSEMBLY_PROVENANCE").is_file()
+            )
 
 
 if __name__ == "__main__":

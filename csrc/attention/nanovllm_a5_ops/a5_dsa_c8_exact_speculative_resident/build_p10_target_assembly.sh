@@ -284,7 +284,38 @@ if [[ -e "${PACKAGE_ROOT}" ]]; then
             "${PACKAGE_ROOT}" "${PACKAGE_ROOT}/${FINAL_MANIFEST_NAME}"
         exit 0
     fi
-    fail "existing_package_manifest_or_artifact_mismatch:path=${PACKAGE_ROOT}"
+    # The package name is derived from the exact VLLM/KVAF revisions.  A
+    # failed/interrupted build can therefore leave a partial directory at the
+    # *next* exact package path.  Treating its mere existence as fatal forces
+    # users to manually delete state and is the source of repeated stale-build
+    # blocks.  Do not reuse it, but do preserve it for diagnosis and build a
+    # fresh package from the verified source pair.
+    #
+    # This is deliberately a narrow, recoverable operation: only a real
+    # directory exactly beneath PACKAGE_PARENT may be renamed.  Symlinks,
+    # files, and any path outside the approved package parent remain
+    # fail-closed.
+    case "${P10_ASSEMBLY_INVALID_PACKAGE_POLICY:-quarantine}" in
+        quarantine)
+            [[ -d "${PACKAGE_ROOT}" && ! -L "${PACKAGE_ROOT}" ]] ||
+                fail "invalid_existing_package_type:path=${PACKAGE_ROOT}"
+            quarantine_root="${PACKAGE_ROOT}.invalid.$(date +%Y%m%d_%H%M%S).$$"
+            case "${quarantine_root}" in
+                "${PACKAGE_PARENT}"/*) ;;
+                *) fail "unsafe_invalid_package_quarantine:path=${quarantine_root}" ;;
+            esac
+            mv -- "${PACKAGE_ROOT}" "${quarantine_root}" ||
+                fail "invalid_package_quarantine_failed:source=${PACKAGE_ROOT}:target=${quarantine_root}"
+            printf 'P10_ASSEMBLY_QUARANTINE source=%s target=%s reason=manifest_or_artifact_mismatch\n' \
+                "${PACKAGE_ROOT}" "${quarantine_root}"
+            ;;
+        fail)
+            fail "existing_package_manifest_or_artifact_mismatch:path=${PACKAGE_ROOT}"
+            ;;
+        *)
+            fail "invalid_existing_package_policy:value=${P10_ASSEMBLY_INVALID_PACKAGE_POLICY}"
+            ;;
+    esac
 fi
 
 mkdir "${PACKAGE_ROOT}"
