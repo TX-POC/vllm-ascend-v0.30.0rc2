@@ -4,18 +4,25 @@ This module deliberately separates two meanings of "graph":
 
 * :func:`launch_p10_forward` builds P10's *device dependency graph* on normal
   NPU streams.  That is the eager product route.
-* :class:`P10ForwardGraph` captures the same three launches as three raw
-  ``aclmdlRI`` ACLGraph segments and replays them with the same device events.
-  This is the actual graph route for P10's direct ACLNN calls.
+* :class:`P10ForwardGraph` captures the replay-safe preparation and native
+  W4A4C8 score launches as raw ``aclmdlRI`` ACLGraph segments.  It relaunches
+  the Direct-HCCP executor on its persistent companion stream for every
+  replay, after the captured preparation event.
 
 The split is necessary because P10 submits raw ACLNN calls directly on its
 caller-selected stream.  ``torch.npu.NPUGraph`` is not the capture owner for
 such calls and can produce a syntactically valid replay that omits those raw
-nodes.  The graph-mode route therefore uses KVAF's verified raw ``aclmdlRI``
-owner once per stream-local operator, then uses ordinary device events
-*between replays*:
+nodes.  Raw ``aclmdlRI`` is the correct owner for the replay-safe ACLNN
+compute nodes, but it is not a transport replay contract for Direct-HCCP:
+a captured Stage-B invocation can leave terminal-looking control aliases
+while omitting the external HCCP payload write on a later replay.  Stage B
+therefore remains a fixed device executor launch, not a captured graph node.
+There is one normal ACLNN submission per forward, but no host candidate loop,
+no per-candidate host Get, and no host completion wait.
 
-``prepare -> {resident executor, native score producer} -> QSFA``.
+The graph-mode route is consequently:
+
+``captured prepare -> {direct resident executor, captured score producer} -> QSFA``.
 
 The braces are intentional.  After the common prepare event, the host enqueues
 the resident executor on its companion stream *before* it enqueues native C8
@@ -335,22 +342,24 @@ def _capture_raw_acl_segment(
 
 
 class P10ForwardGraph:
-    """Capture and replay P10's fixed-address, two-stream forward pipeline.
+    """Capture P10's replay-safe nodes and relaunch its transport executor.
 
     P10's C++ bridge bypasses torch_npu's task queue and submits ACLNN directly
     on the current CANN stream. It consequently uses KVAF's raw ``aclmdlRI``
-    graph owner for three independently captured segments:
+    graph owner for two independently captured segments:
 
     * ``prepare_graph`` on the producer stream;
-    * ``stage_a_graph`` on that same producer stream;
-    * ``stage_b_graph`` on the companion executor stream.
+    * ``stage_a_graph`` on that same producer stream.
 
-    During replay, the prepare graph records one device event.  The executor
-    graph is submitted first after that event, then the native W4A4C8 graph is
-    submitted on the producer stream.  This preserves the eager route's
+    During replay, the prepare graph records one device event.  Stage B is
+    submitted directly first after that event, then the native W4A4C8 graph is
+    replayed on the producer stream.  This preserves the eager route's
     admission order and its absence of a Stage-A-complete -> Stage-B edge.
-    Capture is intentionally one-time and may synchronize.  ``replay`` never
-    synchronizes the host, allocates a new stream, or launches a Python Get.
+    Capturing Stage B is deliberately forbidden: its Direct-HCCP doorbell is
+    an external transport side effect rather than a replay-safe ACL graph
+    node.  Capture is intentionally one-time and may synchronize.  ``replay``
+    never synchronizes the host, allocates a new stream, or launches a Python
+    candidate/Get loop.
     """
 
     def __init__(
@@ -360,20 +369,18 @@ class P10ForwardGraph:
         execution_mode: str,
         prepare_graph: Any,
         stage_a_graph: Any,
-        stage_b_graph: Any,
         producer_stream: Any,
         executor_stream: Any,
         forward_control: torch.Tensor,
         attention_slots: torch.Tensor,
         resident_seq_lengths: torch.Tensor,
-        workspace_tokens: tuple[int, int, int],
-        workspace_counts: tuple[int, int, int],
+        workspace_tokens: tuple[int, int],
+        workspace_counts: tuple[int, int],
     ) -> None:
         self._signature = signature
         self._execution_mode = execution_mode
         self._prepare_graph = prepare_graph
         self._stage_a_graph = stage_a_graph
-        self._stage_b_graph = stage_b_graph
         self._producer_stream = producer_stream
         self._executor_stream = executor_stream
         self._forward_control = forward_control
@@ -388,10 +395,16 @@ class P10ForwardGraph:
         return self._execution_mode
 
     @property
-    def workspace_counts(self) -> tuple[int, int, int]:
-        """Captured workspace buffers for prepare, score, and executor."""
+    def workspace_counts(self) -> tuple[int, int]:
+        """Captured workspace buffers for the prepare and score segments."""
 
         return self._workspace_counts
+
+    @property
+    def captured_segment_count(self) -> int:
+        """The exact number of raw ACLGraph segments retained by this object."""
+
+        return len(self._workspace_tokens)
 
     @classmethod
     def capture(
@@ -405,8 +418,9 @@ class P10ForwardGraph:
     ) -> "P10ForwardGraph":
         """Perform a one-time capture of the exact P10 product operators.
 
-        The capture sequence is deliberately serial only while *constructing*
-        graphs: Stage B's capture must observe a valid canonical C8 output.
+        The warm-up sequence is deliberately serial only while *constructing*
+        the two raw graphs.  It initializes the full product closure,
+        including the non-captured Direct-HCCP executor, outside capture.
         This has no bearing on replay, where the overlap topology below is
         restored.  The initial serial warm-up also forces lazy ACLNN/OPP
         setup outside capture, so a capture failure cannot silently become an
@@ -454,7 +468,6 @@ class P10ForwardGraph:
 
         prepare_graph = None
         stage_a_graph = None
-        stage_b_graph = None
         workspace_tokens: list[int] = []
         workspace_counts: list[int] = []
         try:
@@ -476,22 +489,8 @@ class P10ForwardGraph:
             workspace_tokens.append(token)
             workspace_counts.append(count)
 
-            # Stage-A's capture invocation produced the canonical tensors that
-            # Stage-B's capture invocation reads. This wait is capture-only;
-            # no equivalent wait exists in the replay topology.
-            producer_stream.synchronize()
-
-            stage_b_graph, token, count = _capture_raw_acl_segment(
-                graph_type=raw_graph_type,
-                stream=executor_stream,
-                submit=lambda: _launch_stage_b(inputs),
-                label="stage_b",
-            )
-            workspace_tokens.append(token)
-            workspace_counts.append(count)
-            executor_stream.synchronize()
         except Exception:
-            for graph in (stage_b_graph, stage_a_graph, prepare_graph):
+            for graph in (stage_a_graph, prepare_graph):
                 if graph is not None:
                     try:
                         graph.reset()
@@ -501,7 +500,7 @@ class P10ForwardGraph:
                 _C.release_graph_workspace_capture(token)
             raise
 
-        if len(workspace_tokens) != 3 or len(workspace_counts) != 3:
+        if len(workspace_tokens) != 2 or len(workspace_counts) != 2:
             raise RuntimeError("P10_GRAPH_CAPTURE_FAILED:incomplete_raw_segments")
 
         return cls(
@@ -509,7 +508,6 @@ class P10ForwardGraph:
             execution_mode=execution_mode,
             prepare_graph=prepare_graph,
             stage_a_graph=stage_a_graph,
-            stage_b_graph=stage_b_graph,
             producer_stream=producer_stream,
             executor_stream=executor_stream,
             forward_control=inputs.forward_control,
@@ -534,10 +532,12 @@ class P10ForwardGraph:
 
         if self._execution_mode == "overlap":
             # Preserve device-executor admission before the producer, without
-            # introducing the forbidden Stage-A completion dependency.
+            # introducing the forbidden Stage-A completion dependency.  The
+            # Direct-HCCP doorbell must be issued for every replay; raw
+            # aclmdlRI capture does not provide a transport replay guarantee.
             with torch.npu.stream(self._executor_stream):
                 self._executor_stream.wait_event(prepared)
-                self._stage_b_graph.replay(self._executor_stream)
+                _launch_stage_b(inputs)
                 stage_b_complete = _record_event(self._executor_stream)
             with torch.npu.stream(self._producer_stream):
                 self._producer_stream.wait_event(prepared)
@@ -551,7 +551,7 @@ class P10ForwardGraph:
                 stage_a_complete = _record_event(self._producer_stream)
             with torch.npu.stream(self._executor_stream):
                 self._executor_stream.wait_event(stage_a_complete)
-                self._stage_b_graph.replay(self._executor_stream)
+                _launch_stage_b(inputs)
                 stage_b_complete = _record_event(self._executor_stream)
 
         return P10ForwardLaunch(
@@ -575,7 +575,6 @@ class P10ForwardGraph:
             return
         errors: list[str] = []
         for label, graph in (
-            ("stage_b", self._stage_b_graph),
             ("stage_a", self._stage_a_graph),
             ("prepare", self._prepare_graph),
         ):

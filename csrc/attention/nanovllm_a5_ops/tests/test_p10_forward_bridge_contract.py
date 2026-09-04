@@ -57,6 +57,9 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         ).read_text()
         cls.builder = (ROOT / "build_p10_forward_prepare_opp.sh").read_text()
         cls.setup = (ROOT / "torch_extension" / "p10_forward_bridge_setup.py").read_text()
+        cls.runtime_fixture = (
+            OPS_ROOT / "tests" / "test_p10_w4a4c8_forward_resident_runtime.py"
+        ).read_text()
         cls.common_opapi = (
             OPS_ROOT / "torch_extension" / "csrc" / "op_api_common.h"
         ).read_text()
@@ -175,16 +178,16 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             "stage_b_before_stage_a_after_common_prepare",
         )
 
-    def test_aclgraph_mode_captures_all_three_product_nodes_and_replays_overlap(self) -> None:
-        """Graph mode must own direct ACLNN capture, not a torch wrapper.
+    def test_aclgraph_mode_captures_only_replay_safe_nodes_and_relaunches_hccp(self) -> None:
+        """Graph mode must not pretend Direct-HCCP is a replay-safe graph node.
 
         P10 bypasses torch_npu's task queue and issues raw ACLNN calls. A
         ``torch.npu.NPUGraph`` can return successfully without retaining those
         calls, leaving capture-time control state but no replayed HCCP DMA.
-        The graph owner must therefore be KVAF's raw ``aclmdlRI`` adapter, one
-        segment per stream-local P10 node. Replays use device events between
-        segments; a host wait or eager fallback would invalidate the latency
-        comparison.
+        Raw ``aclmdlRI`` is used for the replay-safe Prepare and C8 score
+        nodes.  Stage B's HCCP doorbell is relaunched on its device executor
+        stream for every replay, so a terminal-ready alias cannot be accepted
+        without a real replay-time payload transfer.
         """
 
         self.assertIn("class P10ForwardGraph", self.graph)
@@ -198,7 +201,9 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         replay = self.graph.split("    def replay(", 1)[1].split(
             "\ndef _record_event", 1
         )[0]
-        self.assertEqual(capture.count("_capture_raw_acl_segment("), 3)
+        self.assertEqual(capture.count("_capture_raw_acl_segment("), 2)
+        self.assertNotIn("submit=lambda: _launch_stage_b(inputs)", capture)
+        self.assertNotIn("self._stage_b_graph", self.graph)
         self.assertIn("raw_graph.capture_begin(stream)", self.graph)
         self.assertIn("raw_graph.capture_end()", self.graph)
         self.assertIn("raw_graph.reset()", self.graph)
@@ -209,12 +214,14 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             "        else:", 1
         )[0]
         self.assertLess(
-            overlap.index("self._stage_b_graph.replay(self._executor_stream)"),
+            overlap.index("_launch_stage_b(inputs)"),
             overlap.index("self._stage_a_graph.replay(self._producer_stream)"),
         )
         self.assertIn("self._executor_stream.wait_event(prepared)", overlap)
         self.assertIn("self._producer_stream.wait_event(prepared)", overlap)
         self.assertNotIn("wait_event(stage_b", overlap)
+        self.assertIn("Direct-HCCP doorbell must be issued for every replay", self.graph)
+        self.assertIn("direct_hccp_captured=0", self.runtime_fixture)
         for token in (
             "tensor_static_alias_mismatch",
             "scalar_tiling_mismatch",

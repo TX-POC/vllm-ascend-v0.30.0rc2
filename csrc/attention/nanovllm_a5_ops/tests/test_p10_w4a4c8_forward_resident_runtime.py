@@ -1362,8 +1362,12 @@ def _run_graph_benchmark() -> int:
         )
         print(
             "P10_GRAPH_CAPTURE "
-            "segments=3 backend=aclmdlRI_raw_direct_aclnn eager_fallback=0 "
+            "segments=2 backend=aclmdlRI_raw_direct_aclnn "
+            "captured=prepare,stage_a stage_b=direct_aclnn_relaunch "
+            "direct_hccp_captured=0 "
             "graph_serial=1 graph_overlap=1 static_alias_gate=1 "
+            f"captured_segments_serial={graph_serial.captured_segment_count} "
+            f"captured_segments_overlap={graph_overlap.captured_segment_count} "
             f"workspace_buffers_serial={sum(graph_serial.workspace_counts)} "
             f"workspace_buffers_overlap={sum(graph_overlap.workspace_counts)}",
             flush=True,
@@ -1494,7 +1498,8 @@ def _run_graph_benchmark() -> int:
         "product_w4a4c8_oracle=1 canonical_topk=1 score_source_lens=1 "
         "ranked_resident_payload=1 qsfa_lengths_and_tail=1 "
         "eager_serial_terminal=1 graph_serial_terminal=1 "
-        "graph_overlap_preseal_claim=1 aclgraph_segments=3 eager_fallback=0",
+        "graph_overlap_preseal_claim=1 aclgraph_segments=2 "
+        "stage_b_direct_relaunch=1 direct_hccp_captured=0",
         flush=True,
     )
     print(
