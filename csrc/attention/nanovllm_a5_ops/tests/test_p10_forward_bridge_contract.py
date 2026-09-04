@@ -86,9 +86,12 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             "FillShard<A5_P10_FORWARD_PREPARE_UNMAPPED_SLOT>",
             "FillShard<0>(queue_leases_gm",
             "FillShard<0>(resident_ready_gm",
-            "speculative_slot_cursor_gm.SetValue(0U, 0)",
-            "A5_P10_FORWARD_PREPARE_PRODUCER_SEAL_SEQUENCE_WORD, 0",
-            "A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD, 0",
+            "kForwardPrepareInt32PerDCacheLine",
+            "DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE,",
+            "DcciDst::CACHELINE_OUT>(tensor[begin])",
+            "WriteGmByPassDCache<int32_t>(speculative_slot_cursor_gm, 0)",
+            "A5_P10_FORWARD_PREPARE_PRODUCER_SEAL_SEQUENCE_WORD",
+            "A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD",
             "DataSyncBarrier<MemDsbT::DDR>()",
         ):
             self.assertIn(token, self.prepare_kernel)
@@ -101,17 +104,23 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             self.assertNotIn(forbidden, self.prepare_kernel)
 
     def test_prepare_publishes_all_sharded_reset_writes_before_stage_b_can_bypass_read(self) -> None:
-        """A graph event orders kernels; this DSB publishes each AIV's shard."""
+        """Each full DCache line has one owner before the trailing DDR DSB.
+
+        The historical element-strided reset let several AIVs dirty different
+        words in a single cache line.  A later writeback could erase only the
+        object half of a freshly published Stage-B mapping, leaving an
+        impossible positive source map.  DSB alone cannot repair that.
+        """
 
         publish = "DataSyncBarrier<MemDsbT::DDR>();"
         self.assertEqual(self.prepare_kernel.count(publish), 1)
-        self.assertGreater(
-            self.prepare_kernel.rfind(publish),
-            self.prepare_kernel.rfind(
-                "A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD, 0"
-            ),
-        )
-        self.assertIn("per-core publication boundary", self.prepare_kernel)
+        self.assertGreater(self.prepare_kernel.rfind(publish), self.prepare_kernel.rfind(
+            "A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD,"))
+        self.assertIn("line += core_count", self.prepare_kernel)
+        self.assertIn("const uint32_t begin = line * kForwardPrepareInt32PerDCacheLine", self.prepare_kernel)
+        self.assertIn("DataCacheCleanAndInvalid<int32_t", self.prepare_kernel)
+        self.assertNotIn("index = core_index; index < element_count", self.prepare_kernel)
+        self.assertIn("unique owner", self.prepare_kernel)
         self.assertNotIn("SyncAll(", self.prepare_kernel)
 
     def test_no_fixed_physical_core_model_enters_the_forward_bridge(self) -> None:

@@ -50,7 +50,10 @@ struct SlotClaimResult {
   int32_t resident_slot;
   int32_t observed_object_slot;
   uint32_t newly_claimed;
-  uint32_t reserved;
+  // A positive source map was observed before this service owned a claim.
+  // In that case the AICore caller must verify (not rewrite) the immutable
+  // authoritative object directory.
+  uint32_t source_already_mapped;
 };
 static_assert(sizeof(SlotClaimResult) == 16U,
               "forward-slot claim SIMT ABI changed");
@@ -286,7 +289,7 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
   result->resident_slot = A5_P10_STAGE_B_UNMAPPED_SLOT;
   result->observed_object_slot = A5_P10_STAGE_B_UNMAPPED_SLOT;
   result->newly_claimed = 0U;
-  result->reserved = 0U;
+  result->source_already_mapped = 0U;
 
   // The source map is a fast BxS cache. The object map is authoritative for
   // transport ownership: two S values resolving to one (P,O) must share one
@@ -296,6 +299,7 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
       A5_P10_STAGE_B_CLAIMING_SLOT);
   if (observed_source >= 0) {
     result->resident_slot = observed_source;
+    result->source_already_mapped = 1U;
     return;
   }
   if (observed_source != A5_P10_STAGE_B_UNMAPPED_SLOT) {
@@ -307,14 +311,12 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
       A5_P10_STAGE_B_UNMAPPED_SLOT, A5_P10_STAGE_B_CLAIMING_SLOT);
   result->observed_object_slot = observed_object;
   if (observed_object >= 0) {
-    // Object was already assigned by another source. Publish its resolved
-    // slot into this source cache only after the object map is readable.
-    // The same object -> source release rule applies to this dedup path as to
-    // a newly claimed object below: a positive source cache entry must never
-    // outrun visibility of the authoritative object directory.
+    // Object was already assigned by another source.  The SIMT service owns
+    // atomic admission only; the caller below publishes the object -> source
+    // result through AICore bypass writes.  That gives the whole forward one
+    // explicit SIMT-to-AICore-to-DDR release path instead of assuming that a
+    // SIMT cache fence alone is a visible publication to every later reader.
     AscendC::Simt::ThreadFence();
-    (void)asc_atomic_cas(source_to_forward_slot + source_offset,
-                         A5_P10_STAGE_B_CLAIMING_SLOT, observed_object);
     result->resident_slot = observed_object;
     return;
   }
@@ -365,15 +367,12 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
                          A5_P10_STAGE_B_UNMAPPED_SLOT);
     return;
   }
-  // The object map is authoritative and the source map is only its fast
-  // cache.  Publish the former before making the latter readable.  A fence
-  // before the object CAS does not establish that release ordering: a
-  // finalizer can otherwise observe source=selected while a bypass read of
-  // the object map still returns the prior EMPTY value.  This is one SIMT
-  // publication fence per successful admission, not a worker rendezvous.
+  // The CAS has established immutable object ownership.  Do not make the
+  // source cache positive here: SIMT admission and AICore's uncached forward
+  // data plane have different publication domains.  The AICore caller uses
+  // the returned scalar result to write object first, issue a DDR barrier,
+  // then publish source through bypass stores.
   AscendC::Simt::ThreadFence();
-  (void)asc_atomic_cas(source_to_forward_slot + source_offset,
-                       A5_P10_STAGE_B_CLAIMING_SLOT, selected);
   result->resident_slot = selected;
   result->newly_claimed = 1U;
 }
@@ -931,6 +930,67 @@ class A5P10ScoreReceiptForwardResidentKernel {
     return true;
   }
 
+  // SIMT owns admission because it supplies the required GM CAS primitive;
+  // AICore owns the forward-visible publication because the next readers are
+  // AICore bypass loads, QSFA, and eventually the host.  Keeping those two
+  // responsibilities separate is deliberate: a SIMT ThreadFence orders the
+  // SIMT service, but it is not a proof that a later uncached AICore/CPU load
+  // observes its map value.  The returned SlotClaimResult is the local
+  // handoff.  After it has crossed the VF event, publish object first, wait
+  // for DDR, then publish its source-cache entry.
+  __aicore__ inline bool PublishClaimedForwardSlot(
+      uint64_t source_offset, uint64_t object_offset) {
+    const int32_t selected = slotClaim_->resident_slot;
+    if (selected < 0) {
+      return false;
+    }
+
+    if (slotClaim_->source_already_mapped != 0U) {
+      // A previously positive source entry must already have released its
+      // canonical object directory.  Do not repair a violation here: a
+      // caller that observes it needs a strict failure, not a fabricated
+      // object ownership record.
+      return ReadGmByPassDCache<int32_t>(
+                 kvObjectToForwardSlot_ + object_offset) == selected;
+    }
+
+    // New admission observes EMPTY; object-dedup observes the immutable
+    // selected slot.  Any other result is a real ownership conflict and must
+    // fail closed rather than overwriting it with a normal GM store.
+    const int32_t observed = slotClaim_->observed_object_slot;
+    if ((slotClaim_->newly_claimed != 0U &&
+         observed != A5_P10_STAGE_B_UNMAPPED_SLOT) ||
+        (slotClaim_->newly_claimed == 0U && observed != selected)) {
+      return false;
+    }
+    const int32_t visible_object = ReadGmByPassDCache<int32_t>(
+        kvObjectToForwardSlot_ + object_offset);
+    if (visible_object != A5_P10_STAGE_B_UNMAPPED_SLOT &&
+        visible_object != A5_P10_STAGE_B_CLAIMING_SLOT &&
+        visible_object != selected) {
+      return false;
+    }
+
+    // This re-publication is safe: SIMT has already atomically claimed this
+    // object, object slots are immutable within a forward, and any dedup
+    // observer returned precisely `selected`.  Bypass stores avoid a new
+    // AICore dirty-line owner; each DSB is the release edge for the next map.
+    WriteGmByPassDCache<int32_t>(
+        kvObjectToForwardSlot_ + object_offset, selected);
+    DataSyncBarrier<MemDsbT::DDR>();
+
+    const int32_t visible_source = ReadGmByPassDCache<int32_t>(
+        sourceToForwardSlot_ + source_offset);
+    if (visible_source != A5_P10_STAGE_B_CLAIMING_SLOT &&
+        visible_source != selected) {
+      return false;
+    }
+    WriteGmByPassDCache<int32_t>(
+        sourceToForwardSlot_ + source_offset, selected);
+    DataSyncBarrier<MemDsbT::DDR>();
+    return true;
+  }
+
   __aicore__ inline bool ClaimSpeculativeSlot(
       uint64_t source_offset, uint64_t object_offset, int32_t* slot,
       bool* newly_claimed) {
@@ -951,7 +1011,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
     wait_flag(PIPE_V, PIPE_S, simtEvent_);
     *slot = slotClaim_->resident_slot;
     *newly_claimed = slotClaim_->newly_claimed != 0U;
-    return *slot >= 0;
+    return *slot >= 0 &&
+           PublishClaimedForwardSlot(source_offset, object_offset);
   }
 
   __aicore__ inline bool ClaimRecallSlot(
@@ -979,7 +1040,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
     wait_flag(PIPE_V, PIPE_S, simtEvent_);
     *slot = slotClaim_->resident_slot;
     *newly_claimed = slotClaim_->newly_claimed != 0U;
-    return *slot >= 0;
+    return *slot >= 0 &&
+           PublishClaimedForwardSlot(source_offset, object_offset);
   }
 
   __aicore__ inline uint32_t FindFreeSeedBuffer() const {

@@ -14,15 +14,46 @@
 using namespace AscendC;
 
 namespace {
+// All mutable P10 maps are int32.  A ForwardPrepare reset is consumed by
+// Stage B through uncached AICore loads and SIMT atomics, so ordinary AIV
+// stores must have one and only one writer for every DCache line.  Splitting
+// a line by element across AIVs is not safe: each AIV can later write back a
+// different dirty copy of that same line and erase another AIV's reset (or a
+// later Stage-B claim).
+constexpr uint32_t kForwardPrepareDCacheLineBytes = 64U;
+constexpr uint32_t kForwardPrepareInt32PerDCacheLine =
+    kForwardPrepareDCacheLineBytes / sizeof(int32_t);
+static_assert(kForwardPrepareDCacheLineBytes % sizeof(int32_t) == 0U,
+              "P10 ForwardPrepare cache-line geometry changed");
+
 template <int32_t kValue>
 __aicore__ inline void FillShard(GlobalTensor<int32_t>& tensor,
                                  uint32_t element_count,
                                  uint32_t core_index,
                                  uint32_t core_count)
 {
-    for (uint32_t index = core_index; index < element_count;
-         index += core_count) {
-        tensor.SetValue(index, kValue);
+    const uint32_t line_count =
+        (element_count + kForwardPrepareInt32PerDCacheLine - 1U) /
+        kForwardPrepareInt32PerDCacheLine;
+    // Each iteration owns a whole 64-byte line.  No other participating AIV
+    // writes or cleans that line, so a cache-line clean is a true publication
+    // operation rather than a lossy merge of independently dirty copies.
+    for (uint32_t line = core_index; line < line_count;
+         line += core_count) {
+        const uint32_t begin = line * kForwardPrepareInt32PerDCacheLine;
+        uint32_t end = begin + kForwardPrepareInt32PerDCacheLine;
+        if (end > element_count) {
+            end = element_count;
+        }
+        for (uint32_t index = begin; index < end; ++index) {
+            tensor.SetValue(index, kValue);
+        }
+        // `DataSyncBarrier` orders instructions but does not by itself make
+        // an ordinary dirty AIV DCache line observable by the SIMT/AICore
+        // consumers.  Clean and invalidate the unique line now; the trailing
+        // DDR barrier below waits for all such publications.
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE,
+                                 DcciDst::CACHELINE_OUT>(tensor[begin]);
     }
 }
 }  // namespace
@@ -57,26 +88,19 @@ extern "C" __global__ __aicore__ void a5_p10_forward_prepare(
     }
 
     GlobalTensor<int32_t> receipt_state_gm;
-    GlobalTensor<int32_t> forward_control_gm;
     GlobalTensor<int32_t> object_to_forward_slot_gm;
     GlobalTensor<int32_t> source_to_forward_slot_gm;
-    GlobalTensor<int32_t> speculative_slot_cursor_gm;
     GlobalTensor<int32_t> queue_leases_gm;
     GlobalTensor<int32_t> resident_ready_gm;
     receipt_state_gm.SetGlobalBuffer(
         reinterpret_cast<__gm__ int32_t*>(receipt_state),
         tiling_data.receiptStateElements);
-    forward_control_gm.SetGlobalBuffer(
-        reinterpret_cast<__gm__ int32_t*>(forward_control),
-        A5_P10_FORWARD_PREPARE_CONTROL_WORDS);
     object_to_forward_slot_gm.SetGlobalBuffer(
         reinterpret_cast<__gm__ int32_t*>(kv_object_to_forward_slot),
         tiling_data.objectToForwardSlotElements);
     source_to_forward_slot_gm.SetGlobalBuffer(
         reinterpret_cast<__gm__ int32_t*>(source_to_forward_slot),
         tiling_data.sourceToForwardSlotElements);
-    speculative_slot_cursor_gm.SetGlobalBuffer(
-        reinterpret_cast<__gm__ int32_t*>(speculative_slot_cursor), 1U);
     queue_leases_gm.SetGlobalBuffer(
         reinterpret_cast<__gm__ int32_t*>(queue_leases),
         tiling_data.queueLeaseElements);
@@ -103,29 +127,40 @@ extern "C" __global__ __aicore__ void a5_p10_forward_prepare(
     // intentionally survive this reset; word 1 is Stage B's diagnostic
     // ledger and is deliberately reset below.
     if (core_index == 0U) {
-        speculative_slot_cursor_gm.SetValue(0U, 0);
-        forward_control_gm.SetValue(
-            0U, A5_P10_FORWARD_PREPARE_PRODUCER_OPEN);
+        // These scalar control writes cross the same AIV -> Stage-B boundary
+        // as the maps above.  Make them direct DDR publications too, rather
+        // than leaving one producer-core DCache line behind after its peers
+        // have correctly cleaned their reset shards.
+        __gm__ int32_t* speculative_slot_cursor_gm =
+            reinterpret_cast<__gm__ int32_t*>(speculative_slot_cursor);
+        __gm__ int32_t* forward_control_gm =
+            reinterpret_cast<__gm__ int32_t*>(forward_control);
+        WriteGmByPassDCache<int32_t>(speculative_slot_cursor_gm, 0);
+        WriteGmByPassDCache<int32_t>(
+            forward_control_gm + 0U,
+            A5_P10_FORWARD_PREPARE_PRODUCER_OPEN);
         // P10 Stage B uses word 1 only as a forward-local diagnostic ledger.
         // It is never a producer scheduling input or a receipt count.
-        forward_control_gm.SetValue(1U, 0);
-        forward_control_gm.SetValue(
-            5U, A5_P10_FORWARD_PREPARE_FORWARD_INCOMPLETE);
-        forward_control_gm.SetValue(7U, 0);
-        forward_control_gm.SetValue(
-            A5_P10_FORWARD_PREPARE_PRODUCER_SEAL_SEQUENCE_WORD, 0);
-        forward_control_gm.SetValue(
-            A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD, 0);
+        WriteGmByPassDCache<int32_t>(forward_control_gm + 1U, 0);
+        WriteGmByPassDCache<int32_t>(
+            forward_control_gm + 5U,
+            A5_P10_FORWARD_PREPARE_FORWARD_INCOMPLETE);
+        WriteGmByPassDCache<int32_t>(forward_control_gm + 7U, 0);
+        WriteGmByPassDCache<int32_t>(
+            forward_control_gm +
+                A5_P10_FORWARD_PREPARE_PRODUCER_SEAL_SEQUENCE_WORD,
+            0);
+        WriteGmByPassDCache<int32_t>(
+            forward_control_gm +
+                A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD,
+            0);
     }
 
     // This is a per-core publication boundary, not a cross-core rendezvous.
-    // Prepare resets the maps/READY table with ordinary AIV stores, while
-    // Stage B subsequently consumes them through bypass loads and SIMT CAS.
-    // The graph event orders the two kernels, but does not by itself flush a
-    // producer AIV's dirty DCache lines to DDR.  Without this boundary a late
-    // Prepare write can erase one half of a source/object claim after Stage B
-    // has atomically published it.  Every participating core must publish its
-    // own FillShard writes; SyncAll would be both unnecessary and invalid for
-    // this independently sharded reset.
+    // Every reset line has already been clean/invalidate-published by its
+    // unique owner.  The graph event orders kernels; this DDR barrier closes
+    // the producer writeback before Stage B begins bypass reads or SIMT CAS.
+    // SyncAll would be both unnecessary and invalid for this independently
+    // sharded reset.
     DataSyncBarrier<MemDsbT::DDR>();
 }

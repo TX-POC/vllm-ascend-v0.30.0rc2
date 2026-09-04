@@ -324,7 +324,7 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "RecordFirstFailure", "MarkRunning",
         ):
             self.assertIn(token, self.abi + self.kernel)
-        self.assertIn("forward_control_gm.SetValue(1U, 0)", (
+        self.assertIn("WriteGmByPassDCache<int32_t>(forward_control_gm + 1U, 0)", (
             OPS_ROOT / "a5_dsa_c8_exact_speculative_resident"
             / "p10_forward_bridge" / "op_kernel" / "a5_p10_forward_prepare.cpp"
         ).read_text())
@@ -336,23 +336,41 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("if (!ResolveConcurrentForwardSlot", self.kernel)
 
     def test_object_claim_is_published_before_the_source_cache(self):
-        """A positive source entry is a release of its authoritative object map."""
+        """A positive source entry releases a bypass-published object map.
+
+        SIMT performs only the atomic ownership claim.  The returned scalar
+        crosses the local VF handoff and AICore publishes object -> DDR ->
+        source.  This prevents a SIMT-only fence from being mistaken for a
+        visible publication to later uncached AICore/CPU readers.
+        """
 
         object_commit = self.kernel.index(
             "asc_atomic_cas(kv_object_to_forward_slot + object_offset,\n"
             "                     A5_P10_STAGE_B_CLAIMING_SLOT, selected)"
         )
+        publish_helper = self.kernel.index("PublishClaimedForwardSlot")
+        object_publish = self.kernel.index(
+            "WriteGmByPassDCache<int32_t>(\n"
+            "        kvObjectToForwardSlot_ + object_offset, selected)",
+            publish_helper,
+        )
+        object_dsb = self.kernel.index("DataSyncBarrier<MemDsbT::DDR>();", object_publish)
         source_publish = self.kernel.index(
+            "WriteGmByPassDCache<int32_t>(\n"
+            "        sourceToForwardSlot_ + source_offset, selected)",
+            object_dsb,
+        )
+        self.assertLess(object_commit, publish_helper)
+        self.assertLess(publish_helper, object_publish)
+        self.assertLess(object_publish, object_dsb)
+        self.assertLess(object_dsb, source_publish)
+        self.assertNotIn(
             "asc_atomic_cas(source_to_forward_slot + source_offset,\n"
-            "                       A5_P10_STAGE_B_CLAIMING_SLOT, selected)"
+            "                       A5_P10_STAGE_B_CLAIMING_SLOT, selected)",
+            self.kernel,
         )
-        release_fence = self.kernel.index(
-            "AscendC::Simt::ThreadFence();", object_commit
-        )
-        self.assertLess(object_commit, release_fence)
-        self.assertLess(release_fence, source_publish)
         self.assertIn("object map is authoritative", self.kernel)
-        self.assertIn("same object -> source release rule", self.kernel)
+        self.assertIn("SIMT owns admission", self.kernel)
 
     def test_aicore_metadata_access_respects_cann_address_spaces(self):
         """Prevent a recurrence of the Stage-B-only 950DT compile failure.
