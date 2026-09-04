@@ -8,6 +8,7 @@ trying to simulate CANN or Direct-HCCP on a development machine.
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from pathlib import Path
 OPS_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = OPS_ROOT / "tests" / "run_p10_w4a4c8_forward_resident_npu.sh"
 FIXTURE = OPS_ROOT / "tests" / "test_p10_w4a4c8_forward_resident_runtime.py"
+BOOTSTRAP = OPS_ROOT / "tools" / "bootstrap_cann_third_party_cache.sh"
 
 
 class P10ProductRunnerContractTest(unittest.TestCase):
@@ -22,12 +24,14 @@ class P10ProductRunnerContractTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.runner = RUNNER.read_text()
         cls.fixture = FIXTURE.read_text()
+        cls.bootstrap = BOOTSTRAP.read_text()
 
     def test_runner_is_valid_and_binds_its_own_exact_source_tree(self) -> None:
-        result = subprocess.run(
-            ["bash", "-n", str(RUNNER)], capture_output=True, text=True, check=False
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for script in (RUNNER, BOOTSTRAP):
+            result = subprocess.run(
+                ["bash", "-n", str(script)], capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for token in (
             "runner_not_from_exact_vllm_source",
             "require_exact_clean_source vllm",
@@ -37,6 +41,70 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "P10_KVAF_EXPECTED_SHA",
         ):
             self.assertIn(token, self.runner)
+
+    def test_runner_bootstraps_a_complete_external_cann_cache_before_build(self) -> None:
+        """A clean Git clone must not masquerade as a dependency cache."""
+
+        for token in (
+            'cann_cache_default="$(dirname "${vllm_root}")/.cann-third-party-$(basename "${ascend_home}")"',
+            "cann_third_party_cache_must_be_external",
+            "bootstrap_cann_third_party_cache.sh",
+            "P10_CANN_3RD_BOOTSTRAP:-1",
+            "cache_complete || fail",
+            "P10_CANN_CACHE path=%s source_tree=0 complete=1",
+        ):
+            self.assertIn(token, self.runner)
+        self.assertNotIn(
+            'cann_cache="${P10_CANN_3RD_LIB_PATH:-${vllm_root}/csrc/third_party}"',
+            self.runner,
+        )
+
+        for token in (
+            "P10_CANN_3RD_MAKESELF_URL",
+            "P10_CANN_3RD_JSON_URL",
+            "P10_CANN_3RD_ABSEIL_URL",
+            "P10_CANN_3RD_PROTOBUF_URL",
+            "P10_CANN_3RD_PROVENANCE",
+            "P10_CANN_CACHE_BOOTSTRAP_PASS",
+            "download_failed:label=",
+            "--netrc-optional",
+            "has_makeself || makeself_missing=1",
+            "has_json || json_missing=1",
+            "has_abseil || abseil_missing=1",
+            "has_protobuf || protobuf_missing=1",
+            'if [[ "${makeself_missing}" -eq 1 ]]; then',
+            'if [[ "${json_missing}" -eq 1 ]]; then',
+            'if [[ "${abseil_missing}" -eq 1 ]]; then',
+            'if [[ "${protobuf_missing}" -eq 1 ]]; then',
+        ):
+            self.assertIn(token, self.bootstrap)
+
+    def test_bootstrap_reuses_a_complete_cache_without_touching_the_network(self) -> None:
+        """A warm cache must return before curl/download work is considered."""
+
+        with tempfile.TemporaryDirectory(prefix="p10-cann-cache-") as raw_cache:
+            cache = Path(raw_cache)
+            (cache / "makeself").mkdir()
+            (cache / "json" / "include" / "nlohmann").mkdir(parents=True)
+            (cache / "pkg").mkdir()
+            for relative in (
+                "makeself/makeself.sh",
+                "makeself/makeself-header.sh",
+                "json/include/nlohmann/json.hpp",
+                "pkg/abseil-cpp-20230802.1.tar.gz",
+                "pkg/protobuf-25.1.tar.gz",
+            ):
+                (cache / relative).touch()
+            result = subprocess.run(
+                ["bash", str(BOOTSTRAP), str(cache)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("P10_CANN_CACHE_BOOTSTRAP_PASS", result.stdout)
+            self.assertIn("reused=1", result.stdout)
+            self.assertNotIn("P10_CANN_CACHE_DOWNLOAD", result.stdout)
 
     def test_runner_accepts_only_one_combined_vendor_and_direct_dispatch(self) -> None:
         for token in (

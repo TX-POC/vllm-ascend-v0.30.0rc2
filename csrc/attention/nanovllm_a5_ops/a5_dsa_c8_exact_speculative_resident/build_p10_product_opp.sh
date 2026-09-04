@@ -117,7 +117,17 @@ esac
 [[ -n "${PACKAGE_ROOT}" ]] || fail "package_root_missing"
 [[ -n "${CANN_3RD_LIB_PATH}" ]] || fail "cann_third_party_cache_path_missing"
 command -v msopgen >/dev/null 2>&1 || fail "msopgen_missing"
-
+# This directory is an external, Git-ignored CANN dependency cache.  The P10
+# runner materializes it before staging this product; do not accept a source
+# worktree or let an expensive CANN build discover a missing dependency late.
+case "${CANN_3RD_LIB_PATH}" in
+    "${VLLM_ROOT}"|"${VLLM_ROOT}"/*)
+        fail "cann_third_party_cache_must_be_external:path=${CANN_3RD_LIB_PATH}"
+        ;;
+esac
+mkdir -p "${CANN_3RD_LIB_PATH}" || \
+    fail "cann_third_party_cache_create_failed:path=${CANN_3RD_LIB_PATH}"
+CANN_3RD_LIB_PATH="$(cd "${CANN_3RD_LIB_PATH}" && pwd -P)"
 for cache_file in \
     "${CANN_3RD_LIB_PATH}/makeself/makeself.sh" \
     "${CANN_3RD_LIB_PATH}/makeself/makeself-header.sh" \
@@ -132,7 +142,8 @@ if [[ ! -r "${CANN_3RD_LIB_PATH}/protobuf/protobuf-all-25.1.tar.gz" &&
       ! -r "${CANN_3RD_LIB_PATH}/pkg/protobuf-25.1.tar.gz" ]]; then
     fail "cann_third_party_cache_incomplete:need=protobuf"
 fi
-CANN_3RD_LIB_PATH="$(cd "${CANN_3RD_LIB_PATH}" && pwd -P)"
+printf 'P10_PRODUCT_CANN_CACHE path=%s complete=1\n' \
+    "${CANN_3RD_LIB_PATH}"
 
 require_clean_exact_git_root vllm "${VLLM_ROOT}" "${EXPECTED_VLLM_SHA}"
 require_clean_exact_git_root kvaf "${KVAF_ROOT}" "${EXPECTED_KVAF_SHA}"

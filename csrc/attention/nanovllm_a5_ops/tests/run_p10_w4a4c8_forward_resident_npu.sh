@@ -189,21 +189,46 @@ print(
 PY
 printf 'P10_RUNNER_STEP label=fp8_raw_hash_probe status=0\n'
 
-cann_cache="${P10_CANN_3RD_LIB_PATH:-${vllm_root}/csrc/third_party}"
-for cache_file in \
-    "${cann_cache}/makeself/makeself.sh" \
-    "${cann_cache}/makeself/makeself-header.sh" \
-    "${cann_cache}/json/include/nlohmann/json.hpp"; do
-    [[ -r "${cache_file}" ]] || fail "cann_third_party_cache_incomplete:path=${cache_file}"
-done
-if [[ ! -r "${cann_cache}/abseil-cpp/abseil-cpp-20230802.1.tar.gz" &&
-      ! -r "${cann_cache}/pkg/abseil-cpp-20230802.1.tar.gz" ]]; then
-    fail "cann_third_party_cache_incomplete:need=abseil"
+# CANN's third-party inputs are Git-ignored build dependencies.  A fresh
+# checkout therefore must not be required to contain them under
+# ``${vllm_root}/csrc/third_party``.  Keep the reusable cache beside the
+# checkout by default, bootstrap only missing required inputs before any P10
+# build, and never allow it to dirty or alter the exact VLLM worktree used for
+# provenance.
+cann_cache_default="$(dirname "${vllm_root}")/.cann-third-party-$(basename "${ascend_home}")"
+cann_cache="${P10_CANN_3RD_LIB_PATH:-${cann_cache_default}}"
+case "${cann_cache}" in
+    "${vllm_root}"|"${vllm_root}"/*)
+        fail "cann_third_party_cache_must_be_external:path=${cann_cache}"
+        ;;
+esac
+mkdir -p "${cann_cache}" || fail "cann_third_party_cache_create_failed:path=${cann_cache}"
+cann_cache="$(cd "${cann_cache}" && pwd -P)"
+cache_bootstrap="${ops_root}/tools/bootstrap_cann_third_party_cache.sh"
+[[ -r "${cache_bootstrap}" ]] || fail "cann_cache_bootstrap_missing:path=${cache_bootstrap}"
+cache_complete() {
+    [[ -r "${cann_cache}/makeself/makeself.sh" ]] &&
+        [[ -r "${cann_cache}/makeself/makeself-header.sh" ]] &&
+        [[ -r "${cann_cache}/json/include/nlohmann/json.hpp" ]] &&
+        { [[ -r "${cann_cache}/abseil-cpp/abseil-cpp-20230802.1.tar.gz" ]] ||
+          [[ -r "${cann_cache}/pkg/abseil-cpp-20230802.1.tar.gz" ]]; } &&
+        { [[ -r "${cann_cache}/protobuf/protobuf-all-25.1.tar.gz" ]] ||
+          [[ -r "${cann_cache}/pkg/protobuf-25.1.tar.gz" ]]; }
+}
+if ! cache_complete; then
+    case "${P10_CANN_3RD_BOOTSTRAP:-1}" in
+        1|true|TRUE|yes|YES)
+            P10_CANN_3RD_LIB_PATH="${cann_cache}" bash "${cache_bootstrap}" \
+                "${cann_cache}"
+            ;;
+        *)
+            fail "cann_third_party_cache_incomplete:path=${cann_cache}:set=P10_CANN_3RD_BOOTSTRAP=1"
+            ;;
+    esac
 fi
-if [[ ! -r "${cann_cache}/protobuf/protobuf-all-25.1.tar.gz" &&
-      ! -r "${cann_cache}/pkg/protobuf-25.1.tar.gz" ]]; then
-    fail "cann_third_party_cache_incomplete:need=protobuf"
-fi
+cache_complete || fail "cann_third_party_cache_incomplete_after_bootstrap:path=${cann_cache}"
+printf 'P10_CANN_CACHE path=%s source_tree=0 complete=1 bootstrap=%s\n' \
+    "${cann_cache}" "${P10_CANN_3RD_BOOTSTRAP:-1}"
 
 # Keep all generated P10 artifacts under the exact source tree and a
 # source-SHA keyed package root.  Do not permit an inherited interactive-shell
