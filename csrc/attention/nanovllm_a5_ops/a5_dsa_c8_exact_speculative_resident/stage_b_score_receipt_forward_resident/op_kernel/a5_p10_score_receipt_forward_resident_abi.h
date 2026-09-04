@@ -89,6 +89,11 @@ enum A5P10StageBPostFailureReason : uint32_t {
   A5_P10_STAGE_B_POST_BEGIN_STATE_IN_FLIGHT = 21U,
   A5_P10_STAGE_B_POST_BEGIN_STATE_UNKNOWN = 22U,
   A5_P10_STAGE_B_POST_BEGIN_RESULT_UNKNOWN = 23U,
+  // PostOnly was confirmed, but the companion could not reconstruct the
+  // CQ-drain record from the immutable published descriptor.  This is an
+  // ambiguous post state: preserve the queue and fail the forward rather
+  // than treating it as a no-post or reusing the transport resource.
+  A5_P10_STAGE_B_POST_BEGIN_REHYDRATE = 24U,
 };
 
 // A persistent Stage-B companion starts from the same cold-bound mutable

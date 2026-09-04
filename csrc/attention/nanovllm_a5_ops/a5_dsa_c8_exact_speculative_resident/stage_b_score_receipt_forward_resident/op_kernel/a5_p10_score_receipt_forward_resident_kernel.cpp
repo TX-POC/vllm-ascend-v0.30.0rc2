@@ -78,113 +78,64 @@ struct StageBWave {
   uint32_t failure_reason;
 };
 
-// KVAF Begin mutates a dense transaction while it builds and rings a WQE.
-// Keep that mutation in a function-local ordinary AICore record, then copy
-// its scalar state into the longer-lived Stage-B wave only after PostOnly has
-// unequivocally succeeded.  In particular, do not pass a nested member of
-// the executor object through the large inline Begin closure: some 950DT
-// compiler schedules lost the failure-side writeback of that nested object
-// on a second wave.  This is a representation boundary only; it neither
-// changes the descriptor, queue lease, resident row, nor the CQ lifecycle.
-__aicore__ inline void MaterializeForwardResidentWaveForDrain(
-    StageBWave* destination,
-    const kvaf_forward_resident_get::KvafForwardResidentBatchGetWave* source) {
-  if (destination == nullptr || source == nullptr) {
-    return;
+// HCCP PostOnly must not write a large dense transaction through this C8
+// executor.  On 950DT that compound out-parameter can lose a nested writeback
+// after the doorbell, leaving neither an explicit failure reason nor a CQ
+// drain record.  KVAF now exposes a scalar Begin status; on success the exact
+// GM descriptor that KVAF already published is reloaded into a small drain
+// record below.  This changes representation only: queue lease, descriptor,
+// resident row, and CQ lifecycle remain the verified KVAF protocol.
+__aicore__ inline uint32_t BeginFailureReasonFromKvafStatus(uint32_t status) {
+  switch (status) {
+    case kvaf_forward_resident_get::kForwardResidentBeginInvalidArgs:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_ARGS;
+    case kvaf_forward_resident_get::kForwardResidentBeginInvalidEntity:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_ENTITY;
+    case kvaf_forward_resident_get::kForwardResidentBeginInvalidQueue:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_QUEUE;
+    case kvaf_forward_resident_get::kForwardResidentBeginInvalidLookup:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_LOOKUP;
+    case kvaf_forward_resident_get::kForwardResidentBeginQueueFull:
+      return A5_P10_STAGE_B_POST_BEGIN_QUEUE_FULL;
+    case kvaf_forward_resident_get::kForwardResidentBeginInvalidOutput:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_OUTPUT;
+    case kvaf_forward_resident_get::kForwardResidentBeginStateIdle:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_IDLE;
+    case kvaf_forward_resident_get::kForwardResidentBeginStateRetired:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_RETIRED;
+    case kvaf_forward_resident_get::kForwardResidentBeginStateFailedSuccess:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_FAILED_SUCCESS;
+    case kvaf_forward_resident_get::kForwardResidentBeginStateUnknown:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_UNKNOWN;
+    case kvaf_forward_resident_get::kForwardResidentBeginResultUnknown:
+    default:
+      return A5_P10_STAGE_B_POST_BEGIN_RESULT_UNKNOWN;
   }
-  destination->kvaf_wave.lease.queue_id = source->lease.queue_id;
-  destination->kvaf_wave.lease.owner_tag = source->lease.owner_tag;
-  destination->kvaf_wave.lease.state = source->lease.state;
-  destination->kvaf_wave.lease.reserved0 = source->lease.reserved0;
-
-  destination->kvaf_wave.queue_args.address_table =
-      source->queue_args.address_table;
-  destination->kvaf_wave.queue_args.valid_table = source->queue_args.valid_table;
-  destination->kvaf_wave.queue_args.indices = source->queue_args.indices;
-  destination->kvaf_wave.queue_args.offsets = source->queue_args.offsets;
-  destination->kvaf_wave.queue_args.mask = source->queue_args.mask;
-  destination->kvaf_wave.queue_args.output_indices =
-      source->queue_args.output_indices;
-  destination->kvaf_wave.queue_args.output = source->queue_args.output;
-  destination->kvaf_wave.queue_args.core_status = source->queue_args.core_status;
-  destination->kvaf_wave.queue_args.channel_entity =
-      source->queue_args.channel_entity;
-  destination->kvaf_wave.queue_args.queue_state = source->queue_args.queue_state;
-  destination->kvaf_wave.queue_args.table_capacity =
-      source->queue_args.table_capacity;
-  destination->kvaf_wave.queue_args.request_capacity =
-      source->queue_args.request_capacity;
-  destination->kvaf_wave.queue_args.output_rows = source->queue_args.output_rows;
-  destination->kvaf_wave.queue_args.block_bytes = source->queue_args.block_bytes;
-  destination->kvaf_wave.queue_args.block_count = source->queue_args.block_count;
-  destination->kvaf_wave.queue_args.jettys_per_core =
-      source->queue_args.jettys_per_core;
-
-  destination->kvaf_wave.transaction.active_count =
-      source->transaction.active_count;
-  destination->kvaf_wave.transaction.total_posts = source->transaction.total_posts;
-  destination->kvaf_wave.transaction.failed_request =
-      source->transaction.failed_request;
-  destination->kvaf_wave.transaction.last_wqe = source->transaction.last_wqe;
-  destination->kvaf_wave.transaction.first_doorbell_cycle =
-      source->transaction.first_doorbell_cycle;
-  destination->kvaf_wave.transaction.profile_start_cycle =
-      source->transaction.profile_start_cycle;
-  destination->kvaf_wave.transaction.profile_setup_done_cycle =
-      source->transaction.profile_setup_done_cycle;
-  destination->kvaf_wave.transaction.profile_compact_done_cycle =
-      source->transaction.profile_compact_done_cycle;
-  destination->kvaf_wave.transaction.profile_post_done_cycle =
-      source->transaction.profile_post_done_cycle;
-  destination->kvaf_wave.transaction.profile_completion_done_cycle =
-      source->transaction.profile_completion_done_cycle;
-  destination->kvaf_wave.transaction.result = source->transaction.result;
-  destination->kvaf_wave.transaction.completion_polls =
-      source->transaction.completion_polls;
-  destination->kvaf_wave.transaction.state = source->transaction.state;
-  destination->kvaf_wave.transaction.profile_enabled =
-      source->transaction.profile_enabled;
-  destination->kvaf_wave.transaction.finalized = source->transaction.finalized;
 }
 
-__aicore__ inline uint32_t BeginFailureReasonFromKvafTransaction(
-    uint64_t result, uint32_t state) {
-  switch (result) {
-    case kvaf_fused_get::kInvalidArgs:
-      return A5_P10_STAGE_B_POST_BEGIN_INVALID_ARGS;
-    case kvaf_fused_get::kInvalidEntity:
-      return A5_P10_STAGE_B_POST_BEGIN_INVALID_ENTITY;
-    case kvaf_fused_get::kInvalidQueue:
-      return A5_P10_STAGE_B_POST_BEGIN_INVALID_QUEUE;
-    case kvaf_fused_get::kInvalidLookup:
-      return A5_P10_STAGE_B_POST_BEGIN_INVALID_LOOKUP;
-    case kvaf_fused_get::kQueueFull:
-      return A5_P10_STAGE_B_POST_BEGIN_QUEUE_FULL;
-    case kvaf_fused_get::kInvalidOutput:
-      return A5_P10_STAGE_B_POST_BEGIN_INVALID_OUTPUT;
-    default:
-      break;
+__aicore__ inline bool RehydrateForwardResidentWaveForDrain(
+    __gm__ const KvafForwardResidentBatchGetControl* control_gm,
+    __ubuf__ kvaf_forward_resident_get::KvafForwardResidentQueueLeaseResult*
+        lease_result,
+    uint32_t expected_active_request_count, StageBWave* wave) {
+  if (control_gm == nullptr || lease_result == nullptr || wave == nullptr ||
+      expected_active_request_count == 0U || lease_result->success == 0U ||
+      lease_result->owner_tag <= 0) {
+    return false;
   }
-  // All legal non-success dense Begin results are handled above.  A success
-  // result is valid only with IN_FLIGHT, and in that case the KVAF wrapper
-  // itself must return true.  Keep each contradictory state distinct so one
-  // target run identifies whether the return/value boundary or the dense
-  // transaction publication is at fault.
-  if (result != kvaf_fused_get::kSuccess) {
-    return A5_P10_STAGE_B_POST_BEGIN_RESULT_UNKNOWN;
+  kvaf_forward_resident_get::KvafForwardResidentBatchGetControl control{};
+  if (!kvaf_forward_resident_get::LoadKvafForwardResidentBatchGetControlFromGmForAicore(
+          control_gm, &control)) {
+    return false;
   }
-  switch (state) {
-    case kvaf_fused_get::kDenseBatchGetIdle:
-      return A5_P10_STAGE_B_POST_BEGIN_STATE_IDLE;
-    case kvaf_fused_get::kDenseBatchGetRetired:
-      return A5_P10_STAGE_B_POST_BEGIN_STATE_RETIRED;
-    case kvaf_fused_get::kDenseBatchGetFailed:
-      return A5_P10_STAGE_B_POST_BEGIN_STATE_FAILED_SUCCESS;
-    case kvaf_fused_get::kDenseBatchGetInFlight:
-      return A5_P10_STAGE_B_POST_BEGIN_STATE_IN_FLIGHT;
-    default:
-      return A5_P10_STAGE_B_POST_BEGIN_STATE_UNKNOWN;
-  }
+  kvaf_forward_resident_get::KvafForwardResidentQueueLease lease{};
+  lease.queue_id = lease_result->queue_id;
+  lease.owner_tag = lease_result->owner_tag;
+  lease.state = kvaf_forward_resident_get::kForwardResidentQueueHeld;
+  lease.reserved0 = 0U;
+  return kvaf_forward_resident_get::
+      InitializeKvafForwardResidentPostedWaveForDrain(
+          control, lease, expected_active_request_count, &wave->kvaf_wave);
 }
 
 __aicore__ inline uint32_t CqFailureReasonFromKvafResult(uint64_t result) {
@@ -453,7 +404,8 @@ __aicore__ inline bool LoadReceiptDescriptor(
 // construction.  Keeping every failure-side observable in a scalar return
 // value makes the Begin boundary independent of the longer-lived executor
 // object's address-space representation.  Zero means that PostOnly has
-// completed and the caller may materialize its persistent CQ-drain wave.
+// completed; StartMicrobatch rehydrates its persistent CQ-drain wave from the
+// descriptor that KVAF already published.
 __aicore__ inline uint32_t BeginForwardResidentMicrobatch(
     __gm__ const KvafForwardResidentBatchGetControl* control_gm,
     uint32_t producer_id, uint32_t queue_hint,
@@ -461,11 +413,10 @@ __aicore__ inline uint32_t BeginForwardResidentMicrobatch(
     uint32_t rows_per_object,
     __ubuf__ kvaf_forward_resident_get::KvafForwardResidentQueueLeaseResult*
         lease_result,
-    event_t simt_event,
-    kvaf_forward_resident_get::KvafForwardResidentBatchGetWave* begin_wave) {
+    event_t simt_event) {
   if (control_gm == nullptr || seeds == nullptr || seed_count == 0U ||
       seed_count > A5_P10_STAGE_B_MICROBATCH_CAPACITY ||
-      rows_per_object == 0U || lease_result == nullptr || begin_wave == nullptr) {
+      rows_per_object == 0U || lease_result == nullptr) {
     return A5_P10_STAGE_B_POST_INVALID_CALL;
   }
 
@@ -503,27 +454,22 @@ __aicore__ inline uint32_t BeginForwardResidentMicrobatch(
         control_gm, lease_result, simt_event, &lease);
     return A5_P10_STAGE_B_POST_DESCRIPTOR_BUILD;
   }
-  if (!kvaf_forward_resident_get::BeginKvafForwardResidentBatchGet(
-          control, lease, descriptor, begin_wave)) {
-    const uint32_t begin_reason = BeginFailureReasonFromKvafTransaction(
-        begin_wave->transaction.result, begin_wave->transaction.state);
-    // The only locally provable no-Post result is an explicit dense FAILED
-    // transaction.  Any other false return is internally contradictory
-    // (including success+IDLE); it may be a compiler/address-space failure
-    // after a doorbell.  Do not turn that ambiguity into a queue reuse race.
-    // The enclosing target process preserves Direct-HCCP diagnostics on a
-    // failed forward, so retaining the lease is both safe and observable.
-    if (begin_wave->lease.state ==
-            kvaf_forward_resident_get::kForwardResidentQueueTerminal &&
-        begin_wave->transaction.state ==
-            kvaf_fused_get::kDenseBatchGetFailed) {
-      kvaf_forward_resident_get::KvafForwardResidentBatchGetTerminal terminal{};
-      (void)kvaf_forward_resident_get::FinishKvafForwardResidentBatchGet(
-          begin_wave, &terminal);
-      (void)kvaf_forward_resident_get::ReturnKvafForwardResidentQueueFromAicore(
-          control_gm, lease_result, simt_event, begin_wave);
+  const uint32_t begin_status =
+      kvaf_forward_resident_get::BeginKvafForwardResidentBatchGetPostOnly(
+          control, lease, descriptor);
+  if (begin_status !=
+      kvaf_forward_resident_get::kForwardResidentBeginPosted) {
+    // Known dense validation failures are provably pre-doorbell and may
+    // return the held lease.  Unknown scalar status means the compiler/hot
+    // path could not prove whether the doorbell happened: preserve the lease
+    // and fail closed instead of introducing an HCCP queue-reuse race.
+    if (kvaf_forward_resident_get::KvafForwardResidentBeginHasNoPost(
+            begin_status)) {
+      (void)kvaf_forward_resident_get::
+          ReturnKvafForwardResidentUnpostedQueueFromAicore(
+              control_gm, lease_result, simt_event, &lease);
     }
-    return begin_reason;
+    return BeginFailureReasonFromKvafStatus(begin_status);
   }
   return 0U;
 }
@@ -1014,18 +960,14 @@ class A5P10ScoreReceiptForwardResidentKernel {
     return kNoBuffer;
   }
 
-  __aicore__ inline bool StartMicrobatch(
-      uint32_t buffer_index, uint32_t seed_count,
-      uint32_t* failure_reason = nullptr) {
-    if (failure_reason != nullptr) {
-      *failure_reason = 0U;
-    }
+  // Return a scalar post result.  Do not use an AICore pointer out-parameter
+  // for failure evidence: it was the final opaque writeback edge that could
+  // erase a valid KVAF Begin diagnostic on a later final-recall wave.
+  __aicore__ inline uint32_t StartMicrobatch(
+      uint32_t buffer_index, uint32_t seed_count) {
     if (buffer_index >= A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY ||
         seed_count == 0U || seed_count > A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
-      if (failure_reason != nullptr) {
-        *failure_reason = A5_P10_STAGE_B_POST_INVALID_CALL;
-      }
-      return false;
+      return A5_P10_STAGE_B_POST_INVALID_CALL;
     }
     uint32_t wave_index = FindFreeWave();
     if (wave_index == kNoBuffer) {
@@ -1033,10 +975,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
       wave_index = FindFreeWave();
     }
     if (wave_index == kNoBuffer) {
-      if (failure_reason != nullptr) {
-        *failure_reason = A5_P10_STAGE_B_POST_NO_FREE_WAVE;
-      }
-      return false;
+      return A5_P10_STAGE_B_POST_NO_FREE_WAVE;
     }
     StageBWave* wave = waves_ + wave_index;
     wave->buffer_index = buffer_index;
@@ -1044,21 +983,21 @@ class A5P10ScoreReceiptForwardResidentKernel {
     wave->seed_count = 0U;
     wave->seeds = nullptr;
     wave->failure_reason = 0U;
-    // The large KVAF closure writes only this ordinary local record.  The
-    // scalar return is the sole failure path.  Persistent StageBWave state is
-    // materialized below only after PostOnly reports success, so a compiler
-    // writeback anomaly cannot manufacture BEGIN_UNKNOWN on a later wave.
-    kvaf_forward_resident_get::KvafForwardResidentBatchGetWave begin_wave{};
+    // PostOnly returns one scalar status.  It cannot mutate a caller-owned
+    // wave; only after that scalar proves POSTED do we reload the published
+    // descriptor into this persistent CQ-drain record.
     const uint32_t begin_reason = BeginForwardResidentMicrobatch(
             controlGm_, worker_, worker_ + buffer_index, localSeeds_[buffer_index],
-            seed_count, rowsPerObject_, leaseResult_, simtEvent_, &begin_wave);
+            seed_count, rowsPerObject_, leaseResult_, simtEvent_);
     if (begin_reason != 0U) {
-      if (failure_reason != nullptr) {
-        *failure_reason = begin_reason;
-      }
-      return false;
+      return begin_reason;
     }
-    MaterializeForwardResidentWaveForDrain(wave, &begin_wave);
+    if (!RehydrateForwardResidentWaveForDrain(
+            controlGm_, leaseResult_, seed_count, wave)) {
+      // PostOnly is already durable here.  Do not release this lease from an
+      // unproven state; preserve the failed forward's Direct-HCCP evidence.
+      return A5_P10_STAGE_B_POST_BEGIN_REHYDRATE;
+    }
     wave->seeds = localSeeds_[buffer_index];
     wave->seed_count = seed_count;
     wave->posted = 1U;
@@ -1076,7 +1015,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     DataSyncBarrier<MemDsbT::DDR>();
     seedBufferBusy_[buffer_index] = true;
-    return true;
+    return 0U;
   }
 
   __aicore__ inline void FlushSpeculativeSeeds(
@@ -1278,13 +1217,15 @@ class A5P10ScoreReceiptForwardResidentKernel {
           localSeeds_[buffer_index][0].source = seed.source;
           localSeeds_[buffer_index][0].kv_object = seed.kv_object;
           localSeeds_[buffer_index][0].resident_slot = seed.resident_slot;
-          uint32_t post_failure_reason = 0U;
-          if (!StartMicrobatch(buffer_index, 1U, &post_failure_reason) &&
-              post_failure_reason != 0U) {
+          const uint32_t post_failure_reason =
+              StartMicrobatch(buffer_index, 1U);
+          if (post_failure_reason != 0U && last_failure_reason == 0U) {
             last_failure_reason = post_failure_reason;
           }
         } else {
-          last_failure_reason = A5_P10_STAGE_B_POST_NO_FREE_WAVE;
+          if (last_failure_reason == 0U) {
+            last_failure_reason = A5_P10_STAGE_B_POST_NO_FREE_WAVE;
+          }
         }
       }
       // This is terminal-only progress; score scanning never waits for CQ.
@@ -1300,7 +1241,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
       if (local_terminal_ready) {
         return true;
       }
-      if (drain_failure_reason != 0U) {
+      if (drain_failure_reason != 0U && last_failure_reason == 0U) {
         last_failure_reason = drain_failure_reason;
       }
     }

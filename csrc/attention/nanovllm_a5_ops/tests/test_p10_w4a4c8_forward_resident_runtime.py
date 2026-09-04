@@ -1013,6 +1013,7 @@ _STAGE_B_POST_DETAIL_NAMES = {
     21: "begin_state_in_flight_returned_false",
     22: "begin_state_unknown",
     23: "begin_result_unknown",
+    24: "begin_rehydrate",
 }
 
 

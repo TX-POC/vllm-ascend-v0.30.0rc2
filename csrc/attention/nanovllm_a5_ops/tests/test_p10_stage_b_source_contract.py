@@ -129,7 +129,8 @@ class P10StageBSourceContractTest(unittest.TestCase):
     def test_transport_uses_only_the_verified_forward_resident_abi(self):
         for name in (
             "P10_STAGE_B_KVAF_FORWARD_RESIDENT_DEVICE_HEADER",
-            "BeginKvafForwardResidentBatchGet",
+            "BeginKvafForwardResidentBatchGetPostOnly",
+            "InitializeKvafForwardResidentPostedWaveForDrain",
             "TryRetireKvafForwardResidentBatchGet",
             "FinishKvafForwardResidentBatchGet",
             "TryAcquireKvafForwardResidentQueueFromAicore",
@@ -142,44 +143,32 @@ class P10StageBSourceContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, self.kernel)
 
-    def test_begin_returns_only_a_scalar_diagnostic_before_wave_materialization(self):
-        """Keep all StageBWave mutation outside the large inline Begin closure.
+    def test_begin_returns_scalar_status_then_rehydrates_published_wave(self):
+        """The PostOnly closure cannot mutate a caller-owned transaction.
 
-        A successful PostOnly transaction is copied into the persistent wave
-        only in StartMicrobatch.  An unsuccessful Begin returns its exact
-        scalar reason directly to the caller; neither its error nor its local
-        KVAF record depends on a writeback to a nested executor member.
+        A successful scalar Begin is followed by a small published-descriptor
+        rehydration step.  A failed Begin remains scalar all the way through
+        final recall, so neither a pointer out-param nor a copied dense wave
+        can silently erase the actual reason.
         """
         begin = self.kernel.split("BeginForwardResidentMicrobatch(", 1)[1].split(
             "// One TryRetire poll", 1
         )[0]
         self.assertIn("inline uint32_t BeginForwardResidentMicrobatch", self.kernel)
-        self.assertIn("KvafForwardResidentBatchGetWave* begin_wave", begin)
-        self.assertIn("return begin_reason;", begin)
+        self.assertIn("BeginKvafForwardResidentBatchGetPostOnly", begin)
+        self.assertIn("BeginFailureReasonFromKvafStatus", begin)
         self.assertNotIn("StageBWave* output", begin)
         self.assertNotIn("output->", begin)
-        self.assertNotIn("descriptor, &output->kvaf_wave", self.kernel)
+        self.assertNotIn("KvafForwardResidentBatchGetWave* begin_wave", begin)
+        self.assertNotIn("BeginKvafForwardResidentBatchGet(", self.kernel)
 
-        self.assertIn("KvafForwardResidentBatchGetWave begin_wave{}", self.kernel)
         self.assertIn("const uint32_t begin_reason = BeginForwardResidentMicrobatch(", self.kernel)
-        self.assertIn("*failure_reason = begin_reason;", self.kernel)
-        self.assertIn(
-            "MaterializeForwardResidentWaveForDrain(wave, &begin_wave)",
-            self.kernel,
-        )
+        self.assertIn("inline uint32_t StartMicrobatch", self.kernel)
+        self.assertNotIn("uint32_t* failure_reason", self.kernel)
+        self.assertIn("RehydrateForwardResidentWaveForDrain(", self.kernel)
+        self.assertIn("InitializeKvafForwardResidentPostedWaveForDrain", self.kernel)
+        self.assertIn("A5_P10_STAGE_B_POST_BEGIN_REHYDRATE", self.abi)
         self.assertIn("wave->posted = 1U;", self.kernel)
-
-        materialize = self.kernel.split(
-            "MaterializeForwardResidentWaveForDrain("
-        )[1].split("BeginFailureReasonFromKvafTransaction(")[0]
-        self.assertNotIn("= *source", materialize)
-        for field in (
-            "lease.queue_id", "queue_args.address_table",
-            "queue_args.output", "transaction.active_count",
-            "transaction.result", "transaction.state",
-            "transaction.finalized",
-        ):
-            self.assertIn(field, materialize)
 
     def test_slots_are_fixed_bands_not_queue_private_or_recycled(self):
         self.assertIn("A5P10ResidentSlotBand", self.abi)
@@ -329,7 +318,8 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "DRAIN", "FINALIZE_DETAIL_BASE", "FINALIZE_FINAL_QSFA",
             "POST_DETAIL_BASE", "POST_BEGIN_INVALID_ARGS", "CQ_PENDING",
             "POST_BEGIN_STATE_IDLE", "POST_BEGIN_RESULT_UNKNOWN",
-            "BeginFailureReasonFromKvafTransaction", "CqFailureReasonFromKvafResult",
+            "POST_BEGIN_REHYDRATE", "BeginFailureReasonFromKvafStatus",
+            "CqFailureReasonFromKvafResult",
             "PostDiagnostic", "failure_reason", "FinalizeDiagnostic",
             "RecordFirstFailure", "MarkRunning",
         ):
