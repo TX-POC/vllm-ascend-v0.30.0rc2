@@ -335,6 +335,24 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("does not retry/recycle a slot", self.kernel)
         self.assertIn("if (!ResolveConcurrentForwardSlot", self.kernel)
 
+    def test_object_claim_is_published_before_the_source_cache(self):
+        """A positive source entry is a release of its authoritative object map."""
+
+        object_commit = self.kernel.index(
+            "asc_atomic_cas(kv_object_to_forward_slot + object_offset,\n"
+            "                     A5_P10_STAGE_B_CLAIMING_SLOT, selected)"
+        )
+        source_publish = self.kernel.index(
+            "asc_atomic_cas(source_to_forward_slot + source_offset,\n"
+            "                       A5_P10_STAGE_B_CLAIMING_SLOT, selected)"
+        )
+        release_fence = self.kernel.index(
+            "AscendC::Simt::ThreadFence();", object_commit
+        )
+        self.assertLess(object_commit, release_fence)
+        self.assertLess(release_fence, source_publish)
+        self.assertIn("object map is authoritative", self.kernel)
+
     def test_aicore_metadata_access_respects_cann_address_spaces(self):
         """Prevent a recurrence of the Stage-B-only 950DT compile failure.
 

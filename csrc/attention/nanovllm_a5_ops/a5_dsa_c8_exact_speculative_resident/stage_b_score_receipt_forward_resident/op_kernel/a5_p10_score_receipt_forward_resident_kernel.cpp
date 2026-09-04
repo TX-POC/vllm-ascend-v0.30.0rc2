@@ -353,7 +353,6 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
   // cache line which races the later AICore bypass publication of IN_FLIGHT
   // or READY.  The claim CASes below are the durable admission transition;
   // the AICore PostOnly boundary publishes IN_FLIGHT.
-  AscendC::Simt::ThreadFence();
   if (asc_atomic_cas(kv_object_to_forward_slot + object_offset,
                      A5_P10_STAGE_B_CLAIMING_SLOT, selected) !=
       A5_P10_STAGE_B_CLAIMING_SLOT) {
@@ -362,6 +361,13 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
                          A5_P10_STAGE_B_UNMAPPED_SLOT);
     return;
   }
+  // The object map is authoritative and the source map is only its fast
+  // cache.  Publish the former before making the latter readable.  A fence
+  // before the object CAS does not establish that release ordering: a
+  // finalizer can otherwise observe source=selected while a bypass read of
+  // the object map still returns the prior EMPTY value.  This is one SIMT
+  // publication fence per successful admission, not a worker rendezvous.
+  AscendC::Simt::ThreadFence();
   (void)asc_atomic_cas(source_to_forward_slot + source_offset,
                        A5_P10_STAGE_B_CLAIMING_SLOT, selected);
   result->resident_slot = selected;
