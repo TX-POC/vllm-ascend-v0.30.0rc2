@@ -128,9 +128,16 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "resident_row_to_qsfa_slot is not a nonidentity permutation",
             "torch.unique(translation)",
             "P10_RUNTIME_PASS",
+            "P10_BOOTSTRAP_ROUNDTRIP_PASS ",
         ):
             self.assertIn(token, self.fixture)
-        self.assertNotIn("runtime.batch_get(", self.fixture)
+        # The sole ordinary BatchGet is a cold source-visibility gate before
+        # Layer-resident binding.  It must never become a timed fallback.
+        self.assertEqual(self.fixture.count("self.runtime.batch_get("), 1)
+        self.assertLess(
+            self.fixture.rindex("self._prove_bootstrap_direct_hccp_payload("),
+            self.fixture.index("self.runtime.bind_layer_resident_batch_get_control("),
+        )
         self.assertNotIn("P8_", self.fixture)
         self.assertNotIn("P9_", self.fixture)
 
@@ -154,7 +161,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "p10_w4a4c8_forward_resident_overlap",
         ):
             self.assertIn(token, self.fixture)
-        self.assertNotIn("runtime.batch_get(", self.fixture)
+        self.assertEqual(self.fixture.count("self.runtime.batch_get("), 1)
 
     def test_graph_benchmark_replays_the_same_product_route_against_eager_serial(self) -> None:
         """Raw ACLGraph timing is replay-only and cannot hide a second ABI."""
@@ -176,7 +183,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.fixture)
         self.assertIn("graph_benchmark", self.runner)
-        self.assertNotIn("runtime.batch_get(", self.fixture)
+        self.assertEqual(self.fixture.count("self.runtime.batch_get("), 1)
 
     def test_graph_compatible_b16_profile_is_the_only_large_direct_hccp_measurement(self) -> None:
         """The requested capacity case must not be mislabeled raw ACLGraph."""
@@ -200,7 +207,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.fixture)
         self.assertIn("graph_compatible_benchmark", self.runner)
-        self.assertNotIn("runtime.batch_get(", self.fixture)
+        self.assertEqual(self.fixture.count("self.runtime.batch_get("), 1)
 
     def test_b16_bootstrap_bounds_only_the_pre_timing_batch_put_wave(self) -> None:
         """Large cold loading must not consume the eager AIV CQ budget at once.
@@ -217,6 +224,9 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "P10_BOOTSTRAP_PUT_CONFIG ",
             "P10_BOOTSTRAP_PUT_PASS ",
             "P10_BOOTSTRAP_PUT_FAIL ",
+            "P10_BOOTSTRAP_SOURCE_READY ",
+            "P10_BOOTSTRAP_ROUNDTRIP_PASS ",
+            "P10_BOOTSTRAP_ROUNDTRIP_FAIL ",
             "keys[start:stop]",
             "offsets[start:stop]",
             "lengths[start:stop]",
@@ -226,6 +236,10 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertLess(
             self.fixture.index("P10_BOOTSTRAP_PUT_PASS "),
             self.fixture.index("self.table = self.runtime.prepare_access_table(keys)"),
+        )
+        self.assertLess(
+            self.fixture.rindex("self._prove_bootstrap_direct_hccp_payload("),
+            self.fixture.index("self.runtime.bind_layer_resident_batch_get_control("),
         )
 
     def test_b16_residency_mask_is_cpu_constructed_before_the_npu_upload(self) -> None:

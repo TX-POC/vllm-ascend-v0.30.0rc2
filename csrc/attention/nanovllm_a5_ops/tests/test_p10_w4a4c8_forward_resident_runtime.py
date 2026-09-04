@@ -398,6 +398,7 @@ class _ForwardResidentKvaf:
         required = (
             "initialize",
             "batch_put",
+            "batch_get",
             "prepare_access_table",
             "access_table_view",
             "bind_layer_resident_batch_get_control",
@@ -426,6 +427,18 @@ class _ForwardResidentKvaf:
 
         self.runtime.initialize(self.entries * ENTRY_BYTES, ENTRY_BYTES)
         source = self.data.to(self.device).reshape(-1).contiguous()
+        # ``source`` is the local-HBM producer for the cold Direct-HCCP Put
+        # bootstrap.  The transfer is intentionally outside every P10 timing
+        # interval, so make the producer/consumer boundary explicit instead
+        # of relying on an implicit interaction between torch's current
+        # stream and the eager KVAF stream resolver.
+        torch.npu.synchronize()
+        print(
+            "P10_BOOTSTRAP_SOURCE_READY "
+            f"bytes={source.numel()} producer=cpu_to_npu current_stream_drained=1 "
+            "timed_interval=excluded",
+            flush=True,
+        )
         keys = list(range(1, self.entries + 1))
         offsets = [index * ENTRY_BYTES for index in range(self.entries)]
         lengths = [ENTRY_BYTES] * self.entries
@@ -486,6 +499,14 @@ class _ForwardResidentKvaf:
             self.table, device="npu", capacity=self.entries
         )
         torch.npu.synchronize()
+        # This is a cold data-plane gate, not a host Get fallback.  It
+        # validates the exact KVAF table, source DDR objects, Direct-HCCP Get
+        # kernel and 656-B packed-row ABI before Layer-resident binding
+        # forbids ordinary eager Gets.  Therefore an all-zero Stage-B result
+        # can be classified immediately as either a Put/DDR baseline fault
+        # or a Stage-B-only descriptor/executor fault; no benchmark result is
+        # accepted on an unproven source payload.
+        self._prove_bootstrap_direct_hccp_payload(access, torch.npu.current_stream())
 
         resident_payload = torch.zeros(
             (RESIDENT_ROWS, PACKED_KV_ROW_BYTES),
@@ -550,6 +571,88 @@ class _ForwardResidentKvaf:
             flush=True,
         )
         return resident_payload, control, leases
+
+    def _prove_bootstrap_direct_hccp_payload(self, access: Any, stream: Any) -> None:
+        """Fail closed unless two cold direct reads match the packed witness.
+
+        The selected rows exercise both the first packed object and the
+        interior byte offset used by the observed P10 failure (source 240 is
+        object 1, offset 112 * 656).  This submission is complete before
+        Layer-resident control is bound, uses the ordinary KVAF Direct-HCCP
+        ABI once, and writes only a disposable two-row output tensor.
+        """
+
+        import torch
+
+        probe_sources = (0, min(240, SOURCE_TOKENS - 1))
+        probe_indices = torch.tensor(
+            [source // BLOCK_TOKENS for source in probe_sources],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        probe_offsets = torch.tensor(
+            [(source % BLOCK_TOKENS) * PACKED_KV_ROW_BYTES for source in probe_sources],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        probe_mask = torch.ones(len(probe_sources), dtype=torch.uint8, device=self.device)
+        probe_output_indices = torch.arange(
+            len(probe_sources), dtype=torch.int32, device=self.device
+        )
+        probe_output = torch.zeros(
+            (len(probe_sources), PACKED_KV_ROW_BYTES),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        try:
+            self.runtime.batch_get(
+                access,
+                probe_indices,
+                probe_offsets,
+                probe_mask,
+                probe_output_indices,
+                probe_output,
+                stream=stream,
+                synchronize=True,
+            )
+            torch.npu.synchronize()
+        except Exception as error:  # noqa: BLE001
+            print(
+                "P10_BOOTSTRAP_ROUNDTRIP_FAIL "
+                f"stage=submit type={type(error).__name__} text={error}",
+                flush=True,
+            )
+            raise
+
+        for output_row, source in enumerate(probe_sources):
+            actual = probe_output[output_row].detach().cpu().contiguous()
+            expected = self.expected_row(0, source).detach().cpu().contiguous()
+            if not torch.equal(actual, expected):
+                mismatch = torch.nonzero(actual != expected, as_tuple=False)
+                first_byte = int(mismatch[0].item()) if mismatch.numel() else -1
+                print(
+                    "P10_BOOTSTRAP_ROUNDTRIP_FAIL "
+                    f"stage=payload row=0 source={source} "
+                    f"table_index={source // BLOCK_TOKENS} "
+                    f"byte_offset={(source % BLOCK_TOKENS) * PACKED_KV_ROW_BYTES} "
+                    f"actual_sha16={_sha16(actual)} expected_sha16={_sha16(expected)} "
+                    f"mismatch_bytes={int(torch.count_nonzero(actual != expected).item())} "
+                    f"first_byte={first_byte} "
+                    f"actual_first16={actual[:16].tolist()} "
+                    f"expected_first16={expected[:16].tolist()} "
+                    f"all_zero={bool(torch.count_nonzero(actual).item() == 0)}",
+                    flush=True,
+                )
+                raise AssertionError(
+                    "P10 cold KVAF Direct-HCCP roundtrip mismatch: "
+                    f"source={source}"
+                )
+        print(
+            "P10_BOOTSTRAP_ROUNDTRIP_PASS "
+            f"probes={len(probe_sources)} sources={','.join(map(str, probe_sources))} "
+            f"bytes={probe_output.numel()} timed_interval=excluded",
+            flush=True,
+        )
 
     def expected_row(self, row: int, source: int) -> Any:
         if row < 0 or row >= BATCH:
