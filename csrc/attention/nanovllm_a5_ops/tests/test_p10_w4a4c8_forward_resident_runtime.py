@@ -1245,9 +1245,12 @@ def _assert_terminal(
                         f"miss_slot_range:row={row}:rank={rank}:source={source}:slot={slot}"
                     )
                     break
-                if int(object_to_slot[row, source]) != slot:
+                object_slot = int(object_to_slot[row, source])
+                if object_slot != slot:
                     mismatches.append(
-                        f"object_dedup:row={row}:rank={rank}:source={source}:slot={slot}"
+                        "object_dedup:"
+                        f"row={row}:rank={rank}:source={source}:"
+                        f"source_slot={slot}:object_slot={object_slot}"
                     )
                     break
                 if int(ready[slot]) != 2:

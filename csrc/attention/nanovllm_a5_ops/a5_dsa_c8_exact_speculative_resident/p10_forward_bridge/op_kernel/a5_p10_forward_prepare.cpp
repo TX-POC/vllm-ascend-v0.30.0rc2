@@ -117,4 +117,15 @@ extern "C" __global__ __aicore__ void a5_p10_forward_prepare(
         forward_control_gm.SetValue(
             A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD, 0);
     }
+
+    // This is a per-core publication boundary, not a cross-core rendezvous.
+    // Prepare resets the maps/READY table with ordinary AIV stores, while
+    // Stage B subsequently consumes them through bypass loads and SIMT CAS.
+    // The graph event orders the two kernels, but does not by itself flush a
+    // producer AIV's dirty DCache lines to DDR.  Without this boundary a late
+    // Prepare write can erase one half of a source/object claim after Stage B
+    // has atomically published it.  Every participating core must publish its
+    // own FillShard writes; SyncAll would be both unnecessary and invalid for
+    // this independently sharded reset.
+    DataSyncBarrier<MemDsbT::DDR>();
 }

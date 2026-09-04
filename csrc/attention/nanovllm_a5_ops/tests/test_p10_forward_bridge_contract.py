@@ -89,6 +89,7 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             "speculative_slot_cursor_gm.SetValue(0U, 0)",
             "A5_P10_FORWARD_PREPARE_PRODUCER_SEAL_SEQUENCE_WORD, 0",
             "A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD, 0",
+            "DataSyncBarrier<MemDsbT::DDR>()",
         ):
             self.assertIn(token, self.prepare_kernel)
         for forbidden in (
@@ -98,6 +99,20 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
             "attention_slots",
         ):
             self.assertNotIn(forbidden, self.prepare_kernel)
+
+    def test_prepare_publishes_all_sharded_reset_writes_before_stage_b_can_bypass_read(self) -> None:
+        """A graph event orders kernels; this DSB publishes each AIV's shard."""
+
+        publish = "DataSyncBarrier<MemDsbT::DDR>();"
+        self.assertEqual(self.prepare_kernel.count(publish), 1)
+        self.assertGreater(
+            self.prepare_kernel.rfind(publish),
+            self.prepare_kernel.rfind(
+                "A5_P10_FORWARD_PREPARE_FIRST_PRESEAL_READY_CLAIM_WORD, 0"
+            ),
+        )
+        self.assertIn("per-core publication boundary", self.prepare_kernel)
+        self.assertNotIn("SyncAll(", self.prepare_kernel)
 
     def test_no_fixed_physical_core_model_enters_the_forward_bridge(self) -> None:
         combined = "\n".join((self.prepare_definition, self.prepare_kernel, self.bridge, self.graph))
