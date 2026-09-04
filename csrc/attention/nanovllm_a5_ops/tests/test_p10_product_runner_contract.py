@@ -228,6 +228,27 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.fixture.index("self.table = self.runtime.prepare_access_table(keys)"),
         )
 
+    def test_b16_residency_mask_is_cpu_constructed_before_the_npu_upload(self) -> None:
+        """Fixture-only mask construction must not invoke a large NPU int kernel.
+
+        Its bit pattern remains the same deterministic row/source formula;
+        only the placement of untimed metadata construction changes.
+        """
+
+        for token in (
+            "miss_mask_cpu = ",
+            "object_snapshot_cpu.masked_fill_(miss_mask_cpu, -1)",
+            "miss_mask = miss_mask_cpu.to(device=device).contiguous()",
+            "object_snapshot = object_snapshot_cpu.to(device=device).contiguous()",
+            "P10_RESIDENCY_MASK_READY ",
+            "construction=cpu upload=npu",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertNotIn(
+            "source_ids = torch.arange(SOURCE_TOKENS, dtype=torch.int32, device=device)",
+            self.fixture,
+        )
+
     def test_benchmark_hashes_fp8_storage_without_a_numpy_float8_conversion(self) -> None:
         """The input-immutability gate must work for the real FP8 Q/K ABI."""
 

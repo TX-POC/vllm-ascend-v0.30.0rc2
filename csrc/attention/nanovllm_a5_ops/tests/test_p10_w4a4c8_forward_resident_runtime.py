@@ -607,18 +607,31 @@ def _build_forward_inputs(
     # receipt scanning skips HCCP for it.  Final hit sources receive unique
     # slots below after the native W4A4C8 oracle is known; non-final hits use
     # slot zero only as a compact fixture witness and are never read by QSFA.
-    source_ids = torch.arange(SOURCE_TOKENS, dtype=torch.int32, device=device)
-    row_ids = torch.arange(BATCH, dtype=torch.int32, device=device).reshape(-1, 1)
+    # This is fixed fixture metadata, not P10 data-plane work.  Keep its
+    # deterministic integer expression on CPU and upload the resulting
+    # immutable mask once.  The A5 vector implementation of this particular
+    # large int32 broadcast/remainder expression has raised a device 334
+    # before any P10 operator runs; moving the pre-timing construction to CPU
+    # avoids that unrelated provider kernel without changing a single mask
+    # bit, source-object identity, or timed operation.
+    source_ids = torch.arange(SOURCE_TOKENS, dtype=torch.int32)
+    row_ids = torch.arange(BATCH, dtype=torch.int32).reshape(-1, 1)
     if KV_MISS_NUMERATOR == KV_MISS_DENOMINATOR:
-        miss_mask = torch.ones((BATCH, SOURCE_TOKENS), dtype=torch.bool, device=device)
+        miss_mask_cpu = torch.ones((BATCH, SOURCE_TOKENS), dtype=torch.bool)
     else:
-        miss_mask = (
+        miss_mask_cpu = (
             (source_ids.reshape(1, -1) + row_ids * 7) % KV_MISS_DENOMINATOR
         ) < KV_MISS_NUMERATOR
-    object_snapshot = torch.where(
-        miss_mask,
-        torch.full((BATCH, SOURCE_TOKENS), -1, dtype=torch.int32, device=device),
-        torch.zeros((BATCH, SOURCE_TOKENS), dtype=torch.int32, device=device),
+    object_snapshot_cpu = torch.zeros((BATCH, SOURCE_TOKENS), dtype=torch.int32)
+    object_snapshot_cpu.masked_fill_(miss_mask_cpu, -1)
+    miss_mask = miss_mask_cpu.to(device=device).contiguous()
+    object_snapshot = object_snapshot_cpu.to(device=device).contiguous()
+    torch.npu.synchronize()
+    print(
+        "P10_RESIDENCY_MASK_READY "
+        f"construction=cpu upload=npu misses={int(miss_mask_cpu.sum().item())} "
+        f"total={BATCH * SOURCE_TOKENS}",
+        flush=True,
     )
     # Object ownership is pool-major, just like ``object_snapshot``.  This
     # was accidentally B=1-shaped in the original fixture; Stage B indexes it
