@@ -174,6 +174,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             'package_root="${package_parent}/p10_v${P10_VLLM_EXPECTED_SHA:0:12}_k${P10_KVAF_EXPECTED_SHA:0:12}"',
             'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PACKAGE_PARENT',
             'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PRODUCT_PACKAGE_ROOT',
+            'P10_ASSEMBLY_INVALID_PACKAGE_POLICY=quarantine',
             'kvaf_build="${kvaf_root}/build-p10-v${P10_VLLM_EXPECTED_SHA:0:12}-k${P10_KVAF_EXPECTED_SHA:0:12}"',
             'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_KVAF_BUILD',
         ):

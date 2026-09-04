@@ -279,6 +279,10 @@ class P10BuildAssemblyContractTest(unittest.TestCase):
                 "P10_BUILD_EXPECTED_KVAF_SHA": kvaf_sha,
                 "P10_BUILD_MODE": "stage",
                 "P10_BUILD_PACKAGE_PARENT": str(package_parent),
+                # The runner must not inherit an interactive shell's stricter
+                # policy.  A partial SHA-keyed package is quarantined and then
+                # rebuilt; failing before that recovery is not a product path.
+                "P10_ASSEMBLY_INVALID_PACKAGE_POLICY": "quarantine",
                 "SOC_VERSION": "",
             })
             first = subprocess.run(

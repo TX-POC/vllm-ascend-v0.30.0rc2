@@ -261,6 +261,7 @@ P10_BUILD_PYTHON="${python_bin}" \
 P10_BUILD_PACKAGE_PARENT="${package_parent}" \
 P10_BUILD_PACKAGE_ROOT="${package_root}" \
 P10_BUILD_JOBS="${build_jobs}" \
+P10_ASSEMBLY_INVALID_PACKAGE_POLICY=quarantine \
 bash "${assembly}"
 printf 'P10_RUNNER_STEP label=combined_product_opp status=0 package=%s\n' "${package_root}"
 
