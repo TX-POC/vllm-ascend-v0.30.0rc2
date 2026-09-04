@@ -202,6 +202,32 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertIn("graph_compatible_benchmark", self.runner)
         self.assertNotIn("runtime.batch_get(", self.fixture)
 
+    def test_b16_bootstrap_bounds_only_the_pre_timing_batch_put_wave(self) -> None:
+        """Large cold loading must not consume the eager AIV CQ budget at once.
+
+        This guard deliberately concerns fixture setup rather than the P10
+        forward.  It preserves one source allocation and the original global
+        object offsets, while every timed serial/overlap invocation remains
+        device-side Stage B Direct-HCCP.
+        """
+
+        for token in (
+            '"P10_BOOTSTRAP_PUT_ROWS", MAX_REQUESTS_PER_WAVE',
+            "invalid_p10_bootstrap_put_rows:",
+            "P10_BOOTSTRAP_PUT_CONFIG ",
+            "P10_BOOTSTRAP_PUT_PASS ",
+            "P10_BOOTSTRAP_PUT_FAIL ",
+            "keys[start:stop]",
+            "offsets[start:stop]",
+            "lengths[start:stop]",
+            "timed_interval=excluded",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertLess(
+            self.fixture.index("P10_BOOTSTRAP_PUT_PASS "),
+            self.fixture.index("self.table = self.runtime.prepare_access_table(keys)"),
+        )
+
     def test_benchmark_hashes_fp8_storage_without_a_numpy_float8_conversion(self) -> None:
         """The input-immutability gate must work for the real FP8 Q/K ABI."""
 

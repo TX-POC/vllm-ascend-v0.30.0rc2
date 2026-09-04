@@ -402,11 +402,58 @@ class _ForwardResidentKvaf:
         self.runtime.initialize(self.entries * ENTRY_BYTES, ENTRY_BYTES)
         source = self.data.to(self.device).reshape(-1).contiguous()
         keys = list(range(1, self.entries + 1))
-        self.runtime.batch_put(
-            keys,
-            source,
-            [index * ENTRY_BYTES for index in range(self.entries)],
-            [ENTRY_BYTES] * self.entries,
+        offsets = [index * ENTRY_BYTES for index in range(self.entries)]
+        lengths = [ENTRY_BYTES] * self.entries
+
+        # BatchPut is a cold fixture bootstrap, before either serial or
+        # overlap timing starts.  The eager AIV BatchPut ABI has one terminal
+        # CQ wait per invocation.  Submitting all B16/S128K blocks in a single
+        # 1.281-GiB wave makes that terminal wait exceed its bounded device
+        # polling window even though every descriptor is valid.  Keep every
+        # source byte, key, offset and destination identical, but bound each
+        # pre-timing transport wave to the known single-wave fixture capacity.
+        # This is deliberately not a host-side Get fallback and is outside
+        # the measured P10 forward interval.
+        bootstrap_rows = _positive_environment_int(
+            "P10_BOOTSTRAP_PUT_ROWS", MAX_REQUESTS_PER_WAVE
+        )
+        if bootstrap_rows > MAX_REQUESTS_PER_WAVE:
+            _blocked(
+                "invalid_p10_bootstrap_put_rows:"
+                f"{bootstrap_rows}; max={MAX_REQUESTS_PER_WAVE}"
+            )
+        bootstrap_waves = math.ceil(self.entries / bootstrap_rows)
+        print(
+            "P10_BOOTSTRAP_PUT_CONFIG "
+            f"entries={self.entries} entry_bytes={ENTRY_BYTES} "
+            f"rows_per_wave={bootstrap_rows} waves={bootstrap_waves} "
+            f"timed_interval=excluded",
+            flush=True,
+        )
+        for start in range(0, self.entries, bootstrap_rows):
+            stop = min(start + bootstrap_rows, self.entries)
+            wave = start // bootstrap_rows + 1
+            try:
+                self.runtime.batch_put(
+                    keys[start:stop],
+                    source,
+                    offsets[start:stop],
+                    lengths[start:stop],
+                )
+            except Exception as error:  # noqa: BLE001
+                print(
+                    "P10_BOOTSTRAP_PUT_FAIL "
+                    f"wave={wave}/{bootstrap_waves} entry_begin={start} "
+                    f"entry_end={stop} bytes={(stop - start) * ENTRY_BYTES} "
+                    f"type={type(error).__name__} text={error}",
+                    flush=True,
+                )
+                raise
+        print(
+            "P10_BOOTSTRAP_PUT_PASS "
+            f"waves={bootstrap_waves} entries={self.entries} "
+            f"bytes={self.entries * ENTRY_BYTES}",
+            flush=True,
         )
         torch.npu.synchronize()
         self.table = self.runtime.prepare_access_table(keys)
