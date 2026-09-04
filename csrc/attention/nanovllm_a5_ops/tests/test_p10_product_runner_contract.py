@@ -276,6 +276,22 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         )
         self.assertNotIn("miss_mask.gather(1, ranked_sources)", self.fixture)
 
+    def test_tnd_query_lengths_are_cumulative_and_reference_indices_fail_closed(self) -> None:
+        """Batched W4A4C8 must use the product TND cumulative-length ABI."""
+
+        for token in (
+            "actual_query = torch.arange(",
+            "1, BATCH + 1, dtype=torch.int32, device=device",
+            "product W4A4C8 Top-K source index outside the logical row",
+            "invalid = (topk_cpu < 0) | (topk_cpu >= SOURCE_TOKENS)",
+            "Do not clamp or",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertNotIn(
+            "actual_query = torch.ones(BATCH, dtype=torch.int32, device=device)",
+            self.fixture,
+        )
+
     def test_benchmark_hashes_fp8_storage_without_a_numpy_float8_conversion(self) -> None:
         """The input-immutability gate must work for the real FP8 Q/K ABI."""
 

@@ -256,7 +256,14 @@ def _build_w4a4c8_inputs(device: Any) -> dict[str, Any]:
     weights = torch.empty(
         (BATCH, INDEX_HEADS), dtype=torch.bfloat16, device=device
     ).uniform_(0.01, 1.0).contiguous()
-    actual_query = torch.ones(BATCH, dtype=torch.int32, device=device)
+    # ``layout_query=TND`` consumes cumulative query lengths, not one
+    # per-row length.  B=1 accidentally makes both encodings identical, but
+    # a B16 tensor with sixteen ``1`` values is non-monotonic and leaves the
+    # product W4A4C8 frontend free to produce invalid source indices.  The
+    # fixture has exactly one query token per request, hence [1, 2, ..., B].
+    actual_query = torch.arange(
+        1, BATCH + 1, dtype=torch.int32, device=device
+    )
     candidate_lens = torch.full(
         (BATCH,), SOURCE_TOKENS, dtype=torch.int32, device=device
     )
@@ -310,10 +317,28 @@ def _reference_w4a4c8(inputs: dict[str, Any]) -> Any:
             f"shape={tuple(topk.shape)} expected={BATCH * TOPK}"
         )
     topk = topk.reshape(BATCH, 1, TOPK).contiguous()
+    # This is a fail-closed product-ABI gate, deliberately before Direct-HCCP
+    # setup.  A corrupt W4A4C8 reference must never be allowed to turn into a
+    # later fixture gather fault or an invalid descriptor.  Do not clamp or
+    # otherwise repair indices here: P10 mathematical equivalence requires
+    # the product frontend itself to return valid source coordinates.
+    topk_cpu = topk.detach().cpu()
+    invalid = (topk_cpu < 0) | (topk_cpu >= SOURCE_TOKENS)
+    invalid_count = int(torch.count_nonzero(invalid).item())
+    if invalid_count:
+        first = torch.nonzero(invalid, as_tuple=False)[0].tolist()
+        first_value = int(topk_cpu[tuple(first)].item())
+        raise RuntimeError(
+            "product W4A4C8 Top-K source index outside the logical row: "
+            f"invalid={invalid_count} first_coord={first} first_value={first_value} "
+            f"allowed=[0,{SOURCE_TOKENS}) min={int(topk_cpu.min().item())} "
+            f"max={int(topk_cpu.max().item())}"
+        )
     print(
         "P10_RUNTIME_REFERENCE "
         f"product=torch_npu.npu_quant_lightning_indexer "
-        f"sparse_sha16={_sha16(topk)} dtype={topk.dtype}",
+        f"sparse_sha16={_sha16(topk)} dtype={topk.dtype} "
+        f"source_range=[{int(topk_cpu.min().item())},{int(topk_cpu.max().item())}]",
         flush=True,
     )
     return topk
