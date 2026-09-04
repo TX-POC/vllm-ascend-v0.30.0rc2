@@ -7,10 +7,13 @@ through its forward bridge, then waits only in this validation process after
 the Stage-B -> QSFA event has been inserted.  The product graph itself has no
 Python candidate loop, host Get submit, or physical-core assignment.
 
-The fixture uses a single active W4A4C8 row and 4,096 source tokens.  This is
-deliberately larger than Top-K: the run must perform a real ordered selection,
-then prove that speculative candidates and final guaranteed recall leave every
-one of the 2,048 true winners in a fixed resident row before QSFA proceeds.
+The default fixture uses a single active W4A4C8 row and 4,096 source tokens.
+``P10_BENCH_PROFILE=b16_s128k_miss5`` selects the capacity profile used for
+the graph-compatible latency comparison: 16 rows, 128 Ki source tokens per
+row, and a deterministic five-percent KV-residency miss mask.  It is not a
+different algorithm or a host-Get baseline; the same native W4A4C8 inputs,
+Direct-HCCP Stage-B operator, final recall, and QSFA boundary are used for
+both serial and overlapping schedules.
 """
 
 from __future__ import annotations
@@ -27,23 +30,54 @@ import traceback
 from typing import Any
 
 
-BATCH = 1
+P10_BENCH_PROFILE = os.environ.get("P10_BENCH_PROFILE", "acceptance")
+
+# The capacity profile deliberately uses an all-source miss mask rather than
+# marking a hand-picked subset of final winners as misses.  Thus Stage B sees
+# the same pre-existing residency decision while it scans receipts as it sees
+# during exact Top-K recall.  1/20 is 5% up to the unavoidable final partial
+# group of a 128 Ki row.
+if P10_BENCH_PROFILE == "acceptance":
+    BATCH = 1
+    SOURCE_TOKENS = 4096
+    KV_MISS_DENOMINATOR = 1
+    KV_MISS_NUMERATOR = 1
+elif P10_BENCH_PROFILE == "b16_s128k_miss5":
+    BATCH = 16
+    SOURCE_TOKENS = 131072
+    KV_MISS_DENOMINATOR = 20
+    KV_MISS_NUMERATOR = 1
+else:
+    raise RuntimeError(
+        "unsupported P10_BENCH_PROFILE:"
+        f"{P10_BENCH_PROFILE}; expected acceptance or b16_s128k_miss5"
+    )
+
 INDEX_HEADS = 64
 KEY_HEADS = 1
 HEAD_DIM = 128
 BLOCK_TOKENS = 128
-SOURCE_TOKENS = 4096
 TOPK = 2048
 PACKED_KV_ROW_BYTES = 656
 ENTRY_BYTES = BLOCK_TOKENS * PACKED_KV_ROW_BYTES
-QUEUE_COUNT = 1
+QUEUE_COUNT = int(os.environ.get("P10_BENCH_QUEUE_COUNT", "1"))
 RECEIPT_WORDS = 5
 SPECULATIVE_ROWS = 64
-RESIDENT_ROWS = SPECULATIVE_ROWS + BATCH * TOPK
+RECALL_ROWS = BATCH * TOPK
+PERSISTENT_BASE = SPECULATIVE_ROWS + RECALL_ROWS
+# The acceptance profile has no preloaded hits.  The B16 profile reserves a
+# distinct persistent band for the actual final hit payloads so that hits can
+# never collide with Direct-HCCP speculative/recall rows.
+PERSISTENT_ROWS = RECALL_ROWS if KV_MISS_NUMERATOR < KV_MISS_DENOMINATOR else 0
+RESIDENT_ROWS = PERSISTENT_BASE + PERSISTENT_ROWS
 ATTENTION_TAIL = 8
 ATTENTION_WIDTH = TOPK + ATTENTION_TAIL
 CONTROL_WORDS = 10
 MAX_REQUESTS_PER_WAVE = 64
+EXECUTOR_WORKERS = int(
+    os.environ.get("P10_BENCH_EXECUTOR_WORKERS", str(min(BATCH, 8)))
+)
+EXECUTOR_WORKER_LIMIT = int(os.environ.get("P10_BENCH_EXECUTOR_WORKER_LIMIT", "16"))
 
 
 class P10Blocked(RuntimeError):
@@ -203,13 +237,17 @@ def _build_w4a4c8_inputs(device: Any) -> dict[str, Any]:
     import torch
 
     blocks = SOURCE_TOKENS // BLOCK_TOKENS
+    # Every active row owns a distinct physical block range.  Reusing one
+    # range for every B row would make the Direct-HCCP S->O map look
+    # multi-row while W4A4C8 still reads a single-row physical cache.
+    physical_blocks = BATCH * blocks
     torch.manual_seed(20260903)
     torch.npu.manual_seed_all(20260903)
     query_bf16 = torch.empty(
         (BATCH, INDEX_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device
     ).uniform_(-1.0, 1.0)
     key_bf16 = torch.empty(
-        (blocks, BLOCK_TOKENS, KEY_HEADS, HEAD_DIM),
+        (physical_blocks, BLOCK_TOKENS, KEY_HEADS, HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
     ).uniform_(-1.0, 1.0)
@@ -222,9 +260,9 @@ def _build_w4a4c8_inputs(device: Any) -> dict[str, Any]:
     candidate_lens = torch.full(
         (BATCH,), SOURCE_TOKENS, dtype=torch.int32, device=device
     )
-    # Ascending blocks keep the test's S -> O token witness directly visible.
+    # ``row * blocks + block`` matches Stage-B's pool-major KVAF object map.
     block_table = torch.arange(
-        blocks, dtype=torch.int32, device=device
+        physical_blocks, dtype=torch.int32, device=device
     ).reshape(BATCH, blocks)
     return {
         "query": query,
@@ -282,11 +320,23 @@ def _reference_w4a4c8(inputs: dict[str, Any]) -> Any:
 
 
 def _payload(entries: int) -> Any:
+    """Build the local-DDR witness without an enormous int64 broadcast temp.
+
+    B16/S128K has 16,384 packed KV blocks (about 1.28 GiB).  The original
+    expression first formed an eleven-GiB int64 tensor.  This preserves the
+    exact byte formula while bounding the largest temporary to about 22 MiB.
+    """
+
     import torch
 
-    entry = torch.arange(entries, dtype=torch.int64).reshape(entries, 1)
-    byte = torch.arange(ENTRY_BYTES, dtype=torch.int64).reshape(1, ENTRY_BYTES)
-    return ((entry * 29 + byte * 7 + (entry >> 2) + 17) & 0xFF).to(torch.uint8)
+    payload = torch.empty((entries, ENTRY_BYTES), dtype=torch.uint8)
+    byte = torch.arange(ENTRY_BYTES, dtype=torch.int32).reshape(1, ENTRY_BYTES)
+    for start in range(0, entries, 64):
+        stop = min(entries, start + 64)
+        entry = torch.arange(start, stop, dtype=torch.int32).reshape(-1, 1)
+        values = (entry * 29 + byte * 7 + (entry >> 2) + 17) & 0xFF
+        payload[start:stop].copy_(values.to(torch.uint8))
+    return payload
 
 
 class _ForwardResidentKvaf:
@@ -311,7 +361,8 @@ class _ForwardResidentKvaf:
                 f"module={module_path} expected_root={expected_build / 'python'}"
             ) from error
         self.device = device
-        self.entries = SOURCE_TOKENS // BLOCK_TOKENS
+        self.blocks = SOURCE_TOKENS // BLOCK_TOKENS
+        self.entries = BATCH * self.blocks
         self.runtime = self.kvaf.NpuRuntime(
             str(_require_file("P10_KVAF_BATCH_GET_KERNEL")),
             0,
@@ -343,6 +394,7 @@ class _ForwardResidentKvaf:
         self.resident_payload: Any | None = None
         self.control: Any | None = None
         self.leases: Any | None = None
+        self.residency_stats: dict[str, int] = {}
 
     def bind(self) -> tuple[Any, Any, Any]:
         import torch
@@ -420,16 +472,20 @@ class _ForwardResidentKvaf:
         self.leases = leases
         print(
             "P10_RUNTIME_HCCP_BIND "
-            f"entries={self.entries} queues={QUEUE_COUNT} resident_rows={RESIDENT_ROWS} "
+            f"entries={self.entries} blocks_per_row={self.blocks} queues={QUEUE_COUNT} "
+            f"resident_rows={RESIDENT_ROWS} source_gib={self.entries * ENTRY_BYTES / (1 << 30):.3f} "
             f"control_magic={words[0]} diagnostic={self.runtime.layer_resident_batch_get_control_diagnostic()}",
             flush=True,
         )
         return resident_payload, control, leases
 
-    def expected_row(self, source: int) -> Any:
+    def expected_row(self, row: int, source: int) -> Any:
+        if row < 0 or row >= BATCH:
+            raise AssertionError(f"row outside KVAF direct table: {row}")
         if source < 0 or source >= SOURCE_TOKENS:
             raise AssertionError(f"source outside KVAF direct table: {source}")
-        return self.data[source // BLOCK_TOKENS].reshape(
+        entry = row * self.blocks + source // BLOCK_TOKENS
+        return self.data[entry].reshape(
             BLOCK_TOKENS, PACKED_KV_ROW_BYTES
         )[source % BLOCK_TOKENS]
 
@@ -492,13 +548,37 @@ def _build_forward_inputs(
         dtype=torch.int32,
         device=device,
     )
-    active_pool = torch.zeros(BATCH, dtype=torch.int32, device=device)
-    object_map = torch.arange(SOURCE_TOKENS, dtype=torch.int32, device=device).reshape(1, -1)
-    object_snapshot = torch.full(
-        (1, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
+    # One pool entry per logical row.  Stage B checks this exact pool-major
+    # object identity before it can form a Direct-HCCP descriptor.
+    active_pool = torch.arange(BATCH, dtype=torch.int32, device=device)
+    object_map = torch.arange(
+        BATCH * SOURCE_TOKENS, dtype=torch.int32, device=device
+    ).reshape(BATCH, SOURCE_TOKENS)
+
+    # This is a real all-source residency mask, not a post-Top-K miss list.
+    # A nonnegative snapshot value means that source is already resident, so
+    # receipt scanning skips HCCP for it.  Final hit sources receive unique
+    # slots below after the native W4A4C8 oracle is known; non-final hits use
+    # slot zero only as a compact fixture witness and are never read by QSFA.
+    source_ids = torch.arange(SOURCE_TOKENS, dtype=torch.int32, device=device)
+    row_ids = torch.arange(BATCH, dtype=torch.int32, device=device).reshape(-1, 1)
+    if KV_MISS_NUMERATOR == KV_MISS_DENOMINATOR:
+        miss_mask = torch.ones((BATCH, SOURCE_TOKENS), dtype=torch.bool, device=device)
+    else:
+        miss_mask = (
+            (source_ids.reshape(1, -1) + row_ids * 7) % KV_MISS_DENOMINATOR
+        ) < KV_MISS_NUMERATOR
+    object_snapshot = torch.where(
+        miss_mask,
+        torch.full((BATCH, SOURCE_TOKENS), -1, dtype=torch.int32, device=device),
+        torch.zeros((BATCH, SOURCE_TOKENS), dtype=torch.int32, device=device),
     )
+    # Object ownership is pool-major, just like ``object_snapshot``.  This
+    # was accidentally B=1-shaped in the original fixture; Stage B indexes it
+    # as ``pool * sourceCapacity + source``, so a B16 case would otherwise
+    # read/write beyond the alias for every row after row zero.
     object_to_slot = torch.full(
-        (1, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
+        (BATCH, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
     )
     source_to_slot = torch.full(
         (BATCH, SOURCE_TOKENS), -1, dtype=torch.int32, device=device
@@ -513,12 +593,9 @@ def _build_forward_inputs(
     resident_ready = torch.zeros(RESIDENT_ROWS, dtype=torch.int32, device=device)
     # A nonidentity bijection proves Stage B translates physical resident rows
     # into downstream QSFA slots instead of treating them as interchangeable.
-    # 5 is coprime with RESIDENT_ROWS (= 2112), so this is a real nonidentity
-    # permutation.  A multiplier of 3 would silently alias three resident
-    # rows onto each logical QSFA slot and make the integration fixture weaker
-    # than the production mapping contract it is meant to prove.
+    # 7 remains coprime for both the small and B16 resident-row capacities.
     resident_to_qsfa = (
-        torch.arange(RESIDENT_ROWS, dtype=torch.int32, device=device) * 5
+        torch.arange(RESIDENT_ROWS, dtype=torch.int32, device=device) * 7
     ) % RESIDENT_ROWS
     attention_slots = torch.full(
         (BATCH, 1, ATTENTION_WIDTH), -77, dtype=torch.int32, device=device
@@ -553,8 +630,8 @@ def _build_forward_inputs(
         selected_slot_lengths_buffer=selected_lengths,
         num_layers=1,
         layer_id=0,
-        executor_worker_count=1,
-        executor_worker_limit=2,
+        executor_worker_count=EXECUTOR_WORKERS,
+        executor_worker_limit=EXECUTOR_WORKER_LIMIT,
         receipt_poll_quantum=1,
         bounded_drain_polls=4096,
     )
@@ -563,8 +640,10 @@ def _build_forward_inputs(
         "canonical_lens": canonical_lens,
         "receipt_state": receipt_state,
         "forward_control": forward_control,
+        "object_snapshot": object_snapshot,
         "object_to_slot": object_to_slot,
         "source_to_slot": source_to_slot,
+        "miss_mask": miss_mask,
         "speculative_cursor": speculative_cursor,
         "resident_ready": resident_ready,
         "resident_to_qsfa": resident_to_qsfa,
@@ -572,6 +651,79 @@ def _build_forward_inputs(
         "selected_lengths": selected_lengths,
     }
     return inputs, tensors
+
+
+def _install_final_hit_payloads(
+    reference: Any, fixture: _ForwardResidentKvaf, tensors: dict[str, Any]
+) -> None:
+    """Materialize only already-resident final KV rows for the test fixture.
+
+    The resident/miss decision itself was made for *every* source token in
+    :func:`_build_forward_inputs`, before P10 starts.  The native W4A4C8 oracle
+    is used here only to give the final resident hits distinct payload rows so
+    that QSFA can validate their bytes.  It does not alter the miss mask,
+    candidate admission, score surface, or canonical Top-K output.
+    """
+
+    import torch
+
+    snapshot = tensors["object_snapshot"]
+    miss_mask = tensors["miss_mask"]
+    if fixture.resident_payload is None:
+        raise AssertionError("resident payload is not cold-bound")
+
+    ranked_sources = reference.reshape(BATCH, TOPK).to(dtype=torch.int64)
+    final_miss = miss_mask.gather(1, ranked_sources)
+    final_hit = ~final_miss
+    final_miss_count = int(torch.count_nonzero(final_miss).item())
+    final_hit_count = int(torch.count_nonzero(final_hit).item())
+    source_miss_count = int(torch.count_nonzero(miss_mask).item())
+
+    if final_hit_count:
+        if PERSISTENT_ROWS < BATCH * TOPK:
+            raise AssertionError("profile has final hits but no persistent slot band")
+        rows = torch.arange(BATCH, dtype=torch.int64, device=reference.device).reshape(-1, 1)
+        ranks = torch.arange(TOPK, dtype=torch.int64, device=reference.device).reshape(1, -1)
+        persistent_slots = PERSISTENT_BASE + rows * TOPK + ranks
+        snapshot.scatter_(
+            1,
+            ranked_sources,
+            torch.where(final_hit, persistent_slots.to(torch.int32), -torch.ones_like(persistent_slots, dtype=torch.int32)),
+        )
+
+        # Gather the fixed resident-hit rows from the same local DDR witness
+        # that Direct-HCCP reads for misses.  This setup is complete before
+        # the timer starts and corresponds to pre-existing HBM cache content.
+        row_cpu = rows.expand(BATCH, TOPK)[final_hit].to(device="cpu")
+        source_cpu = ranked_sources[final_hit].to(device="cpu")
+        entry_cpu = row_cpu * fixture.blocks + source_cpu // BLOCK_TOKENS
+        token_cpu = source_cpu % BLOCK_TOKENS
+        source_rows = fixture.data.reshape(
+            fixture.entries, BLOCK_TOKENS, PACKED_KV_ROW_BYTES
+        )[entry_cpu, token_cpu].contiguous()
+        slot_device = persistent_slots[final_hit].to(dtype=torch.int64)
+        fixture.resident_payload.index_copy_(0, slot_device, source_rows.to(fixture.device))
+
+    # The all-miss acceptance profile has no persistent rows and therefore
+    # must never accidentally acquire a synthetic hit.
+    if PERSISTENT_ROWS == 0 and final_hit_count:
+        raise AssertionError("all-miss profile unexpectedly contains a hit")
+    torch.npu.synchronize()
+    fixture.residency_stats = {
+        "source_miss_count": source_miss_count,
+        "source_total": BATCH * SOURCE_TOKENS,
+        "final_miss_count": final_miss_count,
+        "final_hit_count": final_hit_count,
+    }
+    print(
+        "P10_RUNTIME_RESIDENCY "
+        f"profile={P10_BENCH_PROFILE} source_misses={source_miss_count} "
+        f"source_total={BATCH * SOURCE_TOKENS} "
+        f"source_miss_pct={100.0 * source_miss_count / (BATCH * SOURCE_TOKENS):.4f} "
+        f"final_winner_misses={final_miss_count} final_winner_hits={final_hit_count} "
+        f"persistent_base={PERSISTENT_BASE} persistent_rows={PERSISTENT_ROWS}",
+        flush=True,
+    )
 
 
 _STAGE_B_DIAGNOSTIC_NAMES = {
@@ -618,6 +770,7 @@ def _emit_terminal_diagnostic(
     canonical_sparse = tensors["canonical_sparse"].detach().cpu()
     source_slots = tensors["source_to_slot"].detach().cpu()
     object_slots = tensors["object_to_slot"].detach().cpu()
+    object_snapshot = tensors["object_snapshot"].detach().cpu()
     ready = tensors["resident_ready"].detach().cpu()
     cursor = tensors["speculative_cursor"].detach().cpu()
     attention = tensors["attention_slots"].detach().cpu()
@@ -642,8 +795,13 @@ def _emit_terminal_diagnostic(
                 else -999
             )
             object_slot = (
-                int(object_slots[0, source].item())
+                int(object_slots[row, source].item())
                 if 0 <= source < object_slots.size(1)
+                else -999
+            )
+            persistent_slot = (
+                int(object_snapshot[row, source].item())
+                if 0 <= source < object_snapshot.size(1)
                 else -999
             )
             resident_state = (
@@ -660,7 +818,7 @@ def _emit_terminal_diagnostic(
             detail = (
                 f"reason={_STAGE_B_FINALIZE_DETAIL_NAMES.get(reason, 'unknown')} "
                 f"row={row} rank={rank} source={source} source_slot={source_slot} "
-                f"object_slot={object_slot} resident_state={resident_state} "
+                f"object_slot={object_slot} persistent_slot={persistent_slot} resident_state={resident_state} "
                 f"qsfa_value={qsfa_value} attention_value={attention_value}"
             )
         else:
@@ -708,7 +866,7 @@ def _assert_terminal(
             f"reference_sha16={_sha16(expected)} actual_sha16={_sha16(actual)} mismatch={mismatch}"
         )
     actual_lens = tensors["canonical_lens"].detach().cpu()
-    if actual_lens.tolist() != [SOURCE_TOKENS]:
+    if actual_lens.tolist() != [SOURCE_TOKENS] * BATCH:
         raise AssertionError(f"canonical score-source lengths mismatch: {actual_lens.tolist()}")
     forward = tensors["forward_control"].detach().cpu().tolist()
     if int(forward[5]) != 1:
@@ -716,13 +874,21 @@ def _assert_terminal(
         raise AssertionError(f"Stage B did not reach forward COMPLETE: control={forward}")
     states = tensors["receipt_state"].detach().cpu()
     if int(torch.count_nonzero(states != 4).item()) != 0:
-        raise AssertionError(f"not every produced receipt reached DONE: states={states.tolist()}")
+        raise AssertionError(
+            "not every produced receipt reached DONE: "
+            f"free={int(torch.count_nonzero(states == 0).item())} "
+            f"filling={int(torch.count_nonzero(states == 1).item())} "
+            f"ready={int(torch.count_nonzero(states == 2).item())} "
+            f"claimed={int(torch.count_nonzero(states == 3).item())} "
+            f"done={int(torch.count_nonzero(states == 4).item())}"
+        )
     leases = fixture.leases.detach().cpu()
     if int(torch.count_nonzero(leases).item()) != 0:
         raise AssertionError(f"Direct-HCCP queue lease leaked: {leases.tolist()}")
 
     source_to_slot = tensors["source_to_slot"].detach().cpu()
     object_to_slot = tensors["object_to_slot"].detach().cpu()
+    object_snapshot = tensors["object_snapshot"].detach().cpu()
     ready = tensors["resident_ready"].detach().cpu()
     translation = tensors["resident_to_qsfa"].detach().cpu()
     if int(torch.unique(translation).numel()) != RESIDENT_ROWS or torch.equal(
@@ -734,67 +900,106 @@ def _assert_terminal(
     attention = aliases.attention_slots.detach().cpu()
     lengths = aliases.resident_seq_lengths.detach().cpu()
     payload = fixture.resident_payload.detach().cpu()
-    if lengths.tolist() != [ATTENTION_WIDTH]:
+    if lengths.tolist() != [ATTENTION_WIDTH] * BATCH:
         raise AssertionError(f"QSFA selected length/tail contract broke: {lengths.tolist()}")
-    if not torch.equal(attention[0, 0, TOPK:], torch.full((ATTENTION_TAIL,), -77, dtype=torch.int32)):
+    if not torch.equal(
+        attention[:, 0, TOPK:],
+        torch.full((BATCH, ATTENTION_TAIL), -77, dtype=torch.int32),
+    ):
         raise AssertionError("Stage B modified caller-owned QSFA tail")
 
     mismatches: list[str] = []
     used_slots: set[int] = set()
     ranked_payload = hashlib.sha256()
-    for rank, source_value in enumerate(expected.reshape(-1).tolist()):
-        source = int(source_value)
-        slot = int(source_to_slot[0, source])
-        if slot < 0 or slot >= RESIDENT_ROWS:
-            mismatches.append(f"slot_range:rank={rank}:source={source}:slot={slot}")
-            break
-        if int(object_to_slot[0, source]) != slot:
-            mismatches.append(f"object_dedup:rank={rank}:source={source}:slot={slot}")
-            break
-        if int(ready[slot]) != 2:
-            mismatches.append(f"not_ready:rank={rank}:source={source}:slot={slot}:state={int(ready[slot])}")
-            break
-        if int(attention[0, 0, rank]) != int(translation[slot]):
-            mismatches.append(f"qsfa_translation:rank={rank}:slot={slot}")
-            break
-        if not torch.equal(payload[slot], fixture.expected_row(source)):
-            # One bounded CPU-side diagnostic after the product graph has
-            # completed.  It adds no device synchronization or work and
-            # distinguishes a bad WQE offset, a stale source row, and an
-            # inbound-DMA/cache-visibility failure in one rerun.
-            actual_payload = payload[slot].contiguous()
-            expected_payload = fixture.expected_row(source).contiguous()
-            byte_diff = actual_payload != expected_payload
-            first_byte = int(torch.nonzero(byte_diff, as_tuple=False)[0].item())
-            candidate_match = {
-                candidate: int(
-                    torch.equal(actual_payload, fixture.expected_row(candidate))
+    final_miss_count = 0
+    final_hit_count = 0
+    for row in range(BATCH):
+        for rank, source_value in enumerate(expected[row, 0].tolist()):
+            source = int(source_value)
+            persistent_slot = int(object_snapshot[row, source])
+            if persistent_slot >= 0:
+                final_hit_count += 1
+                slot = persistent_slot
+                if slot < PERSISTENT_BASE or slot >= RESIDENT_ROWS:
+                    mismatches.append(
+                        f"persistent_slot_range:row={row}:rank={rank}:source={source}:slot={slot}"
+                    )
+                    break
+            else:
+                final_miss_count += 1
+                slot = int(source_to_slot[row, source])
+                if slot < 0 or slot >= PERSISTENT_BASE:
+                    mismatches.append(
+                        f"miss_slot_range:row={row}:rank={rank}:source={source}:slot={slot}"
+                    )
+                    break
+                if int(object_to_slot[row, source]) != slot:
+                    mismatches.append(
+                        f"object_dedup:row={row}:rank={rank}:source={source}:slot={slot}"
+                    )
+                    break
+                if int(ready[slot]) != 2:
+                    mismatches.append(
+                        f"not_ready:row={row}:rank={rank}:source={source}:slot={slot}:state={int(ready[slot])}"
+                    )
+                    break
+            if int(attention[row, 0, rank]) != int(translation[slot]):
+                mismatches.append(f"qsfa_translation:row={row}:rank={rank}:slot={slot}")
+                break
+            if not torch.equal(payload[slot], fixture.expected_row(row, source)):
+                # One bounded CPU-side diagnostic after the product graph has
+                # completed.  It adds no device synchronization or work and
+                # distinguishes a bad WQE offset, a stale source row, and an
+                # inbound-DMA/cache-visibility failure in one rerun.
+                actual_payload = payload[slot].contiguous()
+                expected_payload = fixture.expected_row(row, source).contiguous()
+                byte_diff = actual_payload != expected_payload
+                first_byte = int(torch.nonzero(byte_diff, as_tuple=False)[0].item())
+                candidate_match = {
+                    candidate: int(
+                        torch.equal(actual_payload, fixture.expected_row(row, candidate))
+                    )
+                    for candidate in (0, 1, 2)
+                }
+                print(
+                    "P10_RUNTIME_PAYLOAD_DIAG "
+                    f"row={row} rank={rank} source={source} slot={slot} "
+                    f"actual_sha16={_sha16(actual_payload)} "
+                    f"expected_sha16={_sha16(expected_payload)} "
+                    f"mismatch_bytes={int(torch.count_nonzero(byte_diff).item())} "
+                    f"first_byte={first_byte} "
+                    f"actual_first16={actual_payload[:16].tolist()} "
+                    f"expected_first16={expected_payload[:16].tolist()} "
+                    f"match_source0={candidate_match[0]} "
+                    f"match_source1={candidate_match[1]} "
+                    f"match_source2={candidate_match[2]} "
+                    f"all_zero={int(torch.count_nonzero(actual_payload).item()) == 0}",
+                    flush=True,
                 )
-                for candidate in (0, 1, 2)
-            }
-            print(
-                "P10_RUNTIME_PAYLOAD_DIAG "
-                f"rank={rank} source={source} slot={slot} "
-                f"actual_sha16={_sha16(actual_payload)} "
-                f"expected_sha16={_sha16(expected_payload)} "
-                f"mismatch_bytes={int(torch.count_nonzero(byte_diff).item())} "
-                f"first_byte={first_byte} "
-                f"actual_first16={actual_payload[:16].tolist()} "
-                f"expected_first16={expected_payload[:16].tolist()} "
-                f"match_source0={candidate_match[0]} "
-                f"match_source1={candidate_match[1]} "
-                f"match_source2={candidate_match[2]} "
-                f"all_zero={int(torch.count_nonzero(actual_payload).item()) == 0}",
-                flush=True,
-            )
-            mismatches.append(f"payload:rank={rank}:source={source}:slot={slot}")
+                mismatches.append(
+                    f"payload:row={row}:rank={rank}:source={source}:slot={slot}"
+                )
+                break
+            used_slots.add(slot)
+            ranked_payload.update(payload[slot].contiguous().numpy().tobytes())
+        if mismatches:
             break
-        used_slots.add(slot)
-        ranked_payload.update(payload[slot].contiguous().numpy().tobytes())
     if mismatches:
         raise AssertionError("P10 forward-resident closure mismatch: " + ",".join(mismatches))
-    if len(used_slots) != TOPK:
-        raise AssertionError(f"final winners alias resident rows: unique={len(used_slots)} expected={TOPK}")
+    if len(used_slots) != BATCH * TOPK:
+        raise AssertionError(
+            f"final winners alias resident rows: unique={len(used_slots)} "
+            f"expected={BATCH * TOPK}"
+        )
+    if fixture.residency_stats and (
+        final_miss_count != fixture.residency_stats["final_miss_count"]
+        or final_hit_count != fixture.residency_stats["final_hit_count"]
+    ):
+        raise AssertionError(
+            "final residency changed after setup: "
+            f"expected_miss={fixture.residency_stats['final_miss_count']} actual_miss={final_miss_count} "
+            f"expected_hit={fixture.residency_stats['final_hit_count']} actual_hit={final_hit_count}"
+        )
     witness = launch.read_overlap_witness_after_completion()
     if require_preseal_overlap:
         if not witness.overlapped:
@@ -816,7 +1021,7 @@ def _assert_terminal(
         canonical_sha16=_sha16(actual),
         source_lens=tuple(int(value) for value in actual_lens.tolist()),
         selected_lens=tuple(int(value) for value in lengths.tolist()),
-        tail_sha16=_sha16(attention[0, 0, TOPK:]),
+        tail_sha16=_sha16(attention[:, 0, TOPK:]),
         ranked_payload_sha16=ranked_payload.hexdigest()[:16],
     )
     fixture.terminal = True
@@ -828,7 +1033,9 @@ def _assert_terminal(
         )
         print(
             "P10_RUNTIME_HCCP "
-            f"final_winners={TOPK} resident_ready=1 payload=1 queue_leases_zero=1 unique_slots={len(used_slots)}",
+            f"final_winners={BATCH * TOPK} final_misses={final_miss_count} "
+            f"final_hits={final_hit_count} resident_ready=1 payload=1 "
+            f"queue_leases_zero=1 unique_slots={len(used_slots)}",
             flush=True,
         )
         print(
@@ -932,6 +1139,38 @@ def _positive_environment_int(name: str, default: int) -> int:
     return value
 
 
+def _validate_workload_profile() -> None:
+    """Fail before allocating a multi-GiB fixture on a malformed profile."""
+
+    if SOURCE_TOKENS <= 0 or SOURCE_TOKENS % BLOCK_TOKENS != 0:
+        _blocked(f"invalid_source_tokens:{SOURCE_TOKENS}")
+    if TOPK <= 0 or TOPK > SOURCE_TOKENS:
+        _blocked(f"invalid_topk:{TOPK}")
+    if not (0 < KV_MISS_NUMERATOR <= KV_MISS_DENOMINATOR):
+        _blocked(
+            "invalid_kv_miss_ratio:"
+            f"{KV_MISS_NUMERATOR}/{KV_MISS_DENOMINATOR}"
+        )
+    # The current exact KVAF fixture initializes the one queue template used
+    # by the product route.  Do not silently claim a multi-queue experiment
+    # until the template construction is expanded too.
+    if QUEUE_COUNT != 1:
+        _blocked(f"unsupported_queue_count_for_exact_fixture:{QUEUE_COUNT}")
+    if EXECUTOR_WORKERS <= 0 or EXECUTOR_WORKER_LIMIT < EXECUTOR_WORKERS:
+        _blocked(
+            "invalid_executor_workers:"
+            f"count={EXECUTOR_WORKERS}:limit={EXECUTOR_WORKER_LIMIT}"
+        )
+    print(
+        "P10_BENCH_WORKLOAD "
+        f"profile={P10_BENCH_PROFILE} batch={BATCH} source_tokens={SOURCE_TOKENS} "
+        f"topk={TOPK} kv_miss_ratio={KV_MISS_NUMERATOR}/{KV_MISS_DENOMINATOR} "
+        f"executor_workers={EXECUTOR_WORKERS} queue_count={QUEUE_COUNT} "
+        f"graph_capture=none_for_direct_hccp",
+        flush=True,
+    )
+
+
 def _immutable_input_digests(base: dict[str, Any]) -> dict[str, str]:
     """Return a bounded identity check for the product's read-only W4A4C8 ABI."""
 
@@ -993,10 +1232,10 @@ def _reset_benchmark_destination(fixture: _ForwardResidentKvaf, producer_stream:
     """Equalize the only persistent writable payload outside either timing interval.
 
     The Direct-HCCP control/table stay cold-bound throughout the paired run;
-    that is intentional product setup.  The resident payload itself is
-    cleared only after the preceding forward reached terminal state and its
-    queue lease was proven zero.  It prevents an old row from being mistaken
-    for a newly transferred winner if a future regression skips a copy.
+    that is intentional product setup.  Only the forward-owned speculative
+    and recall bands are cleared after the preceding terminal state.  The
+    separate persistent band holds pre-existing HBM hits and must survive
+    between replays, just as it does in the surrounding inference cache.
     """
 
     import torch
@@ -1004,7 +1243,7 @@ def _reset_benchmark_destination(fixture: _ForwardResidentKvaf, producer_stream:
     if fixture.resident_payload is None:
         raise AssertionError("P10 benchmark destination is not cold-bound")
     with torch.npu.stream(producer_stream):
-        fixture.resident_payload.zero_()
+        fixture.resident_payload.narrow(0, 0, PERSISTENT_BASE).zero_()
     torch.npu.synchronize()
 
 
@@ -1042,6 +1281,7 @@ def _run_timed_forward(
     _reset_benchmark_destination(fixture, producer)
     fixture.terminal = False
     inputs, tensors = _build_forward_inputs(device, base, fixture)
+    _install_final_hit_payloads(reference, fixture, tensors)
 
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
@@ -1071,6 +1311,79 @@ def _run_timed_forward(
         emit_summary=False,
     )
     _require_immutable_inputs(immutable_digests, base, context=f"P10 {mode} run")
+    speculative_slots = int(
+        tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
+    )
+    mapped_sources = int(
+        torch.count_nonzero(tensors["source_to_slot"].detach().cpu() >= 0).item()
+    )
+    return P10TimingSample(
+        device_us=device_us,
+        host_us=host_us,
+        signature=signature,
+        speculative_slots=speculative_slots,
+        mapped_sources=mapped_sources,
+    )
+
+
+def _run_timed_static_forward(
+    *,
+    mode: str,
+    base: dict[str, Any],
+    reference: Any,
+    fixture: _ForwardResidentKvaf,
+    launch_p10_forward: Any,
+    inputs: Any,
+    tensors: dict[str, Any],
+    producer_stream: Any,
+    executor_stream: Any,
+    immutable_digests: dict[str, str],
+) -> P10TimingSample:
+    """Time one graph-compatible P10 replay with stable aliases and streams.
+
+    Direct-HCCP is deliberately *not* captured with raw ACLGraph: that route
+    has already shown capture-time state surviving while inbound DMA payloads
+    do not.  The surrounding inference graph can retain its normal static
+    buffers; P10 is a graph-break/escape sequence that reuses those same
+    buffers and logical streams on every replay.  This is the only honest
+    graph-mode measurement until CANN provides a replay contract for HCCP.
+    """
+
+    import torch
+
+    if mode not in ("serial", "overlap"):
+        raise ValueError(f"unsupported P10 graph-compatible mode: {mode}")
+    _reset_benchmark_destination(fixture, producer_stream)
+    fixture.terminal = False
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    host_start_ns = time.perf_counter_ns()
+    with torch.npu.stream(producer_stream):
+        start.record()
+    launch = launch_p10_forward(
+        inputs,
+        producer_stream=producer_stream,
+        executor_stream=executor_stream,
+        execution_mode=mode,
+    )
+    aliases = launch.bind_qsfa(producer_stream)
+    with torch.npu.stream(producer_stream):
+        end.record()
+    end.synchronize()
+    host_us = (time.perf_counter_ns() - host_start_ns) / 1000.0
+    device_us = start.elapsed_time(end) * 1000.0
+    signature = _assert_terminal(
+        reference,
+        fixture,
+        tensors,
+        launch,
+        aliases=aliases,
+        require_preseal_overlap=(mode == "overlap"),
+        emit_summary=False,
+    )
+    _require_immutable_inputs(
+        immutable_digests, base, context=f"P10 graph-compatible {mode} replay"
+    )
     speculative_slots = int(
         tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
     )
@@ -1303,6 +1616,170 @@ def _run_benchmark() -> int:
     return 0
 
 
+def _run_graph_compatible_benchmark() -> int:
+    """Compare serial and fused P10 in the valid graph-inference topology.
+
+    This is intentionally not the old raw-ACLGraph benchmark.  Raw capture
+    currently lacks a Direct-HCCP replay guarantee, so it cannot yield an
+    interpretable payload or latency result.  Instead this path freezes all
+    P10 tensor addresses and logical streams once, then invokes the exact
+    product operators as the graph-compatible custom-op escape on each replay.
+    The surrounding graph can therefore be stable without treating the HCCP
+    doorbell as a capture-safe node.
+    """
+
+    import torch
+
+    warmup = _positive_environment_int("P10_PERF_WARMUP", 1)
+    iterations = _positive_environment_int("P10_PERF_ITERS", 5)
+    device, launch_p10_forward = _load_product_runtime()
+    base = _build_w4a4c8_inputs(device)
+    immutable_digests = _immutable_input_digests(base)
+    reference = _reference_w4a4c8(base)
+    _require_immutable_inputs(immutable_digests, base, context="product oracle")
+    fixture = _ForwardResidentKvaf(device)
+    samples: dict[str, list[P10TimingSample]] = {"serial": [], "overlap": []}
+
+    try:
+        fixture.bind()
+        # These aliases and streams are held for the entire benchmark just as
+        # vLLM's graph cache holds a replay slot.  The direct HCCP executor is
+        # launched into the stable companion stream, never raw-captured.
+        inputs, tensors = _build_forward_inputs(device, base, fixture)
+        _install_final_hit_payloads(reference, fixture, tensors)
+        producer = torch.npu.Stream(device=device)
+        executor = torch.npu.Stream(device=device)
+        print(
+            "P10_GRAPH_COMPAT_CONFIG "
+            "outer_graph=static_aliases p10_capture=none "
+            "direct_hccp=direct_relaunch stable_streams=1 "
+            "serial_added_edge=stage_a_complete_to_stage_b "
+            f"profile={P10_BENCH_PROFILE} batch={BATCH} source_tokens={SOURCE_TOKENS}",
+            flush=True,
+        )
+
+        for iteration in range(warmup):
+            order = ("serial", "overlap") if iteration % 2 == 0 else ("overlap", "serial")
+            for mode in order:
+                _run_timed_static_forward(
+                    mode=mode,
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    launch_p10_forward=launch_p10_forward,
+                    inputs=inputs,
+                    tensors=tensors,
+                    producer_stream=producer,
+                    executor_stream=executor,
+                    immutable_digests=immutable_digests,
+                )
+        print(
+            "P10_GRAPH_COMPAT_WARMUP "
+            f"pairs={warmup} static_aliases=1 terminal=1",
+            flush=True,
+        )
+
+        for iteration in range(iterations):
+            order = ("serial", "overlap") if iteration % 2 == 0 else ("overlap", "serial")
+            for mode in order:
+                sample = _run_timed_static_forward(
+                    mode=mode,
+                    base=base,
+                    reference=reference,
+                    fixture=fixture,
+                    launch_p10_forward=launch_p10_forward,
+                    inputs=inputs,
+                    tensors=tensors,
+                    producer_stream=producer,
+                    executor_stream=executor,
+                    immutable_digests=immutable_digests,
+                )
+                samples[mode].append(sample)
+                print(
+                    "P10_GRAPH_COMPAT_SAMPLE "
+                    f"iteration={iteration} mode={mode} device_us={sample.device_us:.3f} "
+                    f"host_us={sample.host_us:.3f} speculative_slots={sample.speculative_slots} "
+                    f"mapped_sources={sample.mapped_sources}",
+                    flush=True,
+                )
+    finally:
+        fixture.close()
+
+    serial = samples["serial"]
+    overlap = samples["overlap"]
+    if not serial or not overlap:
+        raise AssertionError("P10 graph-compatible benchmark produced no paired samples")
+    expected_signature = serial[0].signature
+    if any(sample.signature != expected_signature for sample in serial + overlap):
+        raise AssertionError("P10 graph-compatible serial/overlap semantic signature mismatch")
+
+    serial_device = [sample.device_us for sample in serial]
+    overlap_device = [sample.device_us for sample in overlap]
+    serial_host = [sample.host_us for sample in serial]
+    overlap_host = [sample.host_us for sample in overlap]
+    _emit_perf_result(
+        "p10_w4a4c8_graph_compatible_serial",
+        serial_device,
+        warmup=warmup,
+        metric="npu_event_forward_prepare_to_qsfa_ready",
+    )
+    _emit_perf_result(
+        "p10_w4a4c8_graph_compatible_fused",
+        overlap_device,
+        warmup=warmup,
+        metric="npu_event_forward_prepare_to_qsfa_ready",
+    )
+    _emit_perf_result(
+        "p10_w4a4c8_graph_compatible_serial_host_diagnostic",
+        serial_host,
+        warmup=warmup,
+        metric="host_submit_to_terminal_diagnostic",
+    )
+    _emit_perf_result(
+        "p10_w4a4c8_graph_compatible_fused_host_diagnostic",
+        overlap_host,
+        warmup=warmup,
+        metric="host_submit_to_terminal_diagnostic",
+    )
+    serial_p50 = _percentile(serial_device, 50.0)
+    fused_p50 = _percentile(overlap_device, 50.0)
+    serial_p90 = _percentile(serial_device, 90.0)
+    fused_p90 = _percentile(overlap_device, 90.0)
+    print(
+        "P10_GRAPH_COMPAT_EQ "
+        "product_w4a4c8_oracle=1 canonical_topk=1 score_source_lens=1 "
+        "ranked_resident_payload=1 qsfa_lengths_and_tail=1 "
+        "same_source_miss_mask=1 static_aliases=1 raw_aclgraph_capture=0",
+        flush=True,
+    )
+    print(
+        "P10_GRAPH_COMPAT_RESULT "
+        f"serial_p50_us={serial_p50:.3f} fused_p50_us={fused_p50:.3f} "
+        f"saved_p50_us={serial_p50 - fused_p50:.3f} "
+        f"saved_p50_pct={100.0 * (serial_p50 - fused_p50) / serial_p50:.3f} "
+        f"serial_p90_us={serial_p90:.3f} fused_p90_us={fused_p90:.3f} "
+        f"saved_p90_us={serial_p90 - fused_p90:.3f} "
+        f"saved_p90_pct={100.0 * (serial_p90 - fused_p90) / serial_p90:.3f}",
+        flush=True,
+    )
+    for mode, values in (("serial", serial), ("fused", overlap)):
+        print(
+            "P10_GRAPH_COMPAT_WORK "
+            f"mode={mode} speculative_slots_min={min(sample.speculative_slots for sample in values)} "
+            f"speculative_slots_max={max(sample.speculative_slots for sample in values)} "
+            f"mapped_sources_min={min(sample.mapped_sources for sample in values)} "
+            f"mapped_sources_max={max(sample.mapped_sources for sample in values)}",
+            flush=True,
+        )
+    print(
+        "P10_RUNTIME_PASS "
+        "route=w4a4c8_score_receipt_direct_hccp_qsfa "
+        "benchmark=graph_compatible_serial_vs_fused",
+        flush=True,
+    )
+    return 0
+
+
 def _run_graph_benchmark() -> int:
     """Compare eager and ACLGraph replay on the exact P10 product closure.
 
@@ -1313,6 +1790,17 @@ def _run_graph_benchmark() -> int:
     excluded from timing: steady-state inference replays an already captured
     graph rather than recapturing each forward.
     """
+
+    # Direct-HCCP's raw ACLGraph replay contract is not established.  The
+    # small historical graph fixture remains available for capture debugging,
+    # but it is explicitly not a valid capacity/latency result for the real
+    # B16 workload.  Route that workload through the fixed-alias, direct-HCCP
+    # graph-compatible path instead of silently measuring a poisoned replay.
+    if P10_BENCH_PROFILE != "acceptance":
+        _blocked(
+            "raw_aclgraph_benchmark_not_valid_for_direct_hccp:"
+            f"profile={P10_BENCH_PROFILE}:use_graph_compatible_benchmark"
+        )
 
     import torch
 
@@ -1548,6 +2036,7 @@ def _run_acceptance() -> int:
     try:
         fixture.bind()
         inputs, tensors = _build_forward_inputs(device, base, fixture)
+        _install_final_hit_payloads(reference, fixture, tensors)
         launch = launch_p10_forward(inputs)
         _assert_terminal(reference, fixture, tensors, launch)
     finally:
@@ -1557,6 +2046,7 @@ def _run_acceptance() -> int:
 
 
 def _main() -> int:
+    _validate_workload_profile()
     runtime_case = os.environ.get("P10_RUNTIME_CASE", "acceptance")
     if runtime_case == "acceptance":
         return _run_acceptance()
@@ -1564,6 +2054,8 @@ def _main() -> int:
         return _run_benchmark()
     if runtime_case == "graph_benchmark":
         return _run_graph_benchmark()
+    if runtime_case == "graph_compatible_benchmark":
+        return _run_graph_compatible_benchmark()
     _blocked(f"invalid_p10_runtime_case:{runtime_case}")
     raise AssertionError("unreachable")
 

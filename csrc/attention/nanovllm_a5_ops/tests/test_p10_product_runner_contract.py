@@ -62,12 +62,12 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.runner.index("ASCEND_LAUNCH_BLOCKING=0"), self.runner.index(probe)
         )
 
-    def test_runner_forwards_only_the_three_explicit_runtime_cases(self) -> None:
+    def test_runner_forwards_only_the_four_explicit_runtime_cases(self) -> None:
         """Benchmarking must not select a second product artifact or route."""
 
         for token in (
             'runtime_case="${P10_RUNTIME_CASE:-acceptance}"',
-            "acceptance|benchmark|graph_benchmark",
+            "acceptance|benchmark|graph_benchmark|graph_compatible_benchmark",
             "invalid_runtime_case:${runtime_case}",
             "runtime_case=%s",
             'P10_RUNTIME_CASE="${runtime_case}" "${python_bin}" "${runtime_fixture}"',
@@ -123,7 +123,8 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "launch_p10_forward(inputs)",
             "launch.bind_qsfa()",
             "strict W4A4C8 canonical Top-K mismatch",
-            "resident_ready=1 payload=1 queue_leases_zero=1",
+            "resident_ready=1 payload=1 ",
+            "queue_leases_zero=1 unique_slots=",
             "resident_row_to_qsfa_slot is not a nonidentity permutation",
             "torch.unique(translation)",
             "P10_RUNTIME_PASS",
@@ -147,7 +148,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "launch.bind_qsfa(producer)",
             "end.synchronize()",
             "require_preseal_overlap=(mode == \"overlap\")",
-            "fixture.resident_payload.zero_()",
+            "fixture.resident_payload.narrow(0, 0, PERSISTENT_BASE).zero_()",
             "P10_PERF_EQ ",
             "p10_w4a4c8_forward_resident_serial",
             "p10_w4a4c8_forward_resident_overlap",
@@ -175,6 +176,27 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         ):
             self.assertIn(token, self.fixture)
         self.assertIn("graph_benchmark", self.runner)
+        self.assertNotIn("runtime.batch_get(", self.fixture)
+
+    def test_graph_compatible_b16_profile_is_the_only_large_direct_hccp_measurement(self) -> None:
+        """The requested capacity case must not be mislabeled raw ACLGraph."""
+
+        for token in (
+            'elif P10_BENCH_PROFILE == "b16_s128k_miss5"',
+            "BATCH = 16",
+            "SOURCE_TOKENS = 131072",
+            "KV_MISS_DENOMINATOR = 20",
+            "_install_final_hit_payloads",
+            "def _run_graph_compatible_benchmark",
+            "P10_GRAPH_COMPAT_CONFIG ",
+            "P10_GRAPH_COMPAT_EQ ",
+            "P10_GRAPH_COMPAT_RESULT ",
+            "same_source_miss_mask=1 static_aliases=1 raw_aclgraph_capture=0",
+            "raw_aclgraph_benchmark_not_valid_for_direct_hccp",
+            'if runtime_case == "graph_compatible_benchmark"',
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertIn("graph_compatible_benchmark", self.runner)
         self.assertNotIn("runtime.batch_get(", self.fixture)
 
     def test_benchmark_hashes_fp8_storage_without_a_numpy_float8_conversion(self) -> None:
