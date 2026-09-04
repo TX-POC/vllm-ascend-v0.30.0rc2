@@ -309,6 +309,10 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
   if (observed_object >= 0) {
     // Object was already assigned by another source. Publish its resolved
     // slot into this source cache only after the object map is readable.
+    // The same object -> source release rule applies to this dedup path as to
+    // a newly claimed object below: a positive source cache entry must never
+    // outrun visibility of the authoritative object directory.
+    AscendC::Simt::ThreadFence();
     (void)asc_atomic_cas(source_to_forward_slot + source_offset,
                          A5_P10_STAGE_B_CLAIMING_SLOT, observed_object);
     result->resident_slot = observed_object;

@@ -352,6 +352,7 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertLess(object_commit, release_fence)
         self.assertLess(release_fence, source_publish)
         self.assertIn("object map is authoritative", self.kernel)
+        self.assertIn("same object -> source release rule", self.kernel)
 
     def test_aicore_metadata_access_respects_cann_address_spaces(self):
         """Prevent a recurrence of the Stage-B-only 950DT compile failure.
