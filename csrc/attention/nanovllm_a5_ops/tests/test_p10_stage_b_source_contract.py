@@ -168,7 +168,10 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("RehydrateForwardResidentWaveForDrain(", self.kernel)
         self.assertIn("InitializeKvafForwardResidentPostedWaveForDrain", self.kernel)
         self.assertIn("A5_P10_STAGE_B_POST_BEGIN_REHYDRATE", self.abi)
-        self.assertIn("wave->posted = 1U;", self.kernel)
+        self.assertIn("wave->state = kStageBWaveDrainable;", self.kernel)
+        self.assertIn("wave->state = kStageBWaveQuarantined;", self.kernel)
+        self.assertIn("IsRetryableKnownNoPostReason", self.kernel)
+        self.assertIn("ReturnKvafForwardResidentUnpostedQueueFromAicore", self.kernel)
 
     def test_slots_are_fixed_bands_not_queue_private_or_recycled(self):
         self.assertIn("A5P10ResidentSlotBand", self.abi)
@@ -257,6 +260,31 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("static_cast<uint64_t>(*workerCount) >= aivCount", self.definition)
         self.assertIn("static_cast<uint64_t>(*workerLimit) >= aivCount", self.definition)
 
+    def test_receipt_poller_rotates_a_bounded_window_instead_of_busy_scanning(self):
+        """The companion must leave AIV/GM bandwidth for C8 between polls.
+
+        This is deliberately a source-level performance safety gate.  It does
+        not add a graph tensor, queue, or physical-core assignment: the local
+        cursor eventually covers the same graph-static receipt stride, while
+        each device turn reads at most the existing 64-seed microbatch size.
+        """
+        for token in (
+            "kP10StageBReceiptProbeBudget",
+            "ownedReceiptCount_",
+            "nextOwnedReceiptOrdinal_",
+            "sealedSweepRemaining_",
+            "sealedSweepAllDone_",
+            "producerSealObserved_",
+            "probe_count = ownedReceiptCount_ < kP10StageBReceiptProbeBudget",
+            "for (uint32_t probe = 0U; probe < probe_count; ++probe)",
+            "nextOwnedReceiptOrdinal_ * tiling_->executorWorkerCount",
+        ):
+            self.assertIn(token, self.kernel)
+        self.assertNotIn(
+            "for (uint32_t receipt = worker_; receipt < receiptCapacity_;",
+            self.kernel,
+        )
+
     def test_receipt_terminal_transition_is_atomic_after_claim(self):
         for token in (
             "FinishClaimedReceiptFromSimt", "FinishClaimedReceiptSimtService",
@@ -303,13 +331,58 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "a5_p10_score_receipt_forward_resident",
             "ConsumeExactScoreReceipt", "BeginForwardResidentMicrobatch",
             "DrainForwardResidentMicrobatch", "FinalizeAssignedRows",
-            "EnsureFinalWinnerReady", "A5_P10_STAGE_B_MICROBATCH_CAPACITY",
+            "WaitForFinalWinnerReady", "PostFinalWinnerBatches",
+            "PostFinalRecallBatchAndDrain",
+            "A5_P10_STAGE_B_MICROBATCH_CAPACITY",
             "A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY",
         ):
             self.assertIn(token, self.kernel)
         self.assertNotIn("KERNEL_TYPE_MIX_AIC_1_2", self.kernel)
         self.assertIn("CalcTschBlockDim(", self.definition)
         self.assertIn("0U, aivCount", self.definition)
+
+    def test_candidate_and_final_recall_use_only_fixed_batched_seed_buffers(self):
+        """No receipt-tail flush or singleton terminal Get may return.
+
+        The target path has exactly the predeclared 2 x 64 UB seed storage.
+        A partial speculative receipt stays local until it reaches 64 or the
+        producer seals; exact final winners then use the same buffers in
+        compact 64-request waves.  This is a scheduling improvement only:
+        canonical Top-K remains the authority for every final request.
+        """
+
+        for token in (
+            "speculativePendingSeedCount_",
+            "FindAppendableSpeculativeSeedBuffer",
+            "TryPostFullSpeculativeSeedBuffers",
+            "DiscardUnpostedSpeculativeSeeds",
+            "PostFinalWinnerBatches",
+            "PostFinalRecallBatchAndDrain",
+            "PublishFinalAttentionSlots",
+            "Only final exact winners may force transport progress",
+            "same\n  // fixed two 64-seed UB buffers",
+        ):
+            self.assertIn(token, self.kernel)
+        self.assertNotIn("StartMicrobatch(buffer_index, 1U)", self.kernel)
+        self.assertNotIn("if (seed_count != 0U) {\n      trace |=", self.kernel)
+        self.assertLess(
+            self.kernel.index("DiscardUnpostedSpeculativeSeeds()"),
+            self.kernel.index("FinalizeAssignedRows()"),
+        )
+
+    def test_pending_owner_is_explicit_and_cannot_be_reposted(self):
+        """A mapped-but-not-posted resident row has one forward-local owner."""
+        for token in (
+            "A5P10ResidentReadyState::PENDING",
+            "TryClaimResidentPending",
+            "PollPendingResidentTransition",
+            "speculativeBandExhausted_",
+            "fatalTransportReason_",
+            "kStageBWaveQuarantined",
+            "POST_BEGIN_SQ_PI_DELTA_MISMATCH",
+        ):
+            self.assertIn(token, self.abi + self.kernel)
+        self.assertNotIn("WaitForPendingResidentTransition", self.kernel)
 
     def test_first_failure_diagnostic_is_forward_local_and_non_scheduling(self):
         for token in (
@@ -346,6 +419,11 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "A5_P10_STAGE_B_TRACE_DESCRIPTOR_INVALID",
             "A5_P10_STAGE_B_TRACE_CLAIMED_NEW",
             "A5_P10_STAGE_B_TRACE_POSTED",
+            "A5_P10_STAGE_B_TRACE_CQ_READY",
+            "A5_P10_STAGE_B_TRACE_PRESEAL_CQ_READY",
+            "prior_trace | trace",
+            "wave->trace_receipt",
+            "speculativeTraceReceipt_",
         ):
             self.assertIn(token, self.abi + self.kernel)
         self.assertIn("descriptor->reserved", self.kernel)

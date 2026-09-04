@@ -26,7 +26,15 @@ namespace {
 constexpr uint32_t kReceiptWords = A5_P10_RECEIPT_WORDS64;
 constexpr uint32_t kSparseCount = A5_P10_SPARSE_COUNT;
 constexpr uint32_t kNoBuffer = A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY;
+constexpr uint32_t kNoReceipt = 0xffffffffU;
 constexpr uint32_t kKvafRowsPerObject = 128U;
+// `source_already_mapped` is a compact SIMT -> AICore result word.  The
+// normal values are zero (this service owns a new source/object claim) and
+// one (a positive source map was already visible).  A speculative-band
+// overflow has no source map to publish because both provisional CASes have
+// been rolled back; use the otherwise-unused value two to stop the remaining
+// receipt scan from repeating the same futile two-map CAS sequence.
+constexpr uint32_t kSlotClaimSpeculativeBandExhausted = 2U;
 
 struct ReceiptClaimResult {
   uint32_t claimed;
@@ -50,9 +58,10 @@ struct SlotClaimResult {
   int32_t resident_slot;
   int32_t observed_object_slot;
   uint32_t newly_claimed;
-  // A positive source map was observed before this service owned a claim.
-  // In that case the AICore caller must verify (not rewrite) the immutable
-  // authoritative object directory.
+  // 0: this service owns a new claim; 1: a positive source map was already
+  // visible; 2: the speculative fixed band was exhausted and both temporary
+  // map claims were rolled back.  In the latter two cases the AICore caller
+  // must not rewrite the immutable authoritative object directory.
   uint32_t source_already_mapped;
 };
 static_assert(sizeof(SlotClaimResult) == 16U,
@@ -102,6 +111,12 @@ constexpr uint32_t kP10StageBCompletionUbOffset =
     kP10StageBSlotClaimUbOffset + AlignP10StageBUb(sizeof(SlotClaimResult));
 constexpr uint32_t kP10StageBScratchEnd =
     kP10StageBCompletionUbOffset + AlignP10StageBUb(sizeof(CompletionResult));
+// A receipt producer owns a graph-static table, but an executor must not
+// reread every FREE entry on every device turn. Keep the polling unit equal to
+// the existing microbatch capacity: this is a local scheduling budget, not a
+// graph ABI, a queue allocation, or an AIV-core reservation.
+constexpr uint32_t kP10StageBReceiptProbeBudget =
+    A5_P10_STAGE_B_MICROBATCH_CAPACITY;
 
 static_assert(kP10StageBSeed0UbOffset >=
                   kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
@@ -109,6 +124,18 @@ static_assert(kP10StageBSeed0UbOffset >=
 static_assert(kP10StageBScratchEnd <=
                   kvaf_fused_get::kDenseBatchGetPostOnlyScratchCeiling,
               "P10 Stage B overlaps KVAF generic BatchGet scratch");
+
+enum StageBWaveState : uint32_t {
+  // The persistent record and its paired fixed UB buffer may be reused.
+  kStageBWaveFree = 0U,
+  // Begin was durably posted and this record is safe to poll through CQ.
+  kStageBWaveDrainable = 1U,
+  // A Begin/CQ terminal has an ownership ambiguity (for example, a post was
+  // proven but its drain record could not be rebuilt, or a terminal queue
+  // release failed).  It must never be polled, reposted, discarded, or reused
+  // inside this forward.  The forward fails closed instead.
+  kStageBWaveQuarantined = 2U,
+};
 
 // A local wave owns one of the two local 64-seed buffers until CQ terminal.
 // Its ownership persists for this invocation only, never across forwards.
@@ -118,7 +145,11 @@ struct StageBWave {
   __ubuf__ A5P10ForwardResidentSeed* seeds;
   uint32_t seed_count;
   uint32_t buffer_index;
-  uint32_t posted;
+  uint32_t state;
+  // One receipt is sufficient for trace-only Post/CQ evidence: this is the
+  // receipt that filled or retried the compact speculative wave. Final
+  // recall deliberately leaves it invalid because it is not pre-seal work.
+  uint32_t trace_receipt;
   // Failure-only evidence retained until this local wave is reused.  It is
   // not graph-visible and never affects queue or resident-slot ownership.
   uint32_t failure_reason;
@@ -153,10 +184,23 @@ __aicore__ inline uint32_t BeginFailureReasonFromKvafStatus(uint32_t status) {
       return A5_P10_STAGE_B_POST_BEGIN_STATE_FAILED_SUCCESS;
     case kvaf_forward_resident_get::kForwardResidentBeginStateUnknown:
       return A5_P10_STAGE_B_POST_BEGIN_STATE_UNKNOWN;
+    case kvaf_forward_resident_get::kForwardResidentBeginSqProducerDeltaMismatch:
+      return A5_P10_STAGE_B_POST_BEGIN_SQ_PI_DELTA_MISMATCH;
     case kvaf_forward_resident_get::kForwardResidentBeginResultUnknown:
     default:
       return A5_P10_STAGE_B_POST_BEGIN_RESULT_UNKNOWN;
   }
+}
+
+// Retrying is permitted only when this exact Stage-B path can prove that it
+// still owns no descriptor and no doorbell could have been observed.  A held
+// queue, an ambiguous scalar Begin result, and every configuration failure
+// are intentionally *not* retryable: repeating them can duplicate a Get or
+// erase the only evidence needed to quarantine the forward.
+__aicore__ inline bool IsRetryableKnownNoPostReason(uint32_t reason) {
+  return reason == A5_P10_STAGE_B_POST_QUEUE_ACQUIRE ||
+      reason == A5_P10_STAGE_B_POST_NO_FREE_WAVE ||
+      reason == A5_P10_STAGE_B_POST_BEGIN_QUEUE_FULL;
 }
 
 __aicore__ inline bool RehydrateForwardResidentWaveForDrain(
@@ -339,6 +383,7 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
       (void)asc_atomic_cas(source_to_forward_slot + source_offset,
                            A5_P10_STAGE_B_CLAIMING_SLOT,
                            A5_P10_STAGE_B_UNMAPPED_SLOT);
+      result->source_already_mapped = kSlotClaimSpeculativeBandExhausted;
       return;
     }
     selected = band_base + static_cast<int32_t>(relative);
@@ -391,6 +436,38 @@ inline void ClaimForwardSlotSimtService(
                            source_offset, object_offset, band_base,
                            band_capacity, fixed_slot,
                            use_speculative_cursor, result);
+}
+
+// Maps are immutable once published, but a mapped row still needs one
+// forward-local owner while its descriptor lives only in a worker's UB seed
+// buffer.  CASing EMPTY -> PENDING is the small shared handoff that prevents
+// a different final-recall worker from posting the same fixed row before the
+// original receipt owner has either posted it or discarded it at producer
+// seal.  It is not a cross-forward lease and it never recycles a resident
+// row.
+__simt_callee__ inline void ClaimResidentPendingFromSimt(
+    __gm__ int32_t* resident_ready, int32_t resident_slot,
+    __ubuf__ SlotClaimResult* result) {
+  if (resident_ready == nullptr || resident_slot < 0 || result == nullptr) {
+    return;
+  }
+  result->newly_claimed = 0U;
+  result->observed_object_slot = asc_atomic_cas(
+      resident_ready + resident_slot,
+      static_cast<int32_t>(A5P10ResidentReadyState::EMPTY),
+      static_cast<int32_t>(A5P10ResidentReadyState::PENDING));
+  if (result->observed_object_slot ==
+      static_cast<int32_t>(A5P10ResidentReadyState::EMPTY)) {
+    result->newly_claimed = 1U;
+  }
+  AscendC::Simt::ThreadFence();
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void ClaimResidentPendingSimtService(
+    __gm__ int32_t* resident_ready, int32_t resident_slot,
+    __ubuf__ SlotClaimResult* result) {
+  ClaimResidentPendingFromSimt(resident_ready, resident_slot, result);
 }
 
 __simt_callee__ inline void MarkWorkerCompleteFromSimt(
@@ -502,8 +579,11 @@ __aicore__ inline uint32_t BeginForwardResidentMicrobatch(
             rows_per_object, resident_slot);
   }
   if (!descriptor_ready) {
-    (void)kvaf_forward_resident_get::ReturnKvafForwardResidentUnpostedQueueFromAicore(
-        control_gm, lease_result, simt_event, &lease);
+    if (!kvaf_forward_resident_get::
+            ReturnKvafForwardResidentUnpostedQueueFromAicore(
+                control_gm, lease_result, simt_event, &lease)) {
+      return A5_P10_STAGE_B_POST_QUEUE_RETURN;
+    }
     return A5_P10_STAGE_B_POST_DESCRIPTOR_BUILD;
   }
   const uint32_t begin_status =
@@ -517,9 +597,11 @@ __aicore__ inline uint32_t BeginForwardResidentMicrobatch(
     // and fail closed instead of introducing an HCCP queue-reuse race.
     if (kvaf_forward_resident_get::KvafForwardResidentBeginHasNoPost(
             begin_status)) {
-      (void)kvaf_forward_resident_get::
-          ReturnKvafForwardResidentUnpostedQueueFromAicore(
-              control_gm, lease_result, simt_event, &lease);
+      if (!kvaf_forward_resident_get::
+              ReturnKvafForwardResidentUnpostedQueueFromAicore(
+                  control_gm, lease_result, simt_event, &lease)) {
+        return A5_P10_STAGE_B_POST_QUEUE_RETURN;
+      }
     }
     return BeginFailureReasonFromKvafStatus(begin_status);
   }
@@ -534,7 +616,7 @@ __aicore__ inline bool DrainForwardResidentMicrobatch(
         lease_result,
     event_t simt_event, StageBWave* wave, bool* terminal) {
   if (control_gm == nullptr || lease_result == nullptr || wave == nullptr ||
-      terminal == nullptr || wave->posted == 0U) {
+      terminal == nullptr || wave->state != kStageBWaveDrainable) {
     return false;
   }
   *terminal = false;
@@ -554,9 +636,14 @@ __aicore__ inline bool DrainForwardResidentMicrobatch(
     if (wave->failure_reason == 0U) {
       wave->failure_reason = A5_P10_STAGE_B_POST_QUEUE_RETURN;
     }
+    // CQ is terminal but queue ownership could not be released. Retrying
+    // Finish/Return would be a second lifecycle operation on a terminal
+    // descriptor, so retain the exact buffer/lease evidence and make the
+    // enclosing forward fail closed.
+    wave->state = kStageBWaveQuarantined;
     return false;
   }
-  wave->posted = 0U;
+  wave->state = kStageBWaveFree;
   *terminal = true;
   return success;
 }
@@ -618,10 +705,20 @@ class A5P10ScoreReceiptForwardResidentKernel {
       waves_[index].seeds = nullptr;
       waves_[index].seed_count = 0U;
       waves_[index].buffer_index = index;
-      waves_[index].posted = 0U;
+      waves_[index].state = kStageBWaveFree;
+      waves_[index].trace_receipt = kNoReceipt;
       waves_[index].failure_reason = 0U;
       seedBufferBusy_[index] = false;
+      speculativePendingSeedCount_[index] = 0U;
+      speculativeTraceReceipt_[index] = kNoReceipt;
     }
+    speculativeBandExhausted_ = false;
+    fatalTransportReason_ = 0U;
+    ownedReceiptCount_ = 0U;
+    nextOwnedReceiptOrdinal_ = 0U;
+    sealedSweepRemaining_ = 0U;
+    sealedSweepAllDone_ = true;
+    producerSealObserved_ = false;
 
     if (tiling_ == nullptr ||
         worker_ >= tiling_->executorWorkerCount ||
@@ -653,6 +750,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
     // have produced its first tile yet. FREE entries become exhausted only
     // after producer_sealed is visible.
     receiptCapacity_ = tiling_->receiptCapacity;
+    if (worker_ < receiptCapacity_) {
+      ownedReceiptCount_ =
+          1U + (receiptCapacity_ - 1U - worker_) /
+                    tiling_->executorWorkerCount;
+    }
     activeRows_ = static_cast<uint32_t>(ReadGmByPassDCache<int32_t>(
         forwardControl_ + A5_P10_STAGE_B_ACTIVE_ROWS));
     rowsPerObject_ = static_cast<uint32_t>(ReadGmByPassDCache<int32_t>(
@@ -750,7 +852,30 @@ class A5P10ScoreReceiptForwardResidentKernel {
       // READY receipt immediately; Stage B does not defer all work until C8
       // completes and seals its static receipt range.
       owned_receipts_done = ServiceOwnedReceipts(producer_sealed);
+      if (HasFatalTransportFailure()) {
+        RecordFirstFailure(PostDiagnostic(
+            worker_, 0U, FatalTransportFailureReason()));
+        return;
+      }
       (void)DrainLocalWaves(false);
+      if (HasFatalTransportFailure()) {
+        RecordFirstFailure(PostDiagnostic(
+            worker_, 0U, FatalTransportFailureReason()));
+        return;
+      }
+      if (!producer_sealed) {
+        // A full 64-seed candidate wave that encountered a temporarily held
+        // queue is retried only while C8 is still scanning. It never creates
+        // a host retry, a new C8 dependency, or a physical-core split. Once
+        // sealed, speculative work cannot hide scan time and must not contend
+        // with the exact final recall queue.
+        (void)TryPostFullSpeculativeSeedBuffers();
+        if (HasFatalTransportFailure()) {
+          RecordFirstFailure(PostDiagnostic(
+              worker_, 0U, FatalTransportFailureReason()));
+          return;
+        }
+      }
 
       if (producer_sealed && !owned_receipts_done) {
         // After the seal, FREE/FILLING/CLAIMED may not wait indefinitely.
@@ -760,6 +885,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
              !owned_receipts_done; ++poll) {
           owned_receipts_done = ServiceOwnedReceipts(true);
           (void)DrainLocalWaves(false);
+          if (HasFatalTransportFailure()) {
+            RecordFirstFailure(PostDiagnostic(
+                worker_, 0U, FatalTransportFailureReason()));
+            return;
+          }
         }
         if (!owned_receipts_done) {
           RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_RECEIPT_TERMINAL);
@@ -771,6 +901,20 @@ class A5P10ScoreReceiptForwardResidentKernel {
         PollReceiptQuantumBoundary();
         poll_turn = 0U;
       }
+    }
+    // A posted early wave must reach its CQ terminal before its fixed UB
+    // seed buffer can be reused for exact recall.  Unposted speculative
+    // candidates are deliberately discarded here: C8 has sealed, so they
+    // cannot hide any more scan time, while final exact recall remains the
+    // sole authority for every Top-K winner.
+    if (!DrainLocalWaves(true)) {
+      RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_DRAIN);
+      return;
+    }
+    if (!DiscardUnpostedSpeculativeSeeds() || HasFatalTransportFailure()) {
+      RecordFirstFailure(PostDiagnostic(
+          worker_, 0U, FatalTransportFailureReason()));
+      return;
     }
     // Only final exact winners may force transport progress. False-positive
     // speculative rows stay allocated but are never emitted.
@@ -827,14 +971,30 @@ class A5P10ScoreReceiptForwardResidentKernel {
 
   // Each worker owns a deterministic stride of the graph-static receipt
   // capacity. READY is claimed atomically anyway so a future tiler may
-  // repartition work without changing the receipt protocol. Before the seal,
-  // FREE remains live because Stage A may publish it later. After the seal,
-  // FREE is an unused tile slot and DONE is a consumed tile slot; both are
-  // terminal for this forward.
+  // repartition work without changing the receipt protocol. The local cursor
+  // visits a bounded number of that worker's records per device turn. This is
+  // essential while C8 is still producing: a full O(receiptCapacity) scan on
+  // every empty poll would turn the companion into the dominant AIV/GM load
+  // and erase the overlap it is meant to expose.
+  //
+  // Before the seal, FREE remains live because Stage A may publish it later.
+  // After the seal, FREE is an unused tile slot and DONE is a consumed tile
+  // slot; a complete post-seal sweep is required before the worker declares
+  // its receipt range terminal.
   __aicore__ inline bool ServiceOwnedReceipts(bool producer_sealed) {
-    bool all_done = true;
-    for (uint32_t receipt = worker_; receipt < receiptCapacity_;
-         receipt += tiling_->executorWorkerCount) {
+    if (ownedReceiptCount_ == 0U) {
+      return true;
+    }
+    if (producer_sealed && !producerSealObserved_) {
+      producerSealObserved_ = true;
+      sealedSweepRemaining_ = ownedReceiptCount_;
+      sealedSweepAllDone_ = true;
+    }
+    const uint32_t probe_count = ownedReceiptCount_ < kP10StageBReceiptProbeBudget
+        ? ownedReceiptCount_ : kP10StageBReceiptProbeBudget;
+    for (uint32_t probe = 0U; probe < probe_count; ++probe) {
+      const uint32_t receipt = worker_ +
+          nextOwnedReceiptOrdinal_ * tiling_->executorWorkerCount;
       const int32_t state_before = ReadGmByPassDCache<int32_t>(
           receiptState_ + receipt);
       if (state_before == static_cast<int32_t>(A5P10ReceiptState::READY) &&
@@ -843,13 +1003,32 @@ class A5P10ScoreReceiptForwardResidentKernel {
       }
       const int32_t state_after = ReadGmByPassDCache<int32_t>(
           receiptState_ + receipt);
-      if (producer_sealed &&
-          state_after != static_cast<int32_t>(A5P10ReceiptState::DONE) &&
-          state_after != static_cast<int32_t>(A5P10ReceiptState::FREE)) {
-        all_done = false;
+      ++nextOwnedReceiptOrdinal_;
+      if (nextOwnedReceiptOrdinal_ == ownedReceiptCount_) {
+        nextOwnedReceiptOrdinal_ = 0U;
+      }
+      if (producer_sealed) {
+        if (state_after != static_cast<int32_t>(A5P10ReceiptState::DONE) &&
+            state_after != static_cast<int32_t>(A5P10ReceiptState::FREE)) {
+          sealedSweepAllDone_ = false;
+        }
+        if (sealedSweepRemaining_ != 0U) {
+          --sealedSweepRemaining_;
+        }
+        if (sealedSweepRemaining_ == 0U) {
+          const bool all_done = sealedSweepAllDone_;
+          // A FILLING/CLAIMED record may become terminal after this exact
+          // sweep. Start another complete bounded sweep rather than treating
+          // one transient observation as a completed forward.
+          sealedSweepRemaining_ = ownedReceiptCount_;
+          sealedSweepAllDone_ = true;
+          if (all_done) {
+            return true;
+          }
+        }
       }
     }
-    return all_done;
+    return false;
   }
 
   __aicore__ inline bool TryClaimReceipt(uint32_t receipt) {
@@ -887,8 +1066,13 @@ class A5P10ScoreReceiptForwardResidentKernel {
     // trace is post-consumption forensic data, never a control transition.
     const uint64_t previous = static_cast<uint64_t>(ReadGmByPassDCache<int64_t>(
         receiptRing_ + receipt * kReceiptWords + 4U));
+    // Receipt consumption writes the initial scan gates, while a later CQ
+    // terminal adds completion evidence for the compact wave.  Both writes
+    // are Stage-B-owned and must accumulate rather than make the later drain
+    // erase the earlier candidate/Post diagnosis.
+    const uint32_t prior_trace = static_cast<uint32_t>(previous >> 32U);
     const uint64_t published = (previous & 0xffffffffULL) |
-        (static_cast<uint64_t>(trace) << 32U);
+        (static_cast<uint64_t>(prior_trace | trace) << 32U);
     WriteGmByPassDCache<int64_t>(
         receiptRing_ + receipt * kReceiptWords + 4U,
         static_cast<int64_t>(published));
@@ -1002,6 +1186,17 @@ class A5P10ScoreReceiptForwardResidentKernel {
         kvObjectToForwardSlot_ + object_offset, selected);
     DataSyncBarrier<MemDsbT::DDR>();
 
+    if (slotClaim_->newly_claimed != 0U) {
+      // Publish the forward-local UB owner before exposing this source map.
+      // A concurrent final-recall worker that finds the immutable mapping can
+      // therefore see PENDING and wait, rather than seeing EMPTY and issuing
+      // a duplicate PostOnly for the same fixed resident row.
+      WriteGmByPassDCache<int32_t>(
+          residentReady_ + selected,
+          static_cast<int32_t>(A5P10ResidentReadyState::PENDING));
+      DataSyncBarrier<MemDsbT::DDR>();
+    }
+
     const int32_t visible_source = ReadGmByPassDCache<int32_t>(
         sourceToForwardSlot_ + source_offset);
     if (visible_source != A5_P10_STAGE_B_CLAIMING_SLOT &&
@@ -1022,6 +1217,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     slotClaim_->resident_slot = A5_P10_STAGE_B_UNMAPPED_SLOT;
     slotClaim_->newly_claimed = 0U;
+    slotClaim_->source_already_mapped = 0U;
     set_flag(PIPE_S, PIPE_V, simtEvent_);
     wait_flag(PIPE_S, PIPE_V, simtEvent_);
     AscendC::Simt::VF_CALL<ClaimForwardSlotSimtService>(
@@ -1034,8 +1230,24 @@ class A5P10ScoreReceiptForwardResidentKernel {
     wait_flag(PIPE_V, PIPE_S, simtEvent_);
     *slot = slotClaim_->resident_slot;
     *newly_claimed = slotClaim_->newly_claimed != 0U;
-    return *slot >= 0 &&
-           PublishClaimedForwardSlot(source_offset, object_offset);
+    if (*slot < 0 && slotClaim_->source_already_mapped ==
+                         kSlotClaimSpeculativeBandExhausted) {
+      speculativeBandExhausted_ = true;
+    }
+    if (*slot < 0) {
+      return false;
+    }
+    if (!PublishClaimedForwardSlot(source_offset, object_offset)) {
+      // A newly claimed object may already have PENDING published before its
+      // source-cache entry.  Do not leave that forward-local owner invisible
+      // and continue scanning: the only safe outcome is to fail this forward
+      // before final recall could reuse the same resident row.
+      fatalTransportReason_ = fatalTransportReason_ == 0U
+          ? A5_P10_STAGE_B_POST_BEGIN_UNKNOWN
+          : fatalTransportReason_;
+      return false;
+    }
+    return true;
   }
 
   __aicore__ inline bool ClaimRecallSlot(
@@ -1063,14 +1275,73 @@ class A5P10ScoreReceiptForwardResidentKernel {
     wait_flag(PIPE_V, PIPE_S, simtEvent_);
     *slot = slotClaim_->resident_slot;
     *newly_claimed = slotClaim_->newly_claimed != 0U;
-    return *slot >= 0 &&
-           PublishClaimedForwardSlot(source_offset, object_offset);
+    if (*slot < 0) {
+      return false;
+    }
+    if (!PublishClaimedForwardSlot(source_offset, object_offset)) {
+      // See the speculative path above.  A failed publication after a fixed
+      // recall-row claim is not recoverable by a second claim or PostOnly.
+      fatalTransportReason_ = fatalTransportReason_ == 0U
+          ? A5_P10_STAGE_B_POST_BEGIN_UNKNOWN
+          : fatalTransportReason_;
+      return false;
+    }
+    return true;
+  }
+
+  // The source/object maps may already have been published by another
+  // receipt worker. In that case final recall must atomically acquire the
+  // row's EMPTY -> PENDING ownership before it writes a seed into its local
+  // UB buffer. This is intentionally one forward-local state transition, not
+  // a reusable arena lease or a cross-forward generation protocol.
+  __aicore__ inline bool TryClaimResidentPending(int32_t resident_slot,
+                                                 bool* owned) {
+    if (owned == nullptr || resident_slot < 0) {
+      return false;
+    }
+    *owned = false;
+    slotClaim_->newly_claimed = 0U;
+    slotClaim_->observed_object_slot = A5_P10_STAGE_B_UNMAPPED_SLOT;
+    set_flag(PIPE_S, PIPE_V, simtEvent_);
+    wait_flag(PIPE_S, PIPE_V, simtEvent_);
+    AscendC::Simt::VF_CALL<ClaimResidentPendingSimtService>(
+        AscendC::Simt::Dim3{1U, 1U, 1U}, residentReady_, resident_slot,
+        slotClaim_);
+    set_flag(PIPE_V, PIPE_S, simtEvent_);
+    wait_flag(PIPE_V, PIPE_S, simtEvent_);
+    *owned = slotClaim_->newly_claimed != 0U;
+    return true;
   }
 
   __aicore__ inline uint32_t FindFreeSeedBuffer() const {
     for (uint32_t index = 0U;
          index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
-      if (!seedBufferBusy_[index]) {
+      if (!seedBufferBusy_[index] &&
+          speculativePendingSeedCount_[index] == 0U) {
+        return index;
+      }
+    }
+    return kNoBuffer;
+  }
+
+  // A speculative candidate is held in one of the two fixed 64-seed UB
+  // buffers until it is full.  Prefer a partially-filled buffer so adjacent
+  // C8 receipts form one real HCCP microbatch instead of receipt-sized
+  // queue acquisitions.  A posted or full-deferred buffer is never reused.
+  __aicore__ inline uint32_t FindAppendableSpeculativeSeedBuffer() const {
+    for (uint32_t index = 0U;
+         index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
+      if (!seedBufferBusy_[index] &&
+          speculativePendingSeedCount_[index] != 0U &&
+          speculativePendingSeedCount_[index] <
+              A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+        return index;
+      }
+    }
+    for (uint32_t index = 0U;
+         index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
+      if (!seedBufferBusy_[index] &&
+          speculativePendingSeedCount_[index] == 0U) {
         return index;
       }
     }
@@ -1080,7 +1351,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
   __aicore__ inline uint32_t FindFreeWave() const {
     for (uint32_t index = 0U;
          index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
-      if (waves_[index].posted == 0U) {
+      if (waves_[index].state == kStageBWaveFree) {
         return index;
       }
     }
@@ -1091,9 +1362,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
   // for failure evidence: it was the final opaque writeback edge that could
   // erase a valid KVAF Begin diagnostic on a later final-recall wave.
   __aicore__ inline uint32_t StartMicrobatch(
-      uint32_t buffer_index, uint32_t seed_count) {
+      uint32_t buffer_index, uint32_t seed_count,
+      uint32_t trace_receipt) {
     if (buffer_index >= A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY ||
-        seed_count == 0U || seed_count > A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+        seedBufferBusy_[buffer_index] || seed_count == 0U ||
+        seed_count > A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
       return A5_P10_STAGE_B_POST_INVALID_CALL;
     }
     uint32_t wave_index = FindFreeWave();
@@ -1106,9 +1379,10 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     StageBWave* wave = waves_ + wave_index;
     wave->buffer_index = buffer_index;
-    wave->posted = 0U;
+    wave->state = kStageBWaveFree;
     wave->seed_count = 0U;
     wave->seeds = nullptr;
+    wave->trace_receipt = kNoReceipt;
     wave->failure_reason = 0U;
     // PostOnly returns one scalar status.  It cannot mutate a caller-owned
     // wave; only after that scalar proves POSTED do we reload the published
@@ -1117,17 +1391,38 @@ class A5P10ScoreReceiptForwardResidentKernel {
             controlGm_, worker_, worker_ + buffer_index, localSeeds_[buffer_index],
             seed_count, rowsPerObject_, leaseResult_, simtEvent_);
     if (begin_reason != 0U) {
+      if (!IsRetryableKnownNoPostReason(begin_reason)) {
+        // An ambiguous Begin may already own a queue/doorbell. Do not let the
+        // caller retain these UB seeds as a retry candidate or turn them into
+        // a later final-recall wave. The enclosing forward records this
+        // failure and stops before any slot can be reused.
+        wave->seeds = localSeeds_[buffer_index];
+        wave->seed_count = seed_count;
+        wave->trace_receipt = trace_receipt;
+        wave->failure_reason = begin_reason;
+        wave->state = kStageBWaveQuarantined;
+        seedBufferBusy_[buffer_index] = true;
+      }
       return begin_reason;
     }
     if (!RehydrateForwardResidentWaveForDrain(
             controlGm_, leaseResult_, seed_count, wave)) {
       // PostOnly is already durable here.  Do not release this lease from an
       // unproven state; preserve the failed forward's Direct-HCCP evidence.
+      // Critically, this buffer is no longer retryable: retrying the same
+      // seeds could duplicate a doorbell that has already been observed.
+      wave->seeds = localSeeds_[buffer_index];
+      wave->seed_count = seed_count;
+      wave->trace_receipt = trace_receipt;
+      wave->failure_reason = A5_P10_STAGE_B_POST_BEGIN_REHYDRATE;
+      wave->state = kStageBWaveQuarantined;
+      seedBufferBusy_[buffer_index] = true;
       return A5_P10_STAGE_B_POST_BEGIN_REHYDRATE;
     }
     wave->seeds = localSeeds_[buffer_index];
     wave->seed_count = seed_count;
-    wave->posted = 1U;
+    wave->trace_receipt = trace_receipt;
+    wave->state = kStageBWaveDrainable;
     // Begin returned successfully, so descriptors are durable and the fixed
     // rows may now be observed as in-flight by final recall.
     for (uint32_t index = 0U; index < seed_count; ++index) {
@@ -1145,14 +1440,91 @@ class A5P10ScoreReceiptForwardResidentKernel {
     return 0U;
   }
 
-  __aicore__ inline uint32_t FlushSpeculativeSeeds(
-      uint32_t buffer_index, uint32_t seed_count) {
+  __aicore__ inline uint32_t FlushSpeculativeSeeds(uint32_t buffer_index) {
+    if (buffer_index >= A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY) {
+      return A5_P10_STAGE_B_POST_INVALID_CALL;
+    }
+    const uint32_t seed_count = speculativePendingSeedCount_[buffer_index];
     if (seed_count == 0U) {
       return 0U;
     }
-    // Busy queues only defer speculation. EMPTY rows are harmless and final
-    // recall reuses the same fixed row for an actual exact winner.
-    return StartMicrobatch(buffer_index, seed_count);
+    // Busy queues only defer speculation. Keep the exact UB seed wave intact
+    // only for a *proven no-post* retryable condition. An unknown Begin or a
+    // rehydrate failure may already own a doorbell, so it quarantines the
+    // buffer and terminates this forward instead of being retried or later
+    // reclassified as final recall.
+    const uint32_t reason = StartMicrobatch(
+        buffer_index, seed_count, speculativeTraceReceipt_[buffer_index]);
+    if (reason == 0U) {
+      speculativePendingSeedCount_[buffer_index] = 0U;
+      speculativeTraceReceipt_[buffer_index] = kNoReceipt;
+    } else if (!IsRetryableKnownNoPostReason(reason)) {
+      fatalTransportReason_ = fatalTransportReason_ == 0U
+          ? reason
+          : fatalTransportReason_;
+    }
+    return reason;
+  }
+
+  __aicore__ inline bool TryPostFullSpeculativeSeedBuffers() {
+    bool retryable_or_posted = true;
+    for (uint32_t index = 0U;
+         index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
+      if (seedBufferBusy_[index] ||
+          speculativePendingSeedCount_[index] !=
+              A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+        continue;
+      }
+      const uint32_t reason = FlushSpeculativeSeeds(index);
+      if (reason != 0U && !IsRetryableKnownNoPostReason(reason)) {
+        return false;
+      }
+      if (reason != 0U) {
+        retryable_or_posted = false;
+      }
+    }
+    return retryable_or_posted;
+  }
+
+  __aicore__ inline bool DiscardUnpostedSpeculativeSeeds() {
+    for (uint32_t index = 0U;
+         index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
+      // Process has terminal-drained every posted wave before this call, so
+      // only descriptor-free local candidates can remain. Their immutable
+      // source/object map remains valid; an exact final winner will batch
+      // Get into that same fixed resident row below.
+      if (!seedBufferBusy_[index]) {
+        for (uint32_t seed = 0U;
+             seed < speculativePendingSeedCount_[index]; ++seed) {
+          const int32_t resident_slot = localSeeds_[index][seed].resident_slot;
+          if (resident_slot < 0) {
+            fatalTransportReason_ = fatalTransportReason_ == 0U
+                ? A5_P10_STAGE_B_POST_INVALID_CALL
+                : fatalTransportReason_;
+            return false;
+          }
+          const int32_t observed = ReadGmByPassDCache<int32_t>(
+              residentReady_ + resident_slot);
+          // A PENDING row is owned solely by this local unposted seed. Return
+          // it to EMPTY before final recall competes for it; any other state
+          // means a lifecycle violation, not a license to overwrite it.
+          if (observed == static_cast<int32_t>(A5P10ResidentReadyState::PENDING)) {
+            WriteGmByPassDCache<int32_t>(
+                residentReady_ + resident_slot,
+                static_cast<int32_t>(A5P10ResidentReadyState::EMPTY));
+          } else {
+            fatalTransportReason_ = fatalTransportReason_ == 0U
+                ? A5_P10_STAGE_B_POST_BEGIN_UNKNOWN
+                : fatalTransportReason_;
+            return false;
+          }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        speculativePendingSeedCount_[index] = 0U;
+        speculativeTraceReceipt_[index] = kNoReceipt;
+      }
+    }
+    return true;
   }
 
   __aicore__ inline void ConsumeExactScoreReceipt(uint32_t receipt) {
@@ -1167,11 +1539,6 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     trace |= A5_P10_STAGE_B_TRACE_DESCRIPTOR_VALID;
     DataSyncBarrier<MemDsbT::DDR>();
-    uint32_t buffer_index = FindFreeSeedBuffer();
-    uint32_t seed_count = 0U;
-    if (buffer_index == kNoBuffer) {
-      trace |= A5_P10_STAGE_B_TRACE_SEED_BUFFER_UNAVAILABLE;
-    }
     for (uint32_t row_delta = 0U;
          row_delta < descriptor.row_count &&
          descriptor.row_begin + row_delta < activeRows_; ++row_delta) {
@@ -1179,7 +1546,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
       for (uint32_t source_delta = 0U;
            source_delta < descriptor.source_count; ++source_delta) {
         const uint32_t source = descriptor.source_begin + source_delta;
-        if (source >= tiling_->sourceCapacity || buffer_index == kNoBuffer) {
+        if (source >= tiling_->sourceCapacity || speculativeBandExhausted_) {
           continue;
         }
         trace |= A5_P10_STAGE_B_TRACE_SOURCE_SCANNED;
@@ -1211,6 +1578,14 @@ class A5P10ScoreReceiptForwardResidentKernel {
           continue;
         }
         trace |= A5_P10_STAGE_B_TRACE_MISS_CANDIDATE;
+        const uint32_t buffer_index = FindAppendableSpeculativeSeedBuffer();
+        if (buffer_index == kNoBuffer) {
+          // Do not create a forward map when neither fixed UB seed buffer can
+          // retain the corresponding descriptor. Exact final recall remains
+          // correct and will claim a fixed row only for a true winner.
+          trace |= A5_P10_STAGE_B_TRACE_SEED_BUFFER_UNAVAILABLE;
+          continue;
+        }
         const uint64_t source_offset = static_cast<uint64_t>(row) *
             tiling_->sourceCapacity + source;
         const uint64_t object_offset = static_cast<uint64_t>(
@@ -1227,33 +1602,30 @@ class A5P10ScoreReceiptForwardResidentKernel {
         // Aggregate/struct copies into __ubuf__ are not a supported AscendC
         // address-space operation.  Keep the 16-byte seed ABI, but issue its
         // four scalar UB stores explicitly.
-        localSeeds_[buffer_index][seed_count].row = static_cast<int32_t>(row);
-        localSeeds_[buffer_index][seed_count].source =
+        const uint32_t seed_index = speculativePendingSeedCount_[buffer_index];
+        localSeeds_[buffer_index][seed_index].row = static_cast<int32_t>(row);
+        localSeeds_[buffer_index][seed_index].source =
             static_cast<int32_t>(source);
-        localSeeds_[buffer_index][seed_count].kv_object = mapping.kv_object;
-        localSeeds_[buffer_index][seed_count].resident_slot = resident_slot;
-        ++seed_count;
-        if (seed_count == A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+        localSeeds_[buffer_index][seed_index].kv_object = mapping.kv_object;
+        localSeeds_[buffer_index][seed_index].resident_slot = resident_slot;
+        ++speculativePendingSeedCount_[buffer_index];
+        // Preserve the receipt that most recently contributed to this compact
+        // wave.  It is telemetry only; the seed payload and all transport
+        // decisions remain the fixed 16-byte ABI above.
+        speculativeTraceReceipt_[buffer_index] = receipt;
+        if (speculativePendingSeedCount_[buffer_index] ==
+            A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
           trace |= A5_P10_STAGE_B_TRACE_POST_ATTEMPTED;
-          const uint32_t post_reason =
-              FlushSpeculativeSeeds(buffer_index, seed_count);
+          const uint32_t post_reason = FlushSpeculativeSeeds(buffer_index);
           trace |= post_reason == 0U ? A5_P10_STAGE_B_TRACE_POSTED
                                      : A5_P10_STAGE_B_TRACE_POST_DEFERRED;
-          buffer_index = FindFreeSeedBuffer();
-          if (buffer_index == kNoBuffer) {
-            trace |= A5_P10_STAGE_B_TRACE_SEED_BUFFER_UNAVAILABLE;
-          }
-          seed_count = 0U;
         }
       }
     }
-    if (seed_count != 0U) {
-      trace |= A5_P10_STAGE_B_TRACE_POST_ATTEMPTED;
-      const uint32_t post_reason =
-          FlushSpeculativeSeeds(buffer_index, seed_count);
-      trace |= post_reason == 0U ? A5_P10_STAGE_B_TRACE_POSTED
-                                 : A5_P10_STAGE_B_TRACE_POST_DEFERRED;
-    }
+    // Do not flush a receipt-sized tail. A partial wave remains in the fixed
+    // UB A/B staging buffers for the next score receipt, then is either
+    // posted at 64 seeds or discarded after producer seal before exact final
+    // recall. This is the required candidate-compact batching boundary.
     // Claim -> durable local copy/terminal decision -> DONE. Ring recycle is
     // intentionally outside this forward-owned kernel boundary.
     DataSyncBarrier<MemDsbT::DDR>();
@@ -1283,8 +1655,16 @@ class A5P10ScoreReceiptForwardResidentKernel {
       for (uint32_t index = 0U;
            index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
         StageBWave* wave = waves_ + index;
-        if (wave->posted == 0U) {
+        if (wave->state == kStageBWaveFree) {
           continue;
+        }
+        if (wave->state == kStageBWaveQuarantined) {
+          if (target_failure_reason != nullptr && wave->failure_reason != 0U) {
+            *target_failure_reason = wave->failure_reason;
+          }
+          // A quarantined record may have observed a doorbell or a CQ terminal
+          // whose queue return failed. Never invoke KVAF on it again.
+          return false;
         }
         pending = true;
         bool wave_has_target = false;
@@ -1321,6 +1701,13 @@ class A5P10ScoreReceiptForwardResidentKernel {
                 wave->seeds[seed].resident_slot == target_slot;
           }
           DataSyncBarrier<MemDsbT::DDR>();
+          if (wave->trace_receipt != kNoReceipt) {
+            uint32_t trace = A5_P10_STAGE_B_TRACE_CQ_READY;
+            if (!ProducerSealed()) {
+              trace |= A5_P10_STAGE_B_TRACE_PRESEAL_CQ_READY;
+            }
+            StoreReceiptTrace(wave->trace_receipt, trace);
+          }
           if (completed_target_slot && target_slot_ready != nullptr) {
             *target_slot_ready = true;
           }
@@ -1331,6 +1718,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         seedBufferBusy_[wave->buffer_index] = false;
         wave->seed_count = 0U;
         wave->seeds = nullptr;
+        wave->trace_receipt = kNoReceipt;
       }
       if (!pending) {
         return true;
@@ -1341,7 +1729,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     for (uint32_t index = 0U;
          index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
-      if (waves_[index].posted != 0U) {
+      if (waves_[index].state != kStageBWaveFree) {
         return false;
       }
     }
@@ -1353,7 +1741,57 @@ class A5P10ScoreReceiptForwardResidentKernel {
         terminal_mode, A5_P10_STAGE_B_UNMAPPED_SLOT, nullptr);
   }
 
-  __aicore__ inline bool EnsureFinalWinnerReady(
+  __aicore__ inline uint32_t FirstQuarantinedWaveReason() const {
+    for (uint32_t index = 0U;
+         index < A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY; ++index) {
+      if (waves_[index].state == kStageBWaveQuarantined) {
+        return waves_[index].failure_reason == 0U
+            ? A5_P10_STAGE_B_POST_BEGIN_UNKNOWN
+            : waves_[index].failure_reason;
+      }
+    }
+    return 0U;
+  }
+
+  __aicore__ inline bool HasFatalTransportFailure() const {
+    return fatalTransportReason_ != 0U || FirstQuarantinedWaveReason() != 0U;
+  }
+
+  __aicore__ inline uint32_t FatalTransportFailureReason() const {
+    return fatalTransportReason_ != 0U ? fatalTransportReason_
+                                       : FirstQuarantinedWaveReason();
+  }
+
+  // PENDING belongs to one worker's local seed buffer. A different worker may
+  // observe the immutable source/object mapping first, but it must wait for
+  // the owner to post (IN_FLIGHT), complete (READY), or discard at seal
+  // (EMPTY). It must never infer ownership merely from a positive map.
+  __aicore__ inline int32_t PollPendingResidentTransition(
+      int32_t resident_slot) {
+    if (resident_slot < 0) {
+      return A5_P10_STAGE_B_UNMAPPED_SLOT;
+    }
+    const int32_t state = ReadGmByPassDCache<int32_t>(
+        residentReady_ + resident_slot);
+    if (state != static_cast<int32_t>(A5P10ResidentReadyState::PENDING)) {
+      return state;
+    }
+    // This is one nonblocking device turn, not a nested bounded wait.  Both
+    // final-recall loops already own the bounded-poll budget; nesting it here
+    // would multiply a stalled peer by boundedDrainPolls squared.
+    (void)DrainLocalWaves(false);
+    if (HasFatalTransportFailure()) {
+      return A5_P10_STAGE_B_UNMAPPED_SLOT;
+    }
+    PollReceiptQuantumBoundary();
+    return ReadGmByPassDCache<int32_t>(residentReady_ + resident_slot);
+  }
+
+  // Final exact recall is now emitted in 64-request waves before this wait
+  // runs.  This function is intentionally read/drain-only: reintroducing an
+  // EMPTY -> single-request Post here would recreate the 1,608 serial tail
+  // that the bounded final batch eliminates.
+  __aicore__ inline bool WaitForFinalWinnerReady(
       const A5P10ForwardResidentSeed& seed, uint32_t rank) {
     if (seed.resident_slot < 0) {
       return false;
@@ -1366,29 +1804,24 @@ class A5P10ScoreReceiptForwardResidentKernel {
       if (state == static_cast<int32_t>(A5P10ResidentReadyState::READY)) {
         return true;
       }
-      if (state == static_cast<int32_t>(A5P10ResidentReadyState::EMPTY)) {
-        const uint32_t buffer_index = FindFreeSeedBuffer();
-        if (buffer_index != kNoBuffer) {
-          // See the scalar UB-store rule in ConsumeExactScoreReceipt().
-          localSeeds_[buffer_index][0].row = seed.row;
-          localSeeds_[buffer_index][0].source = seed.source;
-          localSeeds_[buffer_index][0].kv_object = seed.kv_object;
-          localSeeds_[buffer_index][0].resident_slot = seed.resident_slot;
-          const uint32_t post_failure_reason =
-              StartMicrobatch(buffer_index, 1U);
-          if (post_failure_reason != 0U && last_failure_reason == 0U) {
-            last_failure_reason = post_failure_reason;
-          }
-        } else {
-          if (last_failure_reason == 0U) {
-            last_failure_reason = A5_P10_STAGE_B_POST_NO_FREE_WAVE;
-          }
+      if (state == static_cast<int32_t>(A5P10ResidentReadyState::PENDING)) {
+        // Another worker owns the fixed row in a private seed buffer. It will
+        // either submit it or release PENDING before final publication.
+        (void)PollPendingResidentTransition(seed.resident_slot);
+        if (HasFatalTransportFailure()) {
+          last_failure_reason = FatalTransportFailureReason();
+          break;
         }
+        continue;
+      }
+      if (state != static_cast<int32_t>(A5P10ResidentReadyState::IN_FLIGHT)) {
+        last_failure_reason = A5_P10_STAGE_B_POST_BEGIN_UNKNOWN;
+        break;
       }
       // This is terminal-only progress; score scanning never waits for CQ.
       // A successful terminal for this exact slot is stronger than a second
       // same-kernel GM read: it proves HCCP completed and this worker has
-      // published READY with a DDR barrier.  The latter GM read remains the
+      // published READY with a DDR barrier. The latter GM read remains the
       // path for a slot completed by another worker.
       bool local_terminal_ready = false;
       uint32_t drain_failure_reason = 0U;
@@ -1401,6 +1834,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
       if (drain_failure_reason != 0U && last_failure_reason == 0U) {
         last_failure_reason = drain_failure_reason;
       }
+      PollReceiptQuantumBoundary();
     }
     const int32_t final_state = ReadGmByPassDCache<int32_t>(
         residentReady_ + seed.resident_slot);
@@ -1416,6 +1850,88 @@ class A5P10ScoreReceiptForwardResidentKernel {
     RecordFirstFailure(PostDiagnostic(static_cast<uint32_t>(seed.row), rank,
                                       last_failure_reason));
     return false;
+  }
+
+  __aicore__ inline bool BatchContainsResidentSlot(
+      uint32_t buffer_index, uint32_t seed_count, int32_t resident_slot) const {
+    if (buffer_index >= A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY ||
+        resident_slot < 0) {
+      return false;
+    }
+    for (uint32_t index = 0U; index < seed_count; ++index) {
+      if (localSeeds_[buffer_index][index].resident_slot == resident_slot) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Exact recall is the terminal correctness authority. It uses the same
+  // fixed two 64-seed UB buffers and the same PostOnly/CQ API as speculative
+  // work, but it sends one compact wave at a time and drains it before reuse.
+  // A durable Begin is never retried: a later timeout is a CQ failure, not a
+  // license to duplicate the HCCP request.
+  __aicore__ inline bool PostFinalRecallBatchAndDrain(
+      uint32_t buffer_index, uint32_t seed_count, uint32_t row,
+      uint32_t rank) {
+    if (seed_count == 0U) {
+      return true;
+    }
+    uint32_t post_reason = A5_P10_STAGE_B_POST_INVALID_CALL;
+    for (uint32_t attempt = 0U; attempt < tiling_->boundedDrainPolls;
+         ++attempt) {
+      post_reason = StartMicrobatch(buffer_index, seed_count, kNoReceipt);
+      if (post_reason == 0U) {
+        if (DrainLocalWaves(true)) {
+          return true;
+        }
+        RecordFirstFailure(PostDiagnostic(
+            row, rank, A5_P10_STAGE_B_POST_CQ_PENDING));
+        return false;
+      }
+      if (!IsRetryableKnownNoPostReason(post_reason)) {
+        break;
+      }
+      if (!DrainLocalWaves(true)) {
+        post_reason = A5_P10_STAGE_B_POST_CQ_PENDING;
+        break;
+      }
+      PollReceiptQuantumBoundary();
+    }
+    RecordFirstFailure(PostDiagnostic(row, rank, post_reason));
+    return false;
+  }
+
+  __aicore__ inline bool AppendFinalRecallSeed(
+      uint32_t buffer_index, uint32_t* seed_count,
+      const A5P10ForwardResidentSeed& seed, uint32_t row, uint32_t rank) {
+    if (seed_count == nullptr ||
+        buffer_index >= A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY ||
+        seed.resident_slot < 0 || *seed_count >
+            A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+      return false;
+    }
+    if (BatchContainsResidentSlot(buffer_index, *seed_count,
+                                  seed.resident_slot)) {
+      return true;
+    }
+    if (*seed_count == A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+      return false;
+    }
+    // Aggregate/struct stores into __ubuf__ are unsupported on this route.
+    // Keep the seed ABI but issue the four scalar stores.
+    localSeeds_[buffer_index][*seed_count].row = seed.row;
+    localSeeds_[buffer_index][*seed_count].source = seed.source;
+    localSeeds_[buffer_index][*seed_count].kv_object = seed.kv_object;
+    localSeeds_[buffer_index][*seed_count].resident_slot = seed.resident_slot;
+    ++(*seed_count);
+    if (*seed_count == A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+      if (!PostFinalRecallBatchAndDrain(buffer_index, *seed_count, row, rank)) {
+        return false;
+      }
+      *seed_count = 0U;
+    }
+    return true;
   }
 
   // A second worker may have won the object claim while this worker reaches a
@@ -1514,7 +2030,145 @@ class A5P10ScoreReceiptForwardResidentKernel {
         static_cast<int32_t>(encoded);
   }
 
-  __aicore__ inline bool FinalizeAssignedRows() {
+  // First final pass: materialize every exact miss into at most 64-request
+  // Direct-HCCP waves. No Top-K value, order, or QSFA slot is changed here;
+  // this pass only guarantees that the immutable source/object -> resident
+  // mapping has a terminal transport before the second pass publishes the
+  // QSFA prefix.
+  __aicore__ inline bool PostFinalWinnerBatches() {
+    const uint32_t buffer_index = FindFreeSeedBuffer();
+    if (buffer_index == kNoBuffer) {
+      return false;
+    }
+    uint32_t seed_count = 0U;
+    for (uint32_t row = worker_; row < activeRows_;
+         row += tiling_->executorWorkerCount) {
+      const int32_t selected_length = ReadGmByPassDCache<int32_t>(
+          selectedSlotLengths_ + row);
+      if (selected_length < static_cast<int32_t>(topkPerRow_) ||
+          static_cast<uint32_t>(selected_length) >
+              tiling_->attentionSlotCapacity) {
+        RecordFirstFailure(FinalizeDiagnostic(
+            row, 0U, A5_P10_STAGE_B_FINALIZE_BAD_SELECTED_LENGTH));
+        return false;
+      }
+      for (uint32_t rank = 0U; rank < topkPerRow_; ++rank) {
+        const uint64_t canonical_offset = static_cast<uint64_t>(row) *
+            topkPerRow_ + rank;
+        const int32_t source_value = ReadGmByPassDCache<int32_t>(
+            canonicalSparseIndices_ + canonical_offset);
+        if (source_value < 0 || static_cast<uint32_t>(source_value) >=
+                                    tiling_->sourceCapacity) {
+          continue;
+        }
+        const uint32_t source = static_cast<uint32_t>(source_value);
+        A5P10ActiveRowMapping mapping{};
+        if (!ResolveActiveRowMapping(row, source, &mapping, true)) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_ACTIVE_MAPPING));
+          return false;
+        }
+        if (mapping.persistent_slot >= 0) {
+          continue;
+        }
+        const uint64_t source_offset = static_cast<uint64_t>(row) *
+            tiling_->sourceCapacity + source;
+        const uint64_t object_offset = static_cast<uint64_t>(
+            mapping.pool_entry) * tiling_->kvObjectCapacity +
+            static_cast<uint32_t>(mapping.object_local);
+        int32_t resident_slot = ReadGmByPassDCache<int32_t>(
+            sourceToForwardSlot_ + source_offset);
+        bool newly_claimed = false;
+        if (resident_slot < 0 && !ClaimRecallSlot(source_offset, object_offset,
+                                                   row, rank,
+                                                   &resident_slot,
+                                                   &newly_claimed)) {
+          if (!ResolveConcurrentForwardSlot(source_offset, object_offset,
+                                            &resident_slot)) {
+            RecordFirstFailure(FinalizeDiagnostic(
+                row, rank, A5_P10_STAGE_B_FINALIZE_SLOT_CLAIM));
+            return false;
+          }
+        }
+        if (resident_slot < 0) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_SLOT_CLAIM));
+          return false;
+        }
+        // The map can be owned by a different receipt worker. In that case
+        // resident_ready=PENDING is the durable handoff rather than an EMPTY
+        // row that this worker may post again. A newly created recall mapping
+        // already owns PENDING; an existing map must atomically acquire it.
+        bool owns_pending = newly_claimed;
+        int32_t state = A5_P10_STAGE_B_UNMAPPED_SLOT;
+        for (uint32_t attempt = 0U; attempt < tiling_->boundedDrainPolls;
+             ++attempt) {
+          state = ReadGmByPassDCache<int32_t>(residentReady_ + resident_slot);
+          if (state == static_cast<int32_t>(A5P10ResidentReadyState::READY) ||
+              state == static_cast<int32_t>(A5P10ResidentReadyState::IN_FLIGHT)) {
+            break;
+          }
+          if (state == static_cast<int32_t>(A5P10ResidentReadyState::PENDING)) {
+            if (owns_pending) {
+              break;
+            }
+            state = PollPendingResidentTransition(resident_slot);
+            if (state == static_cast<int32_t>(A5P10ResidentReadyState::PENDING)) {
+              continue;
+            }
+            continue;
+          }
+          if (state == static_cast<int32_t>(A5P10ResidentReadyState::EMPTY)) {
+            bool acquired_pending = false;
+            if (!TryClaimResidentPending(resident_slot, &acquired_pending)) {
+              RecordFirstFailure(FinalizeDiagnostic(
+                  row, rank, A5_P10_STAGE_B_FINALIZE_WINNER_READY));
+              return false;
+            }
+            if (acquired_pending) {
+              owns_pending = true;
+            }
+            continue;
+          }
+          break;
+        }
+        if (HasFatalTransportFailure()) {
+          RecordFirstFailure(PostDiagnostic(
+              row, rank, FatalTransportFailureReason()));
+          return false;
+        }
+        if (state == static_cast<int32_t>(A5P10ResidentReadyState::READY) ||
+            state == static_cast<int32_t>(A5P10ResidentReadyState::IN_FLIGHT)) {
+          continue;
+        }
+        if (!owns_pending ||
+            state != static_cast<int32_t>(A5P10ResidentReadyState::PENDING)) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_WINNER_READY));
+          return false;
+        }
+        const A5P10ForwardResidentSeed seed{static_cast<int32_t>(row),
+                                            static_cast<int32_t>(source),
+                                            mapping.kv_object, resident_slot};
+        if (!AppendFinalRecallSeed(buffer_index, &seed_count, seed, row, rank)) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_WINNER_READY));
+          return false;
+        }
+      }
+    }
+    if (seed_count != 0U &&
+        !PostFinalRecallBatchAndDrain(buffer_index, seed_count, worker_, 0U)) {
+      return false;
+    }
+    return true;
+  }
+
+  // Second final pass: publish only the already-terminal resident rows to
+  // the native QSFA prefix. This preserves the existing [K,K+tail) material
+  // and makes READY, rather than a speculative map or queue state, the sole
+  // data-consumption authority.
+  __aicore__ inline bool PublishFinalAttentionSlots() {
     for (uint32_t row = worker_; row < activeRows_;
          row += tiling_->executorWorkerCount) {
       const int32_t selected_length = ReadGmByPassDCache<int32_t>(
@@ -1565,22 +2219,17 @@ class A5P10ScoreReceiptForwardResidentKernel {
             static_cast<uint32_t>(mapping.object_local);
         int32_t resident_slot = ReadGmByPassDCache<int32_t>(
             sourceToForwardSlot_ + source_offset);
-        bool newly_claimed = false;
-        if (resident_slot < 0 && !ClaimRecallSlot(source_offset, object_offset,
-                                                   row, rank,
-                                                   &resident_slot,
-                                                   &newly_claimed)) {
-          if (!ResolveConcurrentForwardSlot(source_offset, object_offset,
-                                            &resident_slot)) {
-            RecordFirstFailure(FinalizeDiagnostic(
-                row, rank, A5_P10_STAGE_B_FINALIZE_SLOT_CLAIM));
-            return false;
-          }
+        if (resident_slot < 0 &&
+            !ResolveConcurrentForwardSlot(source_offset, object_offset,
+                                          &resident_slot)) {
+          RecordFirstFailure(FinalizeDiagnostic(
+              row, rank, A5_P10_STAGE_B_FINALIZE_SLOT_CLAIM));
+          return false;
         }
-        A5P10ForwardResidentSeed seed{static_cast<int32_t>(row),
-                                      static_cast<int32_t>(source),
-                                      mapping.kv_object, resident_slot};
-        if (!EnsureFinalWinnerReady(seed, rank)) {
+        const A5P10ForwardResidentSeed seed{static_cast<int32_t>(row),
+                                            static_cast<int32_t>(source),
+                                            mapping.kv_object, resident_slot};
+        if (!WaitForFinalWinnerReady(seed, rank)) {
           RecordFirstFailure(FinalizeDiagnostic(
               row, rank, A5_P10_STAGE_B_FINALIZE_WINNER_READY));
           return false;
@@ -1599,6 +2248,10 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     DataSyncBarrier<MemDsbT::DDR>();
     return true;
+  }
+
+  __aicore__ inline bool FinalizeAssignedRows() {
+    return PostFinalWinnerBatches() && PublishFinalAttentionSlots();
   }
 
   __aicore__ inline void MarkWorkerComplete() {
@@ -1634,6 +2287,24 @@ class A5P10ScoreReceiptForwardResidentKernel {
   __ubuf__ CompletionResult* completion_ = nullptr;
   StageBWave waves_[A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY]{};
   bool seedBufferBusy_[A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY]{};
+  // Per-invocation candidate staging only. These words are neither graph
+  // inputs nor GM state: the fixed 2x64 UB layout remains unchanged.
+  uint32_t speculativePendingSeedCount_[A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY]{};
+  uint32_t speculativeTraceReceipt_[A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY]{};
+  bool speculativeBandExhausted_ = false;
+  // First non-retryable transport status. It exists only for this kernel
+  // invocation and turns any ambiguous Post/CQ ownership into a fail-closed
+  // forward before maps, UB buffers, or queue leases can be reused.
+  uint32_t fatalTransportReason_ = 0U;
+  // Receipt polling is deliberately bounded per device turn.  These are
+  // invocation-local cursor state, not graph-visible protocol words: Stage A
+  // remains the sole producer of receipt state, while this worker eventually
+  // covers its deterministic stride before declaring a sealed forward done.
+  uint32_t ownedReceiptCount_ = 0U;
+  uint32_t nextOwnedReceiptOrdinal_ = 0U;
+  uint32_t sealedSweepRemaining_ = 0U;
+  bool sealedSweepAllDone_ = true;
+  bool producerSealObserved_ = false;
 
   __gm__ uint16_t* scoreSurface_ = nullptr;
   __gm__ int64_t* receiptRing_ = nullptr;

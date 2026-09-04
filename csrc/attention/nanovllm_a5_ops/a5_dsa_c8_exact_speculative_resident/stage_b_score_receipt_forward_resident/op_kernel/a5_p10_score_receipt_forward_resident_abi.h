@@ -41,6 +41,13 @@ enum A5P10StageBReceiptTraceBit : uint32_t {
   A5_P10_STAGE_B_TRACE_POST_ATTEMPTED = 1U << 11U,
   A5_P10_STAGE_B_TRACE_POSTED = 1U << 12U,
   A5_P10_STAGE_B_TRACE_POST_DEFERRED = 1U << 13U,
+  // These two bits are trace-only proof that a successful speculative
+  // PostOnly wave reached CQ terminal.  The latter is set only when that
+  // terminal was observed while Stage A was still OPEN, which is the minimum
+  // evidence required before interpreting a latency delta as hidden HCCP
+  // work rather than later final recall.
+  A5_P10_STAGE_B_TRACE_CQ_READY = 1U << 14U,
+  A5_P10_STAGE_B_TRACE_PRESEAL_CQ_READY = 1U << 15U,
 };
 
 constexpr int32_t A5_P10_STAGE_B_UNMAPPED_SLOT = -1;
@@ -123,6 +130,10 @@ enum A5P10StageBPostFailureReason : uint32_t {
   // ambiguous post state: preserve the queue and fail the forward rather
   // than treating it as a no-post or reusing the transport resource.
   A5_P10_STAGE_B_POST_BEGIN_REHYDRATE = 24U,
+  // KVAF observed a nonzero but nonexact SQ producer-index delta. A doorbell
+  // may have reached hardware, so this is quarantine/fail-closed rather than
+  // a retryable queue-full result.
+  A5_P10_STAGE_B_POST_BEGIN_SQ_PI_DELTA_MISMATCH = 25U,
 };
 
 // A persistent Stage-B companion starts from the same cold-bound mutable
@@ -185,6 +196,15 @@ static_assert(sizeof(A5P10ForwardResidentSeed) == 16U,
 
 enum class A5P10ResidentReadyState : int32_t {
   EMPTY = 0,
+  // A fixed resident row has an immutable source/object mapping and one
+  // worker owns a seed in its private 2x64 UB staging buffer.  It is not
+  // readable by QSFA and it is not yet a durable HCCP descriptor.  This
+  // forward-local state closes the only cross-worker handoff gap: a second
+  // worker must wait for PENDING to become EMPTY (discarded at seal),
+  // IN_FLIGHT, or READY rather than submitting the same row a second time.
+  // Keeping it negative preserves the established externally visible
+  // EMPTY=0 / IN_FLIGHT=1 / READY=2 representation.
+  PENDING = -3,
   IN_FLIGHT = 1,
   READY = 2,
 };

@@ -98,6 +98,8 @@ _STAGE_B_RECEIPT_TRACE_BITS = {
     "post_attempted": 1 << 11,
     "posted": 1 << 12,
     "post_deferred": 1 << 13,
+    "cq_ready": 1 << 14,
+    "preseal_cq_ready": 1 << 15,
 }
 
 
@@ -147,12 +149,26 @@ class P10TimingSample(tuple):
         device_us: float,
         host_us: float,
         signature: P10SemanticSignature,
-        speculative_slots: int,
+        speculative_admitted_sources: int,
+        speculative_final_winner_hits: int,
+        speculative_false_positive_sources: int,
+        speculative_cursor_attempts: int,
+        final_recall_sources: int,
         mapped_sources: int,
     ) -> "P10TimingSample":
         return tuple.__new__(
             cls,
-            (device_us, host_us, signature, speculative_slots, mapped_sources),
+            (
+                device_us,
+                host_us,
+                signature,
+                speculative_admitted_sources,
+                speculative_final_winner_hits,
+                speculative_false_positive_sources,
+                speculative_cursor_attempts,
+                final_recall_sources,
+                mapped_sources,
+            ),
         )
 
     @property
@@ -169,11 +185,38 @@ class P10TimingSample(tuple):
 
     @property
     def speculative_slots(self) -> int:
+        """Compatibility alias for actual admitted speculative sources.
+
+        The old metric exposed the raw cursor, which counts failed capacity
+        attempts too. Keep the property name for older result parsers, but
+        make it report the only quantity that can represent early admission.
+        """
+
         return int(self[3])
 
     @property
-    def mapped_sources(self) -> int:
+    def speculative_admitted_sources(self) -> int:
+        return int(self[3])
+
+    @property
+    def speculative_final_winner_hits(self) -> int:
         return int(self[4])
+
+    @property
+    def speculative_false_positive_sources(self) -> int:
+        return int(self[5])
+
+    @property
+    def speculative_cursor_attempts(self) -> int:
+        return int(self[6])
+
+    @property
+    def final_recall_sources(self) -> int:
+        return int(self[7])
+
+    @property
+    def mapped_sources(self) -> int:
+        return int(self[8])
 
 
 def _blocked(reason: str) -> None:
@@ -768,10 +811,14 @@ def _build_forward_inputs(
         (receipt_capacity, RECEIPT_WORDS), dtype=torch.int64, device=device
     )
     receipt_state = torch.zeros(receipt_capacity, dtype=torch.int32, device=device)
-    # Fields [2..4,6] are cold geometry/cutoff.  Word 1 is the Stage-B
-    # diagnostic ledger, reset by prepare; a zero score cutoff gives Stage B
-    # a real speculative workload while final recall still guarantees all
-    # canonical winners.
+    # Fields [2..4,6] are cold geometry/cutoff. Word 1 is the Stage-B
+    # diagnostic ledger, reset by prepare. The low 16 bits of word 6 select
+    # only speculative admission; Guaranteed Recall still materializes every
+    # canonical winner, so a cutoff sweep cannot change P10 mathematics.
+    score_cutoff_u16 = _score_cutoff_u16()
+    score_control = score_cutoff_u16 | (
+        _STAGE_B_RECEIPT_TRACE_ENABLE if STAGE_B_RECEIPT_TRACE else 0
+    )
     forward_control = torch.tensor(
         [
             0,
@@ -780,7 +827,7 @@ def _build_forward_inputs(
             BLOCK_TOKENS,
             BATCH,
             0,
-            _STAGE_B_RECEIPT_TRACE_ENABLE if STAGE_B_RECEIPT_TRACE else 0,
+            score_control,
             0,
             0,
             0,
@@ -1396,6 +1443,92 @@ def _assert_terminal(
     return signature
 
 
+def _collect_speculation_telemetry(
+    reference: Any, tensors: dict[str, Any]
+) -> dict[str, int]:
+    """Report admission quality after the already-terminal exact proof.
+
+    These counters are observations, not scheduling inputs.  In particular,
+    ``speculative_cursor`` is an admission-attempt counter because the device
+    increments it before capacity rejection; it must never be reported as a
+    successful early Get count.
+    """
+
+    import torch
+
+    source_to_slot = tensors["source_to_slot"].detach().cpu()
+    object_snapshot = tensors["object_snapshot"].detach().cpu()
+    canonical = reference.detach().to(device="cpu", dtype=torch.int64).reshape(
+        BATCH, TOPK
+    )
+    if source_to_slot.shape != (BATCH, SOURCE_TOKENS):
+        raise AssertionError(
+            "unexpected source_to_slot telemetry shape: "
+            f"actual={tuple(source_to_slot.shape)}"
+        )
+    if object_snapshot.shape != (BATCH, SOURCE_TOKENS):
+        raise AssertionError(
+            "unexpected object_snapshot telemetry shape: "
+            f"actual={tuple(object_snapshot.shape)}"
+        )
+
+    final_winner_miss_mask = torch.zeros_like(source_to_slot, dtype=torch.bool)
+    final_miss = object_snapshot.gather(1, canonical) < 0
+    winner_positions = torch.nonzero(final_miss, as_tuple=False)
+    if winner_positions.numel():
+        final_winner_miss_mask[
+            winner_positions[:, 0],
+            canonical[winner_positions[:, 0], winner_positions[:, 1]],
+        ] = True
+
+    early_mask = (source_to_slot >= 0) & (source_to_slot < SPECULATIVE_ROWS)
+    admitted = int(torch.count_nonzero(early_mask).item())
+    final_winner_hits = int(
+        torch.count_nonzero(early_mask & final_winner_miss_mask).item()
+    )
+    cursor_attempts = int(
+        tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
+    )
+    return {
+        "speculative_admitted_sources": admitted,
+        "speculative_final_winner_hits": final_winner_hits,
+        "speculative_false_positive_sources": admitted - final_winner_hits,
+        "speculative_cursor_attempts": cursor_attempts,
+        "final_recall_sources": int(
+            torch.count_nonzero(final_winner_miss_mask & ~early_mask).item()
+        ),
+        "mapped_sources": int(torch.count_nonzero(source_to_slot >= 0).item()),
+    }
+
+
+def _make_timing_sample(
+    *,
+    device_us: float,
+    host_us: float,
+    signature: P10SemanticSignature,
+    reference: Any,
+    tensors: dict[str, Any],
+) -> P10TimingSample:
+    telemetry = _collect_speculation_telemetry(reference, tensors)
+    return P10TimingSample(
+        device_us=device_us,
+        host_us=host_us,
+        signature=signature,
+        **telemetry,
+    )
+
+
+def _speculation_metrics_text(sample: P10TimingSample) -> str:
+    return (
+        f"speculative_admitted_sources={sample.speculative_admitted_sources} "
+        f"speculative_final_winner_hits={sample.speculative_final_winner_hits} "
+        f"speculative_false_positive_sources={sample.speculative_false_positive_sources} "
+        f"speculative_cursor_attempts={sample.speculative_cursor_attempts} "
+        f"final_recall_sources={sample.final_recall_sources} "
+        f"mapped_sources={sample.mapped_sources}"
+    )
+
+
 def _verify_runtime_provenance() -> None:
     path = _require_file("P10_PRODUCT_RUNTIME_PROVENANCE")
     values = dict(
@@ -1487,6 +1620,25 @@ def _positive_environment_int(name: str, default: int) -> int:
     return value
 
 
+def _score_cutoff_u16() -> int:
+    """Return the test-only ExactScoreScan cutoff without touching C8 math.
+
+    Stage B consumes the low 16 bits of ``forward_control[6]`` as an unsigned
+    score threshold. Bit 31 remains the independent receipt-trace flag.
+    Fail closed rather than silently truncating an operator experiment into a
+    different threshold.
+    """
+
+    raw = os.environ.get("P10_SCORE_CUTOFF_U16", "0")
+    try:
+        value = int(raw, 0)
+    except ValueError as error:
+        raise P10Blocked(f"invalid_p10_score_cutoff_u16:{raw}") from error
+    if not 0 <= value <= 0xFFFF:
+        _blocked(f"invalid_p10_score_cutoff_u16:{raw}")
+    return value
+
+
 def _validate_workload_profile() -> None:
     """Fail before allocating a multi-GiB fixture on a malformed profile."""
 
@@ -1509,6 +1661,11 @@ def _validate_workload_profile() -> None:
             "invalid_executor_workers:"
             f"count={EXECUTOR_WORKERS}:limit={EXECUTOR_WORKER_LIMIT}"
         )
+    print(
+        "P10_SCORE_CUTOFF_CONFIG "
+        f"cutoff_u16={_score_cutoff_u16()} trace={int(STAGE_B_RECEIPT_TRACE)}",
+        flush=True,
+    )
     print(
         "P10_BENCH_WORKLOAD "
         f"profile={P10_BENCH_PROFILE} batch={BATCH} source_tokens={SOURCE_TOKENS} "
@@ -1767,18 +1924,12 @@ def _run_timed_forward(
     )
     _emit_stage_b_receipt_trace(tensors, context=f"timed_{mode}")
     _require_immutable_inputs(immutable_digests, base, context=f"P10 {mode} run")
-    speculative_slots = int(
-        tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
-    )
-    mapped_sources = int(
-        torch.count_nonzero(tensors["source_to_slot"].detach().cpu() >= 0).item()
-    )
-    return P10TimingSample(
+    return _make_timing_sample(
         device_us=device_us,
         host_us=host_us,
         signature=signature,
-        speculative_slots=speculative_slots,
-        mapped_sources=mapped_sources,
+        reference=reference,
+        tensors=tensors,
     )
 
 
@@ -1841,18 +1992,12 @@ def _run_timed_static_forward(
     _require_immutable_inputs(
         immutable_digests, base, context=f"P10 graph-compatible {mode} replay"
     )
-    speculative_slots = int(
-        tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
-    )
-    mapped_sources = int(
-        torch.count_nonzero(tensors["source_to_slot"].detach().cpu() >= 0).item()
-    )
-    return P10TimingSample(
+    return _make_timing_sample(
         device_us=device_us,
         host_us=host_us,
         signature=signature,
-        speculative_slots=speculative_slots,
-        mapped_sources=mapped_sources,
+        reference=reference,
+        tensors=tensors,
     )
 
 
@@ -1914,18 +2059,12 @@ def _run_timed_graph_forward(
     _require_immutable_inputs(
         immutable_digests, base, context=f"P10 ACLGraph {mode} replay"
     )
-    speculative_slots = int(
-        tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
-    )
-    mapped_sources = int(
-        torch.count_nonzero(tensors["source_to_slot"].detach().cpu() >= 0).item()
-    )
-    return P10TimingSample(
+    return _make_timing_sample(
         device_us=device_us,
         host_us=host_us,
         signature=signature,
-        speculative_slots=speculative_slots,
-        mapped_sources=mapped_sources,
+        reference=reference,
+        tensors=tensors,
     )
 
 
@@ -1986,8 +2125,7 @@ def _run_benchmark() -> int:
                 print(
                     "P10_PERF_SAMPLE "
                     f"iteration={iteration} mode={mode} device_us={sample.device_us:.3f} "
-                    f"host_us={sample.host_us:.3f} speculative_slots={sample.speculative_slots} "
-                    f"mapped_sources={sample.mapped_sources}",
+                    f"host_us={sample.host_us:.3f} {_speculation_metrics_text(sample)}",
                     flush=True,
                 )
     finally:
@@ -2056,13 +2194,25 @@ def _run_benchmark() -> int:
         flush=True,
     )
     for mode in ("serial", "overlap"):
-        speculative = [sample.speculative_slots for sample in samples[mode]]
+        speculative = [sample.speculative_admitted_sources for sample in samples[mode]]
+        winner_hits = [sample.speculative_final_winner_hits for sample in samples[mode]]
+        false_positives = [sample.speculative_false_positive_sources for sample in samples[mode]]
+        cursor_attempts = [sample.speculative_cursor_attempts for sample in samples[mode]]
+        final_recall = [sample.final_recall_sources for sample in samples[mode]]
         mapped = [sample.mapped_sources for sample in samples[mode]]
         print(
             "P10_PERF_WORK "
-            f"mode={mode} speculative_slots_min={min(speculative)} "
-            f"speculative_slots_max={max(speculative)} mapped_sources_min={min(mapped)} "
-            f"mapped_sources_max={max(mapped)}",
+            f"mode={mode} speculative_admitted_sources_min={min(speculative)} "
+            f"speculative_admitted_sources_max={max(speculative)} "
+            f"speculative_final_winner_hits_min={min(winner_hits)} "
+            f"speculative_final_winner_hits_max={max(winner_hits)} "
+            f"speculative_false_positive_sources_min={min(false_positives)} "
+            f"speculative_false_positive_sources_max={max(false_positives)} "
+            f"speculative_cursor_attempts_min={min(cursor_attempts)} "
+            f"speculative_cursor_attempts_max={max(cursor_attempts)} "
+            f"final_recall_sources_min={min(final_recall)} "
+            f"final_recall_sources_max={max(final_recall)} "
+            f"mapped_sources_min={min(mapped)} mapped_sources_max={max(mapped)}",
             flush=True,
         )
     print(
@@ -2155,8 +2305,7 @@ def _run_graph_compatible_benchmark() -> int:
                 print(
                     "P10_GRAPH_COMPAT_SAMPLE "
                     f"iteration={iteration} mode={mode} device_us={sample.device_us:.3f} "
-                    f"host_us={sample.host_us:.3f} speculative_slots={sample.speculative_slots} "
-                    f"mapped_sources={sample.mapped_sources}",
+                    f"host_us={sample.host_us:.3f} {_speculation_metrics_text(sample)}",
                     flush=True,
                 )
     finally:
@@ -2170,26 +2319,39 @@ def _run_graph_compatible_benchmark() -> int:
     if any(sample.signature != expected_signature for sample in serial + overlap):
         raise AssertionError("P10 graph-compatible serial/overlap semantic signature mismatch")
 
-    # A fused timing only has an overlap interpretation if Stage B admitted at
-    # least one pre-final-recall speculative slot.  Without that admission,
-    # the later exact winner path performs the same final recall in both
-    # schedules and a saved-us number would be a misleading measurement of
-    # launch noise rather than HCCP hiding.  Fail closed instead of printing a
-    # product performance pass; a trace-enabled rerun reports the exact gate.
-    overlap_speculative_min = min(sample.speculative_slots for sample in overlap)
-    if overlap_speculative_min == 0:
-        serial_speculative_min = min(sample.speculative_slots for sample in serial)
+    # A fused timing only has an overlap interpretation if Stage B admitted a
+    # pre-final-recall *final winner*.  Mere slot admission can consist wholly
+    # of false positives; the later exact winner path then performs the same
+    # final recall in both schedules and a saved-us number would be launch or
+    # polling noise rather than HCCP hiding.  The separate one-iteration
+    # trace also proves Post/CQ; this non-trace benchmark intentionally gates
+    # only candidate usefulness, not a fabricated transport completion.
+    overlap_speculative_min = min(
+        sample.speculative_admitted_sources for sample in overlap
+    )
+    overlap_winner_hit_min = min(
+        sample.speculative_final_winner_hits for sample in overlap
+    )
+    if overlap_speculative_min == 0 or overlap_winner_hit_min == 0:
+        serial_speculative_min = min(
+            sample.speculative_admitted_sources for sample in serial
+        )
+        serial_winner_hit_min = min(
+            sample.speculative_final_winner_hits for sample in serial
+        )
         print(
             "P10_GRAPH_COMPAT_INCONCLUSIVE "
-            "reason=overlap_has_no_speculative_slots_do_not_claim_hccp_hiding_gain "
-            f"serial_speculative_slots_min={serial_speculative_min} "
-            f"overlap_speculative_slots_min={overlap_speculative_min} "
+            "reason=overlap_has_no_useful_pre_final_winner_candidate_do_not_claim_hccp_hiding_gain "
+            f"serial_speculative_admitted_sources_min={serial_speculative_min} "
+            f"overlap_speculative_admitted_sources_min={overlap_speculative_min} "
+            f"serial_speculative_final_winner_hits_min={serial_winner_hit_min} "
+            f"overlap_speculative_final_winner_hits_min={overlap_winner_hit_min} "
             "next=P10_STAGE_B_RECEIPT_TRACE",
             flush=True,
         )
         raise AssertionError(
-            "P10 graph-compatible overlap admitted zero speculative slots; "
-            "inspect P10_STAGE_B_RECEIPT_TRACE before interpreting latency"
+            "P10 graph-compatible overlap had no useful pre-final winner "
+            "candidate; inspect P10_STAGE_B_RECEIPT_TRACE before interpreting latency"
         )
 
     serial_device = [sample.device_us for sample in serial]
@@ -2228,7 +2390,8 @@ def _run_graph_compatible_benchmark() -> int:
         "P10_GRAPH_COMPAT_EQ "
         "product_w4a4c8_oracle=1 canonical_topk=1 score_source_lens=1 "
         "ranked_resident_payload=1 qsfa_lengths_and_tail=1 "
-        "same_source_miss_mask=1 static_aliases=1 raw_aclgraph_capture=0",
+        "same_source_miss_mask=1 static_aliases=1 raw_aclgraph_capture=0 "
+        "candidate_winner_coverage=1 trace_required_for_hccp_completion=1",
         flush=True,
     )
     print(
@@ -2242,12 +2405,25 @@ def _run_graph_compatible_benchmark() -> int:
         flush=True,
     )
     for mode, values in (("serial", serial), ("fused", overlap)):
+        speculative = [sample.speculative_admitted_sources for sample in values]
+        winner_hits = [sample.speculative_final_winner_hits for sample in values]
+        false_positives = [sample.speculative_false_positive_sources for sample in values]
+        cursor_attempts = [sample.speculative_cursor_attempts for sample in values]
+        final_recall = [sample.final_recall_sources for sample in values]
+        mapped = [sample.mapped_sources for sample in values]
         print(
             "P10_GRAPH_COMPAT_WORK "
-            f"mode={mode} speculative_slots_min={min(sample.speculative_slots for sample in values)} "
-            f"speculative_slots_max={max(sample.speculative_slots for sample in values)} "
-            f"mapped_sources_min={min(sample.mapped_sources for sample in values)} "
-            f"mapped_sources_max={max(sample.mapped_sources for sample in values)}",
+            f"mode={mode} speculative_admitted_sources_min={min(speculative)} "
+            f"speculative_admitted_sources_max={max(speculative)} "
+            f"speculative_final_winner_hits_min={min(winner_hits)} "
+            f"speculative_final_winner_hits_max={max(winner_hits)} "
+            f"speculative_false_positive_sources_min={min(false_positives)} "
+            f"speculative_false_positive_sources_max={max(false_positives)} "
+            f"speculative_cursor_attempts_min={min(cursor_attempts)} "
+            f"speculative_cursor_attempts_max={max(cursor_attempts)} "
+            f"final_recall_sources_min={min(final_recall)} "
+            f"final_recall_sources_max={max(final_recall)} "
+            f"mapped_sources_min={min(mapped)} mapped_sources_max={max(mapped)}",
             flush=True,
         )
     print(
@@ -2407,8 +2583,7 @@ def _run_graph_benchmark() -> int:
                 print(
                     "P10_GRAPH_PERF_SAMPLE "
                     f"iteration={iteration} case={case} device_us={sample.device_us:.3f} "
-                    f"host_us={sample.host_us:.3f} speculative_slots={sample.speculative_slots} "
-                    f"mapped_sources={sample.mapped_sources}",
+                    f"host_us={sample.host_us:.3f} {_speculation_metrics_text(sample)}",
                     flush=True,
                 )
     finally:
@@ -2458,7 +2633,7 @@ def _run_graph_benchmark() -> int:
     eager_serial_p50 = p50["eager_serial"]
     eager_serial_p90 = p90["eager_serial"]
     overlap_speculative = [
-        sample.speculative_slots for sample in samples["graph_overlap"]
+        sample.speculative_admitted_sources for sample in samples["graph_overlap"]
     ]
     print(
         "P10_GRAPH_PERF_EQ "
@@ -2483,19 +2658,31 @@ def _run_graph_benchmark() -> int:
         flush=True,
     )
     for case in cases:
-        speculative = [sample.speculative_slots for sample in samples[case]]
+        speculative = [sample.speculative_admitted_sources for sample in samples[case]]
+        winner_hits = [sample.speculative_final_winner_hits for sample in samples[case]]
+        false_positives = [sample.speculative_false_positive_sources for sample in samples[case]]
+        cursor_attempts = [sample.speculative_cursor_attempts for sample in samples[case]]
+        final_recall = [sample.final_recall_sources for sample in samples[case]]
         mapped = [sample.mapped_sources for sample in samples[case]]
         print(
             "P10_GRAPH_PERF_WORK "
-            f"case={case} speculative_slots_min={min(speculative)} "
-            f"speculative_slots_max={max(speculative)} mapped_sources_min={min(mapped)} "
-            f"mapped_sources_max={max(mapped)}",
+            f"case={case} speculative_admitted_sources_min={min(speculative)} "
+            f"speculative_admitted_sources_max={max(speculative)} "
+            f"speculative_final_winner_hits_min={min(winner_hits)} "
+            f"speculative_final_winner_hits_max={max(winner_hits)} "
+            f"speculative_false_positive_sources_min={min(false_positives)} "
+            f"speculative_false_positive_sources_max={max(false_positives)} "
+            f"speculative_cursor_attempts_min={min(cursor_attempts)} "
+            f"speculative_cursor_attempts_max={max(cursor_attempts)} "
+            f"final_recall_sources_min={min(final_recall)} "
+            f"final_recall_sources_max={max(final_recall)} "
+            f"mapped_sources_min={min(mapped)} mapped_sources_max={max(mapped)}",
             flush=True,
         )
     if min(overlap_speculative) == 0:
         print(
             "P10_GRAPH_PERF_INCONCLUSIVE "
-            "reason=graph_overlap_has_no_speculative_slots_do_not_claim_hccp_hiding_gain",
+            "reason=graph_overlap_has_no_speculative_admission_do_not_claim_hccp_hiding_gain",
             flush=True,
         )
     print(
