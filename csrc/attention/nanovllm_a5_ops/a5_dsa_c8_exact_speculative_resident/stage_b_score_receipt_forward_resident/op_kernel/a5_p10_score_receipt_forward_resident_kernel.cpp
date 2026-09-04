@@ -73,7 +73,40 @@ struct StageBWave {
   uint32_t seed_count;
   uint32_t buffer_index;
   uint32_t posted;
+  // Failure-only evidence retained until this local wave is reused.  It is
+  // not graph-visible and never affects queue or resident-slot ownership.
+  uint32_t failure_reason;
 };
+
+__aicore__ inline uint32_t BeginFailureReasonFromKvafResult(uint64_t result) {
+  switch (result) {
+    case kvaf_fused_get::kInvalidArgs:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_ARGS;
+    case kvaf_fused_get::kInvalidEntity:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_ENTITY;
+    case kvaf_fused_get::kInvalidQueue:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_QUEUE;
+    case kvaf_fused_get::kInvalidLookup:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_LOOKUP;
+    case kvaf_fused_get::kQueueFull:
+      return A5_P10_STAGE_B_POST_BEGIN_QUEUE_FULL;
+    case kvaf_fused_get::kInvalidOutput:
+      return A5_P10_STAGE_B_POST_BEGIN_INVALID_OUTPUT;
+    default:
+      return A5_P10_STAGE_B_POST_BEGIN_UNKNOWN;
+  }
+}
+
+__aicore__ inline uint32_t CqFailureReasonFromKvafResult(uint64_t result) {
+  switch (result) {
+    case kvaf_fused_get::kCqTimeout:
+      return A5_P10_STAGE_B_POST_CQ_TIMEOUT;
+    case kvaf_fused_get::kCqError:
+      return A5_P10_STAGE_B_POST_CQ_ERROR;
+    default:
+      return A5_P10_STAGE_B_POST_CQ_UNKNOWN;
+  }
+}
 
 __simt_callee__ inline void ClaimReceiptFromSimt(
     __gm__ int32_t* receipt_state, __gm__ int32_t* forward_control,
@@ -336,21 +369,27 @@ __aicore__ inline bool BeginForwardResidentMicrobatch(
   if (control_gm == nullptr || seeds == nullptr || seed_count == 0U ||
       seed_count > A5_P10_STAGE_B_MICROBATCH_CAPACITY ||
       rows_per_object == 0U || lease_result == nullptr || output == nullptr) {
+    if (output != nullptr) {
+      output->failure_reason = A5_P10_STAGE_B_POST_INVALID_CALL;
+    }
     return false;
   }
   output->posted = 0U;
   output->seed_count = 0U;
   output->seeds = nullptr;
+  output->failure_reason = 0U;
 
   kvaf_forward_resident_get::KvafForwardResidentBatchGetControl control{};
   if (!kvaf_forward_resident_get::LoadKvafForwardResidentBatchGetControlFromGmForAicore(
           control_gm, &control)) {
+    output->failure_reason = A5_P10_STAGE_B_POST_CONTROL_LOAD;
     return false;
   }
   kvaf_forward_resident_get::KvafForwardResidentQueueLease lease{};
   if (!kvaf_forward_resident_get::TryAcquireKvafForwardResidentQueueFromAicore(
           control_gm, producer_id, queue_hint, lease_result, simt_event,
           &lease)) {
+    output->failure_reason = A5_P10_STAGE_B_POST_QUEUE_ACQUIRE;
     return false;  // bounded queue contention: final recall retries winners.
   }
 
@@ -371,12 +410,15 @@ __aicore__ inline bool BeginForwardResidentMicrobatch(
             rows_per_object, resident_slot);
   }
   if (!descriptor_ready) {
+    output->failure_reason = A5_P10_STAGE_B_POST_DESCRIPTOR_BUILD;
     (void)kvaf_forward_resident_get::ReturnKvafForwardResidentUnpostedQueueFromAicore(
         control_gm, lease_result, simt_event, &lease);
     return false;
   }
   if (!kvaf_forward_resident_get::BeginKvafForwardResidentBatchGet(
           control, lease, descriptor, &output->kvaf_wave)) {
+    output->failure_reason =
+        BeginFailureReasonFromKvafResult(output->kvaf_wave.transaction.result);
     if (output->kvaf_wave.lease.state ==
         kvaf_forward_resident_get::kForwardResidentQueueTerminal) {
       (void)kvaf_forward_resident_get::FinishKvafForwardResidentBatchGet(
@@ -412,8 +454,14 @@ __aicore__ inline bool DrainForwardResidentMicrobatch(
   }
   const bool success = kvaf_forward_resident_get::FinishKvafForwardResidentBatchGet(
       &wave->kvaf_wave, &wave->terminal);
+  if (!success) {
+    wave->failure_reason = CqFailureReasonFromKvafResult(wave->terminal.result);
+  }
   if (!kvaf_forward_resident_get::ReturnKvafForwardResidentQueueFromAicore(
           control_gm, lease_result, simt_event, &wave->kvaf_wave)) {
+    if (wave->failure_reason == 0U) {
+      wave->failure_reason = A5_P10_STAGE_B_POST_QUEUE_RETURN;
+    }
     return false;
   }
   wave->posted = 0U;
@@ -479,6 +527,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
       waves_[index].seed_count = 0U;
       waves_[index].buffer_index = index;
       waves_[index].posted = 0U;
+      waves_[index].failure_reason = 0U;
       seedBufferBusy_[index] = false;
     }
 
@@ -872,9 +921,16 @@ class A5P10ScoreReceiptForwardResidentKernel {
   }
 
   __aicore__ inline bool StartMicrobatch(
-      uint32_t buffer_index, uint32_t seed_count) {
+      uint32_t buffer_index, uint32_t seed_count,
+      uint32_t* failure_reason = nullptr) {
+    if (failure_reason != nullptr) {
+      *failure_reason = 0U;
+    }
     if (buffer_index >= A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY ||
         seed_count == 0U || seed_count > A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
+      if (failure_reason != nullptr) {
+        *failure_reason = A5_P10_STAGE_B_POST_INVALID_CALL;
+      }
       return false;
     }
     uint32_t wave_index = FindFreeWave();
@@ -883,6 +939,9 @@ class A5P10ScoreReceiptForwardResidentKernel {
       wave_index = FindFreeWave();
     }
     if (wave_index == kNoBuffer) {
+      if (failure_reason != nullptr) {
+        *failure_reason = A5_P10_STAGE_B_POST_NO_FREE_WAVE;
+      }
       return false;
     }
     StageBWave* wave = waves_ + wave_index;
@@ -890,6 +949,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
     if (!BeginForwardResidentMicrobatch(
             controlGm_, worker_, worker_ + buffer_index, localSeeds_[buffer_index],
             seed_count, rowsPerObject_, leaseResult_, simtEvent_, wave)) {
+      if (failure_reason != nullptr) {
+        *failure_reason = wave->failure_reason == 0U
+            ? A5_P10_STAGE_B_POST_BEGIN_UNKNOWN
+            : wave->failure_reason;
+      }
       return false;
     }
     // Begin returned successfully, so descriptors are durable and the fixed
@@ -1003,9 +1067,13 @@ class A5P10ScoreReceiptForwardResidentKernel {
   // has already observed directly from KVAF.  It is not a shortcut around
   // readiness: a failed/nonterminal CQ never sets this witness.
   __aicore__ inline bool DrainLocalWavesForTarget(
-      bool terminal_mode, int32_t target_slot, bool* target_slot_ready) {
+      bool terminal_mode, int32_t target_slot, bool* target_slot_ready,
+      uint32_t* target_failure_reason = nullptr) {
     if (target_slot_ready != nullptr) {
       *target_slot_ready = false;
+    }
+    if (target_failure_reason != nullptr) {
+      *target_failure_reason = 0U;
     }
     const uint32_t polls = terminal_mode ? tiling_->boundedDrainPolls : 1U;
     for (uint32_t poll = 0U; poll < polls; ++poll) {
@@ -1017,10 +1085,21 @@ class A5P10ScoreReceiptForwardResidentKernel {
           continue;
         }
         pending = true;
+        bool wave_has_target = false;
+        if (target_slot >= 0 && wave->seeds != nullptr) {
+          for (uint32_t seed = 0U; seed < wave->seed_count; ++seed) {
+            wave_has_target = wave_has_target ||
+                wave->seeds[seed].resident_slot == target_slot;
+          }
+        }
         bool terminal = false;
         const bool success = DrainForwardResidentMicrobatch(
             controlGm_, leaseResult_, simtEvent_, wave, &terminal);
         if (!terminal) {
+          if (!success && wave_has_target && target_failure_reason != nullptr &&
+              wave->failure_reason != 0U) {
+            *target_failure_reason = wave->failure_reason;
+          }
           continue;
         }
         // A terminal success alone makes a fixed resident slot READY. The
@@ -1043,6 +1122,9 @@ class A5P10ScoreReceiptForwardResidentKernel {
           if (completed_target_slot && target_slot_ready != nullptr) {
             *target_slot_ready = true;
           }
+        } else if (wave_has_target && target_failure_reason != nullptr &&
+                   wave->failure_reason != 0U) {
+          *target_failure_reason = wave->failure_reason;
         }
         seedBufferBusy_[wave->buffer_index] = false;
         wave->seed_count = 0U;
@@ -1070,10 +1152,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
   }
 
   __aicore__ inline bool EnsureFinalWinnerReady(
-      const A5P10ForwardResidentSeed& seed) {
+      const A5P10ForwardResidentSeed& seed, uint32_t rank) {
     if (seed.resident_slot < 0) {
       return false;
     }
+    uint32_t last_failure_reason = 0U;
     for (uint32_t attempt = 0U; attempt < tiling_->boundedDrainPolls;
          ++attempt) {
       const int32_t state = ReadGmByPassDCache<int32_t>(
@@ -1089,7 +1172,13 @@ class A5P10ScoreReceiptForwardResidentKernel {
           localSeeds_[buffer_index][0].source = seed.source;
           localSeeds_[buffer_index][0].kv_object = seed.kv_object;
           localSeeds_[buffer_index][0].resident_slot = seed.resident_slot;
-          (void)StartMicrobatch(buffer_index, 1U);
+          uint32_t post_failure_reason = 0U;
+          if (!StartMicrobatch(buffer_index, 1U, &post_failure_reason) &&
+              post_failure_reason != 0U) {
+            last_failure_reason = post_failure_reason;
+          }
+        } else {
+          last_failure_reason = A5_P10_STAGE_B_POST_NO_FREE_WAVE;
         }
       }
       // This is terminal-only progress; score scanning never waits for CQ.
@@ -1098,14 +1187,31 @@ class A5P10ScoreReceiptForwardResidentKernel {
       // published READY with a DDR barrier.  The latter GM read remains the
       // path for a slot completed by another worker.
       bool local_terminal_ready = false;
+      uint32_t drain_failure_reason = 0U;
       (void)DrainLocalWavesForTarget(
-          true, seed.resident_slot, &local_terminal_ready);
+          true, seed.resident_slot, &local_terminal_ready,
+          &drain_failure_reason);
       if (local_terminal_ready) {
         return true;
       }
+      if (drain_failure_reason != 0U) {
+        last_failure_reason = drain_failure_reason;
+      }
     }
-    return ReadGmByPassDCache<int32_t>(residentReady_ + seed.resident_slot) ==
-        static_cast<int32_t>(A5P10ResidentReadyState::READY);
+    const int32_t final_state = ReadGmByPassDCache<int32_t>(
+        residentReady_ + seed.resident_slot);
+    if (final_state == static_cast<int32_t>(A5P10ResidentReadyState::READY)) {
+      return true;
+    }
+    if (last_failure_reason == 0U) {
+      last_failure_reason = final_state ==
+              static_cast<int32_t>(A5P10ResidentReadyState::IN_FLIGHT)
+          ? A5_P10_STAGE_B_POST_CQ_PENDING
+          : A5_P10_STAGE_B_POST_BEGIN_UNKNOWN;
+    }
+    RecordFirstFailure(PostDiagnostic(static_cast<uint32_t>(seed.row), rank,
+                                      last_failure_reason));
+    return false;
   }
 
   // A second worker may have won the object claim while this worker reaches a
@@ -1189,6 +1295,21 @@ class A5P10ScoreReceiptForwardResidentKernel {
         static_cast<int32_t>(encoded);
   }
 
+  __aicore__ inline int32_t PostDiagnostic(uint32_t row, uint32_t rank,
+                                            uint32_t reason) const {
+    const uint64_t ordinal = static_cast<uint64_t>(row) * topkPerRow_ + rank;
+    const uint64_t encoded = ordinal *
+            A5_P10_STAGE_B_DIAGNOSTIC_POST_DETAIL_STRIDE +
+        reason;
+    if (reason == 0U ||
+        reason >= A5_P10_STAGE_B_DIAGNOSTIC_POST_DETAIL_STRIDE ||
+        encoded > 0x3fffffffULL) {
+      return A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE;
+    }
+    return A5_P10_STAGE_B_DIAGNOSTIC_POST_DETAIL_BASE -
+        static_cast<int32_t>(encoded);
+  }
+
   __aicore__ inline bool FinalizeAssignedRows() {
     for (uint32_t row = worker_; row < activeRows_;
          row += tiling_->executorWorkerCount) {
@@ -1255,7 +1376,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         A5P10ForwardResidentSeed seed{static_cast<int32_t>(row),
                                       static_cast<int32_t>(source),
                                       mapping.kv_object, resident_slot};
-        if (!EnsureFinalWinnerReady(seed)) {
+        if (!EnsureFinalWinnerReady(seed, rank)) {
           RecordFirstFailure(FinalizeDiagnostic(
               row, rank, A5_P10_STAGE_B_FINALIZE_WINNER_READY));
           return false;

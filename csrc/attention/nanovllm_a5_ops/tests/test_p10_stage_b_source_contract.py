@@ -250,7 +250,7 @@ class P10StageBSourceContractTest(unittest.TestCase):
         for token in (
             "target_slot_ready", "completed_target_slot",
             "successful CQ terminal", "local_terminal_ready",
-            "DrainLocalWavesForTarget(\n          true, seed.resident_slot, &local_terminal_ready)",
+            "DrainLocalWavesForTarget(\n          true, seed.resident_slot, &local_terminal_ready,",
             "resident_ready=READY", "WriteGmByPassDCache<int32_t>",
             "A5P10ResidentReadyState::IN_FLIGHT",
             "A5P10ResidentReadyState::READY",
@@ -288,7 +288,10 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "A5_P10_STAGE_B_DIAGNOSTIC", "INIT_COMMON", "INIT_GEOMETRY",
             "INIT_KVAF", "INIT_UB", "RECEIPT_TERMINAL", "FINALIZE",
             "DRAIN", "FINALIZE_DETAIL_BASE", "FINALIZE_FINAL_QSFA",
-            "FinalizeDiagnostic", "RecordFirstFailure", "MarkRunning",
+            "POST_DETAIL_BASE", "POST_BEGIN_INVALID_ARGS", "CQ_PENDING",
+            "BeginFailureReasonFromKvafResult", "CqFailureReasonFromKvafResult",
+            "PostDiagnostic", "failure_reason", "FinalizeDiagnostic",
+            "RecordFirstFailure", "MarkRunning",
         ):
             self.assertIn(token, self.abi + self.kernel)
         self.assertIn("forward_control_gm.SetValue(1U, 0)", (

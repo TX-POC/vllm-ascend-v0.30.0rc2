@@ -54,6 +54,32 @@ enum A5P10StageBFinalizeFailureReason : uint32_t {
   A5_P10_STAGE_B_FINALIZE_FINAL_QSFA = 6U,
 };
 
+// Post/CQ detail uses the same existing diagnostic word as finalization
+// detail.  It is intentionally local to a failed forward: it does not add a
+// graph input/output, a scheduling edge, or any transport lifecycle state.
+// A detailed code is `BASE - (row * K + rank) * STRIDE - reason`.
+constexpr int32_t A5_P10_STAGE_B_DIAGNOSTIC_POST_DETAIL_BASE = -210000;
+constexpr uint32_t A5_P10_STAGE_B_DIAGNOSTIC_POST_DETAIL_STRIDE = 32U;
+enum A5P10StageBPostFailureReason : uint32_t {
+  A5_P10_STAGE_B_POST_INVALID_CALL = 1U,
+  A5_P10_STAGE_B_POST_NO_FREE_WAVE = 2U,
+  A5_P10_STAGE_B_POST_CONTROL_LOAD = 3U,
+  A5_P10_STAGE_B_POST_QUEUE_ACQUIRE = 4U,
+  A5_P10_STAGE_B_POST_DESCRIPTOR_BUILD = 5U,
+  A5_P10_STAGE_B_POST_BEGIN_INVALID_ARGS = 6U,
+  A5_P10_STAGE_B_POST_BEGIN_INVALID_ENTITY = 7U,
+  A5_P10_STAGE_B_POST_BEGIN_INVALID_QUEUE = 8U,
+  A5_P10_STAGE_B_POST_BEGIN_INVALID_LOOKUP = 9U,
+  A5_P10_STAGE_B_POST_BEGIN_QUEUE_FULL = 10U,
+  A5_P10_STAGE_B_POST_BEGIN_INVALID_OUTPUT = 11U,
+  A5_P10_STAGE_B_POST_BEGIN_UNKNOWN = 12U,
+  A5_P10_STAGE_B_POST_CQ_TIMEOUT = 13U,
+  A5_P10_STAGE_B_POST_CQ_ERROR = 14U,
+  A5_P10_STAGE_B_POST_CQ_UNKNOWN = 15U,
+  A5_P10_STAGE_B_POST_QUEUE_RETURN = 16U,
+  A5_P10_STAGE_B_POST_CQ_PENDING = 17U,
+};
+
 // A persistent Stage-B companion starts from the same cold-bound mutable
 // tensors as Stage A.  It must not be connected to Stage A through a graph
 // completion edge: it polls receipt_state while this seal remains OPEN.

@@ -987,6 +987,28 @@ _STAGE_B_FINALIZE_DETAIL_NAMES = {
     6: "final_qsfa",
 }
 
+_STAGE_B_POST_DETAIL_BASE = -210000
+_STAGE_B_POST_DETAIL_STRIDE = 32
+_STAGE_B_POST_DETAIL_NAMES = {
+    1: "invalid_call",
+    2: "no_free_wave",
+    3: "control_load",
+    4: "queue_acquire",
+    5: "descriptor_build",
+    6: "begin_invalid_args",
+    7: "begin_invalid_entity",
+    8: "begin_invalid_queue",
+    9: "begin_invalid_lookup",
+    10: "begin_queue_full",
+    11: "begin_invalid_output",
+    12: "begin_unknown",
+    13: "cq_timeout",
+    14: "cq_error",
+    15: "cq_unknown",
+    16: "queue_return",
+    17: "cq_pending",
+}
+
 
 def _emit_terminal_diagnostic(
     fixture: _ForwardResidentKvaf,
@@ -1021,9 +1043,21 @@ def _emit_terminal_diagnostic(
     prefix = [int(value) for value in attention.reshape(-1)[:8].tolist()]
     lease_values = [] if leases is None else [int(value) for value in leases.tolist()]
     detail = "none"
-    if diagnostic <= _STAGE_B_FINALIZE_DETAIL_BASE - 1:
+    diagnostic_name = _STAGE_B_DIAGNOSTIC_NAMES.get(diagnostic, "unknown")
+    if diagnostic <= _STAGE_B_POST_DETAIL_BASE - 1:
+        encoded = _STAGE_B_POST_DETAIL_BASE - diagnostic
+        ordinal, reason = divmod(encoded, _STAGE_B_POST_DETAIL_STRIDE)
+        diagnostic_name = "post_detail"
+        detail_name = _STAGE_B_POST_DETAIL_NAMES.get(reason, "unknown")
+    elif diagnostic <= _STAGE_B_FINALIZE_DETAIL_BASE - 1:
         encoded = _STAGE_B_FINALIZE_DETAIL_BASE - diagnostic
         ordinal, reason = divmod(encoded, _STAGE_B_FINALIZE_DETAIL_STRIDE)
+        detail_name = _STAGE_B_FINALIZE_DETAIL_NAMES.get(reason, "unknown")
+    else:
+        ordinal = 0
+        reason = 0
+        detail_name = "none"
+    if diagnostic <= _STAGE_B_FINALIZE_DETAIL_BASE - 1:
         row, rank = divmod(ordinal, TOPK)
         if 0 <= row < canonical_sparse.size(0) and 0 <= rank < TOPK:
             source = int(canonical_sparse[row, 0, rank].item())
@@ -1054,24 +1088,24 @@ def _emit_terminal_diagnostic(
             )
             attention_value = int(attention[row, 0, rank].item())
             detail = (
-                f"reason={_STAGE_B_FINALIZE_DETAIL_NAMES.get(reason, 'unknown')} "
+                f"reason={detail_name} "
                 f"row={row} rank={rank} source={source} source_slot={source_slot} "
                 f"object_slot={object_slot} persistent_slot={persistent_slot} resident_state={resident_state} "
                 f"qsfa_value={qsfa_value} attention_value={attention_value}"
             )
         else:
-            detail = f"reason={_STAGE_B_FINALIZE_DETAIL_NAMES.get(reason, 'unknown')} ordinal={ordinal} out_of_fixture_range=1"
+            detail = f"reason={detail_name} ordinal={ordinal} out_of_fixture_range=1"
     print(
         "P10_RUNTIME_TERMINAL_DIAG "
         f"control={forward} stage_b_diag={diagnostic} "
-        f"stage_b_diag_name={_STAGE_B_DIAGNOSTIC_NAMES.get(diagnostic, 'unknown')} "
+        f"stage_b_diag_name={diagnostic_name} "
         f"receipt_free={count_eq(receipt, 0)} receipt_filling={count_eq(receipt, 1)} "
         f"receipt_ready={count_eq(receipt, 2)} receipt_claimed={count_eq(receipt, 3)} "
         f"receipt_done={count_eq(receipt, 4)} source_mapped={int(torch.count_nonzero(source_slots >= 0).item())} "
         f"object_mapped={int(torch.count_nonzero(object_slots >= 0).item())} "
         f"resident_empty={count_eq(ready, 0)} resident_in_flight={count_eq(ready, 1)} "
         f"resident_ready={count_eq(ready, 2)} speculative_cursor={int(cursor.reshape(-1)[0].item())} "
-        f"queue_leases={lease_values} attention_prefix={prefix} finalize_detail={detail}",
+        f"queue_leases={lease_values} attention_prefix={prefix} stage_b_detail={detail}",
         flush=True,
     )
 
