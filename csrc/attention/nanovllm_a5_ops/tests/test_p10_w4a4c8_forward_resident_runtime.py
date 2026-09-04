@@ -79,7 +79,10 @@ EXECUTOR_WORKERS = int(
 )
 EXECUTOR_WORKER_LIMIT = int(os.environ.get("P10_BENCH_EXECUTOR_WORKER_LIMIT", "16"))
 STAGE_B_RECEIPT_TRACE = os.environ.get("P10_STAGE_B_RECEIPT_TRACE", "0") == "1"
-_STAGE_B_RECEIPT_TRACE_ENABLE = 0x80000000
+# ``forward_control`` is a signed int32 tensor.  C++ reads this exact word as
+# uint32_t, so use the signed representation of bit 31 rather than trying to
+# construct an out-of-range Python ``0x80000000`` int32 literal.
+_STAGE_B_RECEIPT_TRACE_ENABLE = -(1 << 31)
 _STAGE_B_RECEIPT_TRACE_BITS = {
     "entered": 1 << 0,
     "descriptor_valid": 1 << 1,
