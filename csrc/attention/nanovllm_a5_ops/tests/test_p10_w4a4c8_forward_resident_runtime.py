@@ -523,11 +523,20 @@ class _ForwardResidentKvaf:
         )
         control = torch.zeros(16, dtype=torch.int64, device=self.device)
         leases = torch.zeros(QUEUE_COUNT, dtype=torch.int32, device=self.device)
+        # These are queue-local Direct-HCCP descriptor *outputs* of Stage B,
+        # not host protocol inputs.  On each active wave KVAF first evicts its
+        # local descriptor-cache range, then writes every entry below the
+        # published request count with bypass stores and performs the DDR
+        # publish barrier before doorbell.  A torch zero-fill here would add a
+        # second AIV writer whose delayed dirty-line writeback could corrupt a
+        # valid descriptor after that publish.  Leave only the consumed range
+        # to the device executor; control and leases above intentionally stay
+        # zero-initialized because they *are* protocol inputs.
         descriptors = {
-            "indices": [torch.zeros(MAX_REQUESTS_PER_WAVE, dtype=torch.int32, device=self.device)],
-            "offsets": [torch.zeros(MAX_REQUESTS_PER_WAVE, dtype=torch.int32, device=self.device)],
-            "masks": [torch.zeros(MAX_REQUESTS_PER_WAVE, dtype=torch.uint8, device=self.device)],
-            "outputs": [torch.zeros(MAX_REQUESTS_PER_WAVE, dtype=torch.int32, device=self.device)],
+            "indices": [torch.empty(MAX_REQUESTS_PER_WAVE, dtype=torch.int32, device=self.device)],
+            "offsets": [torch.empty(MAX_REQUESTS_PER_WAVE, dtype=torch.int32, device=self.device)],
+            "masks": [torch.empty(MAX_REQUESTS_PER_WAVE, dtype=torch.uint8, device=self.device)],
+            "outputs": [torch.empty(MAX_REQUESTS_PER_WAVE, dtype=torch.int32, device=self.device)],
         }
         # The process has exactly one logical visible device (physical NPU is
         # mapped before launch), so asking the active provider stream avoids a

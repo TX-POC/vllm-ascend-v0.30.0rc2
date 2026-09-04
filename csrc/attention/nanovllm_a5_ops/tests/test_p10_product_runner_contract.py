@@ -202,6 +202,10 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "(0, 127, 128, 240, 255, 256, 380, SOURCE_TOKENS - 1)",
             "resident_payload = torch.empty(",
             "probe_output = torch.empty(",
+            '"indices": [torch.empty(MAX_REQUESTS_PER_WAVE',
+            '"offsets": [torch.empty(MAX_REQUESTS_PER_WAVE',
+            '"masks": [torch.empty(MAX_REQUESTS_PER_WAVE',
+            '"outputs": [torch.empty(MAX_REQUESTS_PER_WAVE',
             "P10_BENCH_DESTINATION_RESET ",
             "authority=forward_prepare payload_write=none",
         ):
@@ -221,6 +225,10 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertNotIn(".zero_()", reset)
         self.assertNotIn("resident_payload = torch.zeros(", self.fixture)
         self.assertNotIn("probe_output = torch.zeros(", self.fixture)
+        for vector in ("indices", "offsets", "masks", "outputs"):
+            self.assertNotIn(
+                f'"{vector}": [torch.zeros(MAX_REQUESTS_PER_WAVE', self.fixture
+            )
         # The registered transient Direct-HCCP destination is write-only from
         # the host-side fixture.  Its contents become observable only through
         # the device executor's CQ -> READY transition.  In particular, do
