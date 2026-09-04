@@ -653,10 +653,23 @@ def _build_forward_inputs(
     resident_ready = torch.zeros(RESIDENT_ROWS, dtype=torch.int32, device=device)
     # A nonidentity bijection proves Stage B translates physical resident rows
     # into downstream QSFA slots instead of treating them as interchangeable.
+    # It is fixture geometry, not part of the P10 data plane.  In particular,
+    # do not create this int32 multiply/remainder as an ordinary NPU vector
+    # kernel after Direct-HCCP has been bound: on the affected A5 runtime it
+    # can surface the unrelated AIVEC 334 fault before Stage A has run.  The
+    # CPU formula is exactly the same int32 permutation, and the uploaded NPU
+    # tensor remains the alias consumed by Stage B and QSFA.
     # 7 remains coprime for both the small and B16 resident-row capacities.
-    resident_to_qsfa = (
-        torch.arange(RESIDENT_ROWS, dtype=torch.int32, device=device) * 7
+    resident_to_qsfa_cpu = (
+        torch.arange(RESIDENT_ROWS, dtype=torch.int32) * 7
     ) % RESIDENT_ROWS
+    resident_to_qsfa = resident_to_qsfa_cpu.to(device=device).contiguous()
+    torch.npu.synchronize()
+    print(
+        "P10_FIXTURE_STATIC_METADATA_READY "
+        f"construction=cpu upload=npu resident_rows={RESIDENT_ROWS}",
+        flush=True,
+    )
     attention_slots = torch.full(
         (BATCH, 1, ATTENTION_WIDTH), -77, dtype=torch.int32, device=device
     )
@@ -701,9 +714,11 @@ def _build_forward_inputs(
         "receipt_state": receipt_state,
         "forward_control": forward_control,
         "object_snapshot": object_snapshot,
+        "object_snapshot_cpu": object_snapshot_cpu,
         "object_to_slot": object_to_slot,
         "source_to_slot": source_to_slot,
         "miss_mask": miss_mask,
+        "miss_mask_cpu": miss_mask_cpu,
         "speculative_cursor": speculative_cursor,
         "resident_ready": resident_ready,
         "resident_to_qsfa": resident_to_qsfa,
@@ -727,42 +742,77 @@ def _install_final_hit_payloads(
 
     import torch
 
+    # This is untimed fixture setup, so use the CPU-resident immutable mask
+    # and derive the final-hit mapping there.  Apart from avoiding a second
+    # ordinary AIVEC gather/count kernel after Direct-HCCP initialization,
+    # this makes the single upload explicit: ``snapshot`` remains the same
+    # NPU tensor alias passed to Stage B.
     snapshot = tensors["object_snapshot"]
-    miss_mask = tensors["miss_mask"]
+    snapshot_cpu = tensors["object_snapshot_cpu"].clone()
+    miss_mask_cpu = tensors["miss_mask_cpu"]
     if fixture.resident_payload is None:
         raise AssertionError("resident payload is not cold-bound")
 
-    ranked_sources = reference.reshape(BATCH, TOPK).to(dtype=torch.int64)
-    final_miss = miss_mask.gather(1, ranked_sources)
-    final_hit = ~final_miss
-    final_miss_count = int(torch.count_nonzero(final_miss).item())
-    final_hit_count = int(torch.count_nonzero(final_hit).item())
-    source_miss_count = int(torch.count_nonzero(miss_mask).item())
+    ranked_sources_cpu = (
+        reference.detach()
+        .to(device="cpu", dtype=torch.int64)
+        .reshape(BATCH, TOPK)
+        .contiguous()
+    )
+    final_miss_cpu = miss_mask_cpu.gather(1, ranked_sources_cpu)
+    final_hit_cpu = ~final_miss_cpu
+    final_miss_count = int(torch.count_nonzero(final_miss_cpu).item())
+    final_hit_count = int(torch.count_nonzero(final_hit_cpu).item())
+    source_miss_count = int(torch.count_nonzero(miss_mask_cpu).item())
+
+    rows_cpu = torch.arange(BATCH, dtype=torch.int64).reshape(-1, 1)
+    ranks_cpu = torch.arange(TOPK, dtype=torch.int64).reshape(1, -1)
+    persistent_slots_cpu = PERSISTENT_BASE + rows_cpu * TOPK + ranks_cpu
 
     if final_hit_count:
         if PERSISTENT_ROWS < BATCH * TOPK:
             raise AssertionError("profile has final hits but no persistent slot band")
-        rows = torch.arange(BATCH, dtype=torch.int64, device=reference.device).reshape(-1, 1)
-        ranks = torch.arange(TOPK, dtype=torch.int64, device=reference.device).reshape(1, -1)
-        persistent_slots = PERSISTENT_BASE + rows * TOPK + ranks
-        snapshot.scatter_(
+        snapshot_cpu.scatter_(
             1,
-            ranked_sources,
-            torch.where(final_hit, persistent_slots.to(torch.int32), -torch.ones_like(persistent_slots, dtype=torch.int32)),
+            ranked_sources_cpu,
+            torch.where(
+                final_hit_cpu,
+                persistent_slots_cpu.to(dtype=torch.int32),
+                -torch.ones_like(persistent_slots_cpu, dtype=torch.int32),
+            ),
         )
 
         # Gather the fixed resident-hit rows from the same local DDR witness
         # that Direct-HCCP reads for misses.  This setup is complete before
         # the timer starts and corresponds to pre-existing HBM cache content.
-        row_cpu = rows.expand(BATCH, TOPK)[final_hit].to(device="cpu")
-        source_cpu = ranked_sources[final_hit].to(device="cpu")
+        row_cpu = rows_cpu.expand(BATCH, TOPK)[final_hit_cpu]
+        source_cpu = ranked_sources_cpu[final_hit_cpu]
         entry_cpu = row_cpu * fixture.blocks + source_cpu // BLOCK_TOKENS
         token_cpu = source_cpu % BLOCK_TOKENS
         source_rows = fixture.data.reshape(
             fixture.entries, BLOCK_TOKENS, PACKED_KV_ROW_BYTES
         )[entry_cpu, token_cpu].contiguous()
-        slot_device = persistent_slots[final_hit].to(dtype=torch.int64)
+        slot_device = persistent_slots_cpu[final_hit_cpu].to(
+            device=fixture.device, dtype=torch.int64
+        )
         fixture.resident_payload.index_copy_(0, slot_device, source_rows.to(fixture.device))
+
+    # Preserve the original NPU object-snapshot storage identity; Stage B
+    # receives exactly this alias from P10ForwardInputs.
+    snapshot.copy_(snapshot_cpu.to(device=snapshot.device))
+    torch.npu.synchronize()
+    print(
+        "P10_FINAL_HIT_METADATA_READY "
+        "construction=cpu upload=npu "
+        f"final_miss={final_miss_count} final_hit={final_hit_count}",
+        flush=True,
+    )
+    print(
+        "P10_FINAL_HIT_PAYLOAD_READY "
+        "device=npu "
+        f"hits={final_hit_count} bytes={final_hit_count * PACKED_KV_ROW_BYTES}",
+        flush=True,
+    )
 
     # The all-miss acceptance profile has no persistent rows and therefore
     # must never accidentally acquire a synthetic hit.

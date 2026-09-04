@@ -249,6 +249,33 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.fixture,
         )
 
+    def test_b16_fixture_metadata_and_final_hit_setup_are_cpu_derived(self) -> None:
+        """Keep untimed bookkeeping off the fragile ordinary AIVEC path.
+
+        The NPU aliases are still used by the product operator.  This only
+        constrains their deterministic fixture construction and preserves the
+        exact source/slot arithmetic used by the old setup path.
+        """
+
+        for token in (
+            "resident_to_qsfa_cpu = (",
+            "resident_to_qsfa = resident_to_qsfa_cpu.to(device=device).contiguous()",
+            "P10_FIXTURE_STATIC_METADATA_READY ",
+            '"object_snapshot_cpu": object_snapshot_cpu',
+            '"miss_mask_cpu": miss_mask_cpu',
+            "ranked_sources_cpu = (",
+            "final_miss_cpu = miss_mask_cpu.gather(1, ranked_sources_cpu)",
+            "snapshot.copy_(snapshot_cpu.to(device=snapshot.device))",
+            "P10_FINAL_HIT_METADATA_READY ",
+            "P10_FINAL_HIT_PAYLOAD_READY ",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertNotIn(
+            "torch.arange(RESIDENT_ROWS, dtype=torch.int32, device=device) * 7",
+            self.fixture,
+        )
+        self.assertNotIn("miss_mask.gather(1, ranked_sources)", self.fixture)
+
     def test_benchmark_hashes_fp8_storage_without_a_numpy_float8_conversion(self) -> None:
         """The input-immutability gate must work for the real FP8 Q/K ABI."""
 
