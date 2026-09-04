@@ -78,6 +78,75 @@ struct StageBWave {
   uint32_t failure_reason;
 };
 
+// KVAF Begin mutates a dense transaction while it builds and rings a WQE.
+// Keep that mutation in a function-local ordinary AICore record, then copy
+// its scalar state into the longer-lived Stage-B wave only after PostOnly has
+// unequivocally succeeded.  In particular, do not pass a nested member of
+// the executor object through the large inline Begin closure: some 950DT
+// compiler schedules lost the failure-side writeback of that nested object
+// on a second wave.  This is a representation boundary only; it neither
+// changes the descriptor, queue lease, resident row, nor the CQ lifecycle.
+__aicore__ inline void MaterializeForwardResidentWaveForDrain(
+    StageBWave* destination,
+    const kvaf_forward_resident_get::KvafForwardResidentBatchGetWave* source) {
+  if (destination == nullptr || source == nullptr) {
+    return;
+  }
+  destination->kvaf_wave.lease.queue_id = source->lease.queue_id;
+  destination->kvaf_wave.lease.owner_tag = source->lease.owner_tag;
+  destination->kvaf_wave.lease.state = source->lease.state;
+  destination->kvaf_wave.lease.reserved0 = source->lease.reserved0;
+
+  destination->kvaf_wave.queue_args.address_table =
+      source->queue_args.address_table;
+  destination->kvaf_wave.queue_args.valid_table = source->queue_args.valid_table;
+  destination->kvaf_wave.queue_args.indices = source->queue_args.indices;
+  destination->kvaf_wave.queue_args.offsets = source->queue_args.offsets;
+  destination->kvaf_wave.queue_args.mask = source->queue_args.mask;
+  destination->kvaf_wave.queue_args.output_indices =
+      source->queue_args.output_indices;
+  destination->kvaf_wave.queue_args.output = source->queue_args.output;
+  destination->kvaf_wave.queue_args.core_status = source->queue_args.core_status;
+  destination->kvaf_wave.queue_args.channel_entity =
+      source->queue_args.channel_entity;
+  destination->kvaf_wave.queue_args.queue_state = source->queue_args.queue_state;
+  destination->kvaf_wave.queue_args.table_capacity =
+      source->queue_args.table_capacity;
+  destination->kvaf_wave.queue_args.request_capacity =
+      source->queue_args.request_capacity;
+  destination->kvaf_wave.queue_args.output_rows = source->queue_args.output_rows;
+  destination->kvaf_wave.queue_args.block_bytes = source->queue_args.block_bytes;
+  destination->kvaf_wave.queue_args.block_count = source->queue_args.block_count;
+  destination->kvaf_wave.queue_args.jettys_per_core =
+      source->queue_args.jettys_per_core;
+
+  destination->kvaf_wave.transaction.active_count =
+      source->transaction.active_count;
+  destination->kvaf_wave.transaction.total_posts = source->transaction.total_posts;
+  destination->kvaf_wave.transaction.failed_request =
+      source->transaction.failed_request;
+  destination->kvaf_wave.transaction.last_wqe = source->transaction.last_wqe;
+  destination->kvaf_wave.transaction.first_doorbell_cycle =
+      source->transaction.first_doorbell_cycle;
+  destination->kvaf_wave.transaction.profile_start_cycle =
+      source->transaction.profile_start_cycle;
+  destination->kvaf_wave.transaction.profile_setup_done_cycle =
+      source->transaction.profile_setup_done_cycle;
+  destination->kvaf_wave.transaction.profile_compact_done_cycle =
+      source->transaction.profile_compact_done_cycle;
+  destination->kvaf_wave.transaction.profile_post_done_cycle =
+      source->transaction.profile_post_done_cycle;
+  destination->kvaf_wave.transaction.profile_completion_done_cycle =
+      source->transaction.profile_completion_done_cycle;
+  destination->kvaf_wave.transaction.result = source->transaction.result;
+  destination->kvaf_wave.transaction.completion_polls =
+      source->transaction.completion_polls;
+  destination->kvaf_wave.transaction.state = source->transaction.state;
+  destination->kvaf_wave.transaction.profile_enabled =
+      source->transaction.profile_enabled;
+  destination->kvaf_wave.transaction.finalized = source->transaction.finalized;
+}
+
 __aicore__ inline uint32_t BeginFailureReasonFromKvafTransaction(
     uint64_t result, uint32_t state) {
   switch (result) {
@@ -436,28 +505,37 @@ __aicore__ inline bool BeginForwardResidentMicrobatch(
         control_gm, lease_result, simt_event, &lease);
     return false;
   }
+  // Do not pass `output->kvaf_wave` through the deeply inlined KVAF Begin
+  // path.  On 950DT that nested executor member has exhibited a lost
+  // write-back on a later microbatch: Begin returns false, but the caller
+  // observes the untouched zero transaction and can only report
+  // BEGIN_UNKNOWN.  The PostOnly transaction is synchronous up to the
+  // doorbell, so a stack-local ordinary record is the correct boundary.
+  // Materialize it into the persistent wave only after Begin succeeds; the
+  // persistent copy is then exclusively owned by the asynchronous CQ drain.
+  kvaf_forward_resident_get::KvafForwardResidentBatchGetWave begin_wave{};
   if (!kvaf_forward_resident_get::BeginKvafForwardResidentBatchGet(
-          control, lease, descriptor, &output->kvaf_wave)) {
+          control, lease, descriptor, &begin_wave)) {
     output->failure_reason = BeginFailureReasonFromKvafTransaction(
-        output->kvaf_wave.transaction.result,
-        output->kvaf_wave.transaction.state);
+        begin_wave.transaction.result, begin_wave.transaction.state);
     // The only locally provable no-Post result is an explicit dense FAILED
     // transaction.  Any other false return is internally contradictory
     // (including success+IDLE); it may be a compiler/address-space failure
     // after a doorbell.  Do not turn that ambiguity into a queue reuse race.
     // The enclosing target process preserves Direct-HCCP diagnostics on a
     // failed forward, so retaining the lease is both safe and observable.
-    if (output->kvaf_wave.lease.state ==
+    if (begin_wave.lease.state ==
             kvaf_forward_resident_get::kForwardResidentQueueTerminal &&
-        output->kvaf_wave.transaction.state ==
+        begin_wave.transaction.state ==
             kvaf_fused_get::kDenseBatchGetFailed) {
       (void)kvaf_forward_resident_get::FinishKvafForwardResidentBatchGet(
-          &output->kvaf_wave, &output->terminal);
+          &begin_wave, &output->terminal);
       (void)kvaf_forward_resident_get::ReturnKvafForwardResidentQueueFromAicore(
-          control_gm, lease_result, simt_event, &output->kvaf_wave);
+          control_gm, lease_result, simt_event, &begin_wave);
     }
     return false;
   }
+  MaterializeForwardResidentWaveForDrain(output, &begin_wave);
   output->seeds = seeds;
   output->seed_count = seed_count;
   output->posted = 1U;

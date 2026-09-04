@@ -142,6 +142,34 @@ class P10StageBSourceContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, self.kernel)
 
+    def test_begin_uses_a_local_kvaf_wave_then_scalar_materializes_drain_state(self):
+        """Keep Begin's large inline writeback out of a nested executor member.
+
+        A successful PostOnly transaction must still be copied into the
+        persistent wave consumed by CQ drain.  Conversely, an unsuccessful
+        Begin is diagnosed and cleaned up from the same local record, so its
+        result cannot disappear before the failure reason is latched.
+        """
+        self.assertIn("KvafForwardResidentBatchGetWave begin_wave{}", self.kernel)
+        self.assertIn("control, lease, descriptor, &begin_wave", self.kernel)
+        self.assertIn(
+            "MaterializeForwardResidentWaveForDrain(output, &begin_wave)",
+            self.kernel,
+        )
+        self.assertNotIn("descriptor, &output->kvaf_wave", self.kernel)
+
+        materialize = self.kernel.split(
+            "MaterializeForwardResidentWaveForDrain("
+        )[1].split("BeginFailureReasonFromKvafTransaction(")[0]
+        self.assertNotIn("= *source", materialize)
+        for field in (
+            "lease.queue_id", "queue_args.address_table",
+            "queue_args.output", "transaction.active_count",
+            "transaction.result", "transaction.state",
+            "transaction.finalized",
+        ):
+            self.assertIn(field, materialize)
+
     def test_slots_are_fixed_bands_not_queue_private_or_recycled(self):
         self.assertIn("A5P10ResidentSlotBand", self.abi)
         self.assertIn("speculative_slot_band", self.abi)
