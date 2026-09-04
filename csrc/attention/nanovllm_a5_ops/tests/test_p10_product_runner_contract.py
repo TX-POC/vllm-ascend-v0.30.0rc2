@@ -219,6 +219,17 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertNotIn("resident_payload.narrow", reset)
         self.assertNotIn(".zero_()", reset)
         self.assertNotIn("resident_payload = torch.zeros(", self.fixture)
+        # The registered transient Direct-HCCP destination is write-only from
+        # the host-side fixture.  Its contents become observable only through
+        # the device executor's CQ -> READY transition.  In particular, do
+        # not reintroduce a torch stream write whose dirty line can later
+        # write back over an inbound DMA result owned by another AIV.
+        binding = self.fixture.split("resident_payload = torch.empty(", 1)[1].split(
+            "def _prove_bootstrap_direct_hccp_payload", 1
+        )[0]
+        for forbidden in ("resident_payload.zero_", "resident_payload.fill_", "resident_payload.copy_"):
+            self.assertNotIn(forbidden, binding)
+        self.assertIn("fixture.resident_payload.index_copy_", self.fixture)
         self.assertNotIn("P8_", self.fixture)
         self.assertNotIn("P9_", self.fixture)
 
