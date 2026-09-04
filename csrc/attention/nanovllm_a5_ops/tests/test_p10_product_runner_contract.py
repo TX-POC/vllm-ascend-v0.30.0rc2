@@ -198,6 +198,10 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "torch.unique(translation)",
             "P10_RUNTIME_PASS",
             "P10_BOOTSTRAP_ROUNDTRIP_PASS ",
+            "source 380 is the first",
+            "(0, 127, 128, 240, 255, 256, 380, SOURCE_TOKENS - 1)",
+            "P10_BENCH_DESTINATION_RESET ",
+            "authority=forward_prepare payload_write=none",
         ):
             self.assertIn(token, self.fixture)
         # The sole ordinary BatchGet is a cold source-visibility gate before
@@ -207,6 +211,12 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             self.fixture.rindex("self._prove_bootstrap_direct_hccp_payload("),
             self.fixture.index("self.runtime.bind_layer_resident_batch_get_control("),
         )
+        reset = self.fixture.split("def _reset_benchmark_destination(", 1)[1].split(
+            "def _run_timed_forward(", 1
+        )[0]
+        self.assertIn("authority=forward_prepare payload_write=none", reset)
+        self.assertNotIn("resident_payload.narrow", reset)
+        self.assertNotIn(".zero_()", reset)
         self.assertNotIn("P8_", self.fixture)
         self.assertNotIn("P9_", self.fixture)
 
@@ -224,7 +234,8 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "launch.bind_qsfa(producer)",
             "end.synchronize()",
             "require_preseal_overlap=(mode == \"overlap\")",
-            "fixture.resident_payload.narrow(0, 0, PERSISTENT_BASE).zero_()",
+            "P10_BENCH_DESTINATION_RESET ",
+            "authority=forward_prepare payload_write=none",
             "P10_PERF_EQ ",
             "p10_w4a4c8_forward_resident_serial",
             "p10_w4a4c8_forward_resident_overlap",

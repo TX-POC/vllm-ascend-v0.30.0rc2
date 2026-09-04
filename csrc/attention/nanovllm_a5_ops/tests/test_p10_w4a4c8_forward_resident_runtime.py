@@ -573,18 +573,29 @@ class _ForwardResidentKvaf:
         return resident_payload, control, leases
 
     def _prove_bootstrap_direct_hccp_payload(self, access: Any, stream: Any) -> None:
-        """Fail closed unless two cold direct reads match the packed witness.
+        """Fail closed unless cold Direct-HCCP covers every relevant table seam.
 
-        The selected rows exercise both the first packed object and the
-        interior byte offset used by the observed P10 failure (source 240 is
-        object 1, offset 112 * 656).  This submission is complete before
-        Layer-resident control is bound, uses the ordinary KVAF Direct-HCCP
-        ABI once, and writes only a disposable two-row output tensor.
+        This is not a host-Get fallback: it is the same KVAF Direct-HCCP
+        source-table/offset/output ABI that Stage B will use after the
+        layer-resident control is bound.  Keep this cold gate before the
+        product graph so a missing table entry or a bad 128-row boundary is
+        reported as a transport bootstrap fault rather than being misread as
+        a graph or C8 math failure.  In particular source 380 is the first
+        observed B16 failing final-recall source (table 2, offset 124 * 656).
         """
 
         import torch
 
-        probe_sources = (0, min(240, SOURCE_TOKENS - 1))
+        # Deduplicate the small-profile clamps while covering: first row,
+        # both sides of two 128-row table seams, the observed source-380
+        # failure, and the final table entry.  The entire vector remains far
+        # below the fixed 64-request KVAF direct-Get capacity.
+        probe_sources = tuple(
+            dict.fromkeys(
+                min(source, SOURCE_TOKENS - 1)
+                for source in (0, 127, 128, 240, 255, 256, 380, SOURCE_TOKENS - 1)
+            )
+        )
         probe_indices = torch.tensor(
             [source // BLOCK_TOKENS for source in probe_sources],
             dtype=torch.int32,
@@ -1508,22 +1519,36 @@ def _emit_perf_result(operation: str, values: list[float], *, warmup: int, metri
 
 
 def _reset_benchmark_destination(fixture: _ForwardResidentKvaf, producer_stream: Any) -> None:
-    """Equalize the only persistent writable payload outside either timing interval.
+    """Reset forward metadata without writing an inbound-DMA destination.
 
-    The Direct-HCCP control/table stay cold-bound throughout the paired run;
-    that is intentional product setup.  Only the forward-owned speculative
-    and recall bands are cleared after the preceding terminal state.  The
-    separate persistent band holds pre-existing HBM hits and must survive
-    between replays, just as it does in the surrounding inference cache.
+    ``ForwardPrepare`` owns the per-forward reset of the slot maps,
+    ``resident_ready``, queue leases, receipt state, and completion control.
+    It makes every speculative/recall row unreachable until this forward's
+    Direct-HCCP CQ has terminally published ``READY``.  Consequently the
+    payload itself has no reset semantic: every final miss overwrites its
+    fixed row before QSFA may read it, while final hits live in their separate
+    persistent band.
+
+    Do *not* use a torch kernel to zero the Direct-HCCP destination after it
+    has been registered.  A producer-stream AIV may retain dirty zero cache
+    lines that are invisible to the executor AIV's pre-doorbell clean; a
+    later writeback can overwrite an otherwise successful inbound DMA.  The
+    old zero_ therefore created exactly the invalid "CQ success + READY +
+    zero payload" state that this graph-compatible path is meant to reject.
     """
-
-    import torch
 
     if fixture.resident_payload is None:
         raise AssertionError("P10 benchmark destination is not cold-bound")
-    with torch.npu.stream(producer_stream):
-        fixture.resident_payload.narrow(0, 0, PERSISTENT_BASE).zero_()
-    torch.npu.synchronize()
+    # Keep the parameter in the call boundary: it documents that this reset
+    # occurs before work is placed on the stable producer stream, but there
+    # is intentionally no payload write on any stream.
+    del producer_stream
+    print(
+        "P10_BENCH_DESTINATION_RESET "
+        "authority=forward_prepare payload_write=none "
+        "resident_ready=empty_before_stage_b",
+        flush=True,
+    )
 
 
 def _run_timed_forward(
