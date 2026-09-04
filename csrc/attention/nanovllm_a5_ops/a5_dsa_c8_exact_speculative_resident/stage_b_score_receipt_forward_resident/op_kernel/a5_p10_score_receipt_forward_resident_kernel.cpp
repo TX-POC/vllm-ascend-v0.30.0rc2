@@ -404,19 +404,15 @@ __simt_callee__ inline void ClaimForwardSlotFromSimt(
   // cache line which races the later AICore bypass publication of IN_FLIGHT
   // or READY.  The claim CASes below are the durable admission transition;
   // the AICore PostOnly boundary publishes IN_FLIGHT.
-  if (asc_atomic_cas(kv_object_to_forward_slot + object_offset,
-                     A5_P10_STAGE_B_CLAIMING_SLOT, selected) !=
-      A5_P10_STAGE_B_CLAIMING_SLOT) {
-    (void)asc_atomic_cas(source_to_forward_slot + source_offset,
-                         A5_P10_STAGE_B_CLAIMING_SLOT,
-                         A5_P10_STAGE_B_UNMAPPED_SLOT);
-    return;
-  }
-  // The CAS has established immutable object ownership.  Do not make the
-  // source cache positive here: SIMT admission and AICore's uncached forward
-  // data plane have different publication domains.  The AICore caller uses
-  // the returned scalar result to write object first, issue a DDR barrier,
-  // then publish source through bypass stores.
+  // Keep the object map CLAIMING until the AICore caller has published the
+  // resident row as PENDING.  Publishing a positive object slot first would
+  // let a second source for the same object expose its positive source map
+  // while resident_ready still reads EMPTY; that worker could then acquire a
+  // second private seed owner and duplicate the PostOnly request.  The
+  // AICore caller below owns the ordered release:
+  //   resident_ready=PENDING -> object=selected -> source=selected.
+  // A concurrent source that sees CLAIMING rolls its source claim back and
+  // resolves the immutable positive object map only after that release.
   AscendC::Simt::ThreadFence();
   result->resident_slot = selected;
   result->newly_claimed = 1U;
@@ -1178,24 +1174,25 @@ class A5P10ScoreReceiptForwardResidentKernel {
       return false;
     }
 
-    // This re-publication is safe: SIMT has already atomically claimed this
-    // object, object slots are immutable within a forward, and any dedup
-    // observer returned precisely `selected`.  Bypass stores avoid a new
-    // AICore dirty-line owner; each DSB is the release edge for the next map.
-    WriteGmByPassDCache<int32_t>(
-        kvObjectToForwardSlot_ + object_offset, selected);
-    DataSyncBarrier<MemDsbT::DDR>();
-
     if (slotClaim_->newly_claimed != 0U) {
-      // Publish the forward-local UB owner before exposing this source map.
-      // A concurrent final-recall worker that finds the immutable mapping can
-      // therefore see PENDING and wait, rather than seeing EMPTY and issuing
-      // a duplicate PostOnly for the same fixed resident row.
+      // Publish the forward-local UB owner before exposing *either* immutable
+      // map.  A second source may deduplicate through the object map before
+      // it reaches its own source map, so PENDING must precede object=selected
+      // as well as source=selected.  Otherwise the second source can claim an
+      // EMPTY resident row in the publication gap and duplicate PostOnly.
       WriteGmByPassDCache<int32_t>(
           residentReady_ + selected,
           static_cast<int32_t>(A5P10ResidentReadyState::PENDING));
       DataSyncBarrier<MemDsbT::DDR>();
     }
+
+    // SIMT reserved this object by leaving its map CLAIMING.  Now that a
+    // newly admitted row is durably PENDING, release the immutable object
+    // directory first; deduplicated source maps and all later readers can
+    // safely rely on it without ever observing object=selected/ready=EMPTY.
+    WriteGmByPassDCache<int32_t>(
+        kvObjectToForwardSlot_ + object_offset, selected);
+    DataSyncBarrier<MemDsbT::DDR>();
 
     const int32_t visible_source = ReadGmByPassDCache<int32_t>(
         sourceToForwardSlot_ + source_offset);

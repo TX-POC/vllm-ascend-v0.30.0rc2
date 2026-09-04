@@ -384,6 +384,31 @@ class P10StageBSourceContractTest(unittest.TestCase):
             self.assertIn(token, self.abi + self.kernel)
         self.assertNotIn("WaitForPendingResidentTransition", self.kernel)
 
+    def test_new_object_publishes_pending_before_positive_dedup_maps(self):
+        """A second source must never see object=slot while ready is EMPTY.
+
+        A SIMT admission reserves an object with CLAIMING.  The AICore side
+        owns the only release order: PENDING, then object map, then source
+        map.  This closes the cross-worker, same-object double-Post window
+        without another graph tensor, queue, or resident-slot protocol.
+        """
+        pending_publish = self.kernel.index(
+            "residentReady_ + selected,\n"
+            "          static_cast<int32_t>(A5P10ResidentReadyState::PENDING)"
+        )
+        object_publish = self.kernel.index(
+            "kvObjectToForwardSlot_ + object_offset, selected);"
+        )
+        source_publish = self.kernel.index(
+            "sourceToForwardSlot_ + source_offset, selected);"
+        )
+        self.assertLess(pending_publish, object_publish)
+        self.assertLess(object_publish, source_publish)
+        self.assertNotIn(
+            "A5_P10_STAGE_B_CLAIMING_SLOT, selected) !=",
+            self.kernel,
+        )
+
     def test_first_failure_diagnostic_is_forward_local_and_non_scheduling(self):
         for token in (
             "A5_P10_STAGE_B_DIAGNOSTIC", "INIT_COMMON", "INIT_GEOMETRY",
@@ -439,21 +464,31 @@ class P10StageBSourceContractTest(unittest.TestCase):
     def test_object_claim_is_published_before_the_source_cache(self):
         """A positive source entry releases a bypass-published object map.
 
-        SIMT performs only the atomic ownership claim.  The returned scalar
-        crosses the local VF handoff and AICore publishes object -> DDR ->
-        source.  This prevents a SIMT-only fence from being mistaken for a
-        visible publication to later uncached AICore/CPU readers.
+        SIMT retains the object map in CLAIMING. The returned scalar crosses
+        the local VF handoff and AICore publishes PENDING -> DDR -> object ->
+        DDR -> source. This prevents a SIMT-only fence from being mistaken
+        for a visible publication to later uncached AICore/CPU readers, and
+        prevents a deduplicated second source from observing object=slot while
+        resident_ready is still EMPTY.
         """
 
-        object_commit = self.kernel.index(
-            "asc_atomic_cas(kv_object_to_forward_slot + object_offset,\n"
-            "                     A5_P10_STAGE_B_CLAIMING_SLOT, selected)"
+        claim_reservation = self.kernel.index(
+            "Keep the object map CLAIMING until the AICore caller has published"
         )
         publish_helper = self.kernel.index("PublishClaimedForwardSlot")
+        pending_publish = self.kernel.index(
+            "WriteGmByPassDCache<int32_t>(\n"
+            "          residentReady_ + selected,\n"
+            "          static_cast<int32_t>(A5P10ResidentReadyState::PENDING))",
+            publish_helper,
+        )
+        pending_dsb = self.kernel.index(
+            "DataSyncBarrier<MemDsbT::DDR>();", pending_publish
+        )
         object_publish = self.kernel.index(
             "WriteGmByPassDCache<int32_t>(\n"
             "        kvObjectToForwardSlot_ + object_offset, selected)",
-            publish_helper,
+            pending_dsb,
         )
         object_dsb = self.kernel.index("DataSyncBarrier<MemDsbT::DDR>();", object_publish)
         source_publish = self.kernel.index(
@@ -461,10 +496,18 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "        sourceToForwardSlot_ + source_offset, selected)",
             object_dsb,
         )
-        self.assertLess(object_commit, publish_helper)
+        self.assertLess(claim_reservation, publish_helper)
+        self.assertLess(publish_helper, pending_publish)
+        self.assertLess(pending_publish, pending_dsb)
+        self.assertLess(pending_dsb, object_publish)
         self.assertLess(publish_helper, object_publish)
         self.assertLess(object_publish, object_dsb)
         self.assertLess(object_dsb, source_publish)
+        self.assertNotIn(
+            "asc_atomic_cas(kv_object_to_forward_slot + object_offset,\n"
+            "                     A5_P10_STAGE_B_CLAIMING_SLOT, selected)",
+            self.kernel,
+        )
         self.assertNotIn(
             "asc_atomic_cas(source_to_forward_slot + source_offset,\n"
             "                       A5_P10_STAGE_B_CLAIMING_SLOT, selected)",
