@@ -329,6 +329,29 @@ class P10StageBSourceContractTest(unittest.TestCase):
             / "p10_forward_bridge" / "op_kernel" / "a5_p10_forward_prepare.cpp"
         ).read_text())
 
+    def test_opt_in_receipt_trace_preserves_the_source_owned_sequence(self):
+        """Zero early-post must be explainable without changing scheduling.
+
+        The trace uses only the descriptor's declared reserved high word after
+        Stage B has claimed the record.  It must never become a C8 decision,
+        another graph input, or an additional persistent buffer.
+        """
+
+        for token in (
+            "A5_P10_STAGE_B_SCORE_CONTROL_TRACE_ENABLE",
+            "A5P10StageBReceiptTraceBit",
+            "StoreReceiptTrace",
+            "previous & 0xffffffffULL",
+            "traceEnabled_",
+            "A5_P10_STAGE_B_TRACE_DESCRIPTOR_INVALID",
+            "A5_P10_STAGE_B_TRACE_CLAIMED_NEW",
+            "A5_P10_STAGE_B_TRACE_POSTED",
+        ):
+            self.assertIn(token, self.abi + self.kernel)
+        self.assertIn("descriptor->reserved", self.kernel)
+        self.assertIn("sequence = static_cast<uint32_t>(sequence)", self.kernel)
+        self.assertNotIn("receipt_trace", self.definition)
+
     def test_claiming_race_waits_for_durable_object_slot_not_a_reuse(self):
         self.assertIn("ResolveConcurrentForwardSlot", self.kernel)
         self.assertIn("A5_P10_STAGE_B_CLAIMING_SLOT", self.kernel)

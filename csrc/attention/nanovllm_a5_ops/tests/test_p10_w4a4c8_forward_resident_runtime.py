@@ -78,6 +78,24 @@ EXECUTOR_WORKERS = int(
     os.environ.get("P10_BENCH_EXECUTOR_WORKERS", str(min(BATCH, 8)))
 )
 EXECUTOR_WORKER_LIMIT = int(os.environ.get("P10_BENCH_EXECUTOR_WORKER_LIMIT", "16"))
+STAGE_B_RECEIPT_TRACE = os.environ.get("P10_STAGE_B_RECEIPT_TRACE", "0") == "1"
+_STAGE_B_RECEIPT_TRACE_ENABLE = 0x80000000
+_STAGE_B_RECEIPT_TRACE_BITS = {
+    "entered": 1 << 0,
+    "descriptor_valid": 1 << 1,
+    "descriptor_invalid": 1 << 2,
+    "seed_buffer_unavailable": 1 << 3,
+    "source_scanned": 1 << 4,
+    "score_eligible": 1 << 5,
+    "mapping_valid": 1 << 6,
+    "persistent_hit": 1 << 7,
+    "miss_candidate": 1 << 8,
+    "claim_attempted": 1 << 9,
+    "claimed_new": 1 << 10,
+    "post_attempted": 1 << 11,
+    "posted": 1 << 12,
+    "post_deferred": 1 << 13,
+}
 
 
 class P10Blocked(RuntimeError):
@@ -752,7 +770,18 @@ def _build_forward_inputs(
     # a real speculative workload while final recall still guarantees all
     # canonical winners.
     forward_control = torch.tensor(
-        [0, 0, TOPK, BLOCK_TOKENS, BATCH, 0, 0, 0, 0, 0],
+        [
+            0,
+            0,
+            TOPK,
+            BLOCK_TOKENS,
+            BATCH,
+            0,
+            _STAGE_B_RECEIPT_TRACE_ENABLE if STAGE_B_RECEIPT_TRACE else 0,
+            0,
+            0,
+            0,
+        ],
         dtype=torch.int32,
         device=device,
     )
@@ -872,6 +901,7 @@ def _build_forward_inputs(
     tensors = {
         "canonical_sparse": canonical_sparse,
         "canonical_lens": canonical_lens,
+        "receipt_ring": receipt_ring,
         "receipt_state": receipt_state,
         "forward_control": forward_control,
         "object_snapshot": object_snapshot,
@@ -1576,6 +1606,85 @@ def _reset_benchmark_destination(fixture: _ForwardResidentKvaf, producer_stream:
     )
 
 
+def _emit_stage_b_receipt_trace(
+    tensors: dict[str, Any], *, context: str
+) -> None:
+    """Print one bounded, post-terminal explanation of the receipt path.
+
+    This is intentionally a *diagnostic mode*, selected with
+    ``P10_STAGE_B_RECEIPT_TRACE=1``.  Stage B then writes a bitset into the
+    reserved high half of each receipt's fifth word after it owns the record;
+    the source-owned low sequence half is preserved exactly.  No extra graph
+    input, C8 workspace, scheduling edge, or synchronization is introduced.
+
+    The result is an OR-style per-gate count rather than a verbose per-source
+    dump.  It answers the one question needed to interpret a zero speculative
+    cursor: did a receipt fail descriptor validation, have no eligible source,
+    resolve only resident hits, lose slot admission, or defer its Post?
+    """
+
+    if not STAGE_B_RECEIPT_TRACE:
+        return
+
+    import torch
+
+    ring = tensors["receipt_ring"].detach().cpu().reshape(-1, RECEIPT_WORDS)
+    states = tensors["receipt_state"].detach().cpu().reshape(-1)
+    # The trace lives in the high 32 bits.  Mask after the signed right shift
+    # so a high diagnostic bit remains an ordinary unsigned bit pattern.
+    trace_words = torch.bitwise_and(
+        torch.bitwise_right_shift(ring[:, 4].to(dtype=torch.int64), 32),
+        0xFFFFFFFF,
+    )
+    bit_counts = {
+        name: int(torch.count_nonzero(torch.bitwise_and(trace_words, bit)).item())
+        for name, bit in _STAGE_B_RECEIPT_TRACE_BITS.items()
+    }
+    # Decode the source-owned descriptor fields independently of the device
+    # trace.  This makes a malformed Stage-A publication distinguishable from
+    # a valid descriptor rejected later by Stage B.
+    rows = ring[:, 1].to(dtype=torch.int64)
+    sources = ring[:, 2].to(dtype=torch.int64)
+    layout = ring[:, 3].to(dtype=torch.int64)
+    row_begin = torch.bitwise_and(rows, 0xFFFFFFFF)
+    row_count = torch.bitwise_and(torch.bitwise_right_shift(rows, 32), 0xFFFFFFFF)
+    source_begin = torch.bitwise_and(sources, 0xFFFFFFFF)
+    source_count = torch.bitwise_and(
+        torch.bitwise_right_shift(sources, 32), 0xFFFFFFFF
+    )
+    row_stride = torch.bitwise_and(layout, 0xFFFFFFFF)
+    score_bytes = torch.bitwise_and(
+        torch.bitwise_right_shift(layout, 32), 0xFFFFFFFF
+    )
+    descriptor_valid = (
+        (row_count > 0)
+        & (source_count > 0)
+        & (score_bytes == 2)
+        & (row_stride >= source_count * 2)
+        & (row_begin < BATCH)
+        & (source_begin < SOURCE_TOKENS)
+    )
+    state_counts = {
+        f"state_{state}": int(torch.count_nonzero(states == state).item())
+        for state in range(5)
+    }
+    print(
+        "P10_STAGE_B_RECEIPT_TRACE "
+        f"context={context} records={ring.size(0)} "
+        f"trace_records={int(torch.count_nonzero(trace_words).item())} "
+        f"descriptor_valid={int(torch.count_nonzero(descriptor_valid).item())} "
+        f"descriptor_invalid={int(torch.count_nonzero(~descriptor_valid).item())} "
+        f"row_begin_min={int(row_begin.min().item())} "
+        f"row_begin_max={int(row_begin.max().item())} "
+        f"source_begin_min={int(source_begin.min().item())} "
+        f"source_begin_max={int(source_begin.max().item())} "
+        + " ".join(f"{name}={count}" for name, count in state_counts.items())
+        + " "
+        + " ".join(f"{name}={count}" for name, count in bit_counts.items()),
+        flush=True,
+    )
+
+
 def _run_timed_forward(
     *,
     mode: str,
@@ -1639,6 +1748,7 @@ def _run_timed_forward(
         require_preseal_overlap=(mode == "overlap"),
         emit_summary=False,
     )
+    _emit_stage_b_receipt_trace(tensors, context=f"timed_{mode}")
     _require_immutable_inputs(immutable_digests, base, context=f"P10 {mode} run")
     speculative_slots = int(
         tensors["speculative_cursor"].detach().cpu().reshape(-1)[0].item()
@@ -1710,6 +1820,7 @@ def _run_timed_static_forward(
         require_preseal_overlap=(mode == "overlap"),
         emit_summary=False,
     )
+    _emit_stage_b_receipt_trace(tensors, context=f"static_{mode}")
     _require_immutable_inputs(
         immutable_digests, base, context=f"P10 graph-compatible {mode} replay"
     )
@@ -2041,6 +2152,28 @@ def _run_graph_compatible_benchmark() -> int:
     expected_signature = serial[0].signature
     if any(sample.signature != expected_signature for sample in serial + overlap):
         raise AssertionError("P10 graph-compatible serial/overlap semantic signature mismatch")
+
+    # A fused timing only has an overlap interpretation if Stage B admitted at
+    # least one pre-final-recall speculative slot.  Without that admission,
+    # the later exact winner path performs the same final recall in both
+    # schedules and a saved-us number would be a misleading measurement of
+    # launch noise rather than HCCP hiding.  Fail closed instead of printing a
+    # product performance pass; a trace-enabled rerun reports the exact gate.
+    overlap_speculative_min = min(sample.speculative_slots for sample in overlap)
+    if overlap_speculative_min == 0:
+        serial_speculative_min = min(sample.speculative_slots for sample in serial)
+        print(
+            "P10_GRAPH_COMPAT_INCONCLUSIVE "
+            "reason=overlap_has_no_speculative_slots_do_not_claim_hccp_hiding_gain "
+            f"serial_speculative_slots_min={serial_speculative_min} "
+            f"overlap_speculative_slots_min={overlap_speculative_min} "
+            "next=P10_STAGE_B_RECEIPT_TRACE",
+            flush=True,
+        )
+        raise AssertionError(
+            "P10 graph-compatible overlap admitted zero speculative slots; "
+            "inspect P10_STAGE_B_RECEIPT_TRACE before interpreting latency"
+        )
 
     serial_device = [sample.device_us for sample in serial]
     overlap_device = [sample.device_us for sample in overlap]

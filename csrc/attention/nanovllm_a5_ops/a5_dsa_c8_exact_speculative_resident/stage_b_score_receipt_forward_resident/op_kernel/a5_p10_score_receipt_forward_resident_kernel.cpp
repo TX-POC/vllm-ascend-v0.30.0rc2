@@ -659,8 +659,12 @@ class A5P10ScoreReceiptForwardResidentKernel {
         forwardControl_ + A5_P10_STAGE_B_ROWS_PER_OBJECT));
     topkPerRow_ = static_cast<uint32_t>(ReadGmByPassDCache<int32_t>(
         forwardControl_ + A5_P10_STAGE_B_TOPK_PER_ROW));
-    scoreCutoffU16_ = static_cast<uint32_t>(ReadGmByPassDCache<int32_t>(
-        forwardControl_ + A5_P10_STAGE_B_SCORE_CUTOFF_U16)) & 0xffffU;
+    const uint32_t score_control = static_cast<uint32_t>(
+        ReadGmByPassDCache<int32_t>(
+            forwardControl_ + A5_P10_STAGE_B_SCORE_CUTOFF_U16));
+    scoreCutoffU16_ = score_control & 0xffffU;
+    traceEnabled_ =
+        (score_control & A5_P10_STAGE_B_SCORE_CONTROL_TRACE_ENABLE) != 0U;
     speculativeBand_.base =
         ReadGmByPassDCache<int32_t>(speculativeSlotBand_ + 0U);
     speculativeBand_.capacity =
@@ -870,6 +874,25 @@ class A5P10ScoreReceiptForwardResidentKernel {
     set_flag(PIPE_V, PIPE_S, simtEvent_);
     wait_flag(PIPE_V, PIPE_S, simtEvent_);
     return receiptDone_->completed != 0U;
+  }
+
+  __aicore__ inline void StoreReceiptTrace(uint32_t receipt,
+                                            uint32_t trace) {
+    if (!traceEnabled_ || receipt >= receiptCapacity_) {
+      return;
+    }
+    // Word four is `[sequence:uint32, reserved:uint32]`.  Stage A owns the
+    // low sequence word and Stage B is the only claimant allowed to fill the
+    // reserved high word.  Preserve the source-owned sequence exactly; this
+    // trace is post-consumption forensic data, never a control transition.
+    const uint64_t previous = static_cast<uint64_t>(ReadGmByPassDCache<int64_t>(
+        receiptRing_ + receipt * kReceiptWords + 4U));
+    const uint64_t published = (previous & 0xffffffffULL) |
+        (static_cast<uint64_t>(trace) << 32U);
+    WriteGmByPassDCache<int64_t>(
+        receiptRing_ + receipt * kReceiptWords + 4U,
+        static_cast<int64_t>(published));
+    DataSyncBarrier<MemDsbT::DDR>();
   }
 
   // A bounded quantum is an explicit device-side checkpoint between receipt
@@ -1122,26 +1145,33 @@ class A5P10ScoreReceiptForwardResidentKernel {
     return 0U;
   }
 
-  __aicore__ inline void FlushSpeculativeSeeds(
+  __aicore__ inline uint32_t FlushSpeculativeSeeds(
       uint32_t buffer_index, uint32_t seed_count) {
     if (seed_count == 0U) {
-      return;
+      return 0U;
     }
     // Busy queues only defer speculation. EMPTY rows are harmless and final
     // recall reuses the same fixed row for an actual exact winner.
-    (void)StartMicrobatch(buffer_index, seed_count);
+    return StartMicrobatch(buffer_index, seed_count);
   }
 
   __aicore__ inline void ConsumeExactScoreReceipt(uint32_t receipt) {
+    uint32_t trace = A5_P10_STAGE_B_TRACE_ENTERED;
     A5P10ScoreReceiptDescriptor descriptor{};
     if (!LoadReceiptDescriptor(receiptRing_, receipt, &descriptor) ||
         descriptor.row_begin >= activeRows_) {
+      trace |= A5_P10_STAGE_B_TRACE_DESCRIPTOR_INVALID;
+      StoreReceiptTrace(receipt, trace);
       (void)FinishClaimedReceipt(receipt);
       return;
     }
+    trace |= A5_P10_STAGE_B_TRACE_DESCRIPTOR_VALID;
     DataSyncBarrier<MemDsbT::DDR>();
     uint32_t buffer_index = FindFreeSeedBuffer();
     uint32_t seed_count = 0U;
+    if (buffer_index == kNoBuffer) {
+      trace |= A5_P10_STAGE_B_TRACE_SEED_BUFFER_UNAVAILABLE;
+    }
     for (uint32_t row_delta = 0U;
          row_delta < descriptor.row_count &&
          descriptor.row_begin + row_delta < activeRows_; ++row_delta) {
@@ -1152,6 +1182,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         if (source >= tiling_->sourceCapacity || buffer_index == kNoBuffer) {
           continue;
         }
+        trace |= A5_P10_STAGE_B_TRACE_SOURCE_SCANNED;
         const uint64_t score_byte_offset = descriptor.score_surface_offset_bytes +
             static_cast<uint64_t>(row_delta) * descriptor.row_stride_bytes +
             static_cast<uint64_t>(source_delta) * descriptor.score_element_bytes;
@@ -1162,6 +1193,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         if (static_cast<uint32_t>(score) < scoreCutoffU16_) {
           continue;
         }
+        trace |= A5_P10_STAGE_B_TRACE_SCORE_ELIGIBLE;
         A5P10ActiveRowMapping mapping{};
         // A READY receipt is published only after native C8 has written this
         // exact score range.  The final `canonicalScoreSourceLens_` is a
@@ -1170,10 +1202,15 @@ class A5P10ScoreReceiptForwardResidentKernel {
         // without protecting correctness; the receipt's bounded source range
         // is the valid pre-seal authority.  Final Top-K materialization below
         // still requires the canonical length.
-        if (!ResolveActiveRowMapping(row, source, &mapping, false) ||
-            mapping.persistent_slot >= 0) {
+        if (!ResolveActiveRowMapping(row, source, &mapping, false)) {
           continue;
         }
+        trace |= A5_P10_STAGE_B_TRACE_MAPPING_VALID;
+        if (mapping.persistent_slot >= 0) {
+          trace |= A5_P10_STAGE_B_TRACE_PERSISTENT_HIT;
+          continue;
+        }
+        trace |= A5_P10_STAGE_B_TRACE_MISS_CANDIDATE;
         const uint64_t source_offset = static_cast<uint64_t>(row) *
             tiling_->sourceCapacity + source;
         const uint64_t object_offset = static_cast<uint64_t>(
@@ -1181,10 +1218,12 @@ class A5P10ScoreReceiptForwardResidentKernel {
             static_cast<uint32_t>(mapping.object_local);
         int32_t resident_slot = A5_P10_STAGE_B_UNMAPPED_SLOT;
         bool newly_claimed = false;
+        trace |= A5_P10_STAGE_B_TRACE_CLAIM_ATTEMPTED;
         if (!ClaimSpeculativeSlot(source_offset, object_offset, &resident_slot,
                                   &newly_claimed) || !newly_claimed) {
           continue;
         }
+        trace |= A5_P10_STAGE_B_TRACE_CLAIMED_NEW;
         // Aggregate/struct copies into __ubuf__ are not a supported AscendC
         // address-space operation.  Keep the 16-byte seed ABI, but issue its
         // four scalar UB stores explicitly.
@@ -1195,16 +1234,30 @@ class A5P10ScoreReceiptForwardResidentKernel {
         localSeeds_[buffer_index][seed_count].resident_slot = resident_slot;
         ++seed_count;
         if (seed_count == A5_P10_STAGE_B_MICROBATCH_CAPACITY) {
-          FlushSpeculativeSeeds(buffer_index, seed_count);
+          trace |= A5_P10_STAGE_B_TRACE_POST_ATTEMPTED;
+          const uint32_t post_reason =
+              FlushSpeculativeSeeds(buffer_index, seed_count);
+          trace |= post_reason == 0U ? A5_P10_STAGE_B_TRACE_POSTED
+                                     : A5_P10_STAGE_B_TRACE_POST_DEFERRED;
           buffer_index = FindFreeSeedBuffer();
+          if (buffer_index == kNoBuffer) {
+            trace |= A5_P10_STAGE_B_TRACE_SEED_BUFFER_UNAVAILABLE;
+          }
           seed_count = 0U;
         }
       }
     }
-    FlushSpeculativeSeeds(buffer_index, seed_count);
+    if (seed_count != 0U) {
+      trace |= A5_P10_STAGE_B_TRACE_POST_ATTEMPTED;
+      const uint32_t post_reason =
+          FlushSpeculativeSeeds(buffer_index, seed_count);
+      trace |= post_reason == 0U ? A5_P10_STAGE_B_TRACE_POSTED
+                                 : A5_P10_STAGE_B_TRACE_POST_DEFERRED;
+    }
     // Claim -> durable local copy/terminal decision -> DONE. Ring recycle is
     // intentionally outside this forward-owned kernel boundary.
     DataSyncBarrier<MemDsbT::DDR>();
+    StoreReceiptTrace(receipt, trace);
     (void)FinishClaimedReceipt(receipt);
   }
 
@@ -1612,6 +1665,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
   uint32_t rowsPerObject_ = 0U;
   uint32_t topkPerRow_ = 0U;
   uint32_t scoreCutoffU16_ = 0U;
+  bool traceEnabled_ = false;
   // Dense KVAF PostOnly reserves event IDs 0 and 1 for its two WQE banks;
   // generic KVAF compaction reserves 2.  Stage-B's SIMT handshakes therefore
   // use 3.  The event is per AIV invocation, not a fixed Get-core assignment.

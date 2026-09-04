@@ -14,6 +14,35 @@ constexpr uint32_t A5_P10_STAGE_B_MICROBATCH_CAPACITY = 64U;
 constexpr uint32_t A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY = 2U;
 constexpr uint32_t A5_P10_STAGE_B_FINAL_DRAIN_POLLS = 1024U;
 
+// The score threshold occupies only the low 16 bits of forward_control[6].
+// The high diagnostic bit is opt-in and deliberately has no scheduling or
+// numerical meaning.  It lets a failed performance investigation leave a
+// compact per-receipt trail in the descriptor's otherwise-reserved high word,
+// without adding a graph input, a C8 buffer, or a host-side synchronization.
+constexpr uint32_t A5_P10_STAGE_B_SCORE_CONTROL_TRACE_ENABLE = 0x80000000U;
+
+// Stage B owns a receipt after READY -> CLAIMED, so it alone may write this
+// trace bitset.  Each bit says that at least one item in the receipt reached a
+// particular gate; it is not a counter and it never participates in transport
+// ownership, Top-K, resident placement, or QSFA.  The host reads it only after
+// the Stage-B completion event in a trace-enabled diagnostic run.
+enum A5P10StageBReceiptTraceBit : uint32_t {
+  A5_P10_STAGE_B_TRACE_ENTERED = 1U << 0U,
+  A5_P10_STAGE_B_TRACE_DESCRIPTOR_VALID = 1U << 1U,
+  A5_P10_STAGE_B_TRACE_DESCRIPTOR_INVALID = 1U << 2U,
+  A5_P10_STAGE_B_TRACE_SEED_BUFFER_UNAVAILABLE = 1U << 3U,
+  A5_P10_STAGE_B_TRACE_SOURCE_SCANNED = 1U << 4U,
+  A5_P10_STAGE_B_TRACE_SCORE_ELIGIBLE = 1U << 5U,
+  A5_P10_STAGE_B_TRACE_MAPPING_VALID = 1U << 6U,
+  A5_P10_STAGE_B_TRACE_PERSISTENT_HIT = 1U << 7U,
+  A5_P10_STAGE_B_TRACE_MISS_CANDIDATE = 1U << 8U,
+  A5_P10_STAGE_B_TRACE_CLAIM_ATTEMPTED = 1U << 9U,
+  A5_P10_STAGE_B_TRACE_CLAIMED_NEW = 1U << 10U,
+  A5_P10_STAGE_B_TRACE_POST_ATTEMPTED = 1U << 11U,
+  A5_P10_STAGE_B_TRACE_POSTED = 1U << 12U,
+  A5_P10_STAGE_B_TRACE_POST_DEFERRED = 1U << 13U,
+};
+
 constexpr int32_t A5_P10_STAGE_B_UNMAPPED_SLOT = -1;
 constexpr int32_t A5_P10_STAGE_B_CLAIMING_SLOT = -2;
 constexpr int32_t A5_P10_STAGE_B_FORWARD_STATE_INCOMPLETE = 0;
