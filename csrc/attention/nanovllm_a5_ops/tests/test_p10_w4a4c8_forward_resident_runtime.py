@@ -618,7 +618,12 @@ class _ForwardResidentKvaf:
         probe_output_indices = torch.arange(
             len(probe_sources), dtype=torch.int32, device=self.device
         )
-        probe_output = torch.zeros(
+        # Like the product resident payload, this is strictly an inbound DMA
+        # destination.  Initializing it with a torch kernel would let the
+        # cold source-plane classifier create the same cross-AIV dirty-cache
+        # overwrite it is supposed to diagnose.  Every checked row is fully
+        # written by this Direct-HCCP Get before it is observed.
+        probe_output = torch.empty(
             (len(probe_sources), PACKED_KV_ROW_BYTES),
             dtype=torch.uint8,
             device=self.device,
