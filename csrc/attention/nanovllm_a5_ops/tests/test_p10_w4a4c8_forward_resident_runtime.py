@@ -1007,6 +1007,12 @@ _STAGE_B_POST_DETAIL_NAMES = {
     15: "cq_unknown",
     16: "queue_return",
     17: "cq_pending",
+    18: "begin_state_idle",
+    19: "begin_state_retired",
+    20: "begin_state_failed_success",
+    21: "begin_state_in_flight_returned_false",
+    22: "begin_state_unknown",
+    23: "begin_result_unknown",
 }
 
 

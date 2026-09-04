@@ -78,6 +78,17 @@ enum A5P10StageBPostFailureReason : uint32_t {
   A5_P10_STAGE_B_POST_CQ_UNKNOWN = 15U,
   A5_P10_STAGE_B_POST_QUEUE_RETURN = 16U,
   A5_P10_STAGE_B_POST_CQ_PENDING = 17U,
+  // A dense Begin with a non-success result is classified above.  These
+  // codes cover the otherwise-impossible case where Begin returns false but
+  // does not leave an explicit dense failure.  It must fail closed: a caller
+  // cannot prove whether the doorbell was reached, so it must not recycle the
+  // queue from this path.
+  A5_P10_STAGE_B_POST_BEGIN_STATE_IDLE = 18U,
+  A5_P10_STAGE_B_POST_BEGIN_STATE_RETIRED = 19U,
+  A5_P10_STAGE_B_POST_BEGIN_STATE_FAILED_SUCCESS = 20U,
+  A5_P10_STAGE_B_POST_BEGIN_STATE_IN_FLIGHT = 21U,
+  A5_P10_STAGE_B_POST_BEGIN_STATE_UNKNOWN = 22U,
+  A5_P10_STAGE_B_POST_BEGIN_RESULT_UNKNOWN = 23U,
 };
 
 // A persistent Stage-B companion starts from the same cold-bound mutable

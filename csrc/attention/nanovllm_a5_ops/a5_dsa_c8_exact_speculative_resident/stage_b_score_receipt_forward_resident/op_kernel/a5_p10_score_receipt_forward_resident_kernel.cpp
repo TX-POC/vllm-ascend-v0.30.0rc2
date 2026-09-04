@@ -78,7 +78,8 @@ struct StageBWave {
   uint32_t failure_reason;
 };
 
-__aicore__ inline uint32_t BeginFailureReasonFromKvafResult(uint64_t result) {
+__aicore__ inline uint32_t BeginFailureReasonFromKvafTransaction(
+    uint64_t result, uint32_t state) {
   switch (result) {
     case kvaf_fused_get::kInvalidArgs:
       return A5_P10_STAGE_B_POST_BEGIN_INVALID_ARGS;
@@ -93,7 +94,27 @@ __aicore__ inline uint32_t BeginFailureReasonFromKvafResult(uint64_t result) {
     case kvaf_fused_get::kInvalidOutput:
       return A5_P10_STAGE_B_POST_BEGIN_INVALID_OUTPUT;
     default:
-      return A5_P10_STAGE_B_POST_BEGIN_UNKNOWN;
+      break;
+  }
+  // All legal non-success dense Begin results are handled above.  A success
+  // result is valid only with IN_FLIGHT, and in that case the KVAF wrapper
+  // itself must return true.  Keep each contradictory state distinct so one
+  // target run identifies whether the return/value boundary or the dense
+  // transaction publication is at fault.
+  if (result != kvaf_fused_get::kSuccess) {
+    return A5_P10_STAGE_B_POST_BEGIN_RESULT_UNKNOWN;
+  }
+  switch (state) {
+    case kvaf_fused_get::kDenseBatchGetIdle:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_IDLE;
+    case kvaf_fused_get::kDenseBatchGetRetired:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_RETIRED;
+    case kvaf_fused_get::kDenseBatchGetFailed:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_FAILED_SUCCESS;
+    case kvaf_fused_get::kDenseBatchGetInFlight:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_IN_FLIGHT;
+    default:
+      return A5_P10_STAGE_B_POST_BEGIN_STATE_UNKNOWN;
   }
 }
 
@@ -417,10 +438,19 @@ __aicore__ inline bool BeginForwardResidentMicrobatch(
   }
   if (!kvaf_forward_resident_get::BeginKvafForwardResidentBatchGet(
           control, lease, descriptor, &output->kvaf_wave)) {
-    output->failure_reason =
-        BeginFailureReasonFromKvafResult(output->kvaf_wave.transaction.result);
+    output->failure_reason = BeginFailureReasonFromKvafTransaction(
+        output->kvaf_wave.transaction.result,
+        output->kvaf_wave.transaction.state);
+    // The only locally provable no-Post result is an explicit dense FAILED
+    // transaction.  Any other false return is internally contradictory
+    // (including success+IDLE); it may be a compiler/address-space failure
+    // after a doorbell.  Do not turn that ambiguity into a queue reuse race.
+    // The enclosing target process preserves Direct-HCCP diagnostics on a
+    // failed forward, so retaining the lease is both safe and observable.
     if (output->kvaf_wave.lease.state ==
-        kvaf_forward_resident_get::kForwardResidentQueueTerminal) {
+            kvaf_forward_resident_get::kForwardResidentQueueTerminal &&
+        output->kvaf_wave.transaction.state ==
+            kvaf_fused_get::kDenseBatchGetFailed) {
       (void)kvaf_forward_resident_get::FinishKvafForwardResidentBatchGet(
           &output->kvaf_wave, &output->terminal);
       (void)kvaf_forward_resident_get::ReturnKvafForwardResidentQueueFromAicore(

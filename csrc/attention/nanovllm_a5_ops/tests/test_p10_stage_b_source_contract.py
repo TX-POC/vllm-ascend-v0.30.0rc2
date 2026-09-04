@@ -289,7 +289,8 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "INIT_KVAF", "INIT_UB", "RECEIPT_TERMINAL", "FINALIZE",
             "DRAIN", "FINALIZE_DETAIL_BASE", "FINALIZE_FINAL_QSFA",
             "POST_DETAIL_BASE", "POST_BEGIN_INVALID_ARGS", "CQ_PENDING",
-            "BeginFailureReasonFromKvafResult", "CqFailureReasonFromKvafResult",
+            "POST_BEGIN_STATE_IDLE", "POST_BEGIN_RESULT_UNKNOWN",
+            "BeginFailureReasonFromKvafTransaction", "CqFailureReasonFromKvafResult",
             "PostDiagnostic", "failure_reason", "FinalizeDiagnostic",
             "RecordFirstFailure", "MarkRunning",
         ):
