@@ -448,39 +448,38 @@ __aicore__ inline bool LoadReceiptDescriptor(
 // Begin is the unique descriptor publication / PostOnly boundary. KVAF owns
 // its GM/DDR publish barrier and doorbell ordering; Stage B never duplicates
 // either operation.
-__aicore__ inline bool BeginForwardResidentMicrobatch(
+// Return a scalar failure reason rather than mutating a StageBWave during the
+// Begin closure.  This function is deeply inlined with KVAF's descriptor/WQE
+// construction.  Keeping every failure-side observable in a scalar return
+// value makes the Begin boundary independent of the longer-lived executor
+// object's address-space representation.  Zero means that PostOnly has
+// completed and the caller may materialize its persistent CQ-drain wave.
+__aicore__ inline uint32_t BeginForwardResidentMicrobatch(
     __gm__ const KvafForwardResidentBatchGetControl* control_gm,
     uint32_t producer_id, uint32_t queue_hint,
     __ubuf__ A5P10ForwardResidentSeed* seeds, uint32_t seed_count,
     uint32_t rows_per_object,
     __ubuf__ kvaf_forward_resident_get::KvafForwardResidentQueueLeaseResult*
         lease_result,
-    event_t simt_event, StageBWave* output) {
+    event_t simt_event,
+    kvaf_forward_resident_get::KvafForwardResidentBatchGetWave* begin_wave) {
   if (control_gm == nullptr || seeds == nullptr || seed_count == 0U ||
       seed_count > A5_P10_STAGE_B_MICROBATCH_CAPACITY ||
-      rows_per_object == 0U || lease_result == nullptr || output == nullptr) {
-    if (output != nullptr) {
-      output->failure_reason = A5_P10_STAGE_B_POST_INVALID_CALL;
-    }
-    return false;
+      rows_per_object == 0U || lease_result == nullptr || begin_wave == nullptr) {
+    return A5_P10_STAGE_B_POST_INVALID_CALL;
   }
-  output->posted = 0U;
-  output->seed_count = 0U;
-  output->seeds = nullptr;
-  output->failure_reason = 0U;
 
   kvaf_forward_resident_get::KvafForwardResidentBatchGetControl control{};
   if (!kvaf_forward_resident_get::LoadKvafForwardResidentBatchGetControlFromGmForAicore(
           control_gm, &control)) {
-    output->failure_reason = A5_P10_STAGE_B_POST_CONTROL_LOAD;
-    return false;
+    return A5_P10_STAGE_B_POST_CONTROL_LOAD;
   }
   kvaf_forward_resident_get::KvafForwardResidentQueueLease lease{};
+  // Bounded queue contention: final recall retries winners.
   if (!kvaf_forward_resident_get::TryAcquireKvafForwardResidentQueueFromAicore(
           control_gm, producer_id, queue_hint, lease_result, simt_event,
           &lease)) {
-    output->failure_reason = A5_P10_STAGE_B_POST_QUEUE_ACQUIRE;
-    return false;  // bounded queue contention: final recall retries winners.
+    return A5_P10_STAGE_B_POST_QUEUE_ACQUIRE;
   }
 
   kvaf_forward_resident_get::KvafForwardResidentBatchGetDescriptorScratch
@@ -500,46 +499,33 @@ __aicore__ inline bool BeginForwardResidentMicrobatch(
             rows_per_object, resident_slot);
   }
   if (!descriptor_ready) {
-    output->failure_reason = A5_P10_STAGE_B_POST_DESCRIPTOR_BUILD;
     (void)kvaf_forward_resident_get::ReturnKvafForwardResidentUnpostedQueueFromAicore(
         control_gm, lease_result, simt_event, &lease);
-    return false;
+    return A5_P10_STAGE_B_POST_DESCRIPTOR_BUILD;
   }
-  // Do not pass `output->kvaf_wave` through the deeply inlined KVAF Begin
-  // path.  On 950DT that nested executor member has exhibited a lost
-  // write-back on a later microbatch: Begin returns false, but the caller
-  // observes the untouched zero transaction and can only report
-  // BEGIN_UNKNOWN.  The PostOnly transaction is synchronous up to the
-  // doorbell, so a stack-local ordinary record is the correct boundary.
-  // Materialize it into the persistent wave only after Begin succeeds; the
-  // persistent copy is then exclusively owned by the asynchronous CQ drain.
-  kvaf_forward_resident_get::KvafForwardResidentBatchGetWave begin_wave{};
   if (!kvaf_forward_resident_get::BeginKvafForwardResidentBatchGet(
-          control, lease, descriptor, &begin_wave)) {
-    output->failure_reason = BeginFailureReasonFromKvafTransaction(
-        begin_wave.transaction.result, begin_wave.transaction.state);
+          control, lease, descriptor, begin_wave)) {
+    const uint32_t begin_reason = BeginFailureReasonFromKvafTransaction(
+        begin_wave->transaction.result, begin_wave->transaction.state);
     // The only locally provable no-Post result is an explicit dense FAILED
     // transaction.  Any other false return is internally contradictory
     // (including success+IDLE); it may be a compiler/address-space failure
     // after a doorbell.  Do not turn that ambiguity into a queue reuse race.
     // The enclosing target process preserves Direct-HCCP diagnostics on a
     // failed forward, so retaining the lease is both safe and observable.
-    if (begin_wave.lease.state ==
+    if (begin_wave->lease.state ==
             kvaf_forward_resident_get::kForwardResidentQueueTerminal &&
-        begin_wave.transaction.state ==
+        begin_wave->transaction.state ==
             kvaf_fused_get::kDenseBatchGetFailed) {
+      kvaf_forward_resident_get::KvafForwardResidentBatchGetTerminal terminal{};
       (void)kvaf_forward_resident_get::FinishKvafForwardResidentBatchGet(
-          &begin_wave, &output->terminal);
+          begin_wave, &terminal);
       (void)kvaf_forward_resident_get::ReturnKvafForwardResidentQueueFromAicore(
-          control_gm, lease_result, simt_event, &begin_wave);
+          control_gm, lease_result, simt_event, begin_wave);
     }
-    return false;
+    return begin_reason;
   }
-  MaterializeForwardResidentWaveForDrain(output, &begin_wave);
-  output->seeds = seeds;
-  output->seed_count = seed_count;
-  output->posted = 1U;
-  return true;
+  return 0U;
 }
 
 // One TryRetire poll; false with terminal=false is normal nonblocking CQ
@@ -1054,16 +1040,28 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
     StageBWave* wave = waves_ + wave_index;
     wave->buffer_index = buffer_index;
-    if (!BeginForwardResidentMicrobatch(
+    wave->posted = 0U;
+    wave->seed_count = 0U;
+    wave->seeds = nullptr;
+    wave->failure_reason = 0U;
+    // The large KVAF closure writes only this ordinary local record.  The
+    // scalar return is the sole failure path.  Persistent StageBWave state is
+    // materialized below only after PostOnly reports success, so a compiler
+    // writeback anomaly cannot manufacture BEGIN_UNKNOWN on a later wave.
+    kvaf_forward_resident_get::KvafForwardResidentBatchGetWave begin_wave{};
+    const uint32_t begin_reason = BeginForwardResidentMicrobatch(
             controlGm_, worker_, worker_ + buffer_index, localSeeds_[buffer_index],
-            seed_count, rowsPerObject_, leaseResult_, simtEvent_, wave)) {
+            seed_count, rowsPerObject_, leaseResult_, simtEvent_, &begin_wave);
+    if (begin_reason != 0U) {
       if (failure_reason != nullptr) {
-        *failure_reason = wave->failure_reason == 0U
-            ? A5_P10_STAGE_B_POST_BEGIN_UNKNOWN
-            : wave->failure_reason;
+        *failure_reason = begin_reason;
       }
       return false;
     }
+    MaterializeForwardResidentWaveForDrain(wave, &begin_wave);
+    wave->seeds = localSeeds_[buffer_index];
+    wave->seed_count = seed_count;
+    wave->posted = 1U;
     // Begin returned successfully, so descriptors are durable and the fixed
     // rows may now be observed as in-flight by final recall.
     for (uint32_t index = 0U; index < seed_count; ++index) {

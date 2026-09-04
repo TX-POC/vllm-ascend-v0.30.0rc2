@@ -142,21 +142,32 @@ class P10StageBSourceContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, self.kernel)
 
-    def test_begin_uses_a_local_kvaf_wave_then_scalar_materializes_drain_state(self):
-        """Keep Begin's large inline writeback out of a nested executor member.
+    def test_begin_returns_only_a_scalar_diagnostic_before_wave_materialization(self):
+        """Keep all StageBWave mutation outside the large inline Begin closure.
 
-        A successful PostOnly transaction must still be copied into the
-        persistent wave consumed by CQ drain.  Conversely, an unsuccessful
-        Begin is diagnosed and cleaned up from the same local record, so its
-        result cannot disappear before the failure reason is latched.
+        A successful PostOnly transaction is copied into the persistent wave
+        only in StartMicrobatch.  An unsuccessful Begin returns its exact
+        scalar reason directly to the caller; neither its error nor its local
+        KVAF record depends on a writeback to a nested executor member.
         """
+        begin = self.kernel.split("BeginForwardResidentMicrobatch(", 1)[1].split(
+            "// One TryRetire poll", 1
+        )[0]
+        self.assertIn("inline uint32_t BeginForwardResidentMicrobatch", self.kernel)
+        self.assertIn("KvafForwardResidentBatchGetWave* begin_wave", begin)
+        self.assertIn("return begin_reason;", begin)
+        self.assertNotIn("StageBWave* output", begin)
+        self.assertNotIn("output->", begin)
+        self.assertNotIn("descriptor, &output->kvaf_wave", self.kernel)
+
         self.assertIn("KvafForwardResidentBatchGetWave begin_wave{}", self.kernel)
-        self.assertIn("control, lease, descriptor, &begin_wave", self.kernel)
+        self.assertIn("const uint32_t begin_reason = BeginForwardResidentMicrobatch(", self.kernel)
+        self.assertIn("*failure_reason = begin_reason;", self.kernel)
         self.assertIn(
-            "MaterializeForwardResidentWaveForDrain(output, &begin_wave)",
+            "MaterializeForwardResidentWaveForDrain(wave, &begin_wave)",
             self.kernel,
         )
-        self.assertNotIn("descriptor, &output->kvaf_wave", self.kernel)
+        self.assertIn("wave->posted = 1U;", self.kernel)
 
         materialize = self.kernel.split(
             "MaterializeForwardResidentWaveForDrain("
