@@ -64,6 +64,49 @@ struct CompletionResult {
 static_assert(sizeof(CompletionResult) == 16U,
               "completion SIMT ABI changed");
 
+// KVAF Dense PostOnly owns [0, 4 KiB) through get_imm(): two 32-WQE banks
+// consumed by its vector-to-MTE3 submission path.  Stage B must not ask TPipe
+// for an unrelated VECCALC allocation and hope that it lands outside those
+// banks.  It owns the fixed subrange immediately after them for its two seed
+// waves and SIMT result records.
+//
+// [4 KiB, ceiling) is generic-KVAF scratch only when generic compaction runs.
+// P10 invokes Dense PostOnly exclusively, never generic/full BatchGet, so the
+// subrange below is unshared for this closure.  The ceiling is a hard source
+// guard against silently extending into KVAF's later reserved UB.  This is a
+// resource contract, not a capacity tuning knob: 2 x 64 seeds stay fixed.
+constexpr uint32_t AlignP10StageBUb(uint32_t bytes) {
+  return (bytes + 63U) & ~63U;
+}
+
+constexpr uint32_t kP10StageBSeedBytes = AlignP10StageBUb(
+    A5_P10_STAGE_B_MICROBATCH_CAPACITY * sizeof(A5P10ForwardResidentSeed));
+constexpr uint32_t kP10StageBSeed0UbOffset =
+    kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes;
+constexpr uint32_t kP10StageBSeed1UbOffset =
+    kP10StageBSeed0UbOffset + kP10StageBSeedBytes;
+constexpr uint32_t kP10StageBLeaseUbOffset =
+    kP10StageBSeed1UbOffset + kP10StageBSeedBytes;
+constexpr uint32_t kP10StageBReceiptClaimUbOffset =
+    kP10StageBLeaseUbOffset +
+    AlignP10StageBUb(sizeof(kvaf_forward_resident_get::
+                          KvafForwardResidentQueueLeaseResult));
+constexpr uint32_t kP10StageBReceiptDoneUbOffset =
+    kP10StageBReceiptClaimUbOffset + AlignP10StageBUb(sizeof(ReceiptClaimResult));
+constexpr uint32_t kP10StageBSlotClaimUbOffset =
+    kP10StageBReceiptDoneUbOffset + AlignP10StageBUb(sizeof(ReceiptDoneResult));
+constexpr uint32_t kP10StageBCompletionUbOffset =
+    kP10StageBSlotClaimUbOffset + AlignP10StageBUb(sizeof(SlotClaimResult));
+constexpr uint32_t kP10StageBScratchEnd =
+    kP10StageBCompletionUbOffset + AlignP10StageBUb(sizeof(CompletionResult));
+
+static_assert(kP10StageBSeed0UbOffset >=
+                  kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
+              "P10 Stage B overlaps KVAF Dense PostOnly WQE banks");
+static_assert(kP10StageBScratchEnd <=
+                  kvaf_fused_get::kDenseBatchGetPostOnlyScratchCeiling,
+              "P10 Stage B overlaps KVAF generic BatchGet scratch");
+
 // A local wave owns one of the two local 64-seed buffers until CQ terminal.
 // Its ownership persists for this invocation only, never across forwards.
 struct StageBWave {
@@ -512,8 +555,8 @@ __aicore__ inline bool DrainForwardResidentMicrobatch(
 class A5P10ScoreReceiptForwardResidentKernel {
  public:
   __aicore__ inline A5P10ScoreReceiptForwardResidentKernel(
-      TPipe* pipe, const A5P10ScoreReceiptForwardResidentTilingData* tiling)
-      : pipe_(pipe), tiling_(tiling) {}
+      const A5P10ScoreReceiptForwardResidentTilingData* tiling)
+      : tiling_(tiling) {}
 
   __aicore__ inline void Init(
       GM_ADDR score_surface, GM_ADDR receipt_ring, GM_ADDR receipt_state,
@@ -571,7 +614,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
       seedBufferBusy_[index] = false;
     }
 
-    if (pipe_ == nullptr || tiling_ == nullptr ||
+    if (tiling_ == nullptr ||
         worker_ >= tiling_->executorWorkerCount ||
         scoreSurface_ == nullptr || receiptRing_ == nullptr ||
         receiptState_ == nullptr || forwardControl_ == nullptr ||
@@ -651,31 +694,20 @@ class A5P10ScoreReceiptForwardResidentKernel {
       return;
     }
 
-    pipe_->InitBuffer(seedBuffers_[0], A5_P10_STAGE_B_MICROBATCH_CAPACITY *
-                                           sizeof(A5P10ForwardResidentSeed));
-    pipe_->InitBuffer(seedBuffers_[1], A5_P10_STAGE_B_MICROBATCH_CAPACITY *
-                                           sizeof(A5P10ForwardResidentSeed));
-    pipe_->InitBuffer(leaseBuffer_, sizeof(
-        kvaf_forward_resident_get::KvafForwardResidentQueueLeaseResult));
-    pipe_->InitBuffer(receiptClaimBuffer_, sizeof(ReceiptClaimResult));
-    pipe_->InitBuffer(receiptDoneBuffer_, sizeof(ReceiptDoneResult));
-    pipe_->InitBuffer(slotClaimBuffer_, sizeof(SlotClaimResult));
-    pipe_->InitBuffer(completionBuffer_, sizeof(CompletionResult));
-    localSeeds_[0] = (__ubuf__ A5P10ForwardResidentSeed*)
-        seedBuffers_[0].Get<uint8_t>().GetPhyAddr();
-    localSeeds_[1] = (__ubuf__ A5P10ForwardResidentSeed*)
-        seedBuffers_[1].Get<uint8_t>().GetPhyAddr();
-    leaseResult_ = (__ubuf__ kvaf_forward_resident_get::
-        KvafForwardResidentQueueLeaseResult*)
-            leaseBuffer_.Get<uint8_t>().GetPhyAddr();
-    receiptClaim_ = (__ubuf__ ReceiptClaimResult*)
-        receiptClaimBuffer_.Get<uint8_t>().GetPhyAddr();
-    receiptDone_ = (__ubuf__ ReceiptDoneResult*)
-        receiptDoneBuffer_.Get<uint8_t>().GetPhyAddr();
-    slotClaim_ = (__ubuf__ SlotClaimResult*)
-        slotClaimBuffer_.Get<uint8_t>().GetPhyAddr();
-    completion_ = (__ubuf__ CompletionResult*)
-        completionBuffer_.Get<uint8_t>().GetPhyAddr();
+    localSeeds_[0] = reinterpret_cast<__ubuf__ A5P10ForwardResidentSeed*>(
+        get_imm(kP10StageBSeed0UbOffset));
+    localSeeds_[1] = reinterpret_cast<__ubuf__ A5P10ForwardResidentSeed*>(
+        get_imm(kP10StageBSeed1UbOffset));
+    leaseResult_ = reinterpret_cast<__ubuf__ kvaf_forward_resident_get::
+        KvafForwardResidentQueueLeaseResult*>(get_imm(kP10StageBLeaseUbOffset));
+    receiptClaim_ = reinterpret_cast<__ubuf__ ReceiptClaimResult*>(
+        get_imm(kP10StageBReceiptClaimUbOffset));
+    receiptDone_ = reinterpret_cast<__ubuf__ ReceiptDoneResult*>(
+        get_imm(kP10StageBReceiptDoneUbOffset));
+    slotClaim_ = reinterpret_cast<__ubuf__ SlotClaimResult*>(
+        get_imm(kP10StageBSlotClaimUbOffset));
+    completion_ = reinterpret_cast<__ubuf__ CompletionResult*>(
+        get_imm(kP10StageBCompletionUbOffset));
     if (localSeeds_[0] == nullptr || localSeeds_[1] == nullptr ||
         leaseResult_ == nullptr || receiptClaim_ == nullptr ||
         receiptDone_ == nullptr ||
@@ -1466,14 +1498,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
     }
   }
 
-  TPipe* pipe_ = nullptr;
   const A5P10ScoreReceiptForwardResidentTilingData* tiling_ = nullptr;
-  TBuf<TPosition::VECCALC> seedBuffers_[A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY];
-  TBuf<TPosition::VECCALC> leaseBuffer_;
-  TBuf<TPosition::VECCALC> receiptClaimBuffer_;
-  TBuf<TPosition::VECCALC> receiptDoneBuffer_;
-  TBuf<TPosition::VECCALC> slotClaimBuffer_;
-  TBuf<TPosition::VECCALC> completionBuffer_;
   __ubuf__ A5P10ForwardResidentSeed*
       localSeeds_[A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY]{};
   __ubuf__ kvaf_forward_resident_get::KvafForwardResidentQueueLeaseResult*
@@ -1515,7 +1540,10 @@ class A5P10ScoreReceiptForwardResidentKernel {
   uint32_t rowsPerObject_ = 0U;
   uint32_t topkPerRow_ = 0U;
   uint32_t scoreCutoffU16_ = 0U;
-  event_t simtEvent_ = static_cast<event_t>(EVENT_ID0);
+  // Dense KVAF PostOnly reserves event IDs 0 and 1 for its two WQE banks;
+  // generic KVAF compaction reserves 2.  Stage-B's SIMT handshakes therefore
+  // use 3.  The event is per AIV invocation, not a fixed Get-core assignment.
+  event_t simtEvent_ = static_cast<event_t>(EVENT_ID3);
   bool enabled_ = false;
 };
 
@@ -1559,9 +1587,7 @@ extern "C" __global__ __aicore__ void a5_p10_score_receipt_forward_resident(
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   REGISTER_TILING_DEFAULT(A5P10ScoreReceiptForwardResidentTilingData);
   GET_TILING_DATA(tiling_data, tiling);
-  TPipe pipe;
-  a5_p10_stage_b::A5P10ScoreReceiptForwardResidentKernel op(&pipe,
-                                                             &tiling_data);
+  a5_p10_stage_b::A5P10ScoreReceiptForwardResidentKernel op(&tiling_data);
   op.Init(score_surface, receipt_ring, receipt_state, forward_control,
           active_row_pool_entries, kv_object_map, kv_object_slots_snapshot,
           kv_object_to_forward_slot, source_to_forward_slot,

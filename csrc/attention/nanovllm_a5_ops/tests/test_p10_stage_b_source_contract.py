@@ -358,6 +358,45 @@ class P10StageBSourceContractTest(unittest.TestCase):
             self.kernel,
         )
 
+    def test_stage_b_scratch_is_a_declared_non_overlapping_kvaf_ub_layout(self):
+        """Stage B cannot allocate opaque TPipe UB next to KVAF get_imm WQEs.
+
+        Dense PostOnly owns the low 4 KiB for its two WQE banks.  The
+        companion's fixed two 64-seed microbatches and its small SIMT result
+        records must start after that reservation and end before KVAF's
+        generic-compaction region.  This source gate catches the old
+        "standalone HCCP passes, fused post stays EMPTY" failure before an
+        expensive OPP build.
+        """
+        for token in (
+            "kDenseBatchGetReservedWqeUbBytes",
+            "kDenseBatchGetPostOnlyScratchCeiling",
+            "kP10StageBSeed0UbOffset",
+            "kP10StageBSeed1UbOffset",
+            "kP10StageBScratchEnd",
+            "static_assert(kP10StageBSeed0UbOffset >=",
+            "static_assert(kP10StageBScratchEnd <=",
+            "get_imm(kP10StageBSeed0UbOffset)",
+            "get_imm(kP10StageBSeed1UbOffset)",
+            "get_imm(kP10StageBLeaseUbOffset)",
+            "get_imm(kP10StageBCompletionUbOffset)",
+            "return (bytes + 63U) & ~63U;",
+        ):
+            self.assertIn(token, self.kernel)
+        self.assertNotIn("InitBuffer(", self.kernel)
+        self.assertNotIn("TBuf<TPosition::VECCALC>", self.kernel)
+        self.assertNotIn("TPipe* pipe_", self.kernel)
+        self.assertNotIn("TPipe pipe;", self.kernel)
+
+    def test_stage_b_simt_event_does_not_reuse_kvaf_dense_post_events(self):
+        """KVAF owns event 0/1 for WQE banks and 2 for compaction."""
+        self.assertIn("event_t simtEvent_ = static_cast<event_t>(EVENT_ID3)",
+                      self.kernel)
+        self.assertIn("Dense KVAF PostOnly reserves event IDs 0 and 1",
+                      self.kernel)
+        self.assertNotIn("simtEvent_ = static_cast<event_t>(EVENT_ID0)",
+                         self.kernel)
+
     def test_host_has_real_tiler_infer_and_distinct_registration(self):
         for token in (
             "TilingA5P10ScoreReceiptForwardResident",
