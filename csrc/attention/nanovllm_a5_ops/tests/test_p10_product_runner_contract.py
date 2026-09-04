@@ -200,6 +200,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "P10_BOOTSTRAP_ROUNDTRIP_PASS ",
             "source 380 is the first",
             "(0, 127, 128, 240, 255, 256, 380, SOURCE_TOKENS - 1)",
+            "resident_payload = torch.empty(",
             "P10_BENCH_DESTINATION_RESET ",
             "authority=forward_prepare payload_write=none",
         ):
@@ -217,6 +218,7 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertIn("authority=forward_prepare payload_write=none", reset)
         self.assertNotIn("resident_payload.narrow", reset)
         self.assertNotIn(".zero_()", reset)
+        self.assertNotIn("resident_payload = torch.zeros(", self.fixture)
         self.assertNotIn("P8_", self.fixture)
         self.assertNotIn("P9_", self.fixture)
 

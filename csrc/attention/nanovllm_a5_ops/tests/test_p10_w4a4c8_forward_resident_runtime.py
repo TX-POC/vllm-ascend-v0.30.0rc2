@@ -508,7 +508,15 @@ class _ForwardResidentKvaf:
         # accepted on an unproven source payload.
         self._prove_bootstrap_direct_hccp_payload(access, torch.npu.current_stream())
 
-        resident_payload = torch.zeros(
+        # This tensor is an inbound Direct-HCCP destination.  Its transient
+        # bands must never receive a torch producer write after registration:
+        # a dirty DCache line owned by a different producer AIV can write back
+        # after KVAF's executor-side pre-doorbell clean and overwrite a CQ-
+        # successful DMA result.  ForwardPrepare clears reachability, not
+        # payload bytes; final misses overwrite their assigned row before it
+        # can be published READY.  Persistent hits are populated separately
+        # in their disjoint, aligned band below.
+        resident_payload = torch.empty(
             (RESIDENT_ROWS, PACKED_KV_ROW_BYTES),
             dtype=torch.uint8,
             device=self.device,
@@ -573,7 +581,7 @@ class _ForwardResidentKvaf:
         return resident_payload, control, leases
 
     def _prove_bootstrap_direct_hccp_payload(self, access: Any, stream: Any) -> None:
-        """Fail closed unless cold Direct-HCCP covers every relevant table seam.
+        """Fail closed unless cold Direct-HCCP covers targeted table seams.
 
         This is not a host-Get fallback: it is the same KVAF Direct-HCCP
         source-table/offset/output ABI that Stage B will use after the
