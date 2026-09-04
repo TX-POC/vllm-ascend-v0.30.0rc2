@@ -1659,7 +1659,7 @@ def _emit_stage_b_receipt_trace(
     score_bytes = torch.bitwise_and(
         torch.bitwise_right_shift(layout, 32), 0xFFFFFFFF
     )
-    descriptor_valid = (
+    host_layout_valid = (
         (row_count > 0)
         & (source_count > 0)
         & (score_bytes == 2)
@@ -1667,6 +1667,16 @@ def _emit_stage_b_receipt_trace(
         & (row_begin < BATCH)
         & (source_begin < SOURCE_TOKENS)
     )
+    # Match the Stage-B predicate rather than calling a post-terminal host
+    # layout check "descriptor_valid".  The device also rejects an odd byte
+    # offset and a row outside the graph's active-row extent.  Those two
+    # checks caught the shared-scratch overwrite that otherwise looked like a
+    # contradictory host/device diagnosis.
+    offsets = ring[:, 0].to(dtype=torch.int64)
+    active_rows = int(tensors["forward_control"].detach().cpu()[4].item())
+    offset_even = torch.bitwise_and(offsets, 1) == 0
+    row_in_active = row_begin < active_rows
+    device_descriptor_valid = host_layout_valid & offset_even & row_in_active
     state_counts = {
         f"state_{state}": int(torch.count_nonzero(states == state).item())
         for state in range(5)
@@ -1675,8 +1685,12 @@ def _emit_stage_b_receipt_trace(
         "P10_STAGE_B_RECEIPT_TRACE "
         f"context={context} records={ring.size(0)} "
         f"trace_records={int(torch.count_nonzero(trace_words).item())} "
-        f"descriptor_valid={int(torch.count_nonzero(descriptor_valid).item())} "
-        f"descriptor_invalid={int(torch.count_nonzero(~descriptor_valid).item())} "
+        f"host_layout_valid={int(torch.count_nonzero(host_layout_valid).item())} "
+        f"device_descriptor_valid={int(torch.count_nonzero(device_descriptor_valid).item())} "
+        f"device_descriptor_invalid={int(torch.count_nonzero(~device_descriptor_valid).item())} "
+        f"offset_even={int(torch.count_nonzero(offset_even).item())} "
+        f"row_in_active={int(torch.count_nonzero(row_in_active).item())} "
+        f"active_rows={active_rows} "
         f"row_begin_min={int(row_begin.min().item())} "
         f"row_begin_max={int(row_begin.max().item())} "
         f"source_begin_min={int(source_begin.min().item())} "

@@ -429,6 +429,17 @@ __aicore__ inline void QLIVector<QLIT>::PublishScoreReceiptsAfterNativeScoreDma(
             continue;
         }
 
+        // `outInvalidLocal_` is the fixed 64-B receipt staging buffer.  It is
+        // also the only scalar staging buffer used by StoreReceiptState().
+        // Therefore FILLING must be published *before* populating the
+        // five-word descriptor below: writing its scalar state afterward
+        // would overwrite descriptor word zero's low 32 bits (the byte
+        // offset) before the 40-B MTE3 descriptor copy.  This preserves the
+        // existing FREE -> FILLING -> descriptor -> READY protocol without
+        // allocating a new TBuf or touching the native C8 score/Top-K path.
+        StoreReceiptState(
+            receiptSlot, static_cast<int32_t>(A5P10ReceiptState::FILLING));
+
         // A5P10ScoreReceiptDescriptor is exactly five uint64 words.  The
         // first word is a score_surface-relative *byte* offset, never an
         // opaque workspace address nor a uint16 element offset.
@@ -448,12 +459,9 @@ __aicore__ inline void QLIVector<QLIT>::PublishScoreReceiptsAfterNativeScoreDma(
         descriptorLocal.SetValue(4, static_cast<int64_t>(receiptSlot));
         PipeBarrier<PIPE_V>();
 
-        // A consumer observes only READY.  FILLING closes the descriptor
-        // construction interval; descriptor DMA plus DDR barrier completes
-        // before the terminal READY store.
-        StoreReceiptState(
-            receiptSlot, static_cast<int32_t>(A5P10ReceiptState::FILLING));
-
+        // A consumer observes only READY.  FILLING has already closed the
+        // descriptor construction interval; descriptor DMA plus DDR barrier
+        // completes before the terminal READY store.
         const event_t scalarToMte3 = static_cast<event_t>(
             GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
         SetFlag<HardEvent::S_MTE3>(scalarToMte3);

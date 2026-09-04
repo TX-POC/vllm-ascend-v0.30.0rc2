@@ -185,6 +185,38 @@ class P10W4A4C8ScoreReceiptSourceContractTest(unittest.TestCase):
         self.assertNotIn("InitGlobalMemory", self.vector)
         self.assertIn("Stage-A must never clear receipt_state", self.qli)
 
+    def test_filling_does_not_clobber_the_shared_receipt_staging_buffer(self):
+        """The state scalar and five-word descriptor share `outInvalidLocal_`.
+
+        FILLING must therefore be written before descriptor word zero is
+        materialized.  Moving it after descriptor construction silently turns
+        every otherwise-even score offset into an odd value and makes Stage B
+        correctly reject all receipts.
+        """
+        publish = self.vector.index("PublishScoreReceiptsAfterNativeScoreDma")
+        filling = self.vector.index(
+            "StoreReceiptState(\n"
+            "            receiptSlot, static_cast<int32_t>(A5P10ReceiptState::FILLING));",
+            publish,
+        )
+        descriptor = self.vector.index(
+            "auto descriptorLocal = outInvalidLocal_.template ReinterpretCast<int64_t>();",
+            publish,
+        )
+        descriptor_copy = self.vector.index(
+            "DataCopyPad(\n"
+            "            receiptRingGm_[receiptSlot * A5_P10_RECEIPT_WORDS64],",
+            descriptor,
+        )
+        ready = self.vector.index(
+            "StoreReceiptState(\n"
+            "            receiptSlot, static_cast<int32_t>(A5P10ReceiptState::READY));",
+            descriptor_copy,
+        )
+        self.assertLess(filling, descriptor)
+        self.assertLess(descriptor, descriptor_copy)
+        self.assertLess(descriptor_copy, ready)
+
     def test_stage_a_excludes_transport_slots_and_legacy_closures(self):
         code = "\n".join(
             path.read_text()
