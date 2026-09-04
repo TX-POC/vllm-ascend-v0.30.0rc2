@@ -175,12 +175,19 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PACKAGE_PARENT',
             'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_PRODUCT_PACKAGE_ROOT',
             'P10_ASSEMBLY_INVALID_PACKAGE_POLICY=quarantine',
-            'kvaf_build="${kvaf_root}/build-p10-v${P10_VLLM_EXPECTED_SHA:0:12}-k${P10_KVAF_EXPECTED_SHA:0:12}"',
+            'KVAF is built from its own source tree and has no VLLM header dependency.',
+            'python_abi="$("${python_bin}" -c',
+            'cann_id="$(basename "${ascend_home}")"',
+            'kvaf_build="${kvaf_root}/build-p10-k${P10_KVAF_EXPECTED_SHA:0:12}-c${cann_id}-py${python_abi}-a5"',
             'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_KVAF_BUILD',
         ):
             self.assertIn(token, self.runner)
         self.assertNotIn('package_root="${P10_PRODUCT_PACKAGE_ROOT:-', self.runner)
         self.assertNotIn('kvaf_build="${P10_KVAF_BUILD:-', self.runner)
+        self.assertNotIn(
+            'kvaf_build="${kvaf_root}/build-p10-v${P10_VLLM_EXPECTED_SHA:0:12}',
+            self.runner,
+        )
 
     def test_fixture_is_real_w4a4c8_direct_hccp_and_qsfa_closure(self) -> None:
         for token in (

@@ -319,13 +319,16 @@ printf 'P10_BRIDGE_PROVENANCE package=%s init=%s graph=%s bridge=%s sha256=%s\n'
     "${bridge_so}" "$(hash_file "${bridge_so}")"
 printf 'P10_RUNNER_STEP label=forward_bridge status=0\n'
 
-# KVAF is a separate repository, but it is still part of the exact product
-# pair.  Reconfigure the one SHA-keyed build directory before incremental
-# build; this is intentionally not a vLLM-Ascend rebuild.
-# As with the combined OPP package, a forward must not inherit a build tree
-# selected by an earlier shell.  The path itself is provenance, so derive it
-# solely from the exact source pair and reconfigure it below.
-kvaf_build="${kvaf_root}/build-p10-v${P10_VLLM_EXPECTED_SHA:0:12}-k${P10_KVAF_EXPECTED_SHA:0:12}"
+# KVAF is built from its own source tree and has no VLLM header dependency.
+# Key its reusable build directory only by the inputs that can affect its
+# binary: KVAF SHA, CANN distribution, Python ABI, and the fixed A5 CMake
+# flags below.  The combined P10 OPP/bridge remains keyed by the full source
+# pair.  This avoids rebuilding KVAF solely because a P10 C++ source edit
+# requires a fresh OPP package, without opening a stale-artifact path.
+python_abi="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
+[[ "${python_abi}" =~ ^[0-9]+$ ]] || fail "python_abi_probe_invalid:value=${python_abi}"
+cann_id="$(basename "${ascend_home}")"
+kvaf_build="${kvaf_root}/build-p10-k${P10_KVAF_EXPECTED_SHA:0:12}-c${cann_id}-py${python_abi}-a5"
 if [[ -n "${P10_KVAF_BUILD:-}" && "${P10_KVAF_BUILD}" != "${kvaf_build}" ]]; then
     printf 'P10_ASSEMBLY_OVERRIDE_IGNORED name=P10_KVAF_BUILD supplied=%s canonical=%s\n' \
         "${P10_KVAF_BUILD}" "${kvaf_build}"
