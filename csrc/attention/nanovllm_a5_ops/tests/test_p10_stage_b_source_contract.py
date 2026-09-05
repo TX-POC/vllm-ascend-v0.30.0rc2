@@ -343,7 +343,7 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)",
             "a5_p10_score_receipt_forward_resident",
             "ConsumeExactScoreReceipt", "BeginForwardResidentMicrobatch",
-            "DrainForwardResidentMicrobatch", "FinalizeAssignedRows",
+            "DrainForwardResidentMicrobatch", "FinalizeAllRowsAfterScanBarrier",
             "WaitForFinalWinnerReady", "PostFinalWinnerBatches",
             "PostFinalRecallBatchAndDrain",
             "A5_P10_STAGE_B_MICROBATCH_CAPACITY",
@@ -372,7 +372,7 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "PostFinalWinnerBatches",
             "PostFinalRecallBatchAndDrain",
             "PublishFinalAttentionSlots",
-            "Only final exact winners may force transport progress",
+            "Only the dynamically elected last arrival may force final exact",
             "same\n  // fixed two 64-seed UB buffers",
         ):
             self.assertIn(token, self.kernel)
@@ -380,7 +380,55 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertNotIn("if (seed_count != 0U) {\n      trace |=", self.kernel)
         self.assertLess(
             self.kernel.index("DiscardUnpostedSpeculativeSeeds()"),
-            self.kernel.index("FinalizeAssignedRows()"),
+            self.kernel.index("FinalizeAllRowsAfterScanBarrier()"),
+        )
+
+    def test_one_queue_final_recall_has_a_dynamic_post_seal_coordinator(self):
+        """A Q=1 tail is coordinated, never assigned to a fixed Get core.
+
+        Pre-seal workers may overlap score receipt scanning and speculative
+        posting. Once C8 seals, however, all local waves must be terminal
+        before exactly the last logical arrival processes the common exact
+        winner tail. This closes peer-owned queue contention without a new
+        ring, an extra graph tensor, or a physical-core split.
+        """
+        process = self.kernel.split("__aicore__ inline void Process()", 1)[1].split(
+            " private:", 1
+        )[0]
+        final_phase = process.split("// A posted early wave", 1)[1]
+        self.assertLess(
+            final_phase.index("DrainLocalWaves(true)"),
+            final_phase.index("DiscardUnpostedSpeculativeSeeds()"),
+        )
+        self.assertLess(
+            final_phase.index("DiscardUnpostedSpeculativeSeeds()"),
+            final_phase.index("ClaimLastFinalizerAfterScanDrain()"),
+        )
+        self.assertLess(
+            final_phase.index("ClaimLastFinalizerAfterScanDrain()"),
+            final_phase.index("FinalizeAllRowsAfterScanBarrier()"),
+        )
+        self.assertLess(
+            final_phase.index("FinalizeAllRowsAfterScanBarrier()"),
+            final_phase.index("PublishForwardComplete()"),
+        )
+        self.assertIn("if (!is_terminal_finalizer)", final_phase)
+        self.assertIn("ClaimLastFinalizerFromSimt", self.kernel)
+        self.assertIn("A5_P10_STAGE_B_EXECUTOR_PROGRESS", self.abi)
+        final_posts = self.kernel.split("__aicore__ inline bool PostFinalWinnerBatches()", 1)[1].split(
+            "__aicore__ inline bool PublishFinalAttentionSlots()", 1
+        )[0]
+        final_publish = self.kernel.split("__aicore__ inline bool PublishFinalAttentionSlots()", 1)[1].split(
+            "__aicore__ inline bool FinalizeAllRowsAfterScanBarrier()", 1
+        )[0]
+        self.assertIn("for (uint32_t row = 0U; row < activeRows_; ++row)", final_posts)
+        self.assertIn("for (uint32_t row = 0U; row < activeRows_; ++row)", final_publish)
+        self.assertNotIn("worker_ == 0", self.kernel)
+        self.assertNotIn("physical_aiv", self.kernel)
+        # This change must not erase the actual overlap path before C8 seals.
+        self.assertLess(
+            process.index("TryPostFullSpeculativeSeedBuffers()"),
+            process.index("ClaimLastFinalizerAfterScanDrain()"),
         )
 
     def test_exact_score_scan_is_threshold_gated_not_receipt_ranked(self):

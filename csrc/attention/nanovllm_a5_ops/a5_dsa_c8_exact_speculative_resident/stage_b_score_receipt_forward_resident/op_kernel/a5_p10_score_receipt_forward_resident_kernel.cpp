@@ -67,6 +67,10 @@ struct SlotClaimResult {
 static_assert(sizeof(SlotClaimResult) == 16U,
               "forward-slot claim SIMT ABI changed");
 
+// The existing 16-byte SIMT handoff elects the last post-seal worker. It is
+// deliberately not a new GM lifecycle object: `observed + 1 == worker_count`
+// is enough because every worker reaches it only after its local waves have
+// become terminal.
 struct CompletionResult {
   uint32_t is_last;
   uint32_t observed;
@@ -466,7 +470,7 @@ inline void ClaimResidentPendingSimtService(
   ClaimResidentPendingFromSimt(resident_ready, resident_slot, result);
 }
 
-__simt_callee__ inline void MarkWorkerCompleteFromSimt(
+__simt_callee__ inline void ClaimLastFinalizerFromSimt(
     __gm__ int32_t* progress_word, uint32_t worker_count,
     __ubuf__ CompletionResult* result) {
   if (progress_word == nullptr || result == nullptr || worker_count == 0U) {
@@ -481,10 +485,10 @@ __simt_callee__ inline void MarkWorkerCompleteFromSimt(
 }
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(1)
-inline void MarkWorkerCompleteSimtService(__gm__ int32_t* progress_word,
+inline void ClaimLastFinalizerSimtService(__gm__ int32_t* progress_word,
                                           uint32_t worker_count,
                                           __ubuf__ CompletionResult* result) {
-  MarkWorkerCompleteFromSimt(progress_word, worker_count, result);
+  ClaimLastFinalizerFromSimt(progress_word, worker_count, result);
 }
 
 __aicore__ inline bool LoadReceiptDescriptor(
@@ -914,9 +918,23 @@ class A5P10ScoreReceiptForwardResidentKernel {
           worker_, 0U, FatalTransportFailureReason()));
       return;
     }
-    // Only final exact winners may force transport progress. False-positive
+    // Every worker has now terminal-drained only the waves it owns and has
+    // released its descriptor-free speculative PENDING rows. Publish that
+    // quiescence before the dynamic last-arrival election. With one HCCP
+    // queue this is the required handoff: a worker must never mistake another
+    // worker's in-flight wave for a terminal queue-acquire failure.
+    DataSyncBarrier<MemDsbT::DDR>();
+    const bool is_terminal_finalizer = ClaimLastFinalizerAfterScanDrain();
+    if (!is_terminal_finalizer) {
+      return;
+    }
+
+    // Only the dynamically elected last arrival may force final exact
+    // transport progress. At this point every other logical worker has
+    // reached the same post-seal quiescence point, so the single global HCCP
+    // queue cannot be held by another worker's local wave. False-positive
     // speculative rows stay allocated but are never emitted.
-    if (!FinalizeAssignedRows()) {
+    if (!FinalizeAllRowsAfterScanBarrier()) {
       RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_FINALIZE);
       return;
     }
@@ -924,7 +942,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
       RecordFirstFailure(A5_P10_STAGE_B_DIAGNOSTIC_DRAIN);
       return;
     }
-    MarkWorkerComplete();
+    PublishForwardComplete();
   }
 
  private:
@@ -2059,8 +2077,14 @@ class A5P10ScoreReceiptForwardResidentKernel {
       return false;
     }
     uint32_t seed_count = 0U;
-    for (uint32_t row = worker_; row < activeRows_;
-         row += tiling_->executorWorkerCount) {
+    // The post-seal coordinator is dynamically elected after all workers
+    // have drained their own speculative waves. It owns the complete exact
+    // recall tail for this forward so Q=1 cannot turn peer backpressure into
+    // a false terminal failure. This is a logical last-arrival role, never
+    // a fixed worker/core assignment.
+    uint32_t partial_batch_row = 0U;
+    uint32_t partial_batch_rank = 0U;
+    for (uint32_t row = 0U; row < activeRows_; ++row) {
       const int32_t selected_length = ReadGmByPassDCache<int32_t>(
           selectedSlotLengths_ + row);
       if (selected_length < static_cast<int32_t>(topkPerRow_) ||
@@ -2168,6 +2192,10 @@ class A5P10ScoreReceiptForwardResidentKernel {
         const A5P10ForwardResidentSeed seed{static_cast<int32_t>(row),
                                             static_cast<int32_t>(source),
                                             mapping.kv_object, resident_slot};
+        if (seed_count == 0U) {
+          partial_batch_row = row;
+          partial_batch_rank = rank;
+        }
         if (!AppendFinalRecallSeed(buffer_index, &seed_count, seed, row, rank)) {
           RecordFirstFailure(FinalizeDiagnostic(
               row, rank, A5_P10_STAGE_B_FINALIZE_WINNER_READY));
@@ -2176,7 +2204,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
       }
     }
     if (seed_count != 0U &&
-        !PostFinalRecallBatchAndDrain(buffer_index, seed_count, worker_, 0U)) {
+        !PostFinalRecallBatchAndDrain(buffer_index, seed_count,
+                                      partial_batch_row, partial_batch_rank)) {
       return false;
     }
     return true;
@@ -2187,8 +2216,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
   // and makes READY, rather than a speculative map or queue state, the sole
   // data-consumption authority.
   __aicore__ inline bool PublishFinalAttentionSlots() {
-    for (uint32_t row = worker_; row < activeRows_;
-         row += tiling_->executorWorkerCount) {
+    for (uint32_t row = 0U; row < activeRows_; ++row) {
       const int32_t selected_length = ReadGmByPassDCache<int32_t>(
           selectedSlotLengths_ + row);
       if (selected_length < static_cast<int32_t>(topkPerRow_) ||
@@ -2268,30 +2296,32 @@ class A5P10ScoreReceiptForwardResidentKernel {
     return true;
   }
 
-  __aicore__ inline bool FinalizeAssignedRows() {
+  __aicore__ inline bool FinalizeAllRowsAfterScanBarrier() {
     return PostFinalWinnerBatches() && PublishFinalAttentionSlots();
   }
 
-  __aicore__ inline void MarkWorkerComplete() {
+  __aicore__ inline bool ClaimLastFinalizerAfterScanDrain() {
     completion_->is_last = 0U;
     set_flag(PIPE_S, PIPE_V, simtEvent_);
     wait_flag(PIPE_S, PIPE_V, simtEvent_);
-    AscendC::Simt::VF_CALL<MarkWorkerCompleteSimtService>(
+    AscendC::Simt::VF_CALL<ClaimLastFinalizerSimtService>(
         AscendC::Simt::Dim3{1U, 1U, 1U},
         forwardControl_ + A5_P10_STAGE_B_EXECUTOR_PROGRESS,
         tiling_->executorWorkerCount, completion_);
     set_flag(PIPE_V, PIPE_S, simtEvent_);
     wait_flag(PIPE_V, PIPE_S, simtEvent_);
-    if (completion_->is_last != 0U) {
-      DataSyncBarrier<MemDsbT::DDR>();
-      // COMPLETE is the final release flag for the Stage-B -> QSFA graph
-      // edge.  It must not become visible before the bypass-published ready
-      // map and attention-slot prefix are globally ordered.
-      WriteGmByPassDCache<int32_t>(
-          forwardControl_ + A5_P10_STAGE_B_FORWARD_STATE,
-          A5_P10_STAGE_B_FORWARD_STATE_COMPLETE);
-      DataSyncBarrier<MemDsbT::DDR>();
-    }
+    return completion_->is_last != 0U;
+  }
+
+  __aicore__ inline void PublishForwardComplete() {
+    DataSyncBarrier<MemDsbT::DDR>();
+    // COMPLETE is the final release flag for the Stage-B -> QSFA graph edge.
+    // It must not become visible before the dynamically elected finalizer has
+    // bypass-published every READY row and every QSFA prefix entry.
+    WriteGmByPassDCache<int32_t>(
+        forwardControl_ + A5_P10_STAGE_B_FORWARD_STATE,
+        A5_P10_STAGE_B_FORWARD_STATE_COMPLETE);
+    DataSyncBarrier<MemDsbT::DDR>();
   }
 
   const A5P10ScoreReceiptForwardResidentTilingData* tiling_ = nullptr;

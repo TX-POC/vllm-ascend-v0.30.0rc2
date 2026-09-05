@@ -166,8 +166,12 @@ enum A5P10StageBControlWord : uint32_t {
   // Trace control only. Stage A and ExactScoreScan do not use this for a
   // score decision; ExactScoreScan reads predicted_score_cutoff_u16[B].
   A5_P10_STAGE_B_TRACE_CONTROL = 6U,
-  // A bounded Stage-B progress counter, never an arena generation or a
-  // cross-forward lifetime token.
+  // A bounded post-seal quiescence counter. Each logical Stage-B worker
+  // increments it only after its own speculative waves are CQ-terminal and
+  // its descriptor-free seeds have been discarded. The last arrival becomes
+  // the one forward-local final-recall coordinator. This is neither an arena
+  // generation nor a cross-forward lifetime token, and it does not name a
+  // physical AIV core.
   A5_P10_STAGE_B_EXECUTOR_PROGRESS = 7U,
   // Diagnostic only: Stage A writes its final static receipt sequence before
   // it writes PRODUCER_SEALED. Stage B atomically latches the first READY

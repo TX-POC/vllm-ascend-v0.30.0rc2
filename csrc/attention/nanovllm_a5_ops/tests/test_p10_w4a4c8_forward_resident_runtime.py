@@ -1295,6 +1295,7 @@ def _emit_terminal_diagnostic(
         "P10_RUNTIME_TERMINAL_DIAG "
         f"control={forward} stage_b_diag={diagnostic} "
         f"stage_b_diag_name={diagnostic_name} "
+        f"executor_progress={forward[7] if len(forward) > 7 else 'missing'}/{EXECUTOR_WORKERS} "
         f"receipt_free={count_eq(receipt, 0)} receipt_filling={count_eq(receipt, 1)} "
         f"receipt_ready={count_eq(receipt, 2)} receipt_claimed={count_eq(receipt, 3)} "
         f"receipt_done={count_eq(receipt, 4)} source_mapped={int(torch.count_nonzero(source_slots >= 0).item())} "
@@ -1340,6 +1341,13 @@ def _assert_terminal(
     if int(forward[5]) != 1:
         _emit_terminal_diagnostic(fixture, tensors, forward)
         raise AssertionError(f"Stage B did not reach forward COMPLETE: control={forward}")
+    if len(forward) <= 7 or int(forward[7]) != EXECUTOR_WORKERS:
+        _emit_terminal_diagnostic(fixture, tensors, forward)
+        raise AssertionError(
+            "Stage B post-seal quiescence did not elect exactly one finalizer: "
+            f"progress={forward[7] if len(forward) > 7 else '<missing>'} "
+            f"workers={EXECUTOR_WORKERS}"
+        )
     states = tensors["receipt_state"].detach().cpu()
     if int(torch.count_nonzero(states != 4).item()) != 0:
         raise AssertionError(

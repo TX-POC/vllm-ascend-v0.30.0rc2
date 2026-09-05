@@ -75,6 +75,15 @@ not a fictitious in-kernel physical-core policy.
    ready. QSFA therefore consumes its usual slot map;
    it does not learn about receipts or queue leases.
 
+   Before that exact final-recall pass, every logical worker terminal-drains
+   its own speculative waves and discards only its descriptor-free candidate
+   seeds. The last worker to reach this quiescent point is selected by the
+   existing forward-local progress counter and alone processes every row's
+   exact recall tail. This avoids turning ordinary contention for a one-queue
+   KVAF configuration into a forward failure. The selected worker is a
+   last-arrival role, not a fixed AIV core; pre-seal score receipt scanning and
+   speculative PostOnly work remain multi-worker and dynamically leased.
+
 The graph ABI has explicit tensors for every mutable forward-local resource:
 receipt state, source-to-forward-slot map, object-to-forward-slot de-dup map,
 speculative cursor, queue leases, resident readiness, and forward control.
