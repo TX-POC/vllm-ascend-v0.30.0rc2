@@ -82,6 +82,7 @@ class P10ForwardInputs:
     resident_row_to_qsfa_slot: torch.Tensor
     attention_slots_buffer: torch.Tensor
     selected_slot_lengths_buffer: torch.Tensor
+    predicted_score_cutoff_u16: torch.Tensor
     num_layers: int
     layer_id: int
     executor_worker_count: int
@@ -202,6 +203,7 @@ _GRAPH_TENSOR_FIELDS = (
     "resident_row_to_qsfa_slot",
     "attention_slots_buffer",
     "selected_slot_lengths_buffer",
+    "predicted_score_cutoff_u16",
 )
 
 _GRAPH_SCALAR_FIELDS = (
@@ -666,6 +668,7 @@ def _launch_stage_b(inputs: P10ForwardInputs) -> None:
         inputs.resident_row_to_qsfa_slot,
         inputs.attention_slots_buffer,
         inputs.selected_slot_lengths_buffer,
+        inputs.predicted_score_cutoff_u16,
         inputs.num_layers,
         inputs.layer_id,
         inputs.executor_worker_count,

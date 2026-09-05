@@ -21,7 +21,7 @@ namespace {
 
 constexpr int64_t kPrepareInputCount = 7;
 constexpr int64_t kStageAInputCount = 14;
-constexpr int64_t kStageBInputCount = 21;
+constexpr int64_t kStageBInputCount = 22;
 constexpr int64_t kForwardControlWords = 10;
 constexpr int64_t kSparseCount = 2048;
 constexpr int64_t kPackedKvRowBytes = 656;
@@ -144,6 +144,7 @@ void ValidateStageB(
     const at::Tensor& resident_row_to_qsfa_slot,
     const at::Tensor& attention_slots,
     const at::Tensor& selected_slot_lengths,
+    const at::Tensor& predicted_score_cutoff_u16,
     int64_t num_layers, int64_t layer_id,
     int64_t executor_worker_count, int64_t executor_worker_limit,
     int64_t receipt_poll_quantum, int64_t bounded_drain_polls)
@@ -181,6 +182,8 @@ void ValidateStageB(
     }
     RequireSameNpu(score_surface, resident_payload, at::kByte,
                    "resident_payload");
+    RequireSameNpu(score_surface, predicted_score_cutoff_u16, at::kUInt16,
+                   "predicted_score_cutoff_u16");
     TORCH_CHECK(kv_object_map.dim() == 2 &&
                     kv_object_to_forward_slot.dim() == 2 &&
                     kv_object_to_forward_slot.size(0) == kv_object_map.size(0) &&
@@ -198,6 +201,10 @@ void ValidateStageB(
                     canonical_sparse_indices.size(1) == 1 &&
                     canonical_sparse_indices.size(2) == kSparseCount,
                 "canonical_sparse_indices must be int32[B,1,2048].");
+    TORCH_CHECK(predicted_score_cutoff_u16.dim() == 1 &&
+                    predicted_score_cutoff_u16.numel() ==
+                        canonical_sparse_indices.size(0),
+                "predicted_score_cutoff_u16 must be uint16[B].");
     TORCH_CHECK(attention_slots.dim() == 3 && attention_slots.size(0) == canonical_sparse_indices.size(0) &&
                     attention_slots.size(1) == 1 && attention_slots.size(2) >= kSparseCount,
                 "attention_slots_buffer must be int32[B,1,2048+tail].");
@@ -302,6 +309,7 @@ void LaunchStageB(
     const at::Tensor& resident_row_to_qsfa_slot,
     const at::Tensor& attention_slots,
     const at::Tensor& selected_slot_lengths,
+    const at::Tensor& predicted_score_cutoff_u16,
     int64_t num_layers, int64_t layer_id,
     int64_t executor_worker_count, int64_t executor_worker_limit,
     int64_t receipt_poll_quantum, int64_t bounded_drain_polls)
@@ -314,7 +322,8 @@ void LaunchStageB(
         canonical_sparse_indices, canonical_score_source_lens,
         kvaf_forward_resident_control, queue_leases, resident_payload,
         resident_ready, resident_row_to_qsfa_slot, attention_slots,
-        selected_slot_lengths, num_layers, layer_id, executor_worker_count,
+        selected_slot_lengths, predicted_score_cutoff_u16,
+        num_layers, layer_id, executor_worker_count,
         executor_worker_limit, receipt_poll_quantum, bounded_drain_polls);
     const auto keepalive = std::make_tuple(
         score_surface, receipt_ring, receipt_state, forward_control,
@@ -324,7 +333,7 @@ void LaunchStageB(
         canonical_sparse_indices, canonical_score_source_lens,
         kvaf_forward_resident_control, queue_leases, resident_payload,
         resident_ready, resident_row_to_qsfa_slot, attention_slots,
-        selected_slot_lengths);
+        selected_slot_lengths, predicted_score_cutoff_u16);
     P10_EXEC_NPU_CMD_DIRECT(
         aclnnA5P10ScoreReceiptForwardResident, keepalive, score_surface,
         receipt_ring, receipt_state, forward_control, active_row_pool_entries,
@@ -334,6 +343,7 @@ void LaunchStageB(
         canonical_score_source_lens, kvaf_forward_resident_control,
         queue_leases, resident_payload, resident_ready,
         resident_row_to_qsfa_slot, attention_slots, selected_slot_lengths,
+        predicted_score_cutoff_u16,
         num_layers, layer_id, executor_worker_count, executor_worker_limit,
         receipt_poll_quantum, bounded_drain_polls,
         receipt_state, forward_control,

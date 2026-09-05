@@ -62,7 +62,30 @@ PACKED_KV_ROW_BYTES = 656
 ENTRY_BYTES = BLOCK_TOKENS * PACKED_KV_ROW_BYTES
 QUEUE_COUNT = int(os.environ.get("P10_BENCH_QUEUE_COUNT", "1"))
 RECEIPT_WORDS = 5
-SPECULATIVE_ROWS = 64
+# This fixture models the product controller's score prediction, not an
+# arbitrary first-N candidate policy.  It intentionally aims a little below
+# the exact Top-K boundary: K + 256 sources per request is 12.5% more than
+# K=2048.  With the independent 5% all-source cache miss mask below, that
+# predicts roughly 116 Gets/request versus roughly 102 final-winner Gets.
+#
+# ``SPECULATIVE_SLOT_CAPACITY_PER_ROW`` is persistent resident storage, not
+# the transport batch size.  The device executor still owns exactly two 64
+# seed UB buffers and Posts 64 requests per microbatch.  A forward may use
+# many such microbatches without reusing a resident slot.
+PREDICTED_SCORE_GUARD_SOURCES_PER_ROW = int(
+    os.environ.get("P10_MOCK_SCORE_GUARD_SOURCES_PER_ROW", "256")
+)
+PREDICTED_SCORE_WINDOW_PER_ROW = TOPK + PREDICTED_SCORE_GUARD_SOURCES_PER_ROW
+_EXPECTED_SPECULATIVE_MISSES_PER_ROW = (
+    PREDICTED_SCORE_WINDOW_PER_ROW * KV_MISS_NUMERATOR
+    + KV_MISS_DENOMINATOR
+    - 1
+) // KV_MISS_DENOMINATOR
+SPECULATIVE_SLOT_CAPACITY_PER_ROW = max(
+    64,
+    ((_EXPECTED_SPECULATIVE_MISSES_PER_ROW + 63) // 64) * 64,
+)
+SPECULATIVE_ROWS = BATCH * SPECULATIVE_SLOT_CAPACITY_PER_ROW
 RECALL_ROWS = BATCH * TOPK
 PERSISTENT_BASE = SPECULATIVE_ROWS + RECALL_ROWS
 # The acceptance profile has no preloaded hits.  The B16 profile reserves a
@@ -79,13 +102,12 @@ EXECUTOR_WORKERS = int(
 )
 EXECUTOR_WORKER_LIMIT = int(os.environ.get("P10_BENCH_EXECUTOR_WORKER_LIMIT", "16"))
 STAGE_B_RECEIPT_TRACE = os.environ.get("P10_STAGE_B_RECEIPT_TRACE", "0") == "1"
-# Stage A stores native BF16 scores in the monotone sortable-key domain.  In
-# that domain positive zero is 0x8000: zero bits XOR the BF16 sign mask.  Make
-# the initial policy a real score threshold rather than the all-pass key 0.
-# Product integration supplies the same low-16-bit value through graph-visible
-# ``forward_control[6]``; this fixture override is only its temporary policy
-# source while the end-to-end controller is being wired up.
-INITIAL_SCORE_CUTOFF_U16 = 0x8000
+# A calibration-only launch must never accidentally create speculative HCCP
+# work.  The real benchmark cutoff is derived once, outside timing, from the
+# W4A4C8 score surface and then written into the same graph-visible immutable
+# input used by every measured forward.  0xffff is a calibration sentinel, not
+# a score policy: it admits only a maximal sortable key if one exists.
+CALIBRATION_SCORE_CUTOFF_U16 = 0xFFFF
 # ``forward_control`` is a signed int32 tensor.  C++ reads this exact word as
 # uint32_t, so use the signed representation of bit 31 rather than trying to
 # construct an out-of-range Python ``0x80000000`` int32 literal.
@@ -800,7 +822,11 @@ class _ForwardResidentKvaf:
 
 
 def _build_forward_inputs(
-    device: Any, base: dict[str, Any], fixture: _ForwardResidentKvaf
+    device: Any,
+    base: dict[str, Any],
+    fixture: _ForwardResidentKvaf,
+    *,
+    predicted_score_cutoff_u16: tuple[int, ...] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
     from nanovllm_p10_forward_bridge.p10_forward_graph import P10ForwardInputs
@@ -819,14 +845,24 @@ def _build_forward_inputs(
         (receipt_capacity, RECEIPT_WORDS), dtype=torch.int64, device=device
     )
     receipt_state = torch.zeros(receipt_capacity, dtype=torch.int32, device=device)
-    # Fields [2..4,6] are cold geometry/cutoff. Word 1 is the Stage-B
-    # diagnostic ledger, reset by prepare. The low 16 bits of word 6 select
-    # only speculative admission; Guaranteed Recall still materializes every
-    # canonical winner, so a cutoff sweep cannot change P10 mathematics.
-    score_cutoff_u16 = _score_cutoff_u16()
-    score_control = score_cutoff_u16 | (
-        _STAGE_B_RECEIPT_TRACE_ENABLE if STAGE_B_RECEIPT_TRACE else 0
-    )
+    # Fields [2..4] are cold geometry; word 1 is the Stage-B diagnostic
+    # ledger reset by Prepare.  The score prediction is intentionally a
+    # separate immutable uint16[B] tensor, not a low-bit payload in mutable
+    # forward_control.  This preserves the invariant that Prepare can reset
+    # lifecycle state without changing request-local admission policy.
+    if predicted_score_cutoff_u16 is None:
+        predicted_score_cutoff_u16 = (_configured_score_cutoff_u16(),) * BATCH
+    if len(predicted_score_cutoff_u16) != BATCH or any(
+        not 0 <= cutoff <= 0xFFFF for cutoff in predicted_score_cutoff_u16
+    ):
+        _blocked(
+            "invalid_p10_predicted_score_cutoff_u16:"
+            f"count={len(predicted_score_cutoff_u16)}:batch={BATCH}"
+        )
+    predicted_score_cutoff = torch.tensor(
+        predicted_score_cutoff_u16, dtype=torch.uint16, device=device
+    ).contiguous()
+    trace_control = _STAGE_B_RECEIPT_TRACE_ENABLE if STAGE_B_RECEIPT_TRACE else 0
     forward_control = torch.tensor(
         [
             0,
@@ -835,7 +871,7 @@ def _build_forward_inputs(
             BLOCK_TOKENS,
             BATCH,
             0,
-            score_control,
+            trace_control,
             0,
             0,
             0,
@@ -949,6 +985,7 @@ def _build_forward_inputs(
         resident_row_to_qsfa_slot=resident_to_qsfa,
         attention_slots_buffer=attention_slots,
         selected_slot_lengths_buffer=selected_lengths,
+        predicted_score_cutoff_u16=predicted_score_cutoff,
         num_layers=1,
         layer_id=0,
         executor_worker_count=EXECUTOR_WORKERS,
@@ -973,6 +1010,7 @@ def _build_forward_inputs(
         "resident_to_qsfa": resident_to_qsfa,
         "attention_slots": attention_slots,
         "selected_lengths": selected_lengths,
+        "predicted_score_cutoff_u16": predicted_score_cutoff,
     }
     return inputs, tensors
 
@@ -1628,18 +1666,20 @@ def _positive_environment_int(name: str, default: int) -> int:
     return value
 
 
-def _score_cutoff_u16() -> int:
-    """Return the test-only ExactScoreScan cutoff without touching C8 math.
+def _configured_score_cutoff_u16() -> int:
+    """Return a scalar broadcast override or the no-admission cold default.
 
-    Stage B consumes the low 16 bits of ``forward_control[6]`` as an unsigned
-    score threshold. Bit 31 remains the independent receipt-trace flag.  The
-    default is the sortable BF16 key for positive zero, so it admits precisely
-    non-negative native C8 scores rather than treating key ``0`` as a numeric
-    zero threshold.  Fail closed rather than silently truncating an operator
-    experiment into a different threshold.
+    Stage B consumes the immutable ``predicted_score_cutoff_u16[B]`` graph
+    input in the native sortable-key domain.  ``P10_SCORE_CUTOFF_U16`` remains
+    a debugging override that broadcasts one supplied value across B rows;
+    the B16 benchmark normally derives a distinct value per row in
+    :func:`_calibrate_mock_score_cutoff`.  A bare value such as ``0x8000`` is
+    not a useful prediction: it is merely the encoding of zero.
     """
 
-    raw = os.environ.get("P10_SCORE_CUTOFF_U16", hex(INITIAL_SCORE_CUTOFF_U16))
+    raw = os.environ.get("P10_SCORE_CUTOFF_U16")
+    if raw is None:
+        return CALIBRATION_SCORE_CUTOFF_U16
     try:
         value = int(raw, 0)
     except ValueError as error:
@@ -1671,9 +1711,30 @@ def _validate_workload_profile() -> None:
             "invalid_executor_workers:"
             f"count={EXECUTOR_WORKERS}:limit={EXECUTOR_WORKER_LIMIT}"
         )
+    if PREDICTED_SCORE_GUARD_SOURCES_PER_ROW <= 0 or (
+        PREDICTED_SCORE_WINDOW_PER_ROW > SOURCE_TOKENS
+    ):
+        _blocked(
+            "invalid_p10_mock_score_guard_sources_per_row:"
+            f"{PREDICTED_SCORE_GUARD_SOURCES_PER_ROW}"
+        )
+    configured_cutoff = _configured_score_cutoff_u16()
+    configured_policy = (
+        "environment_override"
+        if "P10_SCORE_CUTOFF_U16" in os.environ
+        else (
+            "cold_mock_calibration"
+            if P10_BENCH_PROFILE == "b16_s128k_miss5"
+            else "no_admission_acceptance"
+        )
+    )
     print(
         "P10_SCORE_CUTOFF_CONFIG "
-        f"cutoff_u16={_score_cutoff_u16()} trace={int(STAGE_B_RECEIPT_TRACE)}",
+        "input=predicted_score_cutoff_u16[B] "
+        f"policy={configured_policy} broadcast_override_u16={configured_cutoff} "
+        f"predicted_window_per_row={PREDICTED_SCORE_WINDOW_PER_ROW} "
+        f"speculative_slot_capacity_per_row={SPECULATIVE_SLOT_CAPACITY_PER_ROW} "
+        f"trace={int(STAGE_B_RECEIPT_TRACE)}",
         flush=True,
     )
     print(
@@ -1684,6 +1745,200 @@ def _validate_workload_profile() -> None:
         f"graph_capture=none_for_direct_hccp",
         flush=True,
     )
+
+
+def _calibrate_mock_score_cutoff(
+    *,
+    device: Any,
+    base: dict[str, Any],
+    reference: Any,
+    fixture: _ForwardResidentKvaf,
+) -> tuple[int, ...]:
+    """Choose one B16 prediction cutoff per request before timing begins.
+
+    This is deliberately a *cold benchmark-controller calibration*, not part
+    of P10's product data plane.  It launches only the native W4A4C8
+    score-receipt producer once, reads its graph-owned score surface on the
+    host after that launch is terminal, then selects a per-request cutoff for
+    all later timed forwards.  Stage B is not launched here: there is no
+    CandidateSeed, PostOnly, CQ drain, or KVAF work in this calibration.
+
+    A real request controller will provide this vector from prior request
+    context.  For this mock, row ``r`` uses the native score at rank
+    ``TOPK + guard`` (one sortable-key unit lower when possible).  The fixed
+    all-source 5% resident mask is consulted only *after* that prediction to
+    measure candidate Gets; it never influences cutoff selection.  Thus the
+    runtime data flow remains score threshold -> resident lookup -> miss ->
+    PostOnly, with an explicit small overfetch above final misses.
+    """
+
+    if "P10_SCORE_CUTOFF_U16" in os.environ:
+        cutoff = _configured_score_cutoff_u16()
+        print(
+            "P10_MOCK_SCORE_POLICY "
+            "mode=environment_override cold_calibration=0 "
+            f"cutoff_u16_min={cutoff} cutoff_u16_max={cutoff} "
+            f"cutoff_distinct=1 profile={P10_BENCH_PROFILE}",
+            flush=True,
+        )
+        return (cutoff,) * BATCH
+
+    # The B=1 all-miss acceptance route proves transport/correctness, not an
+    # overlap workload; it intentionally makes no speculative admission
+    # unless a caller explicitly supplies a cutoff.
+    if P10_BENCH_PROFILE != "b16_s128k_miss5":
+        print(
+            "P10_MOCK_SCORE_POLICY "
+            "mode=no_admission_acceptance cold_calibration=0 "
+            f"cutoff_u16_min={CALIBRATION_SCORE_CUTOFF_U16} "
+            f"cutoff_u16_max={CALIBRATION_SCORE_CUTOFF_U16} "
+            "cutoff_distinct=1 "
+            f"profile={P10_BENCH_PROFILE}",
+            flush=True,
+        )
+        return (CALIBRATION_SCORE_CUTOFF_U16,) * BATCH
+
+    import torch
+    from nanovllm_p10_forward_bridge.p10_forward_graph import _launch_stage_a
+
+    # This allocation is intentionally disposable.  The timed static aliases
+    # are allocated only after calibration has completed, so neither score
+    # bytes nor receipt state can leak into a measured forward.
+    immutable_before = _immutable_input_digests(base)
+    calibration_inputs, calibration_tensors = _build_forward_inputs(
+        device,
+        base,
+        fixture,
+        predicted_score_cutoff_u16=(CALIBRATION_SCORE_CUTOFF_U16,) * BATCH,
+    )
+    producer = torch.npu.current_stream()
+    with torch.npu.stream(producer):
+        _launch_stage_a(calibration_inputs)
+        calibration_done = torch.npu.Event(enable_timing=False)
+        calibration_done.record(producer)
+    calibration_done.synchronize()
+
+    calibrated_sparse = calibration_tensors["canonical_sparse"].detach()
+    if not torch.equal(calibrated_sparse, reference):
+        raise AssertionError(
+            "P10 cold score calibration changed native W4A4C8 canonical Top-K"
+        )
+
+    calibrated_lens = calibration_tensors["canonical_lens"].detach().to(
+        device="cpu", dtype=torch.int32
+    )
+    expected_lens = torch.full(
+        (BATCH,), SOURCE_TOKENS, dtype=torch.int32, device="cpu"
+    )
+    if not torch.equal(calibrated_lens, expected_lens):
+        raise AssertionError(
+            "P10 cold score calibration has unexpected canonical lengths: "
+            f"actual={calibrated_lens.tolist()} expected={expected_lens.tolist()}"
+        )
+
+    # Stage A's active C8 pass publishes the native scores consumed by Top-K
+    # in slice zero.  Move only that one slice for cold controller calibration;
+    # no Q/K is recomputed and the timed aliases are allocated later.
+    score_keys = calibration_tensors["score_surface"][:, 0, :].detach().to(
+        device="cpu", dtype=torch.int32
+    ).contiguous()
+    expected_score_shape = (BATCH, SOURCE_TOKENS)
+    if tuple(score_keys.shape) != expected_score_shape:
+        raise AssertionError(
+            "unexpected P10 active score surface shape: "
+            f"actual={tuple(score_keys.shape)} expected={expected_score_shape}"
+        )
+    canonical = reference.detach().to(device="cpu", dtype=torch.int64).reshape(
+        BATCH, TOPK
+    )
+    if torch.any(canonical < 0) or torch.any(canonical >= SOURCE_TOKENS):
+        raise AssertionError("P10 calibration canonical source outside score surface")
+
+    final_score_keys = score_keys.gather(1, canonical)
+    row_kth_keys = final_score_keys.amin(dim=1)
+
+    # Predict from score alone: rank K+guard is already a native score no
+    # greater than the exact K-th boundary.  Do not subtract a second key:
+    # BF16 tie buckets could turn that apparently harmless slack into a large
+    # excess candidate population.  This does not select a runtime top-N;
+    # Stage B still scans every published source and admits each source whose
+    # score crosses this value before looking at resident state.
+    rank_from_smallest = SOURCE_TOKENS - PREDICTED_SCORE_WINDOW_PER_ROW + 1
+    window_cutoffs = torch.kthvalue(
+        score_keys, rank_from_smallest, dim=1
+    ).values
+    cutoff_by_row = window_cutoffs
+    if torch.any(cutoff_by_row < 0) or torch.any(cutoff_by_row > 0xFFFF):
+        _blocked("p10_mock_predicted_score_cutoff_outside_uint16")
+    if torch.any(cutoff_by_row > row_kth_keys):
+        raise AssertionError(
+            "P10 score prediction exceeds its exact Top-K boundary: "
+            f"cutoff_max={int(cutoff_by_row.max().item())}:"
+            f"kth_min={int(row_kth_keys.min().item())}"
+        )
+
+    # The resident mock is fixed for every source before C8.  Only after the
+    # score-only prediction is selected do we measure how many candidates are
+    # cache misses and enforce the fixed forward-resident capacity.
+    miss_mask_cpu = calibration_tensors["miss_mask_cpu"]
+    eligible_mask = score_keys >= cutoff_by_row.unsqueeze(1)
+    eligible_sources_by_row = torch.count_nonzero(eligible_mask, dim=1)
+    eligible_misses_by_row = torch.count_nonzero(
+        eligible_mask & miss_mask_cpu, dim=1
+    )
+    if torch.any(eligible_misses_by_row > SPECULATIVE_SLOT_CAPACITY_PER_ROW):
+        _blocked(
+            "p10_mock_speculative_band_too_small:"
+            f"eligible_misses_max={int(eligible_misses_by_row.max().item())}:"
+            f"capacity_per_row={SPECULATIVE_SLOT_CAPACITY_PER_ROW}:"
+            f"cutoff_min={int(cutoff_by_row.min().item())}"
+        )
+
+    final_miss_mask = miss_mask_cpu.gather(1, canonical)
+    final_misses_by_row = torch.count_nonzero(final_miss_mask, dim=1)
+    final_score_eligible_by_row = torch.count_nonzero(
+        final_miss_mask & (final_score_keys >= cutoff_by_row.unsqueeze(1)), dim=1
+    )
+    if not torch.equal(final_score_eligible_by_row, final_misses_by_row):
+        raise AssertionError(
+            "P10 mock threshold did not cover every final cache miss: "
+            f"eligible={final_score_eligible_by_row.tolist()}:"
+            f"final_misses={final_misses_by_row.tolist()}"
+        )
+    eligible_miss_count = int(eligible_misses_by_row.sum().item())
+    final_miss_count = int(final_misses_by_row.sum().item())
+    if final_miss_count <= 0:
+        _blocked("p10_mock_resident_miss_mask_has_no_final_misses")
+    if eligible_miss_count <= final_miss_count:
+        _blocked(
+            "p10_mock_threshold_not_speculative:"
+            f"eligible_misses={eligible_miss_count}:final_misses={final_miss_count}"
+        )
+
+    _require_immutable_inputs(
+        immutable_before, base, context="cold P10 score calibration"
+    )
+    print(
+        "P10_MOCK_SCORE_POLICY "
+        "mode=cold_stage_a_calibration stage_a_only=1 post_cq=0 timed=0 "
+        f"cutoff_u16_min={int(cutoff_by_row.min().item())} "
+        f"cutoff_u16_max={int(cutoff_by_row.max().item())} "
+        f"cutoff_distinct={int(torch.unique(cutoff_by_row).numel())} "
+        f"actual_topk_kth_min_u16={int(row_kth_keys.min().item())} "
+        f"actual_topk_kth_max_u16={int(row_kth_keys.max().item())} "
+        f"predicted_window_per_row={PREDICTED_SCORE_WINDOW_PER_ROW} "
+        f"eligible_sources_min={int(eligible_sources_by_row.min().item())} "
+        f"eligible_sources_max={int(eligible_sources_by_row.max().item())} "
+        f"eligible_misses_min={int(eligible_misses_by_row.min().item())} "
+        f"eligible_misses_max={int(eligible_misses_by_row.max().item())} "
+        f"eligible_misses={eligible_miss_count} final_winner_misses={final_miss_count} "
+        f"overfetch_ratio={eligible_miss_count / final_miss_count:.4f} "
+        f"speculative_capacity_per_row={SPECULATIVE_SLOT_CAPACITY_PER_ROW} "
+        f"speculative_capacity={SPECULATIVE_ROWS} "
+        f"final_miss_score_eligible={int(final_score_eligible_by_row.sum().item())}",
+        flush=True,
+    )
+    return tuple(int(value) for value in cutoff_by_row.tolist())
 
 
 def _immutable_input_digests(base: dict[str, Any]) -> dict[str, str]:
@@ -1878,6 +2133,7 @@ def _run_timed_forward(
     fixture: _ForwardResidentKvaf,
     launch_p10_forward: Any,
     immutable_digests: dict[str, str],
+    predicted_score_cutoff_u16: tuple[int, ...],
 ) -> P10TimingSample:
     """Run one fully terminal P10 forward with an exact device-side boundary.
 
@@ -1902,7 +2158,12 @@ def _run_timed_forward(
     executor = torch.npu.Stream(device=device)
     _reset_benchmark_destination(fixture, producer)
     fixture.terminal = False
-    inputs, tensors = _build_forward_inputs(device, base, fixture)
+    inputs, tensors = _build_forward_inputs(
+        device,
+        base,
+        fixture,
+        predicted_score_cutoff_u16=predicted_score_cutoff_u16,
+    )
     _install_final_hit_payloads(reference, fixture, tensors)
 
     start = torch.npu.Event(enable_timing=True)
@@ -2099,6 +2360,9 @@ def _run_benchmark() -> int:
 
     try:
         fixture.bind()
+        predicted_score_cutoff_u16 = _calibrate_mock_score_cutoff(
+            device=device, base=base, reference=reference, fixture=fixture
+        )
         # Warm both modes once, then alternate order in measured trials.  The
         # alternation prevents Direct-HCCP and cache warm state from always
         # favouring whichever mode happens to run second.
@@ -2112,6 +2376,7 @@ def _run_benchmark() -> int:
                     fixture=fixture,
                     launch_p10_forward=launch_p10_forward,
                     immutable_digests=immutable_digests,
+                    predicted_score_cutoff_u16=predicted_score_cutoff_u16,
                 )
         print(
             "P10_PERF_WARMUP "
@@ -2130,6 +2395,7 @@ def _run_benchmark() -> int:
                     fixture=fixture,
                     launch_p10_forward=launch_p10_forward,
                     immutable_digests=immutable_digests,
+                    predicted_score_cutoff_u16=predicted_score_cutoff_u16,
                 )
                 samples[mode].append(sample)
                 print(
@@ -2259,10 +2525,18 @@ def _run_graph_compatible_benchmark() -> int:
 
     try:
         fixture.bind()
+        predicted_score_cutoff_u16 = _calibrate_mock_score_cutoff(
+            device=device, base=base, reference=reference, fixture=fixture
+        )
         # These aliases and streams are held for the entire benchmark just as
         # vLLM's graph cache holds a replay slot.  The direct HCCP executor is
         # launched into the stable companion stream, never raw-captured.
-        inputs, tensors = _build_forward_inputs(device, base, fixture)
+        inputs, tensors = _build_forward_inputs(
+            device,
+            base,
+            fixture,
+            predicted_score_cutoff_u16=predicted_score_cutoff_u16,
+        )
         _install_final_hit_payloads(reference, fixture, tensors)
         producer = torch.npu.Stream(device=device)
         executor = torch.npu.Stream(device=device)
@@ -2489,6 +2763,9 @@ def _run_graph_benchmark() -> int:
 
     try:
         fixture.bind()
+        predicted_score_cutoff_u16 = _calibrate_mock_score_cutoff(
+            device=device, base=base, reference=reference, fixture=fixture
+        )
 
         # Each ACLGraph owns persistent, logical streams.  These are not an
         # AIV partition: both streams submit the normal dynamic P10 workers.
@@ -2496,7 +2773,12 @@ def _run_graph_benchmark() -> int:
         # intentionally fail-closed on any captured-address drift.
         serial_producer = torch.npu.Stream(device=device)
         serial_executor = torch.npu.Stream(device=device)
-        serial_inputs, serial_tensors = _build_forward_inputs(device, base, fixture)
+        serial_inputs, serial_tensors = _build_forward_inputs(
+            device,
+            base,
+            fixture,
+            predicted_score_cutoff_u16=predicted_score_cutoff_u16,
+        )
         graph_serial = capture_p10_forward_graph(
             serial_inputs,
             producer_stream=serial_producer,
@@ -2506,7 +2788,12 @@ def _run_graph_benchmark() -> int:
 
         overlap_producer = torch.npu.Stream(device=device)
         overlap_executor = torch.npu.Stream(device=device)
-        overlap_inputs, overlap_tensors = _build_forward_inputs(device, base, fixture)
+        overlap_inputs, overlap_tensors = _build_forward_inputs(
+            device,
+            base,
+            fixture,
+            predicted_score_cutoff_u16=predicted_score_cutoff_u16,
+        )
         graph_overlap = capture_p10_forward_graph(
             overlap_inputs,
             producer_stream=overlap_producer,
@@ -2536,6 +2823,7 @@ def _run_graph_benchmark() -> int:
                     fixture=fixture,
                     launch_p10_forward=launch_p10_forward,
                     immutable_digests=immutable_digests,
+                    predicted_score_cutoff_u16=predicted_score_cutoff_u16,
                 )
             if case == "eager_overlap":
                 return _run_timed_forward(
@@ -2546,6 +2834,7 @@ def _run_graph_benchmark() -> int:
                     fixture=fixture,
                     launch_p10_forward=launch_p10_forward,
                     immutable_digests=immutable_digests,
+                    predicted_score_cutoff_u16=predicted_score_cutoff_u16,
                 )
             if case == "graph_serial":
                 return _run_timed_graph_forward(
@@ -2711,7 +3000,15 @@ def _run_acceptance() -> int:
     fixture = _ForwardResidentKvaf(device)
     try:
         fixture.bind()
-        inputs, tensors = _build_forward_inputs(device, base, fixture)
+        predicted_score_cutoff_u16 = _calibrate_mock_score_cutoff(
+            device=device, base=base, reference=reference, fixture=fixture
+        )
+        inputs, tensors = _build_forward_inputs(
+            device,
+            base,
+            fixture,
+            predicted_score_cutoff_u16=predicted_score_cutoff_u16,
+        )
         _install_final_hit_payloads(reference, fixture, tensors)
         launch = launch_p10_forward(inputs)
         _assert_terminal(reference, fixture, tensors, launch)

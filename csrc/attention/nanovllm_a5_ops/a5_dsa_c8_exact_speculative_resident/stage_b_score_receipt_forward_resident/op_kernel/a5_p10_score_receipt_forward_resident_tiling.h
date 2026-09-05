@@ -27,7 +27,6 @@ struct A5P10ScoreReceiptForwardResidentTilingData {
   uint32_t residentRowCount;
   uint32_t attentionSlotCapacity;
   uint32_t sparseCount;
-  uint32_t scoreCutoffU16;
   uint32_t boundedDrainPolls;
   uint32_t reserved;
 };

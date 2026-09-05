@@ -24,6 +24,7 @@ enum InputIndex : size_t {
   CANONICAL_SCORE_SOURCE_LENS, KVAF_FORWARD_RESIDENT_CONTROL, QUEUE_LEASES,
   RESIDENT_PAYLOAD, RESIDENT_READY, RESIDENT_ROW_TO_QSFA_SLOT,
   ATTENTION_SLOTS_BUFFER, SELECTED_SLOT_LENGTHS_BUFFER,
+  PREDICTED_SCORE_CUTOFF_U16,
 };
 enum OutputIndex : size_t {
   RECEIPT_STATE_ALIAS = 0, FORWARD_CONTROL_ALIAS,
@@ -74,7 +75,7 @@ static ge::graphStatus TilingA5P10ScoreReceiptForwardResident(
     return ge::GRAPH_FAILED;
   }
   for (size_t index = SCORE_SURFACE;
-       index <= SELECTED_SLOT_LENGTHS_BUFFER; ++index) {
+       index <= PREDICTED_SCORE_CUTOFF_U16; ++index) {
     if (!HasInput(context, index)) return ge::GRAPH_FAILED;
   }
   for (size_t index = RECEIPT_STATE_ALIAS;
@@ -85,6 +86,7 @@ static ge::graphStatus TilingA5P10ScoreReceiptForwardResident(
     return context->GetInputDesc(index)->GetDataType();
   };
   if (dtype(SCORE_SURFACE) != ge::DT_UINT16 ||
+      dtype(PREDICTED_SCORE_CUTOFF_U16) != ge::DT_UINT16 ||
       dtype(RECEIPT_RING) != ge::DT_INT64 ||
       dtype(KVAF_FORWARD_RESIDENT_CONTROL) != ge::DT_INT64 ||
       dtype(RESIDENT_PAYLOAD) != ge::DT_UINT8) return ge::GRAPH_FAILED;
@@ -121,6 +123,7 @@ static ge::graphStatus TilingA5P10ScoreReceiptForwardResident(
   const gert::Shape residentToQsfa = context->GetInputShape(RESIDENT_ROW_TO_QSFA_SLOT)->GetStorageShape();
   const gert::Shape attention = context->GetInputShape(ATTENTION_SLOTS_BUFFER)->GetStorageShape();
   const gert::Shape selectedLengths = context->GetInputShape(SELECTED_SLOT_LENGTHS_BUFFER)->GetStorageShape();
+  const gert::Shape predictedScoreCutoff = context->GetInputShape(PREDICTED_SCORE_CUTOFF_U16)->GetStorageShape();
   if (!IsShape(score, {-1, -1, -1}) || !IsShape(ring, {-1, kReceiptWords}) ||
       !IsShape(state, {-1}) || !IsShape(control, {-1}) ||
       !IsShape(activeRows, {-1}) || !IsShape(objectMap, {-1, -1}) ||
@@ -157,7 +160,9 @@ static ge::graphStatus TilingA5P10ScoreReceiptForwardResident(
       kvafControl.GetDim(0) < kKvafControlMinWords || queueLeases.GetDim(0) <= 0 ||
       residentReady.GetDim(0) != residentRows ||
       residentToQsfa.GetDim(0) != residentRows || attention.GetDim(0) != batch ||
-      attention.GetDim(2) < kSparseCount || selectedLengths.GetDim(0) != batch) {
+      attention.GetDim(2) < kSparseCount || selectedLengths.GetDim(0) != batch ||
+      !IsShape(predictedScoreCutoff, {-1}) ||
+      predictedScoreCutoff.GetDim(0) != batch) {
     return ge::GRAPH_FAILED;
   }
   if (batch > std::numeric_limits<uint32_t>::max() ||
@@ -228,7 +233,8 @@ static ge::graphStatus TilingA5P10ScoreReceiptForwardResident(
   tiling->residentRowCount = static_cast<uint32_t>(residentRows);
   tiling->attentionSlotCapacity = static_cast<uint32_t>(attention.GetDim(2));
   tiling->sparseCount = static_cast<uint32_t>(kSparseCount);
-  tiling->scoreCutoffU16 = 0U;  // mutable forward_control is authoritative.
+  // predicted_score_cutoff_u16 is the immutable graph input authoritative for
+  // ExactScoreScan; forward_control carries only trace diagnostics.
   tiling->boundedDrainPolls = static_cast<uint32_t>(*drainPolls);
   tiling->reserved = 0U;
   context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize();
@@ -300,6 +306,7 @@ class A5P10ScoreReceiptForwardResident : public OpDef {
     this->Input("resident_row_to_qsfa_slot").ParamType(REQUIRED).DataType(int32s).Format(formats);
     this->Input("attention_slots_buffer").ParamType(REQUIRED).DataType(int32s).Format(formats);
     this->Input("selected_slot_lengths_buffer").ParamType(REQUIRED).DataType(int32s).Format(formats);
+    this->Input("predicted_score_cutoff_u16").ParamType(REQUIRED).DataType(uint16s).Format(formats);
     this->Output("receipt_state_alias").ParamType(REQUIRED).DataType(int32s).Format(formats);
     this->Output("forward_control_alias").ParamType(REQUIRED).DataType(int32s).Format(formats);
     this->Output("kv_object_to_forward_slot_alias").ParamType(REQUIRED).DataType(int32s).Format(formats);

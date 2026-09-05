@@ -661,7 +661,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
       GM_ADDR kvaf_forward_resident_control, GM_ADDR queue_leases,
       GM_ADDR resident_payload, GM_ADDR resident_ready,
       GM_ADDR resident_row_to_qsfa_slot, GM_ADDR attention_slots_buffer,
-      GM_ADDR selected_slot_lengths_buffer) {
+      GM_ADDR selected_slot_lengths_buffer,
+      GM_ADDR predicted_score_cutoff_u16) {
     scoreSurface_ = reinterpret_cast<__gm__ uint16_t*>(score_surface);
     receiptRing_ = reinterpret_cast<__gm__ int64_t*>(receipt_ring);
     receiptState_ = reinterpret_cast<__gm__ int32_t*>(receipt_state);
@@ -693,6 +694,8 @@ class A5P10ScoreReceiptForwardResidentKernel {
     attentionSlots_ = reinterpret_cast<__gm__ int32_t*>(attention_slots_buffer);
     selectedSlotLengths_ =
         reinterpret_cast<__gm__ int32_t*>(selected_slot_lengths_buffer);
+    predictedScoreCutoffU16_ =
+        reinterpret_cast<__gm__ uint16_t*>(predicted_score_cutoff_u16);
 
     worker_ = GetBlockIdx();
     enabled_ = false;
@@ -729,7 +732,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
         queueLeases_ == nullptr || residentPayload_ == nullptr ||
         residentReady_ == nullptr || residentRowToQsfaSlot_ == nullptr ||
         attentionSlots_ == nullptr ||
-        selectedSlotLengths_ == nullptr ||
+        selectedSlotLengths_ == nullptr || predictedScoreCutoffU16_ == nullptr ||
         tiling_->executorWorkerCount == 0U ||
         tiling_->executorWorkerLimit == 0U ||
         tiling_->executorWorkerCount > tiling_->executorWorkerLimit ||
@@ -757,12 +760,11 @@ class A5P10ScoreReceiptForwardResidentKernel {
         forwardControl_ + A5_P10_STAGE_B_ROWS_PER_OBJECT));
     topkPerRow_ = static_cast<uint32_t>(ReadGmByPassDCache<int32_t>(
         forwardControl_ + A5_P10_STAGE_B_TOPK_PER_ROW));
-    const uint32_t score_control = static_cast<uint32_t>(
+    const uint32_t trace_control = static_cast<uint32_t>(
         ReadGmByPassDCache<int32_t>(
-            forwardControl_ + A5_P10_STAGE_B_SCORE_CUTOFF_U16));
-    scoreCutoffU16_ = score_control & 0xffffU;
+            forwardControl_ + A5_P10_STAGE_B_TRACE_CONTROL));
     traceEnabled_ =
-        (score_control & A5_P10_STAGE_B_SCORE_CONTROL_TRACE_ENABLE) != 0U;
+        (trace_control & A5_P10_STAGE_B_SCORE_CONTROL_TRACE_ENABLE) != 0U;
     speculativeBand_.base =
         ReadGmByPassDCache<int32_t>(speculativeSlotBand_ + 0U);
     speculativeBand_.capacity =
@@ -1550,6 +1552,12 @@ class A5P10ScoreReceiptForwardResidentKernel {
          row_delta < descriptor.row_count &&
          descriptor.row_begin + row_delta < activeRows_; ++row_delta) {
       const uint32_t row = descriptor.row_begin + row_delta;
+      // This is a cold-bound, per-request prediction in the exact native
+      // sortable-key domain.  One bypass read per receipt row preserves the
+      // score -> resident lookup -> miss -> PostOnly ordering while avoiding
+      // a global cutoff that would over-admit rows with lower score ranges.
+      const uint32_t score_cutoff_u16 = static_cast<uint32_t>(
+          ReadGmByPassDCache<uint16_t>(predictedScoreCutoffU16_ + row));
       for (uint32_t source_delta = 0U;
            source_delta < descriptor.source_count; ++source_delta) {
         const uint32_t source = descriptor.source_begin + source_delta;
@@ -1564,7 +1572,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
             scoreSurface_ + score_byte_offset / A5_P10_SCORE_ELEMENT_BYTES);
         // ExactScoreScan's only numerical decision is in the native uint16
         // score domain. It neither changes nor reorders canonical Top-K.
-        if (static_cast<uint32_t>(score) < scoreCutoffU16_) {
+        if (static_cast<uint32_t>(score) < score_cutoff_u16) {
           continue;
         }
         trace |= A5_P10_STAGE_B_TRACE_SCORE_ELIGIBLE;
@@ -2337,6 +2345,7 @@ class A5P10ScoreReceiptForwardResidentKernel {
   __gm__ int32_t* residentRowToQsfaSlot_ = nullptr;
   __gm__ int32_t* attentionSlots_ = nullptr;
   __gm__ int32_t* selectedSlotLengths_ = nullptr;
+  __gm__ uint16_t* predictedScoreCutoffU16_ = nullptr;
 
   A5P10ResidentSlotBand speculativeBand_{};
   A5P10ResidentSlotBand recallBand_{};
@@ -2345,7 +2354,6 @@ class A5P10ScoreReceiptForwardResidentKernel {
   uint32_t activeRows_ = 0U;
   uint32_t rowsPerObject_ = 0U;
   uint32_t topkPerRow_ = 0U;
-  uint32_t scoreCutoffU16_ = 0U;
   bool traceEnabled_ = false;
   // Dense KVAF PostOnly reserves event IDs 0 and 1 for its two WQE banks;
   // generic KVAF compaction reserves 2.  Stage-B's SIMT handshakes therefore
@@ -2369,6 +2377,7 @@ extern "C" __global__ __aicore__ void a5_p10_score_receipt_forward_resident(
     GM_ADDR resident_payload, GM_ADDR resident_ready,
     GM_ADDR resident_row_to_qsfa_slot, GM_ADDR attention_slots_buffer,
     GM_ADDR selected_slot_lengths_buffer,
+    GM_ADDR predicted_score_cutoff_u16,
     GM_ADDR receipt_state_alias, GM_ADDR forward_control_alias,
     GM_ADDR kv_object_to_forward_slot_alias,
     GM_ADDR source_to_forward_slot_alias, GM_ADDR speculative_slot_cursor_alias,
@@ -2403,6 +2412,6 @@ extern "C" __global__ __aicore__ void a5_p10_score_receipt_forward_resident(
           canonical_sparse_indices, canonical_score_source_lens,
           kvaf_forward_resident_control, queue_leases, resident_payload,
           resident_ready, resident_row_to_qsfa_slot, attention_slots_buffer,
-          selected_slot_lengths_buffer);
+          selected_slot_lengths_buffer, predicted_score_cutoff_u16);
   op.Process();
 }

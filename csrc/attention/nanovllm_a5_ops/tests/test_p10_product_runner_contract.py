@@ -326,6 +326,32 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertIn("graph_compatible_benchmark", self.runner)
         self.assertEqual(self.fixture.count("self.runtime.batch_get("), 1)
 
+    def test_b16_mock_uses_a_score_only_per_request_prediction(self) -> None:
+        """The benchmark must model threshold admission, never first-N picks.
+
+        Resident state is deliberately independent of the prediction: the
+        cutoff is chosen from the native score surface first, then the fixed
+        five-percent cache-miss mask measures how many candidates need Get.
+        This preserves the product data-flow shape while keeping the mock
+        small and deterministic.
+        """
+
+        for token in (
+            "predicted_score_cutoff_u16[B]",
+            "PREDICTED_SCORE_GUARD_SOURCES_PER_ROW",
+            "PREDICTED_SCORE_WINDOW_PER_ROW",
+            "torch.kthvalue(",
+            "cutoff_by_row = window_cutoffs",
+            "eligible_mask & miss_mask_cpu",
+            "P10_MOCK_SCORE_POLICY ",
+            "mode=cold_stage_a_calibration",
+            "final_miss_score_eligible=",
+            "speculative_capacity_per_row=",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertNotIn("INITIAL_SCORE_CUTOFF_U16", self.fixture)
+        self.assertNotIn("score_keys[miss_mask_cpu]", self.fixture)
+
     def test_b16_bootstrap_bounds_only_the_pre_timing_batch_put_wave(self) -> None:
         """Large cold loading must not consume the eager AIV CQ budget at once.
 

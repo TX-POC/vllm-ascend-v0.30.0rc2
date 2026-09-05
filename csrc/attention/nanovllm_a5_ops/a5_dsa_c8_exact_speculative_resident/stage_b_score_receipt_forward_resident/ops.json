@@ -23,7 +23,8 @@
       {"name": "resident_ready", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "resident_row_to_qsfa_slot", "param_type": "required", "format": ["ND"], "type": ["int32"]},
       {"name": "attention_slots_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-      {"name": "selected_slot_lengths_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+      {"name": "selected_slot_lengths_buffer", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "predicted_score_cutoff_u16", "param_type": "required", "format": ["ND"], "type": ["uint16"]}
     ],
     "output_desc": [
       {"name": "receipt_state_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},

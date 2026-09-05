@@ -137,14 +137,17 @@ class P10ForwardBridgeContractTest(unittest.TestCase):
         self.assertIn("executor_worker_count", self.bridge)
         self.assertIn("executor_worker_limit", self.bridge)
 
-    def test_stage_b_uses_current_21_input_mapping_abi(self) -> None:
+    def test_stage_b_uses_per_request_22_input_mapping_abi(self) -> None:
         stage_b = self.contract["graph_nodes"]["stage_b"]
-        self.assertEqual(stage_b["inputs"], 21)
+        self.assertEqual(stage_b["inputs"], 22)
         self.assertEqual(stage_b["alias_outputs"], 11)
         self.assertIn("resident_row_to_qsfa_slot", self.bridge)
         self.assertIn("resident_payload.size(0)", self.bridge)
         self.assertIn("never assumes resident rows are QSFA logical slot IDs", self.bridge)
         self.assertIn("at::kUInt16", self.bridge)
+        self.assertIn("predicted_score_cutoff_u16", self.bridge)
+        self.assertIn("predicted_score_cutoff_u16", self.graph)
+        self.assertIn("required_cold_bound_uint16_per_active_row_native_sortable_score_threshold", stage_b["predicted_score_cutoff_u16"])
         self.assertIn("case at::kUInt16", self.common_opapi)
         self.assertIn("return ACL_UINT16", self.common_opapi)
         self.assertIn("aclnnA5P10ScoreReceiptForwardResident", self.bridge)

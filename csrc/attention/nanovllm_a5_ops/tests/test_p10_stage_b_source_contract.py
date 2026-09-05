@@ -62,7 +62,7 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "canonical_sparse_indices", "canonical_score_source_lens",
             "kvaf_forward_resident_control", "queue_leases",
             "resident_payload", "resident_ready", "attention_slots_buffer",
-            "selected_slot_lengths_buffer",
+            "selected_slot_lengths_buffer", "predicted_score_cutoff_u16",
         ):
             self.assertIn(f'Input("{name}")', self.definition)
         self.assertIn('Input("resident_row_to_qsfa_slot")', self.definition)
@@ -82,9 +82,22 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("DT_UINT8", self.definition)
         self.assertIn('"resident_row_to_qsfa_slot"', self.ops_json)
         self.assertEqual(
-            self.ops["input_desc"][18]["name"], "resident_row_to_qsfa_slot"
+            [entry["name"] for entry in self.ops["input_desc"]],
+            [
+                "score_surface", "receipt_ring", "receipt_state",
+                "forward_control", "active_row_pool_entries", "kv_object_map",
+                "kv_object_slots_snapshot", "kv_object_to_forward_slot",
+                "source_to_forward_slot", "speculative_slot_band",
+                "speculative_slot_cursor", "recall_slot_band",
+                "canonical_sparse_indices", "canonical_score_source_lens",
+                "kvaf_forward_resident_control", "queue_leases",
+                "resident_payload", "resident_ready",
+                "resident_row_to_qsfa_slot", "attention_slots_buffer",
+                "selected_slot_lengths_buffer", "predicted_score_cutoff_u16",
+            ],
         )
-        self.assertEqual(len(self.ops["input_desc"]), 21)
+        self.assertEqual(len(self.ops["input_desc"]), 22)
+        self.assertEqual(self.ops["input_desc"][21]["type"], ["uint16"])
         self.assertEqual(len(self.ops["output_desc"]), 11)
         self.assertEqual(
             [entry["name"] for entry in self.ops["attr"]],
@@ -382,7 +395,11 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "// `target_slot_ready`", 1
         )[0]
         self.assertLess(
-            scan.index("score) < scoreCutoffU16_"),
+            scan.index("ReadGmByPassDCache<uint16_t>(predictedScoreCutoffU16_ + row)"),
+            scan.index("score) < score_cutoff_u16"),
+        )
+        self.assertLess(
+            scan.index("score) < score_cutoff_u16"),
             scan.index("ResolveActiveRowMapping(row, source, &mapping, false)"),
         )
         self.assertLess(
@@ -396,6 +413,9 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("stable threshold compaction", scan)
         for forbidden in ("SelectTop", "SortCandidate", "RankReceipt"):
             self.assertNotIn(forbidden, scan)
+        self.assertNotIn("scoreCutoffU16_", self.kernel)
+        self.assertNotIn("A5_P10_STAGE_B_SCORE_CUTOFF_U16", self.abi)
+        self.assertIn("A5_P10_STAGE_B_TRACE_CONTROL", self.abi)
 
     def test_pending_owner_is_explicit_and_cannot_be_reposted(self):
         """A mapped-but-not-posted resident row has one forward-local owner."""

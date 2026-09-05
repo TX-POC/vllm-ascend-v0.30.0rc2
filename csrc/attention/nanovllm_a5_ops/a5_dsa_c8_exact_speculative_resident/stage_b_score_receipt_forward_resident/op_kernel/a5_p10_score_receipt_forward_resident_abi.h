@@ -14,11 +14,13 @@ constexpr uint32_t A5_P10_STAGE_B_MICROBATCH_CAPACITY = 64U;
 constexpr uint32_t A5_P10_STAGE_B_LOCAL_WAVE_CAPACITY = 2U;
 constexpr uint32_t A5_P10_STAGE_B_FINAL_DRAIN_POLLS = 1024U;
 
-// The score threshold occupies only the low 16 bits of forward_control[6].
-// The high diagnostic bit is opt-in and deliberately has no scheduling or
-// numerical meaning.  It lets a failed performance investigation leave a
-// compact per-receipt trail in the descriptor's otherwise-reserved high word,
-// without adding a graph input, a C8 buffer, or a host-side synchronization.
+// ExactScoreScan receives one immutable native sortable-key threshold per
+// active request through the cold-bound `predicted_score_cutoff_u16[B]` input.
+// It is not packed into forward_control: lifecycle control is mutable while a
+// score prediction is request metadata.  Keeping them separate prevents
+// ForwardPrepare from accidentally resetting the prediction and keeps C8's
+// score/Top-K ABI untouched.  forward_control[6] now carries only this opt-in
+// diagnostic bit, with no scheduling or numerical meaning.
 constexpr uint32_t A5_P10_STAGE_B_SCORE_CONTROL_TRACE_ENABLE = 0x80000000U;
 
 // Stage B owns a receipt after READY -> CLAIMED, so it alone may write this
@@ -161,9 +163,9 @@ enum A5P10StageBControlWord : uint32_t {
   A5_P10_STAGE_B_ROWS_PER_OBJECT = 3U,
   A5_P10_STAGE_B_ACTIVE_ROWS = 4U,
   A5_P10_STAGE_B_FORWARD_STATE = 5U,
-  // Low 16 bits of the native uint16 score cut-off. Stage A does not read
-  // this word: ExactScoreScan is wholly a Stage-B operation.
-  A5_P10_STAGE_B_SCORE_CUTOFF_U16 = 6U,
+  // Trace control only. Stage A and ExactScoreScan do not use this for a
+  // score decision; ExactScoreScan reads predicted_score_cutoff_u16[B].
+  A5_P10_STAGE_B_TRACE_CONTROL = 6U,
   // A bounded Stage-B progress counter, never an arena generation or a
   // cross-forward lifetime token.
   A5_P10_STAGE_B_EXECUTOR_PROGRESS = 7U,

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "component": "P10ForwardBridge",
   "scope": "single_w4a4c8_forward",
   "purpose": "Construct the one forward graph that starts the native exact-score producer and the device-side resident executor from the same cold-bound aliases.",
@@ -25,7 +25,8 @@
         "canonical_sparse_indices",
         "canonical_score_source_lens",
         "attention_slots_buffer",
-        "selected_slot_lengths_buffer"
+        "selected_slot_lengths_buffer",
+        "predicted_score_cutoff_u16"
       ]
     },
     "stage_a": {
@@ -38,7 +39,7 @@
       "operator": "A5P10ScoreReceiptForwardResident",
       "launch": "companion_device_stream_after_prepare",
       "submission_order": "stage_b_before_stage_a_after_common_prepare",
-      "inputs": 21,
+      "inputs": 22,
       "alias_outputs": 11,
       "waits_for_stage_a_completion": false,
       "synchronizes_with_stage_a": "receipt_state_READY_and_producer_sealed_only",
@@ -46,6 +47,7 @@
       "physical_aiv_assignment": false,
       "candidate_submission": "device_only",
       "resident_row_to_qsfa_slot": "required_cold_bound_int32_resident_row_to_logical_qsfa_slot_translation",
+      "predicted_score_cutoff_u16": "required_cold_bound_uint16_per_active_row_native_sortable_score_threshold",
       "overlap_witness": "first_preseal_ready_claim_sequence_lt_producer_seal_sequence"
     },
     "qsfa": {

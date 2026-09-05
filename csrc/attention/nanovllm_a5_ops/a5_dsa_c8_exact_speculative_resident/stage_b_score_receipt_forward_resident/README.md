@@ -42,9 +42,12 @@ not a fictitious in-kernel physical-core policy.
    input. Only
    after that seal is `FREE` terminal (an unused slot); `FILLING` or `CLAIMED`
    still requires bounded progress to `DONE`.
-3. A Stage-B worker atomically claims `READY`, performs `ExactScoreScan` and
-   `CandidateCompact`, then resolves `row -> pool -> kv_object -> resident
-   slot` on device. `kv_object_to_forward_slot[P,S]` is authoritative, so
+3. A Stage-B worker atomically claims `READY`, reads the cold-bound native
+   sortable-key prediction `predicted_score_cutoff_u16[row]`, performs
+   `ExactScoreScan` (`score >= cutoff`) and `CandidateCompact`, then resolves
+   `row -> pool -> kv_object -> resident slot` on device. The threshold is
+   request metadata, not a `forward_control` bit field and not a receipt-local
+   top-N selection. `kv_object_to_forward_slot[P,S]` is authoritative, so
    duplicate references to the same pool/source token share one Post and one
    fixed forward slot. A queue lease is dynamic; it is not an AIV-core
    assignment.
