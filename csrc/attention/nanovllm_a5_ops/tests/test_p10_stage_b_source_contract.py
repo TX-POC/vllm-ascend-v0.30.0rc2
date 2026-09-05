@@ -444,6 +444,7 @@ class P10StageBSourceContractTest(unittest.TestCase):
             "A5_P10_STAGE_B_TRACE_DESCRIPTOR_INVALID",
             "A5_P10_STAGE_B_TRACE_CLAIMED_NEW",
             "A5_P10_STAGE_B_TRACE_POSTED",
+            "A5_P10_STAGE_B_TRACE_POST_PRESEAL",
             "A5_P10_STAGE_B_TRACE_CQ_READY",
             "A5_P10_STAGE_B_TRACE_PRESEAL_CQ_READY",
             "prior_trace | trace",
@@ -454,6 +455,23 @@ class P10StageBSourceContractTest(unittest.TestCase):
         self.assertIn("descriptor->reserved", self.kernel)
         self.assertIn("sequence = static_cast<uint32_t>(sequence)", self.kernel)
         self.assertNotIn("receipt_trace", self.definition)
+
+    def test_post_preseal_trace_is_latched_at_the_durable_post_boundary(self):
+        """Admission timing and CQ-observation timing must stay distinct.
+
+        A zero preseal-CQ witness cannot tell whether Stage B posted too late
+        or posted early and only polled/retired after C8 sealed.  The trace
+        check belongs immediately after successful PostOnly, before CQ-wave
+        rehydration; it must remain diagnostic-only.
+        """
+
+        post_boundary = self.kernel.index(
+            "if (traceEnabled_ && trace_receipt != kNoReceipt && !ProducerSealed())"
+        )
+        rehydrate = self.kernel.index("RehydrateForwardResidentWaveForDrain", post_boundary)
+        self.assertLess(post_boundary, rehydrate)
+        self.assertIn("A5_P10_STAGE_B_TRACE_POST_PRESEAL", self.abi)
+        self.assertIn("does not change Post/CQ", self.kernel)
 
     def test_claiming_race_waits_for_durable_object_slot_not_a_reuse(self):
         self.assertIn("ResolveConcurrentForwardSlot", self.kernel)

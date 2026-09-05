@@ -100,6 +100,7 @@ _STAGE_B_RECEIPT_TRACE_BITS = {
     "post_deferred": 1 << 13,
     "cq_ready": 1 << 14,
     "preseal_cq_ready": 1 << 15,
+    "post_preseal": 1 << 16,
 }
 
 

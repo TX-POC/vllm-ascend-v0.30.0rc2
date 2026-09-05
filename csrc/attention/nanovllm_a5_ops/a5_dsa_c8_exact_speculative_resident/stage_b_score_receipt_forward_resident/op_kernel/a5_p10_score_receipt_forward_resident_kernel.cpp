@@ -1402,6 +1402,16 @@ class A5P10ScoreReceiptForwardResidentKernel {
       }
       return begin_reason;
     }
+    // A successful Begin is the durable PostOnly boundary.  Record whether
+    // that boundary was reached while the producer was still OPEN *before*
+    // rehydrating the local CQ record or publishing IN_FLIGHT rows.  This
+    // trace-only observation distinguishes a candidate that arrived too late
+    // from one that was posted early but whose CQ was only observed after the
+    // C8 seal.  It is intentionally opt-in and does not change Post/CQ
+    // ownership, scheduling, Top-K, or resident placement.
+    if (traceEnabled_ && trace_receipt != kNoReceipt && !ProducerSealed()) {
+      StoreReceiptTrace(trace_receipt, A5_P10_STAGE_B_TRACE_POST_PRESEAL);
+    }
     if (!RehydrateForwardResidentWaveForDrain(
             controlGm_, leaseResult_, seed_count, wave)) {
       // PostOnly is already durable here.  Do not release this lease from an

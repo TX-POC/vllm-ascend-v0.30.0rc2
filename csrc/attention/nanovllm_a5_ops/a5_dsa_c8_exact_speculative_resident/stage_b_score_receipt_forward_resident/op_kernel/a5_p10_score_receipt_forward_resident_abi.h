@@ -48,6 +48,13 @@ enum A5P10StageBReceiptTraceBit : uint32_t {
   // work rather than later final recall.
   A5_P10_STAGE_B_TRACE_CQ_READY = 1U << 14U,
   A5_P10_STAGE_B_TRACE_PRESEAL_CQ_READY = 1U << 15U,
+  // `BeginForwardResidentMicrobatch` returned success while Stage A was
+  // still OPEN.  This is intentionally distinct from PRESEAL_CQ_READY:
+  // it proves that a durable PostOnly request was issued with time left in
+  // the producer, but does not claim that its CQ was observed before the
+  // seal.  The two bits separate late candidate admission from transport or
+  // poll latency without adding a graph edge, buffer, or scheduling input.
+  A5_P10_STAGE_B_TRACE_POST_PRESEAL = 1U << 16U,
 };
 
 constexpr int32_t A5_P10_STAGE_B_UNMAPPED_SLOT = -1;
