@@ -370,6 +370,33 @@ class P10StageBSourceContractTest(unittest.TestCase):
             self.kernel.index("FinalizeAssignedRows()"),
         )
 
+    def test_exact_score_scan_is_threshold_gated_not_receipt_ranked(self):
+        """Candidate compaction must preserve threshold semantics.
+
+        The target pipeline selects a non-resident source because its native
+        C8 score crossed the configured cut-off, not because it happened to
+        rank first within an arbitrary receipt window.  Batch capacity is only
+        a Direct-HCCP transport boundary; exact Top-K/recall stays separate.
+        """
+        scan = self.kernel.split("ConsumeExactScoreReceipt", 1)[1].split(
+            "// `target_slot_ready`", 1
+        )[0]
+        self.assertLess(
+            scan.index("score) < scoreCutoffU16_"),
+            scan.index("ResolveActiveRowMapping(row, source, &mapping, false)"),
+        )
+        self.assertLess(
+            scan.index("ResolveActiveRowMapping(row, source, &mapping, false)"),
+            scan.index("if (mapping.persistent_slot >= 0)"),
+        )
+        self.assertLess(
+            scan.index("if (mapping.persistent_slot >= 0)"),
+            scan.index("ClaimSpeculativeSlot(source_offset, object_offset"),
+        )
+        self.assertIn("stable threshold compaction", scan)
+        for forbidden in ("SelectTop", "SortCandidate", "RankReceipt"):
+            self.assertNotIn(forbidden, scan)
+
     def test_pending_owner_is_explicit_and_cannot_be_reposted(self):
         """A mapped-but-not-posted resident row has one forward-local owner."""
         for token in (

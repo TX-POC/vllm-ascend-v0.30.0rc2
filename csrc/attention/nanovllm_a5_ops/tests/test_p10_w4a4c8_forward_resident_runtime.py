@@ -79,6 +79,13 @@ EXECUTOR_WORKERS = int(
 )
 EXECUTOR_WORKER_LIMIT = int(os.environ.get("P10_BENCH_EXECUTOR_WORKER_LIMIT", "16"))
 STAGE_B_RECEIPT_TRACE = os.environ.get("P10_STAGE_B_RECEIPT_TRACE", "0") == "1"
+# Stage A stores native BF16 scores in the monotone sortable-key domain.  In
+# that domain positive zero is 0x8000: zero bits XOR the BF16 sign mask.  Make
+# the initial policy a real score threshold rather than the all-pass key 0.
+# Product integration supplies the same low-16-bit value through graph-visible
+# ``forward_control[6]``; this fixture override is only its temporary policy
+# source while the end-to-end controller is being wired up.
+INITIAL_SCORE_CUTOFF_U16 = 0x8000
 # ``forward_control`` is a signed int32 tensor.  C++ reads this exact word as
 # uint32_t, so use the signed representation of bit 31 rather than trying to
 # construct an out-of-range Python ``0x80000000`` int32 literal.
@@ -1625,12 +1632,14 @@ def _score_cutoff_u16() -> int:
     """Return the test-only ExactScoreScan cutoff without touching C8 math.
 
     Stage B consumes the low 16 bits of ``forward_control[6]`` as an unsigned
-    score threshold. Bit 31 remains the independent receipt-trace flag.
-    Fail closed rather than silently truncating an operator experiment into a
-    different threshold.
+    score threshold. Bit 31 remains the independent receipt-trace flag.  The
+    default is the sortable BF16 key for positive zero, so it admits precisely
+    non-negative native C8 scores rather than treating key ``0`` as a numeric
+    zero threshold.  Fail closed rather than silently truncating an operator
+    experiment into a different threshold.
     """
 
-    raw = os.environ.get("P10_SCORE_CUTOFF_U16", "0")
+    raw = os.environ.get("P10_SCORE_CUTOFF_U16", hex(INITIAL_SCORE_CUTOFF_U16))
     try:
         value = int(raw, 0)
     except ValueError as error:

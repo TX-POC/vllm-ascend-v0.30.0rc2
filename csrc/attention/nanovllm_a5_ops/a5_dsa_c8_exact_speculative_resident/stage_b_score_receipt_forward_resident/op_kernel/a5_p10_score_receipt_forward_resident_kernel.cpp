@@ -1606,9 +1606,12 @@ class A5P10ScoreReceiptForwardResidentKernel {
           continue;
         }
         trace |= A5_P10_STAGE_B_TRACE_CLAIMED_NEW;
-        // Aggregate/struct copies into __ubuf__ are not a supported AscendC
-        // address-space operation.  Keep the 16-byte seed ABI, but issue its
-        // four scalar UB stores explicitly.
+        // This is stable threshold compaction, not a per-receipt top-1/top-M
+        // heuristic: every non-resident source that passed the native score
+        // threshold is appended in scan order until the fixed transport batch
+        // is full.  Aggregate/struct copies into __ubuf__ are not a supported
+        // AscendC address-space operation, so keep the 16-byte seed ABI and
+        // issue its four scalar UB stores explicitly.
         const uint32_t seed_index = speculativePendingSeedCount_[buffer_index];
         localSeeds_[buffer_index][seed_index].row = static_cast<int32_t>(row);
         localSeeds_[buffer_index][seed_index].source =
