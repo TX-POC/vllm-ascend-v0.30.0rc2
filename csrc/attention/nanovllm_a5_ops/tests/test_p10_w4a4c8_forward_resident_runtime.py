@@ -58,6 +58,7 @@ KEY_HEADS = 1
 HEAD_DIM = 128
 BLOCK_TOKENS = 128
 TOPK = 2048
+SCORE_SURFACE_SLICES = (256 + INDEX_HEADS - 1) // INDEX_HEADS
 PACKED_KV_ROW_BYTES = 656
 ENTRY_BYTES = BLOCK_TOKENS * PACKED_KV_ROW_BYTES
 QUEUE_COUNT = int(os.environ.get("P10_BENCH_QUEUE_COUNT", "1"))
@@ -832,14 +833,15 @@ def _build_forward_inputs(
     from nanovllm_p10_forward_bridge.p10_forward_graph import P10ForwardInputs
 
     blocks = SOURCE_TOKENS // BLOCK_TOKENS
-    score_slices = (256 + INDEX_HEADS - 1) // INDEX_HEADS
     receipt_capacity = BATCH * blocks
     canonical_sparse = torch.full(
         (BATCH, 1, TOPK), -1, dtype=torch.int32, device=device
     )
     canonical_lens = torch.zeros(BATCH, dtype=torch.int32, device=device)
     score_surface = torch.zeros(
-        (BATCH, score_slices, SOURCE_TOKENS), dtype=torch.uint16, device=device
+        (BATCH, SCORE_SURFACE_SLICES, SOURCE_TOKENS),
+        dtype=torch.uint16,
+        device=device,
     )
     receipt_ring = torch.zeros(
         (receipt_capacity, RECEIPT_WORDS), dtype=torch.int64, device=device
@@ -996,6 +998,12 @@ def _build_forward_inputs(
     tensors = {
         "canonical_sparse": canonical_sparse,
         "canonical_lens": canonical_lens,
+        # Keep the graph-visible Stage-A alias in the fixture inventory too.
+        # Cold calibration reads the authoritative P10ForwardInputs field,
+        # then verifies this convenience inventory still names that exact
+        # tensor.  This prevents a later fixture-only refactor from silently
+        # losing the score surface that Stage A has actually populated.
+        "score_surface": score_surface,
         "receipt_ring": receipt_ring,
         "receipt_state": receipt_state,
         "forward_control": forward_control,
@@ -1837,9 +1845,47 @@ def _calibrate_mock_score_cutoff(
         )
 
     # Stage A's active C8 pass publishes the native scores consumed by Top-K
-    # in slice zero.  Move only that one slice for cold controller calibration;
-    # no Q/K is recomputed and the timed aliases are allocated later.
-    score_keys = calibration_tensors["score_surface"][:, 0, :].detach().to(
+    # in the cold-bound, graph-visible input alias.  Read that authoritative
+    # alias rather than a convenience dictionary: it is the exact tensor that
+    # was supplied to _launch_stage_a above.  The inventory identity check is
+    # deliberately fail-closed, so a fixture bookkeeping regression cannot
+    # turn into a late KeyError or accidentally select another buffer.
+    score_surface = calibration_inputs.score_surface
+    if not isinstance(score_surface, torch.Tensor):
+        _blocked(
+            "p10_calibration_score_surface_not_tensor:"
+            f"type={type(score_surface).__name__}"
+        )
+    if calibration_tensors.get("score_surface") is not score_surface:
+        _blocked(
+            "p10_calibration_score_surface_inventory_alias_mismatch:"
+            f"keys={','.join(sorted(calibration_tensors))}"
+        )
+    expected_score_surface_shape = (
+        BATCH,
+        SCORE_SURFACE_SLICES,
+        SOURCE_TOKENS,
+    )
+    if (
+        score_surface.dtype != torch.uint16
+        or tuple(score_surface.shape) != expected_score_surface_shape
+        or score_surface.device.type != "npu"
+    ):
+        _blocked(
+            "p10_calibration_score_surface_alias_invalid:"
+            f"dtype={score_surface.dtype}:shape={tuple(score_surface.shape)}:"
+            f"device={score_surface.device}:expected_shape={expected_score_surface_shape}"
+        )
+    print(
+        "P10_CALIBRATION_SCORE_SURFACE "
+        "alias=forward_inputs score_surface_inventory=1 "
+        f"dtype={score_surface.dtype} shape={list(score_surface.shape)} "
+        f"device={score_surface.device}",
+        flush=True,
+    )
+    # Move only active slice zero to CPU for cold controller calibration; no
+    # Q/K is recomputed and the timed aliases are allocated later.
+    score_keys = score_surface[:, 0, :].detach().to(
         device="cpu", dtype=torch.int32
     ).contiguous()
     expected_score_shape = (BATCH, SOURCE_TOKENS)

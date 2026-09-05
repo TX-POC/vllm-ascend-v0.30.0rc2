@@ -352,6 +352,27 @@ class P10ProductRunnerContractTest(unittest.TestCase):
         self.assertNotIn("INITIAL_SCORE_CUTOFF_U16", self.fixture)
         self.assertNotIn("score_keys[miss_mask_cpu]", self.fixture)
 
+    def test_cold_calibration_reads_the_authoritative_stage_a_score_alias(self) -> None:
+        """Fixture bookkeeping may not replace the graph-visible score alias.
+
+        The calibration launch passes ``P10ForwardInputs.score_surface`` to
+        Stage A.  Its cutoff must be derived from that exact alias, while the
+        returned fixture inventory keeps the same object available for
+        diagnostics.  This guards the missing-dict-key regression without
+        requiring an NPU during static validation.
+        """
+
+        for token in (
+            '"score_surface": score_surface',
+            "score_surface = calibration_inputs.score_surface",
+            'calibration_tensors.get("score_surface") is not score_surface',
+            "p10_calibration_score_surface_not_tensor",
+            "P10_CALIBRATION_SCORE_SURFACE ",
+            "expected_score_surface_shape",
+        ):
+            self.assertIn(token, self.fixture)
+        self.assertNotIn('calibration_tensors["score_surface"]', self.fixture)
+
     def test_b16_bootstrap_bounds_only_the_pre_timing_batch_put_wave(self) -> None:
         """Large cold loading must not consume the eager AIV CQ budget at once.
 
