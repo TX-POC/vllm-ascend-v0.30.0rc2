@@ -72,9 +72,23 @@ RECEIPT_WORDS = 5
 # ``SPECULATIVE_SLOT_CAPACITY_PER_ROW`` is persistent resident storage, not
 # the transport batch size.  The device executor still owns exactly two 64
 # seed UB buffers and Posts 64 requests per microbatch.  A forward may use
-# many such microbatches without reusing a resident slot.
+# many such microbatches without reusing a resident slot.  More importantly,
+# this value sizes one *global* forward-resident band; it does not assign a
+# private band to each request.  Stage B claims that band through one atomic
+# ``speculative_slot_cursor``.
+#
+# A W4A4C8 sortable score can have a tie plateau at the predicted cutoff.
+# ``score >= cutoff`` must admit the whole plateau: clipping it to the nominal
+# K+guard rank would change the requested threshold semantics and can omit a
+# real final winner.  Reserve one 64-entry Post microbatch per request solely
+# as bounded storage headroom for that plateau.  It does not cause extra Gets;
+# actual Posts still come only from score-threshold candidates that miss the
+# pre-existing resident cache.
 PREDICTED_SCORE_GUARD_SOURCES_PER_ROW = int(
     os.environ.get("P10_MOCK_SCORE_GUARD_SOURCES_PER_ROW", "256")
+)
+P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW = int(
+    os.environ.get("P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW", "64")
 )
 PREDICTED_SCORE_WINDOW_PER_ROW = TOPK + PREDICTED_SCORE_GUARD_SOURCES_PER_ROW
 _EXPECTED_SPECULATIVE_MISSES_PER_ROW = (
@@ -84,7 +98,15 @@ _EXPECTED_SPECULATIVE_MISSES_PER_ROW = (
 ) // KV_MISS_DENOMINATOR
 SPECULATIVE_SLOT_CAPACITY_PER_ROW = max(
     64,
-    ((_EXPECTED_SPECULATIVE_MISSES_PER_ROW + 63) // 64) * 64,
+    (
+        (
+            _EXPECTED_SPECULATIVE_MISSES_PER_ROW
+            + P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW
+            + 63
+        )
+        // 64
+    )
+    * 64,
 )
 SPECULATIVE_ROWS = BATCH * SPECULATIVE_SLOT_CAPACITY_PER_ROW
 RECALL_ROWS = BATCH * TOPK
@@ -1726,6 +1748,11 @@ def _validate_workload_profile() -> None:
             "invalid_p10_mock_score_guard_sources_per_row:"
             f"{PREDICTED_SCORE_GUARD_SOURCES_PER_ROW}"
         )
+    if P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW < 0:
+        _blocked(
+            "invalid_p10_mock_score_tie_headroom_per_row:"
+            f"{P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW}"
+        )
     configured_cutoff = _configured_score_cutoff_u16()
     configured_policy = (
         "environment_override"
@@ -1741,7 +1768,10 @@ def _validate_workload_profile() -> None:
         "input=predicted_score_cutoff_u16[B] "
         f"policy={configured_policy} broadcast_override_u16={configured_cutoff} "
         f"predicted_window_per_row={PREDICTED_SCORE_WINDOW_PER_ROW} "
+        f"expected_speculative_misses_per_request={_EXPECTED_SPECULATIVE_MISSES_PER_ROW} "
+        f"score_tie_headroom_per_request={P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW} "
         f"speculative_slot_capacity_per_row={SPECULATIVE_SLOT_CAPACITY_PER_ROW} "
+        f"speculative_band_global_capacity={SPECULATIVE_ROWS} "
         f"trace={int(STAGE_B_RECEIPT_TRACE)}",
         flush=True,
     )
@@ -1932,14 +1962,6 @@ def _calibrate_mock_score_cutoff(
     eligible_misses_by_row = torch.count_nonzero(
         eligible_mask & miss_mask_cpu, dim=1
     )
-    if torch.any(eligible_misses_by_row > SPECULATIVE_SLOT_CAPACITY_PER_ROW):
-        _blocked(
-            "p10_mock_speculative_band_too_small:"
-            f"eligible_misses_max={int(eligible_misses_by_row.max().item())}:"
-            f"capacity_per_row={SPECULATIVE_SLOT_CAPACITY_PER_ROW}:"
-            f"cutoff_min={int(cutoff_by_row.min().item())}"
-        )
-
     final_miss_mask = miss_mask_cpu.gather(1, canonical)
     final_misses_by_row = torch.count_nonzero(final_miss_mask, dim=1)
     final_score_eligible_by_row = torch.count_nonzero(
@@ -1953,6 +1975,30 @@ def _calibrate_mock_score_cutoff(
         )
     eligible_miss_count = int(eligible_misses_by_row.sum().item())
     final_miss_count = int(final_misses_by_row.sum().item())
+    # The actual device ABI has one forward-global speculative slot band and
+    # one atomic cursor.  Check that true bound rather than inventing a
+    # per-request 128/192-slot partition in the fixture.  Keep the compact
+    # per-request vectors in this cold diagnostic so a future quantized-score
+    # tie can be understood without another exploratory run.
+    print(
+        "P10_MOCK_SCORE_ADMISSION "
+        "threshold_semantics=score_ge_predicted_cutoff "
+        f"eligible_sources_by_request={eligible_sources_by_row.tolist()} "
+        f"eligible_misses_by_request={eligible_misses_by_row.tolist()} "
+        f"eligible_misses_total={eligible_miss_count} "
+        f"eligible_misses_max={int(eligible_misses_by_row.max().item())} "
+        f"speculative_band_global_capacity={SPECULATIVE_ROWS} "
+        f"score_tie_headroom_per_request={P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW}",
+        flush=True,
+    )
+    if eligible_miss_count > SPECULATIVE_ROWS:
+        _blocked(
+            "p10_mock_speculative_band_too_small:"
+            f"eligible_misses_total={eligible_miss_count}:"
+            f"eligible_misses_max={int(eligible_misses_by_row.max().item())}:"
+            f"global_capacity={SPECULATIVE_ROWS}:"
+            f"cutoff_min={int(cutoff_by_row.min().item())}"
+        )
     if final_miss_count <= 0:
         _blocked("p10_mock_resident_miss_mask_has_no_final_misses")
     if eligible_miss_count <= final_miss_count:
@@ -1973,6 +2019,7 @@ def _calibrate_mock_score_cutoff(
         f"actual_topk_kth_min_u16={int(row_kth_keys.min().item())} "
         f"actual_topk_kth_max_u16={int(row_kth_keys.max().item())} "
         f"predicted_window_per_row={PREDICTED_SCORE_WINDOW_PER_ROW} "
+        f"score_tie_headroom_per_request={P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW} "
         f"eligible_sources_min={int(eligible_sources_by_row.min().item())} "
         f"eligible_sources_max={int(eligible_sources_by_row.max().item())} "
         f"eligible_misses_min={int(eligible_misses_by_row.min().item())} "
@@ -1980,7 +2027,7 @@ def _calibrate_mock_score_cutoff(
         f"eligible_misses={eligible_miss_count} final_winner_misses={final_miss_count} "
         f"overfetch_ratio={eligible_miss_count / final_miss_count:.4f} "
         f"speculative_capacity_per_row={SPECULATIVE_SLOT_CAPACITY_PER_ROW} "
-        f"speculative_capacity={SPECULATIVE_ROWS} "
+        f"speculative_band_global_capacity={SPECULATIVE_ROWS} "
         f"final_miss_score_eligible={int(final_score_eligible_by_row.sum().item())}",
         flush=True,
     )

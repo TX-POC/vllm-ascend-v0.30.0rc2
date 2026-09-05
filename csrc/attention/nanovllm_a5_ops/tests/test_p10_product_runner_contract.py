@@ -340,17 +340,25 @@ class P10ProductRunnerContractTest(unittest.TestCase):
             "predicted_score_cutoff_u16[B]",
             "PREDICTED_SCORE_GUARD_SOURCES_PER_ROW",
             "PREDICTED_SCORE_WINDOW_PER_ROW",
+            "P10_MOCK_SCORE_TIE_HEADROOM_PER_ROW",
             "torch.kthvalue(",
             "cutoff_by_row = window_cutoffs",
             "eligible_mask & miss_mask_cpu",
+            "P10_MOCK_SCORE_ADMISSION ",
             "P10_MOCK_SCORE_POLICY ",
             "mode=cold_stage_a_calibration",
             "final_miss_score_eligible=",
             "speculative_capacity_per_row=",
+            "speculative_band_global_capacity=",
+            "eligible_miss_count > SPECULATIVE_ROWS",
         ):
             self.assertIn(token, self.fixture)
         self.assertNotIn("INITIAL_SCORE_CUTOFF_U16", self.fixture)
         self.assertNotIn("score_keys[miss_mask_cpu]", self.fixture)
+        self.assertNotIn(
+            "torch.any(eligible_misses_by_row > SPECULATIVE_SLOT_CAPACITY_PER_ROW)",
+            self.fixture,
+        )
 
     def test_cold_calibration_reads_the_authoritative_stage_a_score_alias(self) -> None:
         """Fixture bookkeeping may not replace the graph-visible score alias.
