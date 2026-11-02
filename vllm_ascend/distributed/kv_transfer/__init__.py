@@ -15,14 +15,20 @@
 # limitations under the License.
 #
 
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-
 
 def register_connector():
+    # KVAF config is imported during platform discovery. Defer distributed
+    # imports until registration to avoid re-entering current_platform setup.
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
     # Override vLLM KV offloading specs with Ascend NPU handlers. The
     # scheduler-side managers stay upstream; only worker-side transfers use
     # torch.npu streams and the Ascend batched memcpy op.
     from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
+    KVConnectorFactory.register_connector(
+        "KVAFConnector", "vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache", "KVAFConnector"
+    )
 
     for name, class_name in (
         ("CPUOffloadingSpec", "NPUOffloadingSpec"),

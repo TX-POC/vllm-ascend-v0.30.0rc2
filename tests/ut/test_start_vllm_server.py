@@ -38,6 +38,7 @@ class TestStartVllmServer(unittest.TestCase):
             proxy_names = ("http_proxy", "https_proxy", "ftp_proxy", "all_proxy")
             environment = dict(os.environ, PATH=f"{directory}{os.pathsep}{os.environ['PATH']}")
             environment.pop("BASH_ENV", None)
+            environment.pop("ASCEND_LAUNCH_BLOCKING", None)
             for name in proxy_names:
                 environment[name] = environment[name.upper()] = "http://proxy.invalid:8080"
             result = subprocess.run(
@@ -66,6 +67,7 @@ class TestStartVllmServer(unittest.TestCase):
             self.assertIs(configs["--speculative-config"]["enforce_eager"], True)
             self.assertEqual(configs["--additional-config"], {"enable_dsa_cp": False})
             exported = launch["environment"]
+            self.assertEqual(exported["ASCEND_LAUNCH_BLOCKING"], "0")
             for name in proxy_names:
                 self.assertNotIn(name, exported)
                 self.assertNotIn(name.upper(), exported)
@@ -85,11 +87,14 @@ class TestStartVllmServer(unittest.TestCase):
 
             # The editable switch must reach vLLM as a JSON boolean in both states.
             script.write_text(content.replace("enable_dsa_cp=false", "enable_dsa_cp=true", 1))
+            environment["ASCEND_LAUNCH_BLOCKING"] = "1"
             result = subprocess.run(
                 ["bash", str(script)], cwd=directory, env=environment, capture_output=True, text=True, timeout=10
             )
             self.assertEqual(result.returncode, 23, result.stderr)
-            arguments = json.loads(capture.read_text())["arguments"]
+            launch = json.loads(capture.read_text())
+            self.assertEqual(launch["environment"]["ASCEND_LAUNCH_BLOCKING"], "1")
+            arguments = launch["arguments"]
             additional_config = json.loads(arguments[arguments.index("--additional-config") + 1])
             self.assertIs(additional_config["enable_dsa_cp"], True)
 

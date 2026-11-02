@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Connection settings; DDR budget is per vLLM worker, not per TP group."""
+
+from dataclasses import dataclass, field
+from math import isfinite
+from typing import Any
+
+
+@dataclass(frozen=True)
+class KVAFConfig:
+    enabled: bool = False
+    cpu_address: str = "127.0.0.1:28999"
+    cpu_addresses: dict[str, str] = field(default_factory=dict)  # Physical NPU ID -> host:port; overrides cpu_address.
+    build_dir: str = ""
+    ddr_size_gb: float = 1.0
+    hot_tokens: int = 8192  # Per request/layer; excludes the fixed 384-token ABC tail.
+    npu_core_count: int = 2
+    jettys_per_core: int = 2
+    verify_put: bool = False  # Read back one prefill and one decode block per worker for byte comparison.
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("kvaf_config.enabled must be true or false")
+        if type(self.verify_put) is not bool:
+            raise ValueError("kvaf_config.verify_put must be true or false")
+        if not isinstance(self.build_dir, str) or (self.enabled and not self.build_dir.strip()):
+            raise ValueError("kvaf_config.build_dir must name the KVAF build-npu directory")
+        if not isinstance(self.cpu_addresses, dict) or any(
+            not isinstance(key, str) or not key.isdecimal() or str(int(key)) != key for key in self.cpu_addresses
+        ):
+            raise ValueError("kvaf_config.cpu_addresses must map physical NPU IDs (e.g. '4') to host:port")
+        for address in (self.cpu_address, *self.cpu_addresses.values()):
+            if not isinstance(address, str):
+                raise ValueError("KVAF CPU addresses must be host:port strings")
+            host, separator, port = address.rpartition(":")
+            if not separator or not host or not port.isdigit() or not 0 < int(port) <= 65535:
+                raise ValueError("KVAF CPU addresses must be host:port with port in 1..65535")
+        if type(self.ddr_size_gb) not in (int, float) or not isfinite(self.ddr_size_gb) or self.ddr_size_gb <= 0:
+            raise ValueError("kvaf_config.ddr_size_gb must be finite and positive (per worker)")
+        if type(self.hot_tokens) is not int or self.hot_tokens < 8192 or self.hot_tokens % 128:
+            raise ValueError("kvaf_config.hot_tokens must be an integer >= 8192 and a multiple of 128")
+        # Limits of the pinned KVAF native runtime.
+        for name, maximum in (("npu_core_count", 48), ("jettys_per_core", 64)):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 < value <= maximum:
+                raise ValueError(f"kvaf_config.{name} must be an integer in 1..{maximum}")
+
+    @classmethod
+    def from_dict(cls, values: Any) -> "KVAFConfig":
+        if not isinstance(values, dict):
+            raise ValueError("additional_config.kvaf_config must be an object")
+        unknown = values.keys() - cls.__dataclass_fields__.keys()
+        if unknown:
+            raise ValueError(f"Unknown kvaf_config settings: {sorted(unknown)}")
+        return cls(**values)

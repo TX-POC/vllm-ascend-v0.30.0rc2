@@ -718,6 +718,7 @@ class NPUWorker(WorkerBase):
 
         bytes_per_block = 0
         sum_pages = 0
+        target_names = getattr(model_runner, "kvaf_target_layer_names", set())
         for group in kv_cache_groups:
             group_pages = 0
             for layer_name in group.layer_names:
@@ -727,8 +728,26 @@ class NPUWorker(WorkerBase):
                 else:
                     layer_spec = group_spec
                 group_pages += layer_spec.page_size_bytes
-                sum_pages += layer_spec.page_size_bytes
+                if layer_name not in target_names:
+                    sum_pages += layer_spec.page_size_bytes
             bytes_per_block = max(bytes_per_block, group_pages)
+        if target_names:
+            # Hot/ABC/prefill workspaces were allocated before profiling. Only
+            # Indexer/draft grow with scheduler logical block capacity.
+            reserve = (20 << 20) + len(kv_cache_spec) * (2 << 20)
+            speculative = self.vllm_config.speculative_config
+            lookahead = speculative.num_speculative_tokens if speculative else 0
+            length = self.model_config.max_model_len + lookahead
+            workload = 1 + self.vllm_config.scheduler_config.max_num_seqs * sum(
+                (length + group.kv_cache_spec.block_size - 1) // group.kv_cache_spec.block_size + 1
+                for group in kv_cache_groups
+            )
+            blocks = min(workload, max(0, available_memory - reserve) // sum_pages)
+            logger.info(
+                "KVAF HBM budget: logical_blocks=%s auxiliary_bytes_per_block=%s; "
+                "Target workspaces already profiled", blocks, sum_pages,
+            )
+            return blocks * bytes_per_block
         if bytes_per_block > 0 and sum_pages > bytes_per_block:
             scale = bytes_per_block / sum_pages
             logger.info(

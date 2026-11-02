@@ -157,6 +157,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     apply_layerwise_kv_cache_plan,
     get_layerwise_reuse_config,
 )
+from vllm_ascend.distributed.kv_transfer.kvaf.adapter import KVAFAdapter
+from vllm_ascend.distributed.kv_transfer.kvaf.layout import describe_cache_layouts
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
     CopySfaRequestStates,
 )
@@ -424,6 +426,9 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.kvaf_adapter: KVAFAdapter | None = None
+        self.kvaf_cache_state = None
+        self.kvaf_target_layer_names = set()
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         self.kvpp = KVPPRuntime()
@@ -983,7 +988,7 @@ class NPUModelRunner(GPUModelRunner):
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                self.kvaf_aux_caches if self.kvaf_target_layer_names else self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -2283,6 +2288,12 @@ class NPUModelRunner(GPUModelRunner):
             # allocated blocks that may reuse the same physical KV cache IDs.
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        if self.kvaf_adapter is not None and self.kvaf_adapter.writer is not None:
+            # Retire old request generations before cache blocks can be reused.
+            self.kvaf_adapter.writer.release_requests(
+                scheduler_output.finished_req_ids | (scheduler_output.preempted_req_ids or set())
+            )
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
@@ -2309,6 +2320,11 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                if self.kvaf_adapter is not None and self.kvaf_adapter.writer is not None:
+                    with record_function_or_nullcontext("kvaf: request_prepare_and_feedback_wait"):
+                        self.kvaf_adapter.writer.prepare_requests(
+                            self.requests, scheduler_output.num_scheduled_tokens
+                        )
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
@@ -2549,6 +2565,25 @@ class NPUModelRunner(GPUModelRunner):
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
         active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_mode)
+        if self.kvaf_adapter is not None and self.kvaf_adapter.writer is not None:
+            # Use final input-batch order, not scheduler dictionary order.
+            # Stage fixed-address NPU inputs for the original LIDU.
+            kvaf_decode = all(
+                self.requests[req_id].num_computed_tokens >= self.requests[req_id].num_prompt_tokens
+                for req_id in self.input_batch.req_ids[:num_reqs]
+            )
+            if not kvaf_decode:
+                # A prefix-cache replay can leave one prompt token and look
+                # like decode. It must not replay the hot-only decode graph.
+                cudagraph_mode = CUDAGraphMode.NONE
+            with record_function_or_nullcontext("kvaf: cache_input_upload"):
+                self.kvaf_adapter.writer.feedback.prepare(
+                    self.input_batch.req_ids[:num_reqs],
+                    scheduler_output.num_scheduled_tokens,
+                    decode=kvaf_decode,
+                    padded_requests=num_reqs_padded,
+                )
+                self.kvaf_cache_state.policy.align_decode_writes(self.positions)
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2671,10 +2706,18 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.kv_connector_output = kv_connector_output
 
+        if self.kvaf_adapter is not None and self.kvaf_adapter.writer is not None:
+            with record_function_or_nullcontext("kvaf: feedback_d2h_submit"):
+                self.kvaf_adapter.writer.feedback.after_forward()
+
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+        if self.kvaf_adapter is not None and self.kvaf_adapter.writer is not None:
+            # CPU lengths now exclude rejected drafts from the previous step.
+            with record_function_or_nullcontext("kvaf: batch_put"):
+                self.kvaf_adapter.writer.put_requests(self.requests, scheduler_output.num_scheduled_tokens)
         return None
 
     def _num_drafter_query_tokens(self) -> int:
@@ -4335,6 +4378,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def profile_run(self) -> None:
         self.eplb_warmup()
+        self._initialize_kvaf_cache_state()
         if self.sparse_kv_offload_enabled:
             allocate_kv_offload_topk_profile_buffers(
                 getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec(),
@@ -4350,6 +4394,46 @@ class NPUModelRunner(GPUModelRunner):
             with disable_compilation(self.get_model()):
                 self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         super().profile_run()
+
+    def _initialize_kvaf_cache_state(self):
+        if not self.ascend_config.kvaf_config.enabled or self.kvaf_cache_state is not None:
+            return
+        from vllm_ascend.distributed.kv_transfer.kvaf.state import DeviceCacheState
+        from vllm_ascend.distributed.kv_transfer.kvaf.layout import index_groups
+        from vllm_ascend.distributed.kv_transfer.kvaf.layout import TOPK
+        from vllm_ascend.distributed.kv_transfer.kvaf.cache_policy import TAIL, KVCachePolicy
+
+        specs = getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec()
+        drafts = frozenset(getattr(self.drafter, "attn_layer_names", ()))
+        targets = {
+            name: spec for name, spec in specs.items()
+            if name not in drafts and not hasattr(spec, "sfa_dcp_replicated_indexer_size")
+        }
+        if not targets:
+            raise ValueError("KVAF device inputs require Target cache layers")
+        block_size = max(spec.block_size for spec in targets.values())
+        tokens = self.model_config.max_model_len + self.num_spec_tokens
+        tokens = (tokens + block_size - 1) // block_size * block_size
+        tokens = max(TOPK, tokens) + TOPK  # Empty candidates cannot overlap resident KV.
+        hot_tokens = self.ascend_config.kvaf_config.hot_tokens
+        tokens = max(tokens, hot_tokens + TAIL)
+        # FIA graph padding can append one dummy request beyond max_num_reqs.
+        groups = index_groups(targets, self.compilation_config.static_forward_context)
+        self.kvaf_cache_state = DeviceCacheState([g[0] for g in groups], self.max_num_reqs + 1, tokens, self.device)
+        self.kvaf_cache_state.groups = groups
+        self.kvaf_cache_state.indices.update({name: i for i, group in enumerate(groups) for name in group})
+        self.kvaf_cache_state.policy = KVCachePolicy(
+            self.kvaf_cache_state,
+            self.max_num_tokens,
+            self.model_config.max_model_len,
+            group_sizes=[len(g) for g in groups],
+            hot_tokens=hot_tokens,
+        )
+        self.kvaf_target_layer_names = set(targets)
+        logger.info(
+            "KVAF device inputs: layers=%s requests=%s tokens=%s bytes=%s; included in memory profiling",
+            len(targets), self.max_num_reqs, tokens, self.kvaf_cache_state.nbytes,
+        )
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
@@ -4698,6 +4782,67 @@ class NPUModelRunner(GPUModelRunner):
             kv_caches=kv_caches,
         )
 
+        # Connection setup performs a native RMA probe: do it once, after the
+        # final cache views exist and before warmup/graph capture begins.
+        if self.ascend_config.kvaf_config.enabled:
+            if self.kvaf_adapter is not None:
+                raise RuntimeError("KVAF cache initialization cannot be repeated")
+            if (
+                self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.prefill_context_parallel_size != 1
+                or self.parallel_config.decode_context_parallel_size != 1
+            ):
+                raise ValueError("KVAF Target cache writes currently require PP=1, PCP=1 and DCP=1")
+            self.kvaf_aux_caches = [
+                cache for name, cache in kv_caches.items() if name not in self.kvaf_target_layer_names
+            ]
+            layouts = describe_cache_layouts(
+                kv_caches,
+                self.kv_cache_config,
+                draft_layer_names=getattr(self.drafter, "attn_layer_names", ()),
+                layer_specs=self._get_layer_kv_cache_specs(self.kv_cache_config),
+            )
+            self.kvaf_adapter = KVAFAdapter(
+                self.ascend_config.kvaf_config,
+                torch.npu.current_device(),
+                layouts,
+                groups=self.kvaf_cache_state.groups,
+                log_dir=self.ascend_config.ascend_log_path,
+                tp_rank=self.tp_rank,
+                dp_rank=self.dp_rank,
+                # Memory profiling has already initialized HCCL for TP/EP.
+                # Repeating device RaInit can reset its live HDC mutex.
+                reuse_device_ra=(
+                    self.parallel_config.tensor_parallel_size > 1
+                    or (
+                        self.parallel_config.enable_expert_parallel
+                        and self.parallel_config.data_parallel_size > 1
+                    )
+                ),
+            )
+            self.kvaf_adapter.connect()
+            self.kvaf_adapter.bind_caches(kv_caches)
+            self._initialize_kvaf_cache_state()
+            self.kvaf_adapter.writer.feedback.bind_device_pool(self.kvaf_cache_state)
+            self.kvaf_adapter.writer.feedback.bind(self.compilation_config.static_forward_context)
+            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import RequestSnapshotStore
+            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import AuxiliarySnapshotStore
+
+            writer = self.kvaf_adapter.writer
+            geometry = writer.groups[0].geometry
+            auxiliary = AuxiliarySnapshotStore(
+                writer.runtimes[geometry], writer.slots[geometry], layouts, kv_caches,
+                token_bytes=geometry[0], tokens_per_block=geometry[1],
+            )
+            get_kv_transfer_group().bind_archive(RequestSnapshotStore(writer, auxiliary), self.tp_rank)
+
+    def shutdown(self) -> None:
+        if self.kvaf_adapter is not None:
+            self.kvaf_adapter.close()
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if callable(parent_shutdown):
+            parent_shutdown()
+
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
@@ -4964,6 +5109,9 @@ class NPUModelRunner(GPUModelRunner):
             return allocate_kvpp_cache(self.vllm_config, kv_cache_config, self.device)
         # init kv cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
+        if self.kvaf_cache_state is not None:
+            for name, index in self.kvaf_cache_state.indices.items():
+                kv_cache_raw_tensors[name] = (self.kvaf_cache_state.policy.hot[index].view(-1),)
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
@@ -5230,6 +5378,8 @@ class NPUModelRunner(GPUModelRunner):
                         scale_tensor_size = None
                     # Layerwise reuse allocates the representative once.
                     for layer_name_inner in allocation_layers:
+                        if layer_name_inner in self.kvaf_target_layer_names:
+                            continue
                         if scale_tensor_size is not None:
                             kv_cache_raw_tensors[layer_name_inner] = self._allocate_sparse_c8_indexer_tensors(
                                 dsa_k_tensor_size=k_tensor_size,
@@ -5284,6 +5434,8 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         assert v_tensor_size is not None
                         for layer_name_inner in allocation_layers:
+                            if layer_name_inner in self.kvaf_target_layer_names:
+                                continue
                             if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
                                 kv_cache_raw_tensors[layer_name_inner] = (
                                     allocate_kv_cache_tensors_for_sparse_kv_offload(
@@ -5299,6 +5451,8 @@ class NPUModelRunner(GPUModelRunner):
                     # main: every layer owns its own region; give each layer a
                     # private (k, v) so block indices don't collide across layers.
                     for layer_name_inner in allocation_layers:
+                        if layer_name_inner in self.kvaf_target_layer_names:
+                            continue
                         if (
                             "attn" in layer_name_inner
                             and "linear_attn" not in layer_name_inner
@@ -5406,6 +5560,10 @@ class NPUModelRunner(GPUModelRunner):
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
             for layer_name in group.layer_names:
+                if layer_name in self.kvaf_target_layer_names:
+                    index = self.kvaf_cache_state.indices[layer_name]
+                    kv_caches[layer_name] = (self.kvaf_cache_state.policy.hot[index].view(self.c8_cache_dtype),)
+                    continue
                 if layer_name in self.runner_only_attn_layers:
                     continue
 
@@ -6479,7 +6637,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
             kernel_block_sizes=self.kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
-            runner_only_attn_layers=self.runner_only_attn_layers,
+            runner_only_attn_layers=set(self.runner_only_attn_layers) | self.kvaf_target_layer_names,
             static_forward_context=(self.compilation_config.static_forward_context),
         )
 

@@ -26,6 +26,7 @@ from benchmark import (  # noqa: E402
     ProfileCoordinator,
     PromptSource,
     Reporter,
+    prefix_probe,
     preflight,
     run_level,
     summarize_http,
@@ -68,7 +69,9 @@ class Handler(BaseHTTPRequestHandler):
         usage = {
             "prompt_tokens": len(body["prompt"]),
             "completion_tokens": body["max_tokens"],
-            "prompt_tokens_details": {"cached_tokens": max(0, len(body["prompt"]) - 1)},
+            "prompt_tokens_details": {
+                "cached_tokens": getattr(self.server, "cached_tokens", max(0, len(body["prompt"]) - 1))
+            },
         }
         self.wfile.write(("data: " + json.dumps({"choices": [], "usage": usage}) + "\n\n").encode())
         if body["model"] != "truncated":
@@ -195,8 +198,31 @@ class BenchmarkHttpTests(unittest.TestCase):
             self.assertEqual(result["observed_tokens_per_request"], {"a": 3, "b": 0 if early_end else 3})
         self.assertEqual([request[0] for request in self.server.requests], ["/start_profile", "/stop_profile"] * 2)
 
+    def test_terminal_displays_real_prefix_misses_not_just_successful_http(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(result_dir=directory, prefix_warmup=True)
+            reporter = Reporter(config)
+            reporter.report["levels"].append(
+                {
+                    "batch": 2,
+                    "status": "error",
+                    "http": {"success": 2},
+                    "requests": [{"cached_tokens": 130432}, {"cached_tokens": 0}],
+                    "errors": ["prefix verification needs cached_tokens>=130432; received 0"],
+                }
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                reporter.display()
+            self.assertIn("[130432, 0]", output.getvalue())
+            self.assertIn("status=error", output.getvalue())
+            self.assertIn("error: prefix verification", output.getvalue())
+
     def test_wave_routes_all_dp_requests_concurrently(self):
         self.config.data_parallel_size = 2
+        self.config.prefix_warmup = True
+        self.config.cache_block_size = 8
+        self.server.cached_tokens = 16  # 32-token input with one additional MTP tail block.
         http = Http(self.config)
         source = PromptSource(self.config, http)
         self.assertNotEqual(source.build(0), source.build(1))
@@ -205,7 +231,7 @@ class BenchmarkHttpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             self.config.result_dir = directory
             reporter = Reporter(self.config)
-            row = run_level(self.config, http, source, 2, reporter)
+            row = run_level(self.config, http, source, 2, reporter, prefix_extra_recompute_blocks=[1, 1])
             self.assertEqual(row["status"], "ok")
             self.assertEqual(row["http"]["success"], 4)
             self.assertEqual(row["overlap"]["status"], "ready")
@@ -215,6 +241,45 @@ class BenchmarkHttpTests(unittest.TestCase):
         requests = [request for request in self.server.requests if request[0] == "/v1/completions"]
         self.assertEqual(sorted(int(headers["X-Data-Parallel-Rank"]) for _, headers, _ in requests), [0, 0, 1, 1])
         self.assertEqual(len({headers["X-Request-Id"] for _, headers, _ in requests}), 4)
+
+
+class BenchmarkPrefixTests(unittest.TestCase):
+    def test_aligned_and_unaligned_replay_thresholds(self):
+        for length, normal, mtp in ((4096, 3968, 3840), (4097, 4096, 3968), (130000, 129920, 129792)):
+            for extra, threshold in ((0, normal), (1, mtp)):
+                with self.subTest(length=length, extra=extra):
+                    self.assertEqual(
+                        verify_cached({"status": "ok", "cached_tokens": threshold}, length, 128, extra), extra
+                    )
+                    with self.assertRaises(BenchmarkError):
+                        verify_cached({"status": "ok", "cached_tokens": threshold - 1}, length, 128, extra)
+            with self.assertRaises(BenchmarkError):
+                verify_cached({"status": "ok", "cached_tokens": mtp}, length, 128)
+        for cached in (None, 0, 3712):
+            with self.subTest(cached=cached), self.assertRaises(BenchmarkError):
+                verify_cached({"status": "ok", "cached_tokens": cached}, 4096, 128, 1)
+
+    def test_probe_calibrates_each_dp_and_rejects_insufficient_hits(self):
+        config = Config(input_tokens=130000, data_parallel_size=2)
+        source = mock.Mock()
+        source.build.return_value = [11] * 4096
+        http = mock.Mock()
+        http.complete.side_effect = [{"status": "ok", "cached_tokens": cached} for cached in (0, 3968, 0, 3840)]
+        results = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prefix_probe(config, http, source, 128, results), [0, 1])
+        self.assertEqual(len(results), 4)
+        self.assertEqual([call.args[3] for call in http.complete.call_args_list], [0, 0, 1, 1])
+        for cached in (None, 0, 3712):
+            http.complete.side_effect = [
+                {"status": "ok", "cached_tokens": 0},
+                {"status": "ok", "cached_tokens": cached},
+            ]
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(BenchmarkError):
+                prefix_probe(config, http, source, 128, [])
+        config.input_tokens = 256
+        with self.assertRaisesRegex(BenchmarkError, "longer than two cache blocks"):
+            prefix_probe(config, http, source, 128, [])
 
 
 if __name__ == "__main__":

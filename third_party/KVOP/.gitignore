@@ -1,0 +1,4 @@
+**/build/
+**/_custom_opp/
+**/*.so
+**/*.egg-info/
