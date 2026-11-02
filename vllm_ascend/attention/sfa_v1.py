@@ -1920,6 +1920,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping_sfa = self._get_sfa_kv_slot_mapping(attn_metadata)
+        hot_binding = getattr(self, "kvaf_hot", None)
+        hot_active = hot_binding is not None
+        if hot_active:
+            hot, hot_layer = hot_binding
+            kv_cache = (hot.attention_caches[hot_layer], *kv_cache[1:])
+            slot_mapping_sfa = hot.write_slots_for(hot_layer, getattr(self, "kvaf_group_offset", 0))[
+                : slot_mapping_sfa.shape[0]
+            ]
         indexer_attn_metadata = self._get_indexer_attn_metadata()
 
         # Inputs and outputs may be padded for CUDA graphs
@@ -2015,7 +2023,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos,
                 sin,
                 kv_cache,
-                parallel_context.kv_slot_mapping,
+                slot_mapping_sfa if hot_active else parallel_context.kv_slot_mapping,
                 attn_metadata,
             )
             k_pe, k_nope = kv_outputs[:2]
@@ -2049,7 +2057,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 fused_kv_no_split,
                 kv_ag_handles,
                 kv_cache,
-                self._get_sfa_kv_slot_mapping(attn_metadata),
+                slot_mapping_sfa,
                 attn_metadata,
                 parallel_context.gather_full_o_proj,
             )
@@ -2098,15 +2106,27 @@ class AscendSFAImpl(MLAAttentionImpl):
         # inside the indexer's forward would leave their gate closed.
         with attention_transfer_window():
             if has_local_query:
-                attn_output = self._execute_sparse_flash_attention_process(
-                    ql_nope,
-                    q_pe,
-                    kv_cache,
-                    topk_indices,
-                    attn_metadata,
-                    actual_seq_lengths_query,
-                    actual_seq_lengths_key,
-                )
+                if hot_active:
+                    attn_output = hot.attention(
+                        self,
+                        hot_layer,
+                        ql_nope,
+                        q_pe,
+                        topk_indices,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        full_graph=get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL,
+                    )
+                else:
+                    attn_output = self._execute_sparse_flash_attention_process(
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        topk_indices,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
+                    )
 
         if has_local_query:
             attn_output = self._v_up_proj(attn_output)

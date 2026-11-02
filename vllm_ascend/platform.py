@@ -353,6 +353,11 @@ class NPUPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults."""
+        if (vllm_config.additional_config or {}).get("kvaf_config", {}).get("enabled", False):
+            from vllm.config.kv_transfer import KVTransferConfig
+
+            if vllm_config.kv_transfer_config is None:
+                vllm_config.kv_transfer_config = KVTransferConfig(kv_connector="KVAFConnector", kv_role="kv_both")
 
         # TODO: Remove this memory-saving capture-size override and its ceiling
         # restoration once MC2 is no longer used.

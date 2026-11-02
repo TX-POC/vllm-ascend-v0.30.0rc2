@@ -30,6 +30,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.distributed.kv_transfer.kvaf.config import KVAFConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -634,6 +635,7 @@ class AscendConfig:
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
+    kvaf_config: Any = dataclasses.field(default_factory=KVAFConfig, kw_only=True)
 
     # ---- derived fields: sentinel default, after-validator overwrites ----
     enable_shared_expert_dp: bool = False
@@ -683,6 +685,8 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.kvaf_config.enabled and vc.use_v2_model_runner:
+            raise ValueError("KVAF step 1 is integrated with Model Runner V1 only.")
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -1837,6 +1841,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         vllm_config, additional_config.get("sparse_kv_offload_config", {})
     )
     kvpp_config = KVPPConfig.from_vllm_config(vllm_config)
+    kvaf_config = KVAFConfig.from_dict(additional_config.get("kvaf_config", {}))
     # dump_config: keep the mutual-exclusion / materialize logic as a factory
     # pre-step; the resolved path is passed as the dump_config_path field.
     dump_config_path = AscendConfig._resolve_dump_config_path(additional_config)
@@ -1863,6 +1868,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # Factory-injected: derived from additional_config.enable_kvpp + TP.
         "enable_kvpp",
         "kvpp_config",
+        "kvaf_config",
         # Factory-only input: materialized by _resolve_dump_config_path and
         # replaced with the validated dump_config_path field below.
         "dump_config",
@@ -1907,6 +1913,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         scheduler_config=sched,
         sparse_kv_offload_config=sparse_kv,
         kvpp_config=kvpp_config,
+        kvaf_config=kvaf_config,
         dump_config_path=dump_config_path,
         **kwargs,
     )

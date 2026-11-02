@@ -239,3 +239,6 @@ csrc/third_party/
 
 # local build cache
 .vllm_ascend/
+
+# KVAF source, native builds and CPU-side UMDK dependency
+/third_party/KVAF/

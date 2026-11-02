@@ -54,8 +54,12 @@ python3 scripts/benchmark.py
 | 展示/保存 | 实时终端表格、`live.json` 和 `result.json`，保存原始到达事件及错误 |
 
 APC 校验要求服务已开启 prefix caching 和 prompt token 统计。`--cache-block-size`
-需与服务一致，默认 128；校验阈值为输入长度减一个 cache block。
-缓存被驱逐或缺少 cached_tokens 时会报错。结果默认保存到客户端
+需与服务一致，默认 128。探针通过 HTTP 回放识别每个 DP 是否额外重算一个尾块
+（兼容 MTP），并将结果记录在 `prefix_extra_recompute_blocks` 中，按 DP rank 排列。
+正式请求的最低命中数为 `floor((输入长度 - 1) / 块大小) × 块大小 - 额外重算块数 × 块大小`；
+例如块大小 128、额外重算一块时，4096-token 探针要求命中 3840，130000-token 输入要求命中 129792。
+探针输入必须大于两个块；零命中、低于校准阈值或缺少 cached_tokens 时仍会报错。
+校准只允许额外回退一块，不代表识别出了服务的 MTP 配置。结果默认保存到客户端
 `scripts/result/<时间戳_标识>/`，API key 会隐藏。
 
 ## TPOT / TPS 口径

@@ -1,0 +1,192 @@
+diff --git a/access_operator/include/direct_hccp/direct_hccp_session.h b/access_operator/include/direct_hccp/direct_hccp_session.h
+index 2f5c5ef..21e540e 100644
+--- a/access_operator/include/direct_hccp/direct_hccp_session.h
++++ b/access_operator/include/direct_hccp/direct_hccp_session.h
+@@ -22,9 +22,12 @@ void VerboseLog(const char* format, ...);
+ // owned by KVAF after a successful RaInit or borrowed when HCCL already owns a
+ // compatible device RA. Later callers only take a reference. The caller must
+ // pair every success with ReleaseDirectHccpSession after all of its RaCtx
+-// resources are gone.
++// resources are gone. On the first acquisition, reuse_device_ra asserts that
++// the caller already initialized device RA: skip RaInit without probing or
++// falling back to another initialization of the shared HDC state.
+ bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
+-                              DirectHccpSession **session);
++                              DirectHccpSession **session,
++                              bool reuse_device_ra = false);
+
+ // Releases a logical transport reference. The RA/HDC bootstrap remains
+ // process-owned after its first successful initialization: CANN has no close
+diff --git a/access_operator/src/direct_hccp/direct_hccp_session.cc b/access_operator/src/direct_hccp/direct_hccp_session.cc
+index b2c5aa1..0ea37f5 100644
+--- a/access_operator/src/direct_hccp/direct_hccp_session.cc
++++ b/access_operator/src/direct_hccp/direct_hccp_session.cc
+@@ -190,10 +190,21 @@ bool CallRaInit(DirectHccpSession *session, uint32_t mode, const char *role) {
+ // and KVAF resolve RA through different library images. KVAF therefore owns
+ // and deinitializes device RA only after a successful RaInit; on 328002 it
+ // borrows the existing RA while retaining independent data-plane resources.
+-bool EnsureDeviceRa(DirectHccpSession *session) {
++bool EnsureDeviceRa(DirectHccpSession *session, bool reuse_device_ra) {
+   if (session == nullptr) {
+     return false;
+   }
++  if (reuse_device_ra) {
++    // Repeated RaInit can reinitialize HCCL's live HDC mutex before returning
++    // EEXIST. The caller explicitly owns this already-initialized device RA.
++    session->device_ra_owned = false;
++    std::fprintf(stderr,
++                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_REUSED "
++                 "role=device_aiv physical=%u hdc_type=%u "
++                 "source=caller_initialized\n",
++                 session->key.physical_device_id, session->key.hdc_type);
++    return true;
++  }
+   const int ret = CallRaInitWithRetry(session, kOfflineHdc, "device_aiv");
+   if (ret == 0) {
+     session->device_ra_owned = true;
+@@ -247,7 +258,7 @@ void CallRaDeinitBestEffort(DirectHccpSession *session, uint32_t mode, const cha
+                role, session->key.physical_device_id, mode, ret);
+ }
+
+-bool Bootstrap(DirectHccpSession *session) {
++bool Bootstrap(DirectHccpSession *session, bool reuse_device_ra) {
+   if (!CallRaInit(session, kPeerOnline, "peer_online")) {
+     return false;
+   }
+@@ -272,7 +283,7 @@ bool Bootstrap(DirectHccpSession *session) {
+   VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_READY physical=%u hdc_type=%u\n",
+              session->key.physical_device_id, session->key.hdc_type);
+
+-  if (!EnsureDeviceRa(session)) {
++  if (!EnsureDeviceRa(session, reuse_device_ra)) {
+     CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
+     session->peer_ra_owned = false;
+     return false;
+@@ -296,7 +307,8 @@ void DestroySession(DirectHccpSession *session) {
+ }  // namespace
+
+ bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
+-                              DirectHccpSession **session) {
++                              DirectHccpSession **session,
++                              bool reuse_device_ra) {
+   if (session == nullptr || hdc_type == 0U) {
+     return false;
+   }
+@@ -314,7 +326,7 @@ bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
+
+   auto created = std::make_unique<DirectHccpSession>();
+   created->key = key;
+-  if (!LoadSessionApi(created.get()) || !Bootstrap(created.get())) {
++  if (!LoadSessionApi(created.get()) || !Bootstrap(created.get(), reuse_device_ra)) {
+     DestroySession(created.get());
+     return false;
+   }
+diff --git a/bindings/src/npu_python_runtime.cc b/bindings/src/npu_python_runtime.cc
+index c68f5a8..0ff363e 100644
+--- a/bindings/src/npu_python_runtime.cc
++++ b/bindings/src/npu_python_runtime.cc
+@@ -221,7 +221,8 @@ class NpuPythonRuntime final {
+                    std::uint32_t adaptive_ub_miss_count,
+                    std::string peer_ub_device,
+                    std::vector<std::string> adaptive_peer_ub_devices,
+-                   std::uint32_t batch_get_max_inflight_total) {
++                   std::uint32_t batch_get_max_inflight_total,
++                   bool reuse_device_ra) {
+     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
+                               batch_get_token_bytes,
+                               batch_get_tokens_per_block};
+@@ -231,6 +232,7 @@ class NpuPythonRuntime final {
+     options.npu_core_count = npu_core_count;
+     options.jettys_per_core = jettys_per_core;
+     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
++    options.reuse_device_ra = reuse_device_ra;
+     options.npu_eids = std::move(npu_eids);
+     options.adaptive_ub_device = adaptive_ub_device;
+     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
+@@ -529,7 +531,7 @@ void BindNpuPythonRuntime(py::module_& module) {
+       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
+                     std::uint32_t, std::string, std::uint32_t,
+                     std::vector<std::string>, bool, std::uint32_t,
+-                    std::string, std::vector<std::string>, std::uint32_t>(),
++                    std::string, std::vector<std::string>, std::uint32_t, bool>(),
+            py::arg("batch_get_kernel_object_path"),
+            py::arg("batch_get_token_bytes"),
+            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
+@@ -542,7 +544,8 @@ void BindNpuPythonRuntime(py::module_& module) {
+            py::arg("peer_ub_device") = "",
+            py::arg("adaptive_peer_ub_devices") =
+                std::vector<std::string>{},
+-           py::arg("batch_get_max_inflight_total") = 2048)
++           py::arg("batch_get_max_inflight_total") = 2048,
++           py::arg("reuse_device_ra") = false)
+       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
+            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
+       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index f79c5c1..ae94c0e 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -37,6 +37,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
+   target_link_libraries(kvaf_npu_runtime
+     PUBLIC kvaf_runtime
+     PRIVATE kvaf_peer_link kvaf_default_access_operator
++            kvaf_direct_hccp_session
+             kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
+   if(KVAF_ENABLE_AIV_BATCH_PUT)
+     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)
+diff --git a/runtime/include/npu_runtime.h b/runtime/include/npu_runtime.h
+index fb9a6c4..0ff6b29 100644
+--- a/runtime/include/npu_runtime.h
++++ b/runtime/include/npu_runtime.h
+@@ -46,6 +46,9 @@ struct NpuRuntimeOptions {
+   // Optional strict K-side UB device selected by an earlier Runtime process.
+   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
+   std::string peer_ub_device{};
++  // Caller already initialized device RA (for example through HCCL). Borrow
++  // it without calling RaInit again; the caller retains its lifetime.
++  bool reuse_device_ra{false};
+ };
+
+ // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
+diff --git a/runtime/src/npu_runtime.cc b/runtime/src/npu_runtime.cc
+index 8c0ec7e..3c33535 100644
+--- a/runtime/src/npu_runtime.cc
++++ b/runtime/src/npu_runtime.cc
+@@ -23,6 +23,7 @@
+
+ #include "batch_get_abi.h"
+ #include "access_operator.h"
++#include "direct_hccp/direct_hccp_session.h"
+ #include "peer_link.h"
+ #include "meta_manager.h"
+ #include "startup_bandwidth_probe.h"
+@@ -79,6 +80,8 @@ struct NpuLocalEidCandidate {
+ constexpr char kUbDevIdPath[] = "/proc/asdrv_ub/dev_id";
+ constexpr char kUbPairInfoPath[] = "/proc/asdrv_ub/pair_info";
+ constexpr char kUbSelectorLockPath[] = "/tmp/kvaf_npu_runtime_asdrv_ub.lock";
++// Same PID-scoped HDC service used by the BatchGet and BatchPut transports.
++constexpr std::uint32_t kPidHdcType = 18U;
+
+ std::string EidToHex(const std::array<std::uint8_t, peer::kEidBytes>& eid) {
+   static constexpr char kHex[] = "0123456789abcdef";
+@@ -522,6 +525,20 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size)
+   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
+     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
+   }
++  if (impl_->options.reuse_device_ra) {
++    std::uint32_t physical_device_id = 0U;
++    if (!ResolvePhysicalDeviceId(impl_->options.device_id, &physical_device_id)) {
++      return Internal("cannot resolve physical NPU for caller-initialized device RA");
++    }
++    direct_hccp::DirectHccpSession* session = nullptr;
++    if (!direct_hccp::AcquireDirectHccpSession(
++            physical_device_id, kPidHdcType, &session, true)) {
++      return Internal("failed to borrow caller-initialized device RA");
++    }
++    // The shared session remains cached at refs=0 for the process lifetime.
++    // Every candidate's BatchGet/BatchPut transport acquires this same session.
++    direct_hccp::ReleaseDirectHccpSession(session);
++  }
+
+   std::uint32_t candidate_count = 0U;
+   std::uint32_t device_count = 0U;

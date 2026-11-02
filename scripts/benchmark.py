@@ -34,8 +34,8 @@ class Config:
     base_url: str = "http://127.0.0.1:8080"
     model: str = "glm"
     api_key: str = ""
-    input_tokens: int = 130816  # Leave 256 output tokens within a 131072-token context.
-    output_tokens: int = 256
+    input_tokens: int = 130560  # Leave 512 output tokens within a 131072-token context.
+    output_tokens: int = 512
     levels: tuple[int, ...] = (1, 2, 4, 8, 16)
     data_parallel_size: int = 1
     tensor_parallel_size: int = 8
@@ -43,7 +43,7 @@ class Config:
     prompt_field: str = "question"
     dataset_length_policy: str = "truncate"  # or strict; short inputs fail.
     repeat_prompt: bool = False
-    prefix_warmup: bool = False  # Requires APC + cached_tokens telemetry.
+    prefix_warmup: bool = True  # Requires APC + cached_tokens telemetry.
     cache_block_size: int = 128  # For APC verification; match the service setting.
     request_timeout: int = 3000
     result_dir: str = "scripts/result"
@@ -357,6 +357,11 @@ class Reporter:
             )
             if overlap.get("reason"):
                 lines.append(f"       overlap: {overlap['reason']}")
+            if self.report["config"].get("prefix_warmup") and row.get("http"):
+                cached = [r.get("cached_tokens") for r in row.get("requests", ())]
+                lines.append(f"       prefix cached_tokens/request: {cached}; status={row.get('status')}")
+            for error in dict.fromkeys(row.get("errors", ())):
+                lines.append(f"       error: {error}")
         if progress:
             lines.append(progress)
         if sys.stdout.isatty() and self.last_lines:
@@ -401,22 +406,28 @@ def preflight(http, config, *, output_tokens=None):
         )
 
 
-def verify_cached(result, input_tokens, block_size):
+def verify_cached(result, input_tokens, block_size, extra_recompute_blocks=0):
     if result["status"] != "ok":
         raise BenchmarkError("prefix request failed: " + str(result["error"]))
     cached = result.get("cached_tokens")
-    threshold = max(1, input_tokens - block_size)
-    if type(cached) is not int or cached < threshold:
+    if type(cached) is not int:
+        raise BenchmarkError("prefix verification needs integer cached_tokens; enable --enable-prompt-tokens-details")
+    # The final prompt token must be recomputed; cache hits end on block boundaries.
+    full_prefix = (input_tokens - 1) // block_size * block_size
+    threshold = max(1, full_prefix - extra_recompute_blocks * block_size)
+    if cached < threshold:
         raise BenchmarkError(
             f"prefix verification needs cached_tokens>={threshold}; received {cached!r}. "
-            "Enable prompt-token details and ensure the warmed prefix remains resident."
+            "Check warmed prefix residency and --cache-block-size."
         )
+    return max(0, (full_prefix - cached + block_size - 1) // block_size)
 
 
 def prefix_probe(config, http, source, block_size, results):
-    length = min(config.input_tokens, max(4096, 2 * block_size))
-    if length <= block_size:
-        raise BenchmarkError("prefix capability probe needs input longer than one cache block")
+    length = min(config.input_tokens, max(4096, 3 * block_size))
+    if length <= 2 * block_size:
+        raise BenchmarkError("prefix capability probe needs input longer than two cache blocks to verify MTP replay")
+    extra_recompute_blocks = []
     for rank in range(config.data_parallel_size):
         print(f"Checking native prefix-cache replay on DP{rank}...", flush=True)
         prompt = source.build(2**32 - 1 - rank, length, synthetic=True)
@@ -424,8 +435,12 @@ def prefix_probe(config, http, source, block_size, results):
         results.extend(pair)
         if pair[0]["status"] != "ok":
             raise BenchmarkError("prefix capability warmup failed: " + str(pair[0]["error"]))
-        verify_cached(pair[1], length, block_size)
-    return results
+        # MTP may drop one additional tail block. Calibrate once per DP over HTTP;
+        # measured requests must then meet this same bound, even if caches evict.
+        extra = verify_cached(pair[1], length, block_size, extra_recompute_blocks=1)
+        extra_recompute_blocks.append(extra)
+        print(f"DP{rank}: cached_tokens={pair[1]['cached_tokens']}; extra replay blocks={extra}", flush=True)
+    return extra_recompute_blocks
 
 
 def warm_prefixes(config, http, source, batch, warmed, reporter):
@@ -540,7 +555,7 @@ class ProfileCoordinator:
         return self.result
 
 
-def run_level(config, http, source, batch, reporter, *, profile_tokens=None):
+def run_level(config, http, source, batch, reporter, *, profile_tokens=None, prefix_extra_recompute_blocks=None):
     """One synchronized wave; profiling waves are stored outside baseline results."""
     run_id = uuid.uuid4().hex
     jobs = [
@@ -601,7 +616,8 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None):
     if config.prefix_warmup:
         for result in row["requests"]:
             try:
-                verify_cached(result, config.input_tokens, config.cache_block_size)
+                extra = prefix_extra_recompute_blocks[result["dp_rank"]] if prefix_extra_recompute_blocks else 0
+                verify_cached(result, config.input_tokens, config.cache_block_size, extra)
             except BenchmarkError as exc:
                 row["errors"].append(str(exc))
     if not profile:
@@ -640,7 +656,7 @@ def parse_args(argv=None):
     for field in dataclasses.fields(Config):
         options = {"default": field.default}
         if isinstance(field.default, bool):
-            options["action"] = "store_true"
+            options["action"] = argparse.BooleanOptionalAction
         elif field.name == "levels":
             options.update(type=lambda text: tuple(map(int, text.split(","))), help="batch sizes per DP: 1,2,4,8,16")
         else:
@@ -687,15 +703,29 @@ def main(argv=None):
             run_prefill_profile(config, http, source, reporter)
         else:
             warmed = set()
+            prefix_extra_recompute_blocks = None
             if config.prefix_warmup:
                 reporter.report["prefix_probe"] = []
-                prefix_probe(config, http, source, config.cache_block_size, reporter.report["prefix_probe"])
+                prefix_extra_recompute_blocks = prefix_probe(
+                    config, http, source, config.cache_block_size, reporter.report["prefix_probe"]
+                )
+                reporter.report["prefix_extra_recompute_blocks"] = prefix_extra_recompute_blocks
             for batch in config.levels:
                 if config.prefix_warmup:
                     warm_prefixes(config, http, source, batch, warmed, reporter)
-                run_level(config, http, source, batch, reporter)
+                run_level(
+                    config, http, source, batch, reporter, prefix_extra_recompute_blocks=prefix_extra_recompute_blocks
+                )
                 if args.profile_decode and args.profile_decode_batch in (None, batch):
-                    run_level(config, http, source, batch, reporter, profile_tokens=args.profile_decode_tokens)
+                    run_level(
+                        config,
+                        http,
+                        source,
+                        batch,
+                        reporter,
+                        profile_tokens=args.profile_decode_tokens,
+                        prefix_extra_recompute_blocks=prefix_extra_recompute_blocks,
+                    )
         failed = any(row["status"] != "ok" for row in reporter.report["levels"] + reporter.report["profiles"])
         reporter.report["status"] = "error" if failed else "ok"
         return 1 if failed else 0

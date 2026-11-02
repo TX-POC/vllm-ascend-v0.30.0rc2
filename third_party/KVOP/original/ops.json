@@ -1,0 +1,39 @@
+[
+  {
+    "op": "A5LiduFusedBatchGetPrepareMtp",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "topk_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "token_to_slot_pool", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "slot_to_token_pool", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "eviction_cursors", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "miss_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "miss_slot_bitmap", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "logical_seq_lengths", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "profile_enabled", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "miss_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "offsets", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "output_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "resident_seq_lengths", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "token_to_slot_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "slot_to_token_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "eviction_cursors_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "profiling", "param_type": "required", "format": ["ND"], "type": ["int64"]}
+    ],
+    "attr": [
+      {"name": "layer_id", "param_type": "required", "type": "int"},
+      {"name": "num_layers", "param_type": "required", "type": "int"},
+      {"name": "max_num_reqs", "param_type": "required", "type": "int"},
+      {"name": "qcap", "param_type": "required", "type": "int"}
+    ]
+  }
+]
