@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -63,20 +64,73 @@ class DeviceCacheState:
         return sum(t.numel() * t.element_size() for t in self.storage.values()) + self.policy.nbytes
 
 
-@dataclass
 class DDRSlotPool:
-    capacity: int
-    next_key: int = 0
-    free: list[int] = field(default_factory=list)
-    references: dict[int, int] = field(default_factory=dict)
+    """Reference-counted slots with soft layer regions and coalescing extents.
 
-    def take(self, count: int) -> list[int]:
-        if count > len(self.free) + self.capacity - self.next_key:
+    A region is an allocation preference, not a capacity limit. Native KVAF
+    keys are slot IDs; only returned access-table addresses are used by Get.
+    """
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.references = {}
+        self.extents = [(0, capacity)] if capacity else []
+        self.regions = {}
+
+    def partition(self, weights):
+        total = sum(weights.values())
+        start = cumulative = 0
+        for name, weight in weights.items():
+            cumulative += weight
+            end = min(self.capacity, int(self.capacity * cumulative / total))
+            self.regions[name] = (start, end)
+            start = end
+
+    def take(self, count, *, region=None, after=None):
+        if count < 0 or count > sum(end - start for start, end in self.extents):
             raise RuntimeError("KVAF DDR slots exhausted; increase kvaf_ddr_size_gb or reduce concurrent KV length")
-        keys = [self.free.pop() for _ in range(min(count, len(self.free)))]
-        remaining = count - len(keys)
-        keys.extend(range(self.next_key, self.next_key + remaining))
-        self.next_key += remaining
+        if not count:
+            return []
+        low, high = self.regions.get(region, (0, self.capacity))
+        selected = []
+        # Extend decode at its previous segment's end whenever possible.
+        if after is not None:
+            for start, end in self.extents:
+                if start <= after and after + count <= end and low <= after < after + count <= high:
+                    selected = [(after, after + count)]
+                    break
+        # Prefer one whole segment within the layer region, then anywhere.
+        for left, right in ((low, high), (0, self.capacity)):
+            if selected:
+                break
+            for start, end in self.extents:
+                begin, stop = max(start, left), min(end, right)
+                if stop - begin >= count:
+                    selected = [(begin, begin + count)]
+                    break
+        if not selected:
+            # Fragmentation must not turn available capacity into admission
+            # failure. Fill the preferred region first, then borrow outside it.
+            remaining = count
+            for left, right in ((low, high), (0, low), (high, self.capacity)):
+                for start, end in self.extents:
+                    begin, stop = max(start, left), min(end, right)
+                    size = min(remaining, max(0, stop - begin))
+                    if size:
+                        selected.append((begin, begin + size))
+                        remaining -= size
+                    if not remaining:
+                        break
+                if not remaining:
+                    break
+        for begin, stop in sorted(selected):
+            for i, (start, end) in enumerate(self.extents):
+                if start <= begin and stop <= end:
+                    self.extents[i : i + 1] = ([(start, begin)] if start < begin else []) + (
+                        [(stop, end)] if stop < end else []
+                    )
+                    break
+        keys = [key for start, end in selected for key in range(start, end)]
         self.references.update((key, 1) for key in keys)
         return keys
 
@@ -93,6 +147,22 @@ class DDRSlotPool:
                 retired.append(key)
         return retired
 
+    def recycle(self, keys):
+        """Called after native batch_free, or for never-published reservations."""
+        runs = []
+        for key in sorted(keys):
+            if runs and runs[-1][1] == key:
+                runs[-1] = (runs[-1][0], key + 1)
+            else:
+                runs.append((key, key + 1))
+        merged = []
+        for start, end in sorted([*self.extents, *runs]):
+            if merged and merged[-1][1] == start:
+                merged[-1] = (merged[-1][0], end)
+            else:
+                merged.append((start, end))
+        self.extents = merged
+
 
 @dataclass
 class RequestGroupState:
@@ -100,6 +170,7 @@ class RequestGroupState:
     addresses: list[int] = field(default_factory=list)
     keys: list[int] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
+    reserved: deque[int] = field(default_factory=deque)
 
 
 @dataclass

@@ -10,15 +10,20 @@ rank reaches that decision independently from the same gathered snapshot --
 there is no leader. See ``docs/.../balance_schedule_refactor.md`` for the
 design.
 
-The ``schedule()`` body is a verbatim copy of the **v0.24.0** release tag's
-``Scheduler.schedule()`` (the production pin), plus exactly three balance
+KVAF additionally limits each step to one prompt-computing request so its
+four-layer prefill history workspace can be shared across requests. Async
+receive-only jobs do not consume that slot. Both the original base entry
+point (used by AsyncScheduler) and this subclass reach the same policy.
+
+The ``schedule()`` body follows the pinned upstream release's
+``Scheduler.schedule()``, plus the KVAF prefill limit and three balance
 deltas: (1) the disabled-path early return that delegates to ``super()``,
 (2) the ``balance_flag`` break inside the WAITING loop
 (``any-rank-at-cap => global freeze``), and (3) ``if request_queue is None:
 break`` in place of upstream's ``assert request_queue is not None`` (so a
 drained-rank schedule does not assert when balance defers admission). Both
 supported vLLM refs expose ``schedule(throttle_prefills=False)``, so the
-disabled fast path forwards that argument directly.
+disabled fast path forwards that argument to the original upstream method.
 
 The engine-core side is NOT copied: ``BalanceDPEngineCoreProc`` hooks
 ``_has_global_unfinished_reqs`` (called every iteration by upstream's
@@ -57,6 +62,7 @@ touch configs that don't use it, e.g. PD-disaggregated recompute).
 """
 
 import time
+from functools import wraps
 
 import torch
 import torch.distributed as dist
@@ -161,8 +167,11 @@ class BalanceScheduler(Scheduler):
         dist.all_gather(self.balance_queue, running_tensor, group=self.dp_group)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        if not self._balance_enabled:
-            return super().schedule(throttle_prefills)
+        single_prefill = (self.vllm_config.additional_config or {}).get("kvaf_config", {}).get("enabled", False)
+        balance_enabled = getattr(self, "_balance_enabled", False)
+        if not balance_enabled and not single_prefill:
+            return _upstream_schedule(self, throttle_prefills)
+        prefill_request_id = None
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -234,6 +243,14 @@ class BalanceScheduler(Scheduler):
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                req_index += 1
+                continue
+
+            if (
+                single_prefill
+                and prefill_request_id is not None
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
                 req_index += 1
                 continue
 
@@ -329,6 +346,8 @@ class BalanceScheduler(Scheduler):
                     else:
                         preempted_req = self.running.pop()
 
+                    if preempted_req.request_id == prefill_request_id:
+                        prefill_request_id = None
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -340,6 +359,8 @@ class BalanceScheduler(Scheduler):
                 break
 
             # Schedule the request.
+            if single_prefill and request.num_computed_tokens < request.num_prompt_tokens:
+                prefill_request_id = request.request_id
             scheduled_running_reqs.append(request)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
@@ -398,7 +419,7 @@ class BalanceScheduler(Scheduler):
                 # Keep admission balanced across DP ranks: if any rank was at
                 # the running cap after the previous step, stop admitting new
                 # waiting requests on every rank.
-                if max(t.item() for t in self.balance_queue) == self.max_num_running_reqs:
+                if balance_enabled and max(t.item() for t in self.balance_queue) == self.max_num_running_reqs:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -598,6 +619,16 @@ class BalanceScheduler(Scheduler):
                 limit_lookahead_tokens = load_kv_async and self.use_eagle
                 effective_lookahead_tokens = 0 if limit_lookahead_tokens else self.num_lookahead_tokens
 
+                if (
+                    single_prefill
+                    and prefill_request_id is not None
+                    and not load_kv_async
+                    and num_computed_tokens < request.num_prompt_tokens
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0
                 if self.is_encoder_decoder and request.has_encoder_inputs and encoder_inputs_to_schedule:
@@ -687,6 +718,8 @@ class BalanceScheduler(Scheduler):
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(request_id)
+                if single_prefill and num_computed_tokens < request.num_prompt_tokens:
+                    prefill_request_id = request_id
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -897,3 +930,19 @@ class BalanceDPEngineCoreProc(DPEngineCoreProc):
 _sched_mod.Scheduler = BalanceScheduler
 
 # The patch for engine core has been moved to patch_engine_core.py
+
+
+# AsyncScheduler may already have imported the original base class. Patch its
+# inherited entry point too; keep its _update_after_schedule implementation and
+# placeholder handling intact. Non-KVAF calls retain the upstream scheduler.
+_upstream_schedule = Scheduler.schedule
+
+
+@wraps(_upstream_schedule)
+def _schedule_with_kvaf_prefill_limit(self, throttle_prefills=False):
+    if (self.vllm_config.additional_config or {}).get("kvaf_config", {}).get("enabled", False):
+        return BalanceScheduler.schedule(self, throttle_prefills)
+    return _upstream_schedule(self, throttle_prefills)
+
+
+Scheduler.schedule = _schedule_with_kvaf_prefill_limit

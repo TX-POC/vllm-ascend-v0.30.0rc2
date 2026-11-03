@@ -37,12 +37,12 @@ class TestKVAFPut(unittest.TestCase):
         self.assertFalse(self.runtime.pages)
 
     def test_ddr_full_does_not_publish_extra_pages(self):
-        self.writer.slots[(656, 128)].capacity = 1
-        self.run_chunk([("a", 0, 128, 256)])
+        pool_type = type(self.writer.slots[(656, 128)])
+        self.writer.slots[(656, 128)] = pool_type(1)
         with self.assertRaisesRegex(RuntimeError, "slots exhausted"):
-            self.run_chunk([("a", 128, 128, 256)])
-        self.assertEqual(len(self.writer.requests["a"][0].addresses), 1)
-        self.assertEqual(self.writer.put_pages, 1)
+            self.run_chunk([("a", 0, 128, 256)])
+        self.assertEqual(len(self.writer.requests["a"][0].addresses), 0)
+        self.assertEqual(self.writer.put_pages, 0)
 
     def test_failed_verification_preserves_keys_for_cleanup(self):
         self.writer.verify = lambda *args: (_ for _ in ()).throw(RuntimeError("readback mismatch"))
