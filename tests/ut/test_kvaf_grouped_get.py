@@ -3,7 +3,6 @@
 
 import importlib
 import unittest
-from collections import Counter
 from dataclasses import replace
 from types import ModuleType
 from types import SimpleNamespace as NS
@@ -199,34 +198,37 @@ class TestGrouped(unittest.TestCase):
             data = self.hot.hot[0].view(-1, 656)[rows, 0]
             torch.testing.assert_close(data, self.values("a", torch.arange(640), local))
 
-    def test_prefill_four_layers_reuse_history_for_two_requests(self):
-        self.chunk([("a", 0, 256, 512), ("b", 0, 256, 512)])
-        self.prepare([("a", 256, 256, 512), ("b", 256, 256, 512)])
-        self.write()
+    def test_prefill_four_layers_reuse_one_workspace_across_requests(self):
+        self.chunk([("a", 0, 256, 512)])
+        self.chunk([("b", 0, 256, 512)])
+        self.assertEqual(self.hot.group_context.shape, (1, 8192, 4, 656))
+        address = self.hot.group_context.data_ptr()
         self.runtimes[4].reads.clear()
-        seen = Counter()
         module = ModuleType("vllm_ascend.device.device_op")
 
-        def sfa(impl, q, rope, caches, indices, metadata, query_ends, key_end, **kw):
-            name = "a" if seen[impl.kvaf_group_offset] == 0 else "b"
-            seen[impl.kvaf_group_offset] += 1
-            data = caches[0].view(-1, 656)[:512, 0]
-            torch.testing.assert_close(data, self.values(name, torch.arange(512), impl.kvaf_group_offset))
-            self.assertEqual(kw["sparse_mode"], 3)
-            return q
+        for name in ("a", "b"):
+            self.prepare([(name, 256, 256, 512)])
+            self.write()
 
-        module.DeviceOperator = NS(execute_sparse_flash_attention_process=sfa)
-        with patch.dict("sys.modules", {"vllm_ascend.device.device_op": module}):
-            for local in range(4):
-                self.hot.attention(
-                    NS(kvaf_group_offset=local),
-                    0,
-                    torch.zeros(512, 1),
-                    torch.zeros(512, 1),
-                    torch.zeros(512, 1, 2048, dtype=torch.int32),
-                    NS(num_prefills=2, seq_lens=torch.tensor([256, 256], dtype=torch.int32)),
-                    None,
-                )
+            def sfa(impl, q, rope, caches, indices, metadata, query_ends, key_end, name=name, **kw):
+                data = caches[0].view(-1, 656)[:512, 0]
+                torch.testing.assert_close(data, self.values(name, torch.arange(512), impl.kvaf_group_offset))
+                self.assertEqual(kw["sparse_mode"], 3)
+                return q
+
+            module.DeviceOperator = NS(execute_sparse_flash_attention_process=sfa)
+            with patch.dict("sys.modules", {"vllm_ascend.device.device_op": module}):
+                for local in range(4):
+                    self.hot.attention(
+                        NS(kvaf_group_offset=local),
+                        0,
+                        torch.zeros(256, 1),
+                        torch.zeros(256, 1),
+                        torch.zeros(256, 1, 2048, dtype=torch.int32),
+                        NS(num_prefills=1, seq_lens=torch.tensor([256], dtype=torch.int32)),
+                        None,
+                    )
+            self.assertEqual(self.hot.group_context.data_ptr(), address)
         self.assertEqual(self.runtimes[4].reads, [256, 256])
 
     def test_decode_one_lidu_get_and_layer_slot_offsets(self):

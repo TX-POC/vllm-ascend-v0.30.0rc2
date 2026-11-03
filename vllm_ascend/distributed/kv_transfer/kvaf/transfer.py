@@ -23,6 +23,8 @@ class KVTransfer:
     ):
         self.runtimes = runtimes
         self.slots = {geometry: DDRSlotPool(count) for geometry, count in slot_counts.items()}
+        self.layouts = layouts
+        self._regions_ready = False
         self.groups = []
         for layout in layouts:
             if "target" not in layout.roles or layout.cache_kind != "main":
@@ -47,6 +49,30 @@ class KVTransfer:
         self.put_pages = self.put_bytes = self.released_pages = 0
         self.phase_pages = {"prefill": 0, "decode": 0}
 
+    def configure_slot_regions(self):
+        if self._regions_ready:
+            return
+        weights = {geometry: {} for geometry in self.slots}
+        for i, layer in enumerate(self.groups):
+            weights[layer.geometry][i] = 1
+        geometry = self.groups[0].geometry
+        # Match runtime_weights: old auxiliary snapshots and their active
+        # borrowers coexist; Target prefixes themselves share references.
+        aux = sum(
+            2 * sum(p.page_bytes for p in layout.planes) / layout.block_size
+            for layout in self.layouts
+            if "target" not in layout.roles or layout.cache_kind != "main"
+        )
+        if aux:
+            weights[geometry][None] = aux / geometry[0]
+        for geometry, pool in self.slots.items():
+            if weights[geometry]:
+                pool.partition(weights[geometry])
+        self._regions_ready = True
+        logger.info(
+            "KVAF DDR layout: layer-group regions; contiguous prompt reservations; shared prefix pages retained"
+        )
+
     def release_requests(self, req_ids: Iterable[str]) -> None:
         """Free native DDR entries before making their slot IDs reusable."""
         for req_id in req_ids:
@@ -57,6 +83,9 @@ class KVTransfer:
                 continue
             pages = byte_count = freed_pages = 0
             for layer, state in zip(self.groups, states):
+                pool = self.slots[layer.geometry]
+                pool.recycle(pool.release(state.reserved))
+                state.reserved.clear()
                 if not state.keys:
                     state.progress.clear()
                     continue
@@ -64,7 +93,7 @@ class KVTransfer:
                 freed_pages += len(retired)
                 if retired:
                     self.runtimes[layer.geometry].batch_free(retired)
-                    self.slots[layer.geometry].free.extend(retired)
+                    self.slots[layer.geometry].recycle(retired)
                 pages += len(state.keys)
                 byte_count += len(state.keys) * layer.geometry[0] * layer.geometry[1]
                 self.released_pages += len(state.keys)
@@ -85,6 +114,7 @@ class KVTransfer:
 
     def prepare_requests(self, requests, scheduled_tokens):
         """Prepare request metadata before forward; KVCachePolicy owns Target storage."""
+        self.configure_slot_regions()
         if self.feedback is not None:
             self.feedback.poll_feedback()
         if self.policy is not None:
@@ -152,10 +182,27 @@ class KVTransfer:
             count = tokens // BLOCK_SIZE - len(state.keys)
             if count <= 0:
                 continue
-            keys = self.slots[layer.geometry].take(count)
+            pool = self.slots[layer.geometry]
+            if len(state.reserved) < count:
+                prompt = policy.requests[req_id].num_prompt_tokens
+                # Reserve only the unshared prompt suffix. Reservation does not
+                # publish addresses or make unwritten pages readable by Get.
+                desired = max(count, (prompt + BLOCK_SIZE - 1) // BLOCK_SIZE - len(state.keys))
+                previous = state.reserved[-1] if state.reserved else state.keys[-1] if state.keys else None
+                state.reserved.extend(
+                    pool.take(
+                        desired - len(state.reserved),
+                        region=i,
+                        after=None if previous is None else previous + 1,
+                    )
+                )
+            keys = [state.reserved.popleft() for _ in range(count)]
+            # Keep attempted pages owned even if native Put fails partway;
+            # request cleanup must free them before these IDs can be reused.
+            state.keys.extend(keys)
             offsets = [
                 policy._source_offset(req_id, p) * policy.group_sizes[i]
-                for p in range(len(state.keys), len(state.keys) + count)
+                for p in range(len(state.keys) - count, len(state.keys))
             ]
             self.runtimes[layer.geometry].batch_put(
                 keys=keys,
@@ -163,7 +210,6 @@ class KVTransfer:
                 input_offsets=offsets,
                 lengths=[BLOCK_SIZE * TOKEN_BYTES * policy.group_sizes[i]] * count,
             )
-            state.keys.extend(keys)
             self._publish_addresses(layer, keys, [(state, count)])
             written += count * policy.group_sizes[i]
             if self.verify is not None and phase not in self._verified:

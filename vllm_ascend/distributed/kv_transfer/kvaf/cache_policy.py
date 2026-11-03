@@ -370,8 +370,11 @@ class KVCachePolicy(DecodeHotCache):
             self.local_offsets[width] = torch.arange(width, dtype=torch.int64, device=pool.device)[:, None]
         if max(self.group_sizes) > 1:
             width = max(self.group_sizes)
+            # KVAF's scheduler admits one prompt computation per step. Keep
+            # its four-layer history until the group's last layer consumes it;
+            # subsequent steps reuse this address on the ordered compute stream.
             self.group_context = torch.empty(
-                (pool.max_requests - 1, length, width, TOKEN_BYTES), dtype=torch.int8, device=pool.device
+                (1, length, width, TOKEN_BYTES), dtype=torch.int8, device=pool.device
             )
         self.context_offsets_by_width = {w: self.context_offsets * w for w in set(self.group_sizes)}
         self.plans = {}
@@ -436,7 +439,8 @@ class KVCachePolicy(DecodeHotCache):
                     synchronize=True,
                 )
         logger.info(
-            "KVAF grouped Get: groups=%s widths=%s; one LIDU/Get per group; prefill history workspace=%.2f MiB",
+            "KVAF grouped Get: groups=%s widths=%s; one LIDU/Get per group; "
+            "max_prefill_requests=1; prefill history workspace=%.2f MiB",
             len(self.group_sizes),
             self.group_sizes,
             (self.context.numel() + (0 if self.group_context is None else self.group_context.numel())) / (1 << 20),
@@ -699,7 +703,7 @@ class KVCachePolicy(DecodeHotCache):
                 decode_row += 1
             else:
                 history = p.start // BLOCK_SIZE * BLOCK_SIZE
-                context = self.context.view(-1, 1, TOKEN_BYTES) if width == 1 else self.group_context[p.owner - 1]
+                context = self.context.view(-1, 1, TOKEN_BYTES) if width == 1 else self.group_context[0]
                 if history and local == 0:
                     self.context_count.fill_(history)
                     runtime = self.writer.runtimes[self.writer.groups[layer].geometry]
