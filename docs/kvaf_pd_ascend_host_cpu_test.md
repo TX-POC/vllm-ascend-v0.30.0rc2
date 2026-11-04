@@ -346,3 +346,5 @@ python3 tests/python/bench_hbm_read_raw_addr.py \
 联调记录保存：SDK/框架/镜像版本、T0/T1、机头 CPU 架构、设备号/EID、监听和实际 endpoint、NUMA/CPU 绑定、DDR 配额与峰值、每条命令退出码、PASS 标记及 K 日志。**本文硬件步骤待现场执行，当前云环境未实测同机 URMA、CPU/NPU 数据面或模型 PD。**
 
 文档校验：11 段 Bash 示例通过语法检查，5 条 SDK 测试/压测命令的参数与固定提交源码匹配；Markdown 格式、codespell 和 typos 检查通过。这些是文档检查结果，不是硬件命令执行结果。
+
+单机 8 卡、已可运行四层模型的 P/D 资源划分、当前接线缺口和后续部署验收见 [单机 8 卡四层模型 PD 教程](kvaf_pd_single_server_8npu_4layer.md)。
