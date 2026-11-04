@@ -101,3 +101,5 @@ ruff format --check vllm_ascend/distributed/kv_transfer/kvaf/pd tests/ut/test_kv
 3. 新增原生 `KVConnectorBase_V1` 的 `PDKVoffloadConnector`，明确 Scheduler/Worker 分工，通过原生模块路径/插件注册加载，默认不选择。复用现有 ZMQ/调度元数据边界及 P/D 握手。
 4. 接入逐层事件、全建链、请求 block 映射、按层双 Pull 与请求级门控；由 Backend 导入 tail/目录并继续 Decode/MTP3。
 5. 完成取消/抢占/错误上报和物理 storage 复用闭环，再给出可执行的原生格式部署配置。每批代码新增对应 UT，通过后提交开发分支。
+
+安装、当前 CPU UT、独立 SDK 链路验证及完整 PD 的后续验收步骤见 [安装、部署与测试方法](kvaf_pd_install_deploy_test.md)。
