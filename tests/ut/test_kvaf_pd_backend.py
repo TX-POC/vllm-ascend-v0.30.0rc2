@@ -79,6 +79,16 @@ class TestPDBackend(unittest.TestCase):
         context = {name: NS(impl=NS(skip_topk=i > 0)) for i, name in enumerate(names)}
         self.assertEqual(native_layout.index_groups(names, context), (names,))
 
+    def test_native_tail_block_binding_cannot_be_reused_by_another_live_receive(self):
+        self.assertEqual(self.hot.reserve_receive("a", {"l0": 9, "l1": 7}), 0)
+        self.assertEqual(self.hot.receive_slot_for("a", "l0", 9), 0)
+        with self.assertRaisesRegex(RuntimeError, "still owned"):
+            self.hot.reserve_receive("b", {"l0": 9})
+        self.assertNotIn("b", self.hot.receive_slots)
+        self.hot.release("a")
+        self.assertEqual(self.hot.reserve_receive("b", {"l0": 9}), 0)
+        self.assertEqual(self.hot.receive_slot_for("b", "l0", 9), 0)
+
     def test_tail_stays_in_receive_buffer_until_first_decode_prepare(self):
         for cache in self.hot.hot:
             cache.fill_(119)

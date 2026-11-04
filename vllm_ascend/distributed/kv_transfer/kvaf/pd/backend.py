@@ -6,6 +6,8 @@ directory and Get implementation use that geometry without four-layer token
 interleaving. Import this only from an enabled PD Worker/Runner extension.
 """
 
+from threading import RLock
+
 import torch
 
 from ..cache_policy import KVCachePolicy
@@ -19,6 +21,30 @@ class PDCachePolicy(KVCachePolicy):
             pool, max_tokens, max_model_len, native=native, group_sizes=(1,) * len(pool.names), hot_tokens=hot_tokens
         )
         self._received_tails = {}
+        self.receive_slots = {}
+        self.receive_blocks = {}
+        self._receive_lock = RLock()
+        self._receive_free = list(reversed(range(pool.max_requests - 1)))
+
+    def reserve_receive(self, req_id, blocks=None):
+        with self._receive_lock:
+            bindings = tuple((layer, block) for layer, block in (blocks or {}).items())
+            if any(key in self.receive_blocks and self.receive_blocks[key][0] != req_id for key in bindings):
+                raise RuntimeError("native tail block is still owned by another PD receive")
+            if req_id not in self.receive_slots:
+                if not self._receive_free:
+                    raise RuntimeError("PD ordinary tail receive capacity exhausted")
+                self.receive_slots[req_id] = self._receive_free.pop()
+            for key in bindings:
+                self.receive_blocks[key] = (req_id, self.receive_slots[req_id])
+            return self.receive_slots[req_id]
+
+    def receive_slot_for(self, req_id, layer, native_block):
+        with self._receive_lock:
+            owner, slot = self.receive_blocks[layer, native_block]
+            if owner != req_id:
+                raise ValueError("ordinary receive block belongs to another request")
+            return slot
 
     def bind(self, manager):
         names = tuple(layer.layout.layer_names for layer in manager.writer.groups)
@@ -83,6 +109,13 @@ class PDCachePolicy(KVCachePolicy):
         for key in tuple(self._received_tails):
             if key[0] == req_id:
                 del self._received_tails[key]
+        with self._receive_lock:
+            slot = self.receive_slots.pop(req_id, None)
+            if slot is not None:
+                self._receive_free.append(slot)
+            for key, (owner, _) in tuple(self.receive_blocks.items()):
+                if owner == req_id:
+                    self.receive_blocks.pop(key)
 
 
 def create_decode_cache(
@@ -103,4 +136,9 @@ def create_decode_cache(
     pool = DeviceCacheState(names, max_requests + 1, tokens, device)
     pool.groups = tuple((name,) for name in names)
     pool.policy = PDCachePolicy(pool, max_tokens, max_model_len, native=native, hot_tokens=hot_tokens)
+    # Charge the compact ordinary receiver to native profiling, independently
+    # of Hot. Runner replaces this reservation with the final layer arenas.
+    pool.storage["pd_receive_reservation"] = torch.empty(
+        (len(names), max_requests, BLOCK_SIZE, TOKEN_BYTES), dtype=torch.int8, device=device
+    )
     return pool

@@ -1,12 +1,12 @@
-# 单机 8 卡、4 层模型、机头 CPU KVAF：PD 部署准备与验收教程
+# 单机 8 卡、4 层模型、机头 CPU KVAF：临时 PD 验证教程
 
 ## 1. 适用范围与当前状态
 
 使用用户已确认能正常运行的 GLM5.3 W4A4C8 四层模型，不修改模型权重、量化方案或原生核心代码。目标是在同一服务器中隔离 P/D 两组 NPU，以机头 CPU DDR 作为临时 K 池。
 
-**当前 v0.30.0rc2-develop 仍只有 PD 地址、注册、事务、完成门控和 Backend 组件，没有可启动的 PDKVoffloadConnector。不能仅靠启动参数完成本方案。** 本文给出可执行的环境/K 准备，以及接线完成后的准确拓扑、配置要求和验收流程；P/D 启动命令需在第 5 节代码接线完成后提供。
+**当前分支已实现独立 PDKVoffloadConnector 与外部 Worker/Runner 接入。** 本文只描述临时单机验证，生产目标仍为原始两台 P、两台 D、八台 K 的 TP8/DP2 与 TP1/DP16 方案，不能用四层模型测试替代生产验收。SDK 构建和通用配置见 [Connector 部署说明](kvaf_pd_connector.md)。
 
-框架组件基线为 cef996c1b；SDK 参考为 codex/cpu-pull-hbm-reference 的 a2f212b2811a40ea2df4351a451381897351dd49。详细实现状态见 [实施记录](kvaf_pd_implementation.md)。
+首批组件历史基线为 cef996c1b；当前使用开发分支的新 Connector 接入实现。SDK 参考为 codex/cpu-pull-hbm-reference 的 a2f212b2811a40ea2df4351a451381897351dd49。详细实现状态见 [实施记录](kvaf_pd_implementation.md)。
 
 用户现场已反馈以下 SDK 测试通过：LOCAL_CPU_PULL_PASS、REMOTE_OFFLOAD_PASS、HBM_RAW_PASS。这验证了测试所用设备和配置下的 CPU Pull、NPU raw READ、共享 DDR 与 Get/Put；不代表完整模型 PD 已接通。这些现场结果并非本云环境的硬件实测。
 
@@ -56,7 +56,7 @@ git -C "$KVAF_PD_SRC" rev-parse HEAD
 
 当前最小 CPU Pull binding 在 build-hostcpu-pull-py312 中。组合测试应使用现场真正生成 HBM_RAW_PASS 的**完整构建目录**，其中应同时有 Get/Put/raw object，不能把最小 binding 当作完整算子构建。Python 扩展必须是 cpython-312；旧 cpython-311 目录不用于此解释器。
 
-完整 binding 的构建方法见 [机头 CPU 指南第 7 节](kvaf_pd_ascend_host_cpu_test.md#7-第二步完整-binding验证双-pull-和-getput)，其中 Python_EXECUTABLE 必须指向本节的 NPU_PYTHON；若旧构建目录绑定其他 Python，使用新的构建目录。
+独立 SDK 测试的完整 binding 构建方法见 [机头 CPU 指南第 7 节](kvaf_pd_ascend_host_cpu_test.md#7-第二步完整-binding验证双-pull-和-getput)，其中 Python_EXECUTABLE 必须指向本节的 NPU_PYTHON；若旧构建目录绑定其他 Python，使用新的构建目录。
 
 ### 3.2 K 服务
 
@@ -101,9 +101,9 @@ numactl --hardware
 
 DDR 预算由每个 D Runtime 初始化参数控制，不是 K 启动时的统一 --ddr-size 参数。
 
-## 4. P/D 接线完成后应使用的原生配置
+## 4. P/D 原生配置
 
-下面是配置要求表，**不是当前提交可执行的启动命令**。
+下面的临时配置与生产配置使用同一代码入口，卡数和层数只由原生部署参数决定。
 
 | 项目 | P | D |
 | --- | --- | --- |
@@ -118,27 +118,29 @@ DDR 预算由每个 D Runtime 初始化参数控制，不是 K 启动时的统�
 | MTP | 保留已验证 MTP3 配置 | 保留 MTP3 与所需层/长度 |
 | DDR | 注册到对应 D region | 每 worker 独立 Runtime/region，逐层 (656,128) |
 
-使用原生 kv-transfer/additional-config 和既有启动格式。新的配置模块路径、worker/runner 加载入口及 ZMQ 端口要以实际实现为准；本文不填入尚不存在的路径。
+使用原生 kv-transfer/additional-config 和 --worker-cls。配置模块路径为 vllm_ascend.distributed.kv_transfer.kvaf.pd.connector，Worker 为 vllm_ascend.distributed.kv_transfer.kvaf.pd.worker.PDKVWorker。D 设 kv_port=31000 时，四个 DP worker 的 TCP 控制端口为 31000～31003；P 的 decode_endpoints 填实际 VLLM_HOST_IP 对应的这四个 endpoint。完整字段见 [通用配置](kvaf_pd_connector.md#3-原生配置入口)。
 
 原脚本 scripts/start_vllm_server.sh 是非 PD 的 TP8 基线。仅修改它的可见卡、端口或 kvaf_enabled，不会自动生成新的 PD 连接和地址交接。
 
-## 5. 当前必须补齐的代码接入点
+## 5. 本配置的启用方法
 
-这部分是实现缺口，不是模型层数、显存或 K 服务是否可用的问题：
+先运行通用说明中的 scripts/install_kvaf_pd.sh，构建包含 RA 借用补丁的完整 binding；P/D 使用同一正确 Python ABI，并把该 build/python 加入 PYTHONPATH。
 
-1. 新增真实的 PDKVoffloadConnector 类与注册入口，接入原生 Scheduler/Worker 生命周期和 Proxy 请求定位。
-2. 外部 Runner/Backend 提供 P 的真实逐层注册范围和 D 普通接收区，绑定原生 block 分配结果，按实际 cache specs 处理 Indexer 共享/别名；保持 Connector 不计算 Hot 地址。
-3. D 初始化四个独立 Runtime/region，交换 ticket、PA Meta、SDK descriptor；全建链并导入各 P/D peer 所需 MR。
-4. P 每层写入完成后产生 Ready/Meta；D 做 TP4→TP1 贡献选择、完整主 KV CPU Pull、Indexer/Scale/tail raw READ。空贡献也进入完成汇总。
-5. 完成 DDR Wait/Commit/目录发布、请求首轮 Decode 门控、P 物理存储复用、MTP、取消/抢占和错误释放闭环。
-6. 兼容现有初始化与 bind_archive 边界，解决旧 Adapter 与目标 SDK 的 reuse_device_ra/HCCL 生命周期差异。独立 SDK PASS 不等同于 TP/EP 会话中的 RA 兼容已验证。
+在已经验证能运行四层模型的原生命令基础上修改：
 
-四层模型能减少资源和计算量；这些接口仍须存在。因此当前不能通过填一个 Connector 名称直接完成本部署。
+1. P：ASCEND_RT_VISIBLE_DEVICES=0,1,2,3，TP4、DP1、HTTP 8100；additional-config.kvaf_config 设置 enabled=false、正确 build_dir；选 kv_producer。
+2. D：ASCEND_RT_VISIBLE_DEVICES=4,5,6,7，TP1、DP4、本地 DP4、HTTP 8200；kvaf_config 设置 enabled=true、cpu_address=127.0.0.1:28999、正确 build_dir 和每 worker DDR 预算；选 kv_consumer，关闭本地 prefix caching。
+3. 两侧增加同一个原生 --worker-cls，kv_connector=PDKVoffloadConnector，kv_connector_module_path 指向新模块；P 的 decode_endpoints 列出本机实际可达 IP 的 31000～31003。
+4. 保留已经验证的 W4A4C8、MTP3、EP 和其他模型配置。先用 eager 做小规模验证，再按原设计验证图模式与异步调度。
 
-## 6. 接线完成后的启动顺序
+D 的 Target 主 KV block table 保持原生分配结果。Backend 将本请求的原生 tail block 绑定到独立普通接收池的物理槽；Connector 通过该绑定计算普通 HBM 目的 offset，不将原生虚拟主 KV block ID 当成 Hot 地址或直接写入 ABC。
+
+该方法不修改原脚本 scripts/start_vllm_server.sh；生产部署换回原始 TP8/DP2、TP1/DP16、八个 K endpoint 及全部实际层数。
+
+## 6. 启动顺序
 
 1. K 先就绪，核实真实监听、candidate 和 Host 内存预算。
-2. 启动 P/D 原生进程组并分配 HBM；D 建立各自 Runtime/DDR，返回 ticket。
+2. 先启动 D 原生进程组，建立各自 Runtime/DDR 和控制监听；再启动 P，完成独立 HBM 初始化并获取 ticket。
 3. 完成 P 按层、按 peer 注册、PA Meta 交换和 D attach。四 P worker 与四 D worker 是 16 种 worker 对组合，模型层/MR 对象按 SDK 生命周期组织。
 4. 各 worker 报告初始化完成后，Proxy 注册 P HTTP 8100、D HTTP 8200 endpoint，再开放 HTTP 8000 接收请求。
 5. 先单请求、短上下文，再检查满块/tail 边界、MTP、并发及资源回收。

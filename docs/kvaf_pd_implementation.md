@@ -1,105 +1,66 @@
-# GLM5.3 W4A4C8 PD：首批实现与验证记录
+# GLM5.3 W4A4C8 PD：实现与验证记录
 
-日期：2026-11-04。开发分支：`v0.30.0rc2-develop`。
+日期：2026-11-04。开发分支：v0.30.0rc2-develop。
 
-用户已授权按已确认设计开始实现，并明确要求提交开发分支前新增 UT。本记录描述**第一批组件实现**，不代表完整 `PDKVoffloadConnector` 已可部署。
+本轮已在首批组件基础上接入独立 PDKVoffloadConnector、外部 Worker/Runner、真实内存注册、布局交换与双 Pull。原生 Runner、Worker、注意力、Connector factory 均未修改。功能通过原生 Connector/module path 与 --worker-cls 显式启用，默认路径不加载这些扩展。
 
-框架基线：`af69306b27f703c4227d2ab312208c5df2c1a986`。SDK 契约依据：KVAF `codex/cpu-pull-hbm-reference`，`a2f212b2811a40ea2df4351a451381897351dd49` 的 `docs/connector_pull_api_design.md`、Python 绑定及 Runtime 源码。
+原始目标保持两台 P 的 TP8/DP2/EP16、两台 D 的 TP1/DP16/EP16、八台 K、原生 Proxy。单机 8 卡四层是临时验证配置，不限制最终代码的 worker 数、实际层数或 K 地址数量。
 
-## 1. 本批实现
+框架原始基线：af69306b27f703c4227d2ab312208c5df2c1a986；首批组件：cef996c1b0c6a7c0f6c85c51ceb91e2a53d9f937。SDK 契约核对：KVAF codex/cpu-pull-hbm-reference 的 a2f212b2811a40ea2df4351a451381897351dd49。
 
-所有运行时代码均新增于 `vllm_ascend/distributed/kv_transfer/kvaf/pd/`，没有修改原生核心、注册表、CLI、算子或已有 KVAF 逻辑。包导入不注册 Connector、不创建 Runtime/MR、连接、线程或 Tensor，不加载 KVAF/torch_npu。现有启动方式继续走现有路径。
+## 1. 开发计划落实
 
-| 文件 | 已实现内容 |
-| --- | --- |
-| `layout.py` | 从实际 Tensor 检查逐层 PA 布局；逻辑 block 查各自 block table；生成源 offset、HBM output offset；满块/tail 分流；原生 TP 贡献区间；Put entries 地址绑定及范围检查 |
-| `registration.py` | 每层、每 D peer 独立 CPU/NPU source；返回 PA layout 和不解包的 SDK descriptor/ticket；生产事件完成后 Ready；按 source/sequence 匹配释放；失败保活 |
-| `transfer.py` | 原 Put 的 Submit/Wait/Commit/Abort 与恢复；raw READ output/三数组保活和 `resolve_raw_addr`；复用 `KVTransfer._publish_addresses` 做 Commit 后目录发布 |
-| `state.py` | 请求 epoch、实际 P 贡献者、层/chunk 的完成汇总；区分 P 源复用与 D 首轮 Decode 门控；覆盖空贡献者和显式列入的 MTP 层 |
-| `backend.py` | PD 专用逐层 DDR 几何；复用原生目录/Get；完成接收的 tail 在首次 Decode prepare 才导入 ABC；复用原生续写、稳定满块发布及释放 |
-| `tests/ut/test_kvaf_pd.py` | CPU UT，使用真实 Tensor/字节数据、原生目录发布方法和 SDK 边界替身 |
-| `tests/ut/test_kvaf_pd_backend.py` | 逐层目录/Get、首次 Decode tail 导入、4-token 写入节奏及稳定满块续写的 CPU 回归 |
-
-本批没有增加可启动的 `PDKVoffloadConnector` 注册入口，也没有提供可执行部署配置。Scheduler/Worker 接线、ZMQ 消息服务、Runtime 初始化、全网 MR attach、真实接收区分配尚未完成。Backend 的接收引用/续写已在 CPU 层实现，但未接入 Runner。组件不能单独用于生产 PD 推理。
-
-## 2. 保持的需求与地址契约
-
-- P：TP8/DP2/EP16，D：TP1/DP16/EP16；D worker 单 K endpoint、独立 Runtime/region。EP 不再乘出额外 worker。
-- P→D 静态 `KVAF_Meta` 布局字段是 PA。SDK descriptor/ticket 原样传递，内部 UBA 信息由 KVAF 注册、导入和同步。
-- 每个 plane 先由其 block table 取得 P 物理 block，再计算 `(plane_PA - layer_PA) + physical_block * 128 * token_bytes`，宽度分别为 656、128、4 字节。
-- HBM 目的偏移相对本次实际 `output.data_ptr()`；不拿不同分配的最小/最大指针伪造连续源或 output。
-- 只把主 KV 满块送 DDR；tail 只传有效字节到 HBM；Indexer/Scale 保留完整有效历史。N=300 时 DDR 主 KV 167,936 字节、HBM tail 28,864 字节，84 个 padding token 不搬运。
-- Connector 不计算 Hot/LRU/ABC 地址。只有 D Backend 在计算准备阶段导入有效 tail 并按原生逻辑装载 Hot。
-- MTP3、请求级双路径门控、D 本地 prefix 关闭，以及原事务恢复后走原生错误通道的 C01～C06 决策不变。
-
-`plan_layer` 的 `first_block` 表示首个尚未传输的逻辑块。非最终 chunk 只发送新满块；最终 chunk 才带 tail。调用方在完成后推进该值，不能直接取上一 chunk 长度的向上取整值。TP 贡献规则复用原生 SFA 的块区间算法；C8 模型真实复制性、draft ownership 和 alias-storage 生命周期仍须在 Worker 接线时核实。
-
-## 3. 调用及所有权约束
-
-1. 初始化时，每个真实层存储、每个 D peer 建立独立 `LayerRegistration`。SDK 当前 NPU source 仅允许一个 reader，不能复用一个对象服务全部 D。CPU source 绑定该 D region 的 ticket。生产端和消费端布局都必须对应实际连续 Tensor。
-2. 原生分配器仍拥有 D HBM block。DDR key 必须来自现有 `writer.slots[geometry]`，请求目录来自 `writer.requests`，本模块不建立第二个 key 池。
-3. 源写事件完成后发布 Ready。收到完整源信息后，在 Runtime 可独占的短事务窗口内执行 PreparePut；当前 SDK 从 Prepare 起阻止普通 Get，不能长期预留后等待 Prefill。
-4. `LayerPlan.ddr_segments` 从本次 `put.entries` 取绝对 DDR 地址并核对 key/长度；空满块集合不调用 CPU Pull。当前逐层计划会拒绝四层交错 payload。
-5. `CpuPullTransfer` 使用调用方已有的 Put；Submit 只提交，Wait 只确认搬运，Commit 成功后才允许 publish。丢失响应只恢复原 Put，Commit 决定不得改 Abort。DMA 不确定时保留源和目的空间。
-6. `NpuPullTransfer` 在给定 NPU stream 创建连续 int64 三数组，数据进入 output，返回值只代表完成。异常后只有原 Ready 的 `resolve_raw_addr` 成功才能记完成。失败清理/取消不能当作数据就绪。
-7. 每批最多 4096 段。`Segments.batches()` 只分描述符；每个子批必须申请独立 Ready。CPU 批次须同时划分 Put/key，不能拆同一 Put 后用多个单源 Submit 填孔。
-8. Worker 的 Runtime 访问，包括既有 Decode Get，必须统一串行协调。组件不启动后台线程，也未提供跨线程并发保证。
-9. 只有已完成的传输才能产生完成事件；业务 ACK 不能代替 DMA 证明。P 物理 storage 复用还必须汇总同一存储的所有注册源/reader。取消、抢占或超时本身不解除保活。
-10. 退出先停止新任务并恢复/完成旧任务，再 release batch、D detach、P source shutdown，最后释放 Runtime/DDR。源码组件保留对象引用，但完整 Worker 仍须承担全生命周期协调。
-
-## 4. M1 已证实的接入缺口
-
-以下是源码接口事实，不是重新询问已确认的业务定义。
-
-| 技术项 | 源码依据 | 对完整接入的影响与下一步 |
+| 阶段 | 本轮实现 | 验证边界 |
 | --- | --- | --- |
-| 四层交错 DDR 与逐层源 | 框架 `kvaf/layout.py:grouped_layouts`、`cache_policy.py`；SDK `runtime/src/connector_runtime.cc:SubmitCpuPull`、API 第 12 节 | 用户已选择 PD 外部 Backend 改用逐层 DDR。已实现 singleton group、目录/Get 复用及 CPU UT；不修改原生全局分组 |
-| 单层注册的真实存储 | `model_runner_v1.py:_allocate_kv_cache_tensors`、`_allocate_sparse_c8_indexer_tensors`；SDK source register 绑定 | 当前 main/indexer 并非天然一个共同层 allocation。本批只接受经实际存储验证的布局。下一步在外部 Runner/Backend 的分配阶段组织逐层 arena；不在传输时伪造范围或增加整层拼接复制 |
-| D 普通 tail 接收区 | `model_runner_v1.py:_initialize_kvaf_cache_state`、`_allocate_kv_cache_tensors`、`_reshape_kv_cache_tensors` | 当前 Target 绑定 Hot。PD Backend 已提供完成接收的引用绑定、首次 Decode 导入和续写；Runner 普通接收 buffer 分配与原生 block 关联仍需接线 |
-| RA/HCCL 兼容 | `kvaf/adapter.py:connect`、`scripts/patches/kvaf-reuse-device-ra.patch`；SDK `bindings/src/npu_python_runtime.cc` | 旧 Adapter 传 `reuse_device_ra`，目标分支构造签名未包含它。必须适配依赖的 RA 生命周期，不能通过删参数忽略 TP/EP 已有 HCCL 会话 |
-| 初始化顺序/归档绑定 | `model_runner_v1.py` 中 register_kv_caches 早于 KVAFAdapter.connect，后续调用 connector.bind_archive | Worker 注册阶段不能假定 DDR 已初始化。新 Connector 需要明确两阶段握手并兼容原生 bind_archive 边界，不能把旧 prefix Connector 当作 PD 实现 |
-| Runtime 串行事务 | SDK PreparePut 的 pending 保护以及普通 Get 的 Busy 检查 | 必须协调 PD 接收与既有 Decode Get；本批提供事务组件，未接入调度排他窗口 |
-| 错误/MTP/首 token 交接 | 原生 `sfa_pd_rd2h` Scheduler/Worker 与匹配的 vLLM engine | 继续复用原生错误、worker 完成汇总和请求元数据生命周期；本批 UT 不代表 engine/模型接线已验证 |
+| M0 需求与地址契约 | 保持 C01～C06、三条 PA offset 公式、主 KV 满块/有效 tail 分流 | 延续用户确认结果 |
+| M1 外部扩展与依赖 | 原生 Connector 接口、继承的 Worker/Runner；SDK device RA 借用补丁与源码构建脚本 | 对照 vLLM v0.30.0 抽象接口；补丁应用检查、C++ 语法检查；HCCL 共存待硬件 |
+| M2 初始化与注册 | D ticket、按层真实 arena、每 D peer 独立 CPU/NPU source、PA metadata、SDK attach、detach | 真 TCP、真实 CPU Tensor、SDK 边界替身；16×16 注册矩阵 |
+| M3 资源与地址 | 全部 cache group、generation、原生 tail block 到普通接收槽的绑定、单层 DDR key/Put entries | block table、typed scale、PA/UBA 区分、TP8→TP1、空贡献 |
+| M4 按层双 Pull | 写事件后 Ready、HBM raw READ、主 KV CPU Pull、4096 分批、原 Put 恢复、完成汇总 | 字节、padding、chunk、Commit 失联、失败/取消、源复用 |
+| M5 Decode Backend | singleton DDR、原生目录/Get、普通 tail 在计算准备期导入 ABC、后续稳定满块发布 | 实际原生 Backend 的 CPU Get/续写；保持全局 GROUP_WIDTH=4 |
+| M6 轻量验证与交付 | 新增 UT、已有 KVAF 回归、原生格式配置与部署说明 | CPU/mock 与语法检查；NPU 精度、性能、多机长稳待现场 |
 
-### 4.1 DDR 适配路线（已确认并实施组件）
+详细配置和生命周期说明见 [Connector 部署说明](kvaf_pd_connector.md)。
 
-用户于本轮明确选择：仅在新 PD 外部 Backend 中改用逐层 DDR 布局，保留现有 Pull 接口，同时调整 PD 的目录与 Get 布局。
+## 2. 接入与所有权
 
-`create_decode_cache` 使用实际 Target 层名建立 `((layer0,), (layer1,), ...)`，每层几何为 `(656, 128)`，一个 D worker 可共用同一个该几何的 Runtime/region。`PDCachePolicy` 继承原生 KVCachePolicy，显式使用全 1 的 group_sizes，保留原生目录下标、Get 描述符和 key 池；拒绝四层组绑定。没有修改 `GROUP_WIDTH=4`，非 PD 分组保持原实现。
+- Scheduler 继承原生 SFA PD 的请求路由、metaserver rendezvous 和 block 分配；新增 generation 与全部 cache group seed。不把 DSpark 的上下文协议带入普通 MTP。
+- P 普通主 KV、indexer、scale 在真实逐层 arena 中生成最终原生 Tensor views。实际没有 indexer 的层只注册 main；MTP 层以实际 drafter ownership 判断。
+- D 的 Hot/ABC 保持原生计算 Backend 所有。独立普通 tail 接收容量在 profile 前计入；最终 arena 的 indexer 使用原生 blocks，tail 查询 Backend 对本请求原生 block 的绑定。
+- 一个 D worker 使用一个 K endpoint 的独立 Runtime/region。KVAF 内部完成 PA/UBA 映射与 K 同步；业务 TCP 只传 PA 布局和不透明 SDK 对象。
+- P 到所有 D region 建链不等于请求广播。复制的主 KV 由一个贡献方发送，indexer/scale 沿原生 TP 区间分配；空贡献仍确认。
+- PreparePut 仅在源已就绪、Runtime 可独占时发起，避免 SDK pending Put 长期阻断普通 Get。PD 接收和原生 Decode Get 使用同一串行锁，并在 PD 使用 Runtime 前等待 Runner 记录的计算事件，覆盖图重放异步 Get。D 控制监听延后到原生 warmup 完成。
+- 满块主 KV 使用现有 writer.slots 与 writer.requests，Commit 后通过原生目录方法发布，不引入第二套 DDR 分配器或手算绝对 DDR 地址。
+- P 图重放通过 frame 入口复用保护和成功 forward/sample 后的 Target 通知补发接入；CPU/fullmesh EID 按本机物理卡分别配置，支持多 TP/DP worker。
+- MTP snapshot 在原生 deferred finalization 后发送。所有实际必需层和贡献方完成、DDR 发布与 HBM 数据就绪后，才通过原生 finished_recving 放行 D。
+- 在途请求的原生释放会暂缓；安全完成后释放 DDR key 和 tail 槽。源复用须经过 SDK release。未知 DMA/Commit 保留原句柄和存储、停止后续 Get；终态失败接入原生 load-error 和请求完成回报，不额外增加业务 rePrefill。
+- 正常退出先排空，再 D detach、P source shutdown、Runtime/DDR 关闭。完成后不保留每批 NPU descriptor arrays 到请求结束。
 
-`bind_received_tail` 只保存已完成接收的 Tensor 和有效长度；首次 Decode prepare 调用 Backend 的 `_seed` 时才复制有效字节进入 ABC。短上下文的完整 KV 从 DDR 加载也发生在计算准备阶段。后续 4-token 写入、MTP 对齐和稳定满块发布复用原生策略。UT 已验证跨层 Get 数据、tail 不提前进入 Hot、续写后前 384 个 token 的 DDR 字节内容、同一 key 池的释放。
+## 3. 依赖兼容与关闭方式
 
-每层 Get 次数与原四层合并路径不同，当前不承诺性能；内存预算和算子实际输入仍需随 Runner 接线及硬件验证。用户三条 PA→offset 公式、满块/tail 规则及单 K endpoint 策略不变，不新增 SDK Pull 签名。
+PDAdapter 适配新分支现有的 CPU Pull/raw READ 方法签名。scripts/install_kvaf_pd.sh 从用户既有源码构建，应用 scripts/patches/kvaf-pd-borrow-device-ra.patch；它在显式启用时跳过已有 HCCL device RA 的重复初始化，不修改其默认独立运行行为。新 binding 以能力标记防止误加载未补丁版本。SDK 不透明类型只提供 pickle 构造，工具导入检查仅对当前受限元数据通道增加定点例外。
 
-## 5. 验证
+重新使用既有原生 Worker 和既有 Connector 配置，新 PD 路径保持关闭；不需要修改原生文件或运行一次全局替换补丁。旧非 PD KVAF 安装脚本和全局四层 DDR 分组保持原实现。回退前仍须先排空在途传输。
 
-CPU 环境：Python 3.12、torch 2.10.0+cpu。
+## 4. UT 与静态验证
 
 ```bash
-PYTHONPATH=third_party/KVOP python -m unittest discover -s tests/ut -p 'test_kvaf_pd*.py' -v
 PYTHONPATH=third_party/KVOP python -m unittest discover -s tests/ut -p 'test_kvaf_*.py' -v
 ruff check vllm_ascend/distributed/kv_transfer/kvaf/pd tests/ut/test_kvaf_pd*.py
 ruff format --check vllm_ascend/distributed/kv_transfer/kvaf/pd tests/ut/test_kvaf_pd*.py
+bash -n scripts/install_kvaf_pd.sh
 ```
 
-- 新增 43 项 UT：通过。
-- 已有 78 项 KVAF UT：通过；与本批一起运行共 121 项通过。
-- 新增文件的 Ruff check/format、codespell、typos、markdownlint、Gitleaks：通过；Python compileall：通过。
-- 全仓 `bash format.sh ci`：已在隔离文件副本执行，未整体通过。失败来自基线文件的格式、`prefix_cache.py` 拼写/日志入口、既有禁止导入和 GitHub workflow 配置；自动格式化触及的 11 个原有文件均未带回开发检出。本次新增文件没有格式修正差异。
-- 首次全仓检查还遇到 ShellCheck 工具并行解压冲突；固定工具路径后，单独重跑全仓 shellcheck 已通过。
+新增 test_kvaf_pd_flow.py 使用真实回环 TCP，替换 SDK/NPU 边界但运行实际注册、地址、事务和 Backend 代码：四层加 MTP 字节、TP4/TP8→TP1、chunk、空贡献、尾块、不提前放行、Commit 原事务恢复、失败/取消及释放。生产注册测试覆盖 TP8/DP2 的 16 个 P worker、TP1/DP16 的 16 个 D region 和 8 个 K endpoint。
 
-云工作区保留验证记录：`/workspace/scratch/pd-kvaf-ut.log`、`pd-component-ut.log`、`pd-format-ci.log`、`pd-scoped-lint.log`、`pd-shellcheck.log`。全仓检查失败不能写成全仓 CI 通过；本批没有为修复基线问题改动原生文件。
+新增 test_kvaf_pd_integration.py 直接执行复用的原生 Scheduler 实现，检查原生 Proxy 参数、全局 DP 端口、MTP cache groups、容量与取消；Runner 的 NPU 边界替身检查最终 Tensor 存储和 typed scale；Connector 生命周期和显式开关独立校验。首批地址、事务、门控及 Backend UT 继续保留。
 
-覆盖范围包括真实字节数据落点、padding、分块边界、不同 P/D block table、TP 贡献和空贡献、非连续 allocation 拒绝、段数/越界/重叠、精确覆盖、源对象隔离、stale sequence、Submit/Commit 丢包恢复、raw READ 恢复、复用原生目录发布与错误保活。
+最终全量 KVAF UT：160 项通过（原有 121 项与本轮新增 39 项）。修改范围的 Ruff check/format、Python 编译、Shell 语法、禁止导入检查通过；文档 Markdown、拼写和 typos 检查通过，Gitleaks 使用缓存二进制重跑通过。SDK Host binding 构建与实际 CPU/NPU Ready 类型往返通过；SDK CTest 的 13 项 Host 用例通过，1 项 NPU binding 参数测试因本次 Host 构建没有 NpuRuntime 而失败，未将其计为硬件验证通过。全仓 bash format.sh ci 在隔离文件副本执行；基线存在原有格式、拼写、日志和 workflow 检查问题，不通过修改原生核心来修复无关项。新增/修改文件单独检查；全仓未通过不能写成全仓 CI 通过。
 
-没有运行模型精度、NPU 算子、UB/RDMA、全网建链、性能或端到端 PD 测试。原因包括当前云环境无硬件，以及完整 Connector/Backend 尚未接线；CPU/mock 通过不替代这些验证。
+没有执行真实 NPU binding 全量构建、模型精度、UB 数据面、生产全建链、性能或长稳测试。云环境无 NPU/CANN/UB；CPU/mock 通过不替代现场验证，也不证明原生 engine 在所有硬件错误下的最终行为。
 
-## 6. 后续开发顺序
+## 5. 现场后续验收
 
-1. 将已实现的 PD 逐层 Backend 接入外部 Runner，并完成 RA 依赖兼容；保留现有 Pull 签名，同步更新相应 UT。
-2. 用外部 Worker/Runner 扩展提供真实逐层 arena、D 普通接收区和可复用 Runtime；落实初始化顺序和内存预算。
-3. 新增原生 `KVConnectorBase_V1` 的 `PDKVoffloadConnector`，明确 Scheduler/Worker 分工，通过原生模块路径/插件注册加载，默认不选择。复用现有 ZMQ/调度元数据边界及 P/D 握手。
-4. 接入逐层事件、全建链、请求 block 映射、按层双 Pull 与请求级门控；由 Backend 导入 tail/目录并继续 Decode/MTP3。
-5. 完成取消/抢占/错误上报和物理 storage 复用闭环，再给出可执行的原生格式部署配置。每批代码新增对应 UT，通过后提交开发分支。
+先用已能运行的单机四层模型验证实际 cache views、RA/HCCL、双 Pull 和 MTP，再按原始生产拓扑检查全层、多请求、长上下文、并发、图模式、取消/抢占与资源回收。采用 SDK 独立测试、临时单机模型、原始生产部署三个验收层次，分别记录版本和 PASS，不互相替代。
 
-安装、当前 CPU UT、独立 SDK 链路验证及完整 PD 的后续验收步骤见 [安装、部署与测试方法](kvaf_pd_install_deploy_test.md)。
+入口：[通用安装测试](kvaf_pd_install_deploy_test.md)、[机头 CPU 测试](kvaf_pd_ascend_host_cpu_test.md)、[临时单机配置](kvaf_pd_single_server_8npu_4layer.md)。

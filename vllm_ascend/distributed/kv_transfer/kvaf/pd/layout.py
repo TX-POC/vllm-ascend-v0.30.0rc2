@@ -52,8 +52,9 @@ class LayerLayout:
         _integer(self.nbytes, "layer bytes", 1)
         if not self.name or self.pa_base + self.nbytes > MAX_INT64:
             raise ValueError("invalid layer name or PA range")
-        if sorted(p.name for p in self.planes) != sorted(name for name, _ in PLANE_BYTES):
-            raise ValueError("a layer must contain exactly main, indexer and scale")
+        names = sorted(p.name for p in self.planes)
+        if names not in (["main"], sorted(name for name, _ in PLANE_BYTES)):
+            raise ValueError("a layer requires main, with both indexer and scale when owned")
         end = self.pa_base
         for plane in sorted(self.planes, key=lambda p: p.pa_base):
             if plane.pa_base < end or plane.pa_base + plane.blocks * plane.block_bytes > self.pa_base + self.nbytes:
@@ -68,11 +69,13 @@ class LayerLayout:
         raw READ as output), not a synthetic span between unrelated pointers.
         No tensors are allocated, read, concatenated, or retained here.
         """
-        if not layer_tensor.is_contiguous() or set(tensors) != {name for name, _ in PLANE_BYTES}:
-            raise ValueError("require a contiguous layer Tensor and all three planes")
+        if not layer_tensor.is_contiguous() or set(tensors) not in ({"main"}, {name for name, _ in PLANE_BYTES}):
+            raise ValueError("require a contiguous layer Tensor and the owned planes")
         storage = layer_tensor.untyped_storage().data_ptr()
         planes = []
         for plane_name, width in PLANE_BYTES:
+            if plane_name not in tensors:
+                continue
             tensor = tensors[plane_name]
             if (
                 tensor.device != layer_tensor.device
@@ -183,6 +186,7 @@ def plan_layer(
     final: bool = True,
     member: int = 0,
     ratio: int = 1,
+    offload_main: bool = True,
 ) -> LayerPlan:
     """Plan one contributor's newly complete blocks and optional final tail.
 
@@ -198,12 +202,19 @@ def plan_layer(
     if source.name != output.name or first_block > end:
         raise ValueError("layer identity or chunk block interval mismatch")
     owned = contributor_range(end - first_block, member, ratio, first_block)
-    blocks = tuple(range(first_block, full)) if member == 0 else ()
+    if {p.name for p in source.planes} != {p.name for p in output.planes}:
+        raise ValueError("P/D disagree about the indexer owner")
+    blocks = tuple(range(first_block, full)) if member == 0 and offload_main else ()
     main = tuple(source.offset("main", source_tables["main"], q) for q in blocks)
     src, dst, sizes = [], [], []
     for plane_name, width in PLANE_BYTES:
+        if plane_name not in {p.name for p in source.planes}:
+            continue
         if plane_name == "main":
-            selected = (full,) if member == 0 and final and tail and full >= first_block else ()
+            if offload_main:
+                selected = (full,) if member == 0 and final and tail and full >= first_block else ()
+            else:
+                selected = range(first_block, end) if member == 0 else ()
         else:
             selected = owned
         for q in selected:

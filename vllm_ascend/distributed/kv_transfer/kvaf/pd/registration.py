@@ -21,6 +21,22 @@ class SourceMetadata:
     npu_ticket: Any
     npu_address: str
 
+    def check_ready(self, path: str, ready: Any) -> None:
+        source = ready.source
+        if path == "cpu":
+            fields = ("source_id", "source_bytes", "region_id", "region_epoch")
+            valid = all(getattr(source, name) == getattr(self.cpu_descriptor, name) for name in fields)
+        elif path == "npu":
+            valid = (source.source_id, source.source_epoch, source.source_bytes) == (
+                self.npu_ticket["source_id"],
+                self.npu_ticket["epoch"],
+                self.npu_ticket["bytes"],
+            )
+        else:
+            raise ValueError("unknown source path")
+        if not valid:
+            raise ValueError("Ready does not belong to the registered P layer/peer")
+
     def attach(self, runtime: Any, *, peer: str, local_eid: str) -> None:
         if peer != self.peer:
             raise ValueError("source registration belongs to another D peer")
@@ -66,7 +82,12 @@ class LayerRegistration:
         self._attempted = True
         self.cpu_descriptor = self.cpu.register(ddr_ticket, self.tensor, stream)
         self.npu_ticket = self.npu.register(self.tensor, stream)
-        self.npu.listen(listen_address)
+        port = self.npu.listen(listen_address)
+        host, _, requested_port = advertised_address.rpartition(":")
+        if requested_port == "0":
+            if type(port) is not int or not 0 < port <= 65535:
+                raise RuntimeError("SDK did not return the bound source port")
+            advertised_address = f"{host}:{port}"
         self.metadata = SourceMetadata(self.peer, self.layout, self.cpu_descriptor, self.npu_ticket, advertised_address)
         return self.metadata
 

@@ -14,7 +14,7 @@
 | KVAF | TX-POC/KVAF-Devlop，codex/cpu-pull-hbm-reference；a2f212b2811a40ea2df4351a451381897351dd49 |
 | SDK 接口 | 该提交的 docs/connector_pull_api_design.md、cpu_pull_offload_usage.md 和 Python 测试源码 |
 
-**当前可直接进行 SDK 独立联调。完整 PDKVoffloadConnector、Scheduler/Worker/ZMQ、接收区分配和 Runtime 接线尚未完成，因此本指南不宣称当前能启动 GLM5.3 端到端 PD。** 模型接线条件仍见 [实施记录](kvaf_pd_implementation.md)；原部署方法见 [安装、部署与测试](kvaf_pd_install_deploy_test.md)。
+本指南的独立 SDK 测试继续适用。当前开发分支已新增独立 PDKVoffloadConnector、外部 Worker/Runner 与双 Pull 接入；模型部署采用 [Connector 配置说明](kvaf_pd_connector.md)，包括 HCCL device RA 借用补丁。完整模型和原生产拓扑仍需现场验收，独立 SDK PASS 不等同于模型 PD 精度通过。
 
 机头 CPU 替代 K 不改变已确认契约：每 D worker 独立 Runtime/region、逐层 DDR 几何 `(656,128)`、PA Meta、SDK 解析 UBA、主 KV 满块入 DDR、tail 和完整 Indexer/Scale 入 D HBM，Hot 仅由 Backend 在计算阶段加载。
 
@@ -49,7 +49,7 @@ flowchart LR
 
 该拓扑同样不需要独立鲲鹏服务器。现有 SDK 脚本让两个 NPU 测试进程通过同机 Pipe/listener 交换元数据，但 K endpoint 可以在节点 B；因此 T1 能直接沿用同一组测试命令。
 
-T1 **不是**跨主机 P 实例与 D 实例的完整分离部署；后者仍依赖 Connector 接线。测试记录必须写明 T0/T1、实际物理节点和 K 进程数。
+T1 **不是**跨主机 P 实例与 D 实例的完整分离部署；后者按新的 Connector 配置部署并单独验收。测试记录必须写明 T0/T1、实际物理节点和 K 进程数。
 
 ## 3. 准备目录和环境
 
@@ -284,8 +284,8 @@ Python binding 和 Get/Put/raw object 来自同次 SDK 构建；raw 使用 V2 AB
 | 单卡 CPU Pull | LOCAL_CPU_PULL_PASS；checksum、Commit 和释放成功 |
 | 双卡 CPU Pull | REMOTE_OFFLOAD_PASS；共享 region、显式事务和源复用正确 |
 | 双 Pull + Get/Put | HBM_RAW_PASS；两个源的数据、目标 output 和普通 DDR Get/Put 校验通过 |
-| PD 组件逻辑 | 新增 43 项/总回归 121 项 CPU UT 通过，版本按原指南 |
-| 全模型接线后 | 再检查 GLM5.3、MTP3、真实层/块地址、完成门控及普通接收区；当前尚未完成 |
+| PD 逻辑 | 当前分支含 Connector、原生 Scheduler、外部 Runner 和真实 TCP 的 CPU/mock UT，数量见实施记录 |
+| 全模型现场验收 | 检查 GLM5.3、MTP3、真实层/块地址、完成门控及普通接收区；云环境无硬件，尚未执行 |
 
 CPU UT 命令见 [原指南第 3 节](kvaf_pd_install_deploy_test.md#3-a当前-cpu-安装与-ut)，不需要 K 服务。源码使用新 PD 的逐层 Backend，不修改全局四层分组。
 
@@ -341,10 +341,10 @@ python3 tests/python/bench_hbm_read_raw_addr.py \
 
 退出顺序：停止新提交 → 完成/恢复原 Put 和 raw READ → release batch → D detach → P source shutdown → D Runtime/DDR 关闭 → K 服务最后停止。不要通过先重启 K 或超时释放源内存来跳过在途 DMA；K 重启产生新代次，旧 ticket/地址不能继续使用。
 
-进入真实 vLLM TP/DP/EP 联调前，还需完成新 Connector/Runner 接线、真实逐层 arena/接收区、MTP 与错误/抢占释放，以及目标 SDK 的 RA/HCCL 兼容。旧 Adapter 的 `reuse_device_ra` 签名差异仍存在，机头 CPU 部署不解决它。
+进入真实 vLLM TP/DP/EP 联调时，使用新 Connector、外部 Worker/Runner 和新 PD SDK 构建脚本。它显式借用 HCCL 的 device RA，不向新分支传入旧 Adapter 的 reuse_device_ra 构造参数；现场仍须验证 TP/EP 会话中的实际 RA/HCCL 兼容。详见 [Connector 部署说明](kvaf_pd_connector.md)。
 
 联调记录保存：SDK/框架/镜像版本、T0/T1、机头 CPU 架构、设备号/EID、监听和实际 endpoint、NUMA/CPU 绑定、DDR 配额与峰值、每条命令退出码、PASS 标记及 K 日志。**本文硬件步骤待现场执行，当前云环境未实测同机 URMA、CPU/NPU 数据面或模型 PD。**
 
 文档校验：11 段 Bash 示例通过语法检查，5 条 SDK 测试/压测命令的参数与固定提交源码匹配；Markdown 格式、codespell 和 typos 检查通过。这些是文档检查结果，不是硬件命令执行结果。
 
-单机 8 卡、已可运行四层模型的 P/D 资源划分、当前接线缺口和后续部署验收见 [单机 8 卡四层模型 PD 教程](kvaf_pd_single_server_8npu_4layer.md)。
+单机 8 卡、已可运行四层模型的 P/D 资源划分、原生启动配置和部署验收见 [单机 8 卡四层模型 PD 教程](kvaf_pd_single_server_8npu_4layer.md)。

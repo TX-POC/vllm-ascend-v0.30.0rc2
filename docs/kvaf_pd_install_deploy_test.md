@@ -1,20 +1,20 @@
 # GLM5.3 W4A4C8：安装、部署与测试方法
 
-适用版本：`v0.30.0rc2-develop` 首批实现 `cef996c1b0c6a7c0f6c85c51ceb91e2a53d9f937`。
+适用版本：`v0.30.0rc2-develop` 的独立 PD Connector 接入实现；首批组件历史版本为 `cef996c1b0c6a7c0f6c85c51ceb91e2a53d9f937`。
 
 ## 1. 当前可执行范围
 
-当前提交包含地址、注册、Pull 事务、完成门控和 PD 逐层 DDR Backend 组件。完整 `PDKVoffloadConnector`、Scheduler/Worker/ZMQ 接线、接收区分配、Runtime 初始化与全网 MR attach 尚未完成，**当前不能启动端到端 PD 推理**。
+当前分支已接入独立 PDKVoffloadConnector、外部 Worker/Runner、真实逐层 arena、普通 tail 接收区、TCP 布局交换、全建链注册、双 Pull 与原生 Decode Backend。实际入口、原生配置和 SDK RA 补丁以 [Connector 部署说明](kvaf_pd_connector.md) 为准。当前云环境只执行 CPU/mock 逻辑验证，真实模型 PD 仍需现场验收。
 
 按以下层次执行，避免把组件测试成功当成模型部署成功：
 
 | 层次 | 环境 | 当前能做什么 | 通过意味着什么 |
 | --- | --- | --- | --- |
-| A：组件 UT | Linux CPU、Python 3.12 | 直接安装测试依赖并运行 43 项新 UT、121 项 KVAF 总回归 | 地址、字节、事务及 Backend 关键逻辑通过 |
-| B：独立 SDK | 950DT NPU + 鲲鹏 K + CANN/UB | 构建 KVAF，运行 CPU Pull、NPU raw READ、KVOP 测试 | 对应设备/链路/算子通过，不等于 PD 接线完成 |
-| C：完整 PD | 两台 P、两台 D、八台 K、Proxy | 完成剩余接线后按第 8 节验收 | 模型、跨节点路由、传输和释放均通过 |
+| A：组件 UT | Linux CPU、Python 3.12 | 安装测试依赖并运行全部 KVAF UT | 地址、字节、事务及 Backend 关键逻辑通过 |
+| B：独立 SDK | 950DT NPU + 鲲鹏 K + CANN/UB | 构建 KVAF，运行 CPU Pull、NPU raw READ、KVOP 测试 | 对应设备/链路/算子通过，不等于完整模型 PD 验收通过 |
+| C：完整 PD | 两台 P、两台 D、八台 K、Proxy | 按新 Connector 配置启动，再按第 8 节验收 | 模型、跨节点路由、传输和释放均通过 |
 
-无 NPU/CANN/UB 时先执行 A；这些硬件缺失不阻塞当前开发与逻辑验证。本文未执行容器启动、SDK 硬件构建或模型部署。实现状态详见 [首批实施记录](kvaf_pd_implementation.md)。
+无 NPU/CANN/UB 时先执行 A；这些硬件缺失不阻塞当前开发与逻辑验证。本文未执行容器启动、SDK 硬件构建或模型部署。实现状态详见 [实施记录](kvaf_pd_implementation.md)。
 
 暂无独立鲲鹏服务器时，先按 [昇腾机头 CPU 作为临时 K 的联调测试](kvaf_pd_ascend_host_cpu_test.md) 部署 CPU 服务；该文档覆盖同机双卡及借另一台昇腾机头 CPU 的测试方法。
 
@@ -23,7 +23,7 @@
 | 内容 | 版本依据 |
 | --- | --- |
 | 框架仓 | `https://github.com/TX-POC/vllm-ascend-v0.30.0rc2.git`，`v0.30.0rc2-develop` |
-| 本文验收代码 | `cef996c1b0c6a7c0f6c85c51ceb91e2a53d9f937` |
+| 本文验收代码 | 当前开发分支的 PD Connector 接入实现 |
 | 新 Pull SDK | `https://github.com/TX-POC/KVAF-Devlop.git`，`codex/cpu-pull-hbm-reference` |
 | SDK 源码核对提交 | `a2f212b2811a40ea2df4351a451381897351dd49` |
 
@@ -47,7 +47,7 @@ git -C "$KVAF_PD_SRC" rev-parse HEAD
 分支会继续更新。如需精确复现本文，在上述新克隆中固定版本：
 
 ```bash
-git -C "$ASCEND_SRC" checkout --detach cef996c1b0c6a7c0f6c85c51ceb91e2a53d9f937
+git -C "$ASCEND_SRC" switch v0.30.0rc2-develop
 git -C "$KVAF_PD_SRC" checkout --detach a2f212b2811a40ea2df4351a451381897351dd49
 ```
 
@@ -55,7 +55,7 @@ git -C "$KVAF_PD_SRC" checkout --detach a2f212b2811a40ea2df4351a451381897351dd49
 
 - 框架的 `scripts/install_kvaf.sh` 固定旧 SDK `c4375e13...`，并应用旧版 RA 补丁；本方法的新 Pull SDK 使用独立目录，按第 5 节构建。
 - 目标 SDK 的 `build.sh npu` 没有显式开启 `KVAF_ENABLE_CPU_OFFLOAD`。新建构建目录时默认 OFF；只执行它不足以准备 CPU Pull API。
-- 旧 Adapter 传入的 `reuse_device_ra` 在目标 SDK 构造签名中尚未适配。独立 SDK 测试在未建立 HCCL 的测试进程中执行；TP/EP 推理集成还须完成 RA 生命周期兼容，不能通过删除该参数直接绕过。
+- 新 PD 入口使用专用 Runtime 适配，不传旧 Adapter 的 reuse_device_ra 参数。进入 TP/EP 模型联调前，必须按 [Connector 说明](kvaf_pd_connector.md#2-sdk-源码构建) 构建显式借用 HCCL device RA 的 binding；独立 SDK PASS 不等于 HCCL 共存已实测。
 
 ## 3. A：当前 CPU 安装与 UT
 
@@ -320,7 +320,7 @@ python3 tests/python/bench_hbm_read_raw_addr.py \
 
 ## 8. C：完整 PD 部署后的验收方法
 
-本节是后续接线完成后的验收流程，**不是当前提交的可执行启动配置**。现有 `scripts/start_vllm_server.sh` 是非 PD 基线，`kvaf_enabled=true` 也不会选择新 `PDKVoffloadConnector`。此时不要把未注册的名称填入启动命令后当成已支持。
+本节用于真实硬件验收。启动采用 [新 Connector 的原生配置](kvaf_pd_connector.md#3-原生配置入口)；现有 scripts/start_vllm_server.sh 保持非 PD 基线，不会仅因 kvaf_enabled=true 自动选择新 Connector。
 
 ### 8.1 启动与就绪顺序
 
@@ -395,7 +395,7 @@ DSA_BASE_URL="$PD_PROXY_URL" DSA_MODEL=glm DSA_MAX_TOKENS=64 \
 | `reuse_device_ra` 参数报错 | 旧 Adapter/目标 SDK 签名不兼容，按实施记录完成适配 |
 | TCP 可达但注册/READ 失败 | UB provider、候选/EID、CPU 与 fullmesh 路由、MR 导入和设备可见性 |
 | `Busy` / pending Put | 原事务仍持有 Runtime；协调已有 Decode Get，不另建事务绕过 |
-| `unknown connector PDKVoffloadConnector` | 当前版本尚未实现/注册完整入口，安装 SDK 不能补齐该接线 |
+| `unknown connector PDKVoffloadConnector` | 核对框架分支/导入路径及 kv_connector_module_path；同时选择外部 PDKVWorker，单独安装 SDK 不会切换框架代码 |
 
 每轮保存：版本清单、启动配置、测试命令与退出码、UT 计数、SDK PASS 标记、按用例的有效字节数、故障恢复结果和性能原始数据。诊断数据在独立验证阶段采集，推理热路径不加逐步 Debug/Info 打印。
 
