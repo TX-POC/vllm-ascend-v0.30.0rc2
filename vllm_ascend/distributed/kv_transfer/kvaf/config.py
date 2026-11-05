@@ -16,9 +16,15 @@ class KVAFConfig:
     hot_tokens: int = 8192  # Per request/layer; excludes the fixed 384-token ABC tail.
     npu_core_count: int = 2
     jettys_per_core: int = 2
+    decode_backend: str = "batch_get"  # batch_get or li_fetch; fixed for the worker lifetime.
+    intermediate_fetches: int = 8  # LIFetch windows, including the initial hot window; 1..32.
     verify_put: bool = False  # Read back one prefill and one decode block per worker for byte comparison.
 
     def __post_init__(self) -> None:
+        if self.decode_backend not in ("batch_get", "li_fetch"):
+            raise ValueError("kvaf_config.decode_backend must be batch_get or li_fetch")
+        if type(self.intermediate_fetches) is not int or not 1 <= self.intermediate_fetches <= 32:
+            raise ValueError("kvaf_config.intermediate_fetches must be an integer in 1..32")
         if type(self.enabled) is not bool:
             raise ValueError("kvaf_config.enabled must be true or false")
         if type(self.verify_put) is not bool:
@@ -39,6 +45,8 @@ class KVAFConfig:
             raise ValueError("kvaf_config.ddr_size_gb must be finite and positive (per worker)")
         if type(self.hot_tokens) is not int or self.hot_tokens < 8192 or self.hot_tokens % 128:
             raise ValueError("kvaf_config.hot_tokens must be an integer >= 8192 and a multiple of 128")
+        if self.decode_backend == "li_fetch" and self.hot_tokens % 256:
+            raise ValueError("li_fetch requires hot_tokens aligned to the original kernel's 256-token tiles")
         # Limits of the pinned KVAF native runtime.
         for name, maximum in (("npu_core_count", 48), ("jettys_per_core", 64)):
             value = getattr(self, name)

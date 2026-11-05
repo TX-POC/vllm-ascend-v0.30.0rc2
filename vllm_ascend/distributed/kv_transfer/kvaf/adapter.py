@@ -36,8 +36,15 @@ class KVAFAdapter:
         dp_rank: int,
         reuse_device_ra: bool = False,
         groups=None,
+        fused_workers: int | None = None,
     ):
         self.config = config
+        if fused_workers is not None:
+            if config.decode_backend != "li_fetch" or type(fused_workers) is not int or fused_workers < 1:
+                raise ValueError("Fused worker allocation requires li_fetch and a positive worker count")
+            if config.jettys_per_core != 2:
+                raise ValueError("LIFetch requires two jettys per transport worker")
+        self.transport_workers = config.npu_core_count if fused_workers is None else fused_workers
         self.device_id = device_id  # Logical NPU ID; KVAF resolves the physical device itself.
         self.reuse_device_ra = reuse_device_ra
         self.cpu_address = config.cpu_address
@@ -141,7 +148,7 @@ class KVAFAdapter:
                         batch_get_token_bytes=token_bytes,
                         batch_get_tokens_per_block=block_size,
                         device_id=self.device_id,
-                        npu_core_count=self.config.npu_core_count,
+                        npu_core_count=self.transport_workers,
                         batch_put_kernel_object_path=str(kernels["put"]),
                         jettys_per_core=self.config.jettys_per_core,
                         reuse_device_ra=self.reuse_device_ra,
@@ -237,9 +244,9 @@ class NativeCacheAdapter:
         if pool.max_tokens > NATIVE_SLOT_CAPACITY or pool.max_tokens < 2 * TOPK:
             raise ValueError(f"LIDU requires {2 * TOPK}..{NATIVE_SLOT_CAPACITY} map entries including spare slots")
         if native is None:
-            from nanovllm_dsa_lidu_fused_batch_get_prepare_mtp import lidu_fused_batch_get_prepare_mtp_out
+            from kvip import lidu
 
-            native = lidu_fused_batch_get_prepare_mtp_out
+            native = lidu
         self.prepare_op, self.pool = native, pool
         layers, batch = len(pool.names), pool.max_requests
         self.max_queries = batch * MAX_QUERIES

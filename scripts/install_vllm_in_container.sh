@@ -15,6 +15,6 @@ python3 -m pip install 'setuptools>=77.0.3,<81.0.0' 'setuptools-scm>=8' 'setupto
 # Keep the image's matched torch/torch-npu/CANN dependencies.
 VLLM_TARGET_DEVICE=empty python3 -m pip install --no-deps --no-build-isolation -e /vllm-workspace/vllm
 python3 -m pip install --no-deps --no-build-isolation -e "$repo_root"
-python3 -m pip install --no-deps --no-build-isolation -e "$repo_root/third_party/KVOP"
+# Optional KVAF operators: bash scripts/install_kvip.sh (builds external KVIP and KVAF).
 
 echo 'Editable vLLM and vLLM-Ascend installation complete.'

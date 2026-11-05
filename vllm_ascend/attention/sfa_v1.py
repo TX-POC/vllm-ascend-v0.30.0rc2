@@ -1572,8 +1572,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         return hidden_states, ql_nope, q_pe, q_c
 
     def _prepare_indexer_metadata(self, indexer_metadata, attn_metadata) -> None:
-        """Allow an attention backend to supply indexer selection metadata."""
-        return
+        """Select the group's LI implementation after projection/cache writes."""
+        binding = getattr(self, "kvaf_hot", None)
+        if binding is not None:
+            policy, group = binding
+            policy.prepare_indexer_metadata(group, getattr(self, "kvaf_group_offset", 0), indexer_metadata)
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:

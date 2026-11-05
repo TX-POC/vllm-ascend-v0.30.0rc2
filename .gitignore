@@ -242,3 +242,10 @@ csrc/third_party/
 
 # KVAF source, native builds and CPU-side UMDK dependency
 /third_party/KVAF/
+
+# Optional public fused operator checkout
+/third_party/KVIP/
+
+# Standalone KVAF backend comparison artifacts
+/experiments/kvaf/vendor/
+/experiments/kvaf/results/

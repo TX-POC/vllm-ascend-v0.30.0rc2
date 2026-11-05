@@ -133,6 +133,7 @@ def describe_cache_layouts(
 
 TOPK = 2048
 MAX_QUERIES = 4
+FUSED_HISTORY_ALIGNMENT = 256  # Original LIFetch LI tile-pair requirement.
 NATIVE_SLOT_CAPACITY = (1 << 17) + 20 * 128
 NATIVE_BITMAP_WORDS = 4176
 BLOCK_SIZE = 128
