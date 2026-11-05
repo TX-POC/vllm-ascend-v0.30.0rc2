@@ -30,6 +30,7 @@ class PullJob:
     transfers: list = field(default_factory=list)
     finished: bool = False
     error: Exception | None = None
+    acknowledged: bool = False
 
 
 class Receiver:
@@ -48,13 +49,17 @@ class Receiver:
         stream_factory=lambda: None,
         raw_transfer=NpuPullTransfer,
         start_immediately=True,
+        draft_limit=None,
+        num_spec_tokens=3,
     ):
         self.runtime, self.writer, self.pool, self.memories = runtime, writer, pool, memories
         self.identity = uuid4().hex
         self.timeout, self.local_eid = timeout, local_eid
+        self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
         self.activate, self.stream_factory, self.raw_transfer = activate, stream_factory, raw_transfer
         self.condition = Condition(RLock())
         self.sources, self.requests, self.jobs = {}, {}, {}
+        self.terminal_jobs = {}
         self.finished, self.errors = set(), set()
         self.native_finished = set()
         self.closed = False
@@ -120,7 +125,12 @@ class Receiver:
         self.activate()
         operation = message["op"]
         if operation == "hello":
-            return {"peer": self.identity, "ticket": self.runtime.offload_region()}
+            return {
+                "peer": self.identity,
+                "ticket": self.runtime.offload_region(),
+                "draft_limit": self.draft_limit,
+                "num_spec_tokens": self.num_spec_tokens,
+            }
         if message.get("peer") != self.identity:
             raise ValueError("stale D worker/DDR region")
         if operation == "register":
@@ -148,23 +158,12 @@ class Receiver:
                     if key[0] == producer:
                         self.runtime.detach_hbm(source.npu_ticket)
                         self.sources.pop(key)
+                self.terminal_jobs = {key: value for key, value in self.terminal_jobs.items() if value[0] != producer}
             return True
         if operation == "plan":
             return self._plan(message)
-        if operation in ("pull", "complete", "status"):
-            job = self.jobs[message["job"]]
-            if (message["producer"], message["generation"]) != (job.producer, job.generation):
-                raise ValueError("stale source/job identity")
-            if operation == "pull":
-                return self._pull(job, message)
-            if operation == "complete":
-                return self._complete(job)
-            with self.runtime.lock:
-                return {
-                    "done": job.finished,
-                    "error": str(job.error) if job.error else None,
-                    "completed": dict(job.completed),
-                }
+        if operation in ("pull", "complete", "status", "ack_complete"):
+            return self._job_operation(operation, message)
         if operation == "cancel":
             request = self._request(message["request"], message["generation"])
             with self.runtime.lock:
@@ -182,6 +181,53 @@ class Receiver:
             return True
         raise ValueError("unknown PD control operation")
 
+    def _job_operation(self, operation, message):
+        with self.runtime.lock:
+            key = message["job"]
+            identity = message["producer"], message["generation"]
+            job = self.jobs.get(key)
+            if job is None:
+                terminal = self.terminal_jobs.get(key)
+                if terminal is None:
+                    if operation == "ack_complete":
+                        return True  # Duplicate cleanup carries no resource ownership.
+                    raise KeyError(key)
+                if identity != terminal[:2]:
+                    raise ValueError("stale source/job identity")
+                if operation == "ack_complete":
+                    self.terminal_jobs.pop(key)
+                    return True
+                if operation == "complete":
+                    return True
+                if operation == "pull":
+                    raise RuntimeError("Pull job is terminal")
+                return {"done": True, "error": terminal[2], "completed": {}}
+            if identity != (job.producer, job.generation):
+                raise ValueError("stale source/job identity")
+            if operation == "pull":
+                return self._pull(job, message)
+            if operation == "complete":
+                return self._complete(job)
+            if operation == "ack_complete":
+                if not job.finished:
+                    raise RuntimeError("layer completion must precede its acknowledgement")
+                job.acknowledged = True
+                return True
+            return {
+                "done": job.finished,
+                "error": str(job.error) if job.error else None,
+                "completed": dict(job.completed),
+            }
+
+    def _forget_request_jobs(self, request_id):
+        for key, job in tuple(self.jobs.items()):
+            if job.request_id == request_id:
+                if job.finished and not job.acknowledged:
+                    # No tensors or SDK handles: recover a lost complete reply
+                    # even when native Decode teardown already won the race.
+                    self.terminal_jobs[key] = (job.producer, job.generation, str(job.error) if job.error else None)
+                self.jobs.pop(key)
+
     def _plan(self, message):
         request = self._request(message["request"], message["generation"])
         with self.runtime.lock:
@@ -191,6 +237,8 @@ class Receiver:
             source = self.sources[producer, layer].layout
             memory = self.memories[layer]
             member, ratio = message["member"], message["ratio"]
+            if type(member) is not int or type(ratio) is not int or not 0 <= member < ratio:
+                raise ValueError("invalid Pull contributor")
             if member in request["cancel_votes"]:
                 raise ValueError("source participant already cancelled this generation")
             cohort = (message["cohort"], ratio)
@@ -198,24 +246,47 @@ class Receiver:
                 raise ValueError("request routed to multiple P contributor groups")
             request["cohort"] = cohort
             tokens, first, final = message["tokens"], message["first"], message["final"]
-            if not 0 <= tokens <= request["seed"].tokens or final and tokens != request["seed"].tokens:
+            if type(tokens) is not int or type(first) is not int or first < 0 or type(final) is not bool:
+                raise ValueError("invalid Pull progress")
+            if (
+                not 0 <= tokens <= request["seed"].tokens
+                or first > tokens // BLOCK_SIZE
+                or final
+                and tokens != request["seed"].tokens
+            ):
                 raise ValueError("P/D disagree about prompt length")
             slot = self.pool.policy.receive_slots[request["id"]] if memory.offload_main else None
             if memory.offload_main and request["seed"].tokens % BLOCK_SIZE:
                 native_block = request["seed"].blocks[memory.groups["main"]][request["seed"].tokens // BLOCK_SIZE]
                 slot = self.pool.policy.receive_slot_for(request["id"], layer, native_block)
             tables = memory.tables(request["seed"].blocks, tail_slot=slot, tokens=tokens)
-            plan = plan_layer(
-                source,
-                memory.describe(layer),
-                message["tables"],
-                tables,
-                tokens,
-                first_block=first,
-                final=final,
-                member=member,
-                ratio=ratio,
-                offload_main=memory.offload_main,
+            skipped = message.get("draft_skipped", False)
+            if type(skipped) is not bool:
+                raise ValueError("draft skip must be an explicit boolean")
+            if skipped and (
+                memory.offload_main
+                or self.draft_limit is None
+                or request["seed"].tokens + self.num_spec_tokens <= self.draft_limit
+            ):
+                raise ValueError("draft skip would leave KV required by native Decode uninitialized")
+            # A skipped MTP frame carries progress, never dummy-forward bytes.
+            # At this prompt length the same native limit also skips every
+            # later D draft, so no MTP source or destination is required.
+            plan = (
+                None
+                if skipped
+                else plan_layer(
+                    source,
+                    memory.describe(layer),
+                    message["tables"],
+                    tables,
+                    tokens,
+                    first_block=first,
+                    final=final,
+                    member=member,
+                    ratio=ratio,
+                    offload_main=memory.offload_main,
+                )
             )
             owner = (layer, member)
             previous = [
@@ -228,7 +299,11 @@ class Receiver:
                 raise ValueError("duplicate, missing or out-of-order layer chunk")
             if previous and any(job.producer != producer for job in previous):
                 raise ValueError("P contributor identity changed mid-request")
-            count = {"cpu": (len(plan.full_blocks) + MAX_SEGMENTS - 1) // MAX_SEGMENTS, "npu": len(plan.hbm.batches())}
+            count = (
+                {"cpu": 0, "npu": 0}
+                if skipped
+                else {"cpu": (len(plan.full_blocks) + MAX_SEGMENTS - 1) // MAX_SEGMENTS, "npu": len(plan.hbm.batches())}
+            )
             job_id = uuid4().hex
             self.jobs[job_id] = PullJob(
                 request["id"],
@@ -442,9 +517,7 @@ class Receiver:
                     self.writer.release_requests((request["id"],))
                     self.native_finished.discard(request["id"])
                     self.requests.pop(external_id)
-                    for key, job in tuple(self.jobs.items()):
-                        if job.request_id == request["id"]:
-                            self.jobs.pop(key)
+                    self._forget_request_jobs(request["id"])
 
     def close(self):
         with self.runtime.lock:

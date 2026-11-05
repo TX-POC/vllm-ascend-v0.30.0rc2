@@ -15,7 +15,7 @@
 | pd/receiver.py、layout.py、transfer.py | PA offset、双 Pull、原 Put 恢复、DDR 目录发布、请求级汇总 |
 | pd/runtime.py、backend.py | 每 D worker 独立 Runtime/region、逐层 DDR、Get 串行协调、计算阶段 tail 导入 |
 
-初始化：先启动 K 和 D。D link_to、初始化 DDR，在原生 warmup/图捕获结束后开启控制监听；P 独立初始化实际 KV，向每个 D 获取 ticket，按层按 peer 分别注册 CPU/NPU source，再把 PA 布局和不透明 SDK descriptor/ticket 交给 D attach。每个 NPU source 只供一个 D reader；不同 D region 不共享 Put 或 source 对象。
+初始化：先启动 K 和 D。D link_to、初始化 DDR，在原生 warmup/图捕获结束后开启控制监听；P 独立初始化实际 KV，向每个 D 获取 ticket，核对两端原生 drafter 的有效长度上限和 speculative token 数，再按层按 peer 分别注册 CPU/NPU source，把 PA 布局和不透明 SDK descriptor/ticket 交给 D attach。两端上限或 MTP 宽度不一致时，在注册前拒绝接入。每个 NPU source 只供一个 D reader；不同 D region 不共享 Put 或 source 对象。
 
 业务层的静态 KVAF_Meta 是 **PA**。Register 映射 PA/UBA 并把 UBA 信息同步给 K；Connector 不交换或拼接 UBA 绝对地址。三类源偏移继续使用：
 
@@ -33,9 +33,13 @@ scale:   (scale_PA - layer_PA) + P_physical_block * 128 * 4
 - 仅完整主 KV blocks：submit_cpu_pull，直接进入对应 D region 的远端 DDR；Wait、Commit 和目录发布完成后计入就绪。
 - 实际 MTP cache 按原生所有权保留在 HBM；在原生 deferred connector finalization、MTP 写入完成后发送其有效 prompt snapshot，不把 MTP3 当作三个独立模型层，不启用 DSpark 协议。
 
-主 KV 使用复制域的 member 0；indexer/scale 复用原生 TP 块区间分摊和旋转规则，空贡献也完成汇总。全建链只决定可访问范围，请求只使用实际选中的 P DP/TP 贡献组和 D worker。P 在新 frame 写缓存前排空旧读取；图重放省略 Python 写通知时，在原生 forward/sample 成功后补发 Target 层通知，MTP 仍以实际写入通知为依据，不伪造未生成的 KV。
+主 KV 使用复制域的 member 0；indexer/scale 复用原生 TP 块区间分摊和旋转规则，空贡献也完成汇总。全建链只决定可访问范围，请求只使用实际选中的 P DP/TP 贡献组和 D worker。P 在新 frame 写缓存前排空旧读取；图重放省略 Python 写通知时，在原生 forward/sample 成功后补发 Target 层通知，MTP 则仅在实际原生 proposal 成功后补发对应通知。
 
-每次最多 4096 段，超限分成独立 Ready/Put 批次。DDR 地址以本次 Put entries 为准。PreparePut 会阻止该 Runtime 的普通 Get，因此不长期持有 Prepare 等待 P 计算；接收与原生 Decode Get 共用串行锁。
+P 沿用原生 Proxy 的单 token Prefill（max_tokens=1）。Scheduler 按完整 prompt 是否满足 prompt_len + 3 ≤ 原生 drafter 有效上限分两类准入，同一活动批次保持同类，避免长请求触发批级 skip_drafting 后遗漏短请求必需的 MTP prefix。分类不改变 MTP3，也不增加用户配置项。
+
+当原生实际执行 _skip_drafting 时，外部 Runner 在 DP 占位 forward 前标记跳过；占位执行产生的写钩子不会触发请求 KV 传输。只有完整 prompt_len + 3 已超过 D 的同一原生上限、后续 Decode 也必然沿用原生跳过流程时，D 才接受该 MTP 层的零 DMA 进度贡献。所有参与 rank 仍须完成汇总。其他缺失的必需 MTP KV 会报错，不通过清零缓存或业务 rePrefill 掩盖。
+
+每次最多 4096 段，超限分成独立 Ready/Put 批次。DDR 地址以本次 Put entries 为准。PreparePut 会阻止该 Runtime 的普通 Get，因此不长期持有 Prepare 等待 P 计算；接收与原生 Decode Get 共用串行锁。complete 应答丢失时只查询原 job 状态，必要时重发幂等 complete；不会重发 Pull 或创建新的 Ready/Put。P 确认后发送 ack_complete，正常路径不积累终态记录；清理应答丢失时，D 仅保留恢复所需的小记录至确认或 source detach。
 
 ## 2. SDK 源码构建
 
@@ -114,7 +118,11 @@ port = kv_port + 全局 data_parallel_rank * tensor_parallel_size + TP_rank
 
 该对象放进 P 的 kv_connector_extra_config；不另建中间配置协议。可选 cpu_eids、npu_eids 是“本机物理 NPU ID 字符串 → 32 位十六进制 EID”的字典，分别固定 CPU↔NPU 路径和 NPU↔NPU fullmesh 路径。每台 P/D 主机填本机真实 EID；例如 D 只暴露物理 4～7 时，键仍填 4～7。缺项使用 SDK 自动发现，但必须现场确认能发现正确的 fullmesh EID，不能直接套用 CPU 路由 EID。timeout 默认 120 秒。
 
-保持原生 W4A4C8、block_size=128、MTP3；支持 PP=PCP=DCP=1，P TP 必须为 D TP 的整数倍。D 关闭本地 vLLM prefix caching；P 沿用已验证的 prefix 配置。新 PD 模式使用逐层 (656,128) DDR，不修改非 PD 的 GROUP_WIDTH=4，不混用旧 KVAF prefix Connector、local-CPU sparse offload、KVPP 或 layerwise storage reuse。
+保持原生 W4A4C8、block_size=128、MTP3；支持 PP=PCP=DCP=1，P TP 必须为 D TP 的整数倍。P 仅接收原生 Proxy 的 max_tokens=1 Prefill；P/D 原生 drafter 的有效上限和 speculative token 数必须一致。
+
+本次新 PD 入口支持的已验证 prefix 配置为 **P/D 均设置 enable_prefix_caching=false**，启动参数使用原生 --no-enable-prefix-caching。原生 P 会在实际 MTP 写入前缓存各 group 的 hash；若开启本地 prefix caching，长度上限附近跳过 MTP 的未写页可能被后续短请求复用，因此本入口拒绝该配置。C05 的“P 沿已验证配置”在本次实现中具体落实为关闭；原生非 PD 配置与既有 prefix 能力保持原行为。
+
+新 PD 模式使用逐层 (656,128) DDR，不修改非 PD 的 GROUP_WIDTH=4，不混用旧 KVAF prefix Connector、local-CPU sparse offload、KVPP 或 layerwise storage reuse。
 
 完整源码编译/安装仍沿用原模型环境。新 Worker 继承原 NPUWorker，原模型、量化和算子选择保持原生入口。
 
@@ -140,7 +148,7 @@ ruff check vllm_ascend/distributed/kv_transfer/kvaf/pd tests/ut/test_kvaf_pd*.py
 ruff format --check vllm_ascend/distributed/kv_transfer/kvaf/pd tests/ut/test_kvaf_pd*.py
 ```
 
-当前全量 160 项 KVAF UT 通过。新增 UT 使用真实 CPU Tensor、真实回环 TCP，替换 SDK/NPU 边界，覆盖：逐层 PA 注册、typed scale、普通 tail 与 Hot 隔离、双 Pull 字节落点、原生目录/Get/ABC 续算、TP4/TP8→TP1、空贡献、chunk、MTP、Commit 丢失恢复、失败/取消和释放。另以 16 个 P worker、16 个 D region、8 个 K endpoint 检查完整注册矩阵，并直接执行复用的原生 Scheduler 代码。
+本轮全量 **193 项 KVAF UT 通过**，包括 MTP 长度边界、图执行完成通知、P 抢占后满块水位续传及 complete 丢应答恢复，详见 [实施记录](kvaf_pd_implementation.md)。UT 使用真实 CPU Tensor、真实回环 TCP，替换 SDK/NPU 边界，覆盖：逐层 PA 注册、typed scale、普通 tail 与 Hot 隔离、双 Pull 字节落点、原生目录/Get/ABC 续算、TP4/TP8→TP1、空贡献、chunk、MTP、Commit 丢失恢复、失败/取消和释放。另以 16 个 P worker、16 个 D region、8 个 K endpoint 检查完整注册矩阵，并直接执行复用的原生 Scheduler 代码。
 
 云环境没有 NPU/CANN/UB，没有执行真实 NPU binding 全量编译、模型精度、生产多机全建链、长稳或性能测试。CPU/mock 通过只代表对应关键逻辑与接口检查通过。现场仍按原设计进行短/长上下文、127/128/129/255/256/300 边界、MTP、并发、取消和生产拓扑验收；单机四层结果不替代生产验收。
 

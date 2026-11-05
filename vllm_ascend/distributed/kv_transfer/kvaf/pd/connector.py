@@ -53,7 +53,7 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
             raise RuntimeError("PD cache registration cannot repeat")
         self._caches = kv_caches
 
-    def bind_pd_backend(self, *, sdk, runtime, memories, writer, pool):
+    def bind_pd_backend(self, *, sdk, runtime, memories, writer, pool, draft_limit):
         import torch
         from vllm.distributed import get_tensor_model_parallel_rank
         from vllm.platforms import current_platform
@@ -104,6 +104,8 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 dp_rank=pc.data_parallel_rank,
                 cpu_eid=cpu_eid,
                 npu_eid=npu_eid,
+                draft_limit=draft_limit,
+                num_spec_tokens=self.vllm_config.speculative_config.num_speculative_tokens,
             )
         else:
             port = (
@@ -121,6 +123,8 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 activate=activate,
                 stream_factory=stream,
                 start_immediately=False,
+                draft_limit=draft_limit,
+                num_spec_tokens=self.vllm_config.speculative_config.num_speculative_tokens,
             )
 
     def start_pd_control(self):
@@ -167,6 +171,14 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def finish_pd_forward(self):
         if self.is_producer and self.worker is not None:
             self.worker.complete_forward()
+
+    def skip_pd_drafting(self, limit):
+        if self.is_producer and self.worker is not None:
+            self.worker.skip_drafting(limit)
+
+    def complete_pd_drafting(self):
+        if self.is_producer and self.worker is not None:
+            self.worker.complete_drafting()
 
     def get_finished(self, finished_req_ids):
         if self.worker is None:

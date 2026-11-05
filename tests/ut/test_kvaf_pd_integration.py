@@ -40,7 +40,8 @@ def config(*, producer=False, tp=1, dp=16, rank=0):
             data_parallel_rank=rank,
             worker_cls=CONFIG.WORKER_CLASS,
         ),
-        speculative_config=NS(method="deepseek_mtp", num_speculative_tokens=3),
+        speculative_config=NS(method="deepseek_mtp", num_speculative_tokens=3, draft_model_config=None),
+        model_config=NS(max_model_len=4096),
         cache_config=NS(enable_prefix_caching=False),
         scheduler_config=NS(max_num_seqs=2),
         additional_config={"kvaf_config": {"enabled": not producer, "build_dir": "/kvaf/build-pd"}},
@@ -173,7 +174,8 @@ class TestPDConfig(unittest.TestCase):
             CONFIG.PDConfig.from_vllm(value)
         value = config(producer=True)
         value.cache_config.enable_prefix_caching = True
-        CONFIG.PDConfig.from_vllm(value)
+        with self.assertRaisesRegex(ValueError, "P/D prefix"):
+            CONFIG.PDConfig.from_vllm(value)
 
     def test_unknown_flags_and_missing_full_mesh_fail_before_sdk_loading(self):
         value = config(producer=True)
@@ -241,6 +243,7 @@ class TestNativeSchedulers(unittest.TestCase):
             prompt_token_ids=list(range(300)),
             all_token_ids=list(range(300)),
             num_computed_tokens=0,
+            max_tokens=1,
             kv_transfer_params={"do_remote_prefill": True, "metaserver": "http://proxy"},
         )
 
@@ -342,7 +345,8 @@ class TestExternalRunner(unittest.TestCase):
             ),
         }
         with patch.dict(sys.modules, modules):
-            cls.runner_type = importlib.import_module(f"{PACKAGE}.pd.runner").PDKVModelRunner
+            cls.runner_module = importlib.import_module(f"{PACKAGE}.pd.runner")
+            cls.runner_type = cls.runner_module.PDKVModelRunner
 
     def runner(self, *, decode):
         runner = self.runner_type.__new__(self.runner_type)
@@ -437,6 +441,56 @@ class TestExternalRunner(unittest.TestCase):
         runner = self.runner_type.__new__(self.runner_type)
         runner.kvaf_adapter = None
         self.assertEqual(runner._run_pd_compute(lambda: 9), 9)
+
+    def test_native_skip_marker_precedes_dummy_forward(self):
+        runner = self.runner_type.__new__(self.runner_type)
+        runner.is_kv_producer = True
+        runner.effective_drafter_max_model_len = 4096
+        trace = []
+        connector = NS(skip_pd_drafting=lambda limit: trace.append(("skip", limit)))
+        runner_module = self.runner_module
+        with (
+            patch.object(runner_module, "get_kv_transfer_group", return_value=connector),
+            patch.object(
+                NativeRunnerBoundary,
+                "_skip_drafting",
+                side_effect=lambda *args, **kwargs: trace.append("dummy") or 7,
+                create=True,
+            ),
+        ):
+            self.assertEqual(runner._skip_drafting("scheduler"), 7)
+        self.assertEqual(trace, [("skip", 4096), "dummy"])
+
+    def test_successful_native_graph_proposal_proves_mtp_write(self):
+        runner = self.runner_type.__new__(self.runner_type)
+        runner.is_kv_producer = True
+        connector = Mock()
+        runner_module = self.runner_module
+        result = object()
+        with (
+            patch.object(runner_module, "get_kv_transfer_group", return_value=connector),
+            patch.object(NativeRunnerBoundary, "propose_draft_token_ids", return_value=result, create=True),
+        ):
+            self.assertIs(runner.propose_draft_token_ids("sample"), result)
+        connector.complete_pd_drafting.assert_called_once_with()
+
+    def test_failed_native_proposal_cannot_prove_mtp_write(self):
+        runner = self.runner_type.__new__(self.runner_type)
+        runner.is_kv_producer = True
+        connector = Mock()
+        runner_module = self.runner_module
+        with (
+            patch.object(runner_module, "get_kv_transfer_group", return_value=connector),
+            patch.object(
+                NativeRunnerBoundary,
+                "propose_draft_token_ids",
+                side_effect=RuntimeError("native proposal failed"),
+                create=True,
+            ),
+            self.assertRaisesRegex(RuntimeError, "native proposal failed"),
+        ):
+            runner.propose_draft_token_ids("sample")
+        connector.complete_pd_drafting.assert_not_called()
 
 
 if __name__ == "__main__":

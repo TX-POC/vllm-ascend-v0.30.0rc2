@@ -128,10 +128,10 @@ DDR 预算由每个 D Runtime 初始化参数控制，不是 K 启动时的统�
 
 在已经验证能运行四层模型的原生命令基础上修改：
 
-1. P：ASCEND_RT_VISIBLE_DEVICES=0,1,2,3，TP4、DP1、HTTP 8100；additional-config.kvaf_config 设置 enabled=false、正确 build_dir；选 kv_producer。
+1. P：ASCEND_RT_VISIBLE_DEVICES=0,1,2,3，TP4、DP1、HTTP 8100；additional-config.kvaf_config 设置 enabled=false、正确 build_dir；选 kv_producer；增加原生 --no-enable-prefix-caching。
 2. D：ASCEND_RT_VISIBLE_DEVICES=4,5,6,7，TP1、DP4、本地 DP4、HTTP 8200；kvaf_config 设置 enabled=true、cpu_address=127.0.0.1:28999、正确 build_dir 和每 worker DDR 预算；选 kv_consumer，关闭本地 prefix caching。
 3. 两侧增加同一个原生 --worker-cls，kv_connector=PDKVoffloadConnector，kv_connector_module_path 指向新模块；P 的 decode_endpoints 列出本机实际可达 IP 的 31000～31003。
-4. 保留已经验证的 W4A4C8、MTP3、EP 和其他模型配置。先用 eager 做小规模验证，再按原设计验证图模式与异步调度。
+4. 保留已经验证的 W4A4C8、MTP3、EP 和其他模型配置；P/D 使用相同的原生 drafter 有效长度上限。P 通过原生 Proxy 执行 max_tokens=1 的 Prefill。先用 eager 做小规模验证，再按原设计验证图模式与异步调度。
 
 D 的 Target 主 KV block table 保持原生分配结果。Backend 将本请求的原生 tail block 绑定到独立普通接收池的物理槽；Connector 通过该绑定计算普通 HBM 目的 offset，不将原生虚拟主 KV block ID 当成 Hot 地址或直接写入 ABC。
 

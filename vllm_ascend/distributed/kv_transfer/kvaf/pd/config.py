@@ -70,8 +70,10 @@ class PDConfig:
             or speculative.method not in ("mtp", "deepseek_mtp")
         ):
             raise ValueError("PD KVAF requires native MTP with three speculative tokens")
-        if transfer.is_kv_consumer and config.cache_config.enable_prefix_caching:
-            raise ValueError("disable native D prefix caching for PD KVAF")
+        if config.cache_config.enable_prefix_caching:
+            # Native prefix hashes do not track whether a near-limit MTP
+            # forward was skipped. Reusing those pages can expose stale KV.
+            raise ValueError("disable native P/D prefix caching for PD KVAF")
         if transfer.kv_role not in ("kv_producer", "kv_consumer"):
             raise ValueError("PD KVAF requires a distinct producer or consumer role")
         return result

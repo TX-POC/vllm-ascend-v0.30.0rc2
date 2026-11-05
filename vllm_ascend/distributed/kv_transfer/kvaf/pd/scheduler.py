@@ -12,6 +12,14 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import (
 )
 
 
+def native_draft_limit(vllm_config):
+    """Match the native Runner's effective drafter context limit."""
+    draft_config = vllm_config.speculative_config.draft_model_config
+    if draft_config is not None and draft_config.max_model_len is not None:
+        return draft_config.max_model_len
+    return vllm_config.model_config.max_model_len
+
+
 @dataclass(frozen=True)
 class ReceiveRequest:
     generation: str
@@ -29,14 +37,40 @@ class ProducerScheduler(SFAPDRD2HProducerScheduler):
         super().__init__(*args, **kwargs)
         self._pd_owners = set()
         self._pd_cancellations = {}
+        self._pd_draft_limit = native_draft_limit(self.vllm_config)
+        self._pd_num_speculative_tokens = self.vllm_config.speculative_config.num_speculative_tokens
+        self._pd_admitted_classes = {}
+        self._pd_sent_tokens = {}
+
+    def _requires_draft(self, request):
+        if request.max_tokens != 1:
+            raise ValueError("PD P requires native proxy prefill with max_tokens=1")
+        # Use the complete prompt even during chunked prefill: admitting a
+        # near-limit request beside a short one can make native batch-wide
+        # skip_drafting leave the short request without its MTP prefix.
+        return len(request.prompt_token_ids) + self._pd_num_speculative_tokens <= self._pd_draft_limit
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        requires_draft = self._requires_draft(request)
+        if self._pd_admitted_classes and requires_draft != next(iter(self._pd_admitted_classes.values())):
+            return None, False
+        return super().get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        requires_draft = self._requires_draft(request)
+        if self._pd_admitted_classes and requires_draft != next(iter(self._pd_admitted_classes.values())):
+            raise ValueError("PD P cannot admit mixed native MTP drafting classes")
         super().update_state_after_alloc(request, blocks, num_external_tokens)
         if request.request_id in self._reqs_need_send_layerwise:
             params = request.kv_transfer_params
             if not params.get("kvaf_generation") or params.get("remote_cached_tokens", 0):
                 raise ValueError("PD KVAF requires a D generation and no D native cached prefix")
+            previous = self._pd_sent_tokens.get(request.request_id)
+            if previous is not None and params["kvaf_generation"] != previous[0]:
+                raise ValueError("PD P cannot change the generation of an already transferred request")
+            self._pd_sent_tokens.setdefault(request.request_id, (params["kvaf_generation"], 0))
             self._pd_owners.add(request.request_id)
+        self._pd_admitted_classes[request.request_id] = requires_draft
 
     def build_connector_meta(self, scheduler_output):
         generations = {
@@ -44,7 +78,18 @@ class ProducerScheduler(SFAPDRD2HProducerScheduler):
             for req_id, info in self._reqs_need_send_layerwise.items()
         }
         metadata = super().build_connector_meta(scheduler_output)
-        metadata.generations = generations
+        for req_id, request in list(metadata.requests.items()):
+            generation, sent = self._pd_sent_tokens.get(req_id, (generations[req_id], 0))
+            first = max(request.local_transed_tokens, sent)
+            complete = request.local_computed_tokens // min(self.block_size) * min(self.block_size)
+            if not request.chunk_finish and complete <= first:
+                # Native preemption resets its tracker and P's physical block
+                # table. Keep D's committed prefix while P recomputes it.
+                del metadata.requests[req_id]
+                continue
+            request.local_transed_tokens = first
+            self._pd_sent_tokens[req_id] = generation, max(sent, complete)
+        metadata.generations = {req_id: generations[req_id] for req_id in metadata.requests}
         metadata.cancellations, self._pd_cancellations = self._pd_cancellations, {}
         return metadata
 
@@ -55,6 +100,8 @@ class ProducerScheduler(SFAPDRD2HProducerScheduler):
         # vLLM keeps P's physical blocks until every rank reports send complete.
         hold = request.request_id in self._pd_owners
         self._pd_owners.discard(request.request_id)
+        self._pd_admitted_classes.pop(request.request_id, None)
+        self._pd_sent_tokens.pop(request.request_id, None)
         return hold, None
 
 

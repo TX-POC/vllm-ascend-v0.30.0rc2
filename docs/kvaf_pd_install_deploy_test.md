@@ -332,7 +332,7 @@ python3 tests/python/bench_hbm_read_raw_addr.py \
 
 MR 全建链不表示每个请求从全部 P 副本重复传输。请求仍须匹配其 P DP/TP 贡献组和目标 D worker。
 
-接线完成版本的配置须沿用原生 `--kv-transfer-config` / `--additional-config`：P producer、D consumer，显式选择真实注册的新 Connector；P TP8/DP2、D TP1/DP16，均 EP16；主 KV block size 128、C8、MTP3；D 本地 vLLM prefix 关闭，P 沿已验证配置。新 PD 的 DDR/Get 为逐层几何 `(656,128)`；非 PD 原生 `GROUP_WIDTH=4` 不变。
+接线完成版本的配置须沿用原生 `--kv-transfer-config` / `--additional-config`：P producer、D consumer，显式选择真实注册的新 Connector；P TP8/DP2、D TP1/DP16，均 EP16；主 KV block size 128、C8、MTP3。当前新 PD 支持的 P/D 本地 prefix 配置均为关闭（原生 `--no-enable-prefix-caching`），避免原生缓存复用未写入的 MTP 页；两端原生 drafter 有效长度上限相同，P 由原生 Proxy 执行 max_tokens=1 的 Prefill。新 PD 的 DDR/Get 为逐层几何 `(656,128)`；非 PD 原生 `GROUP_WIDTH=4` 不变。
 
 真实模块路径、worker 入口、ZMQ/源 listener 端口及外部接收区接口应随实现给出，当前没有可执行的对应字段组合。
 

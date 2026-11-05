@@ -180,6 +180,7 @@ class PDKVModelRunner(NPUModelRunner):
             memories=self.pd_memories,
             writer=self.kvaf_adapter.writer if self.kvaf_adapter is not None else None,
             pool=self.kvaf_cache_state,
+            draft_limit=self.effective_drafter_max_model_len,
         )
 
     def _run_pd_compute(self, operation, *args, **kwargs):
@@ -206,6 +207,19 @@ class PDKVModelRunner(NPUModelRunner):
         result = self._run_pd_compute(super().sample_tokens, *args, **kwargs)
         if self.is_kv_producer:
             get_kv_transfer_group().finish_pd_forward()
+        return result
+
+    def _skip_drafting(self, *args, **kwargs):
+        if self.is_kv_producer:
+            get_kv_transfer_group().skip_pd_drafting(self.effective_drafter_max_model_len)
+        return super()._skip_drafting(*args, **kwargs)
+
+    def propose_draft_token_ids(self, *args, **kwargs):
+        result = super().propose_draft_token_ids(*args, **kwargs)
+        if self.is_kv_producer:
+            # Captured MTP graphs may omit Python write hooks, just as target
+            # graphs do. Only a successful real native proposal proves validity.
+            get_kv_transfer_group().complete_pd_drafting()
         return result
 
     def shutdown(self):

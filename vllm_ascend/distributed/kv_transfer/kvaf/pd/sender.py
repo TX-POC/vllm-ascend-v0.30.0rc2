@@ -31,16 +31,20 @@ class Sender:
         dp_rank,
         cpu_eid="",
         npu_eid="",
+        draft_limit=None,
+        num_spec_tokens=3,
     ):
         self.sdk, self.memories, self.config = sdk, memories, config
         self.producer, self.host, self.device_id = producer, host, device_id
         self.cpu_eid, self.npu_eid = cpu_eid, npu_eid
+        self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
         self.activate, self.stream_factory, self.event_factory = activate, stream_factory, event_factory
         self.external_id, self.tp_rank, self.tp_size, self.dp_rank = external_id, tp_rank, tp_size, dp_rank
         self.registrations, self.peers, self.futures = {}, {}, {}
         self.executor = ThreadPoolExecutor(max_workers=min(len(memories), 8), thread_name_prefix="kvaf-pd-send")
         self.metadata = None
         self.dispatched, self.draft_written = set(), set()
+        self.draft_skipped = self.draft_completed = False
         self.native_finished, self.final_submitted, self.active_requests = set(), set(), {}
         self.forward_pending = set()
         self.closed = False
@@ -59,6 +63,11 @@ class Sender:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"D worker is not ready at {endpoint}") from None
                 Event().wait(0.1)
+        if (hello.get("draft_limit"), hello.get("num_spec_tokens", 3)) != (
+            self.draft_limit,
+            self.num_spec_tokens,
+        ):
+            raise ValueError("P/D native drafter limits and speculative widths must match")
         self.peers[endpoint] = hello["peer"]
         stream = self.stream_factory()
         for layer, memory in self.memories.items():
@@ -86,6 +95,7 @@ class Sender:
     def bind(self, metadata):
         self.metadata = deepcopy(metadata)
         self.dispatched, self.draft_written = set(), set()
+        self.draft_skipped = self.draft_completed = False
         self.forward_pending.update(metadata.requests)
         for req_id, request in metadata.requests.items():
             self.active_requests[req_id] = (request, metadata.generations[req_id])
@@ -113,11 +123,29 @@ class Sender:
         if not self.memories[layer].offload_main:
             # Native MTP may write this cache more than once. Dispatch its
             # final prompt snapshot at deferred native connector finalization.
-            self.draft_written.add(layer)
+            if not self.draft_skipped:
+                self.draft_written.add(layer)
             return
         self._dispatch(layer)
 
-    def _dispatch(self, layer):
+    def skip_drafting(self, limit):
+        if self.metadata is None or not self.metadata.requests:
+            return
+        if limit != self.draft_limit or any(
+            request.prompt_len + self.num_spec_tokens <= limit for request in self.metadata.requests.values()
+        ):
+            raise RuntimeError("native draft skip cannot omit KV required by a future D draft")
+        # Native DP alignment may execute dummy MTP forwards. Their hooks do
+        # not describe request KV and must never trigger a real source Pull.
+        self.draft_skipped = True
+        self.draft_written.clear()
+
+    def complete_drafting(self):
+        if self.draft_skipped:
+            raise RuntimeError("one native frame cannot both skip and complete drafting")
+        self.draft_completed = True
+
+    def _dispatch(self, layer, *, skipped=False):
         if layer in self.dispatched:
             return
         self.wait_layer(layer)
@@ -128,9 +156,9 @@ class Sender:
         requests = tuple(
             (req_id, request, self.metadata.generations[req_id]) for req_id, request in self.metadata.requests.items()
         )
-        self.futures[layer] = self.executor.submit(self._send_layer, layer, requests, event)
+        self.futures[layer] = self.executor.submit(self._send_layer, layer, requests, event, skipped)
 
-    def _send_layer(self, layer, requests, event):
+    def _send_layer(self, layer, requests, event, skipped=False):
         self.activate()
         event.synchronize()
         memory = self.memories[layer]
@@ -155,6 +183,7 @@ class Sender:
                 "member": member,
                 "ratio": ratio,
                 "tables": memory.tables(request.local_block_ids),
+                "draft_skipped": skipped,
             }
             planned = self._call(endpoint, message)
             registration = self.registrations[endpoint, layer]
@@ -184,13 +213,32 @@ class Sender:
                     registration.release(path, ready)
                 if failed:
                     break
-            self._call(endpoint, dict(op="complete", job=planned["job"], generation=generation))
+            self._complete_job(endpoint, planned["job"], generation)
+
+    def _complete_job(self, endpoint, job_id, generation):
+        message = dict(job=job_id, generation=generation)
+        for attempt in range(2):
+            try:
+                self._call(endpoint, dict(message, op="complete"))
+                break
+            except (ConnectionError, OSError, TimeoutError):
+                status = self._call(endpoint, dict(message, op="status"))
+                if status["done"]:
+                    break
+                if attempt:
+                    raise RuntimeError("layer completion remains unconfirmed; retain source") from None
+                # complete is idempotent metadata; never replay its Pulls.
+        # Completion is already proven. A lost cleanup ACK must not prevent P
+        # storage reuse; D retains only a small terminal record until detach.
+        with suppress(ConnectionError, OSError, TimeoutError, RuntimeError):
+            self._call(endpoint, dict(message, op="ack_complete"))
 
     def finalize(self):
         if self.metadata is None or not self.metadata.requests:
             return
-        for layer in self.draft_written:
-            self._dispatch(layer)
+        for layer, memory in self.memories.items():
+            if not memory.offload_main and (self.draft_skipped or self.draft_completed or layer in self.draft_written):
+                self._dispatch(layer, skipped=self.draft_skipped)
 
     def complete_forward(self):
         if self.metadata is None or not self.metadata.requests:
