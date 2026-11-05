@@ -27,6 +27,7 @@ class Diagnostics:
         self.retained = None  # Keep uncertain diagnostic Get buffers/handle alive.
         self.context = ()
         self.draft_skipped = False
+        self.indexer_owners = set()
 
     def select(self, request, generation, alias=None):
         key = (request, generation)
@@ -186,6 +187,14 @@ class Diagnostics:
         )
 
     def decorate_indexer(self, indexer, layer, *, draft=False):
+        # Native IndexerWrapper dispatches compute/cache writes to its impl.
+        if not callable(getattr(indexer, "write_cache", None)):
+            indexer = getattr(indexer, "impl", None)
+        if not callable(getattr(indexer, "write_cache", None)):
+            self.emit("INDEXER_UNSUPPORTED", layer, layer=layer)
+            return
+        if id(indexer) in self.indexer_owners:
+            return
         native = indexer.write_cache
 
         @wraps(native)
@@ -212,3 +221,4 @@ class Diagnostics:
 
         # Instance-local decorator, installed only in this opt-in PD Runner.
         indexer.write_cache = write
+        self.indexer_owners.add(id(indexer))

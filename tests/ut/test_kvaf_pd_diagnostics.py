@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in evidence and injected byte corruption using real PD transactions."""
 
+import ast
 import importlib
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -284,6 +286,42 @@ class TestPDDiagnostics(unittest.TestCase):
         writes = [e for e in events(diag) if e["event"] == "INDEXER_WRITE"]
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0]["operator"], "scatter_cache")
+
+    def test_native_wrapper_delegates_write_to_backend_once(self):
+        # Load the actual wrapper class without importing NPU-only dependencies.
+        source = Path("vllm_ascend/ops/mla.py").read_text()
+        definition = next(
+            n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "IndexerWrapper"
+        )
+        namespace = {"nn": torch.nn, "torch": torch, "AscendSFAIndexerBackend": Mock()}
+        module = ast.parse("from __future__ import annotations")
+        module.body.append(definition)
+        exec(compile(module, "mla.py", "exec"), namespace)
+        wrapper = namespace["IndexerWrapper"].__new__(namespace["IndexerWrapper"])
+        torch.nn.Module.__init__(wrapper)
+        backend = torch.nn.Module()
+        backend.write_cache = Mock(return_value=7)
+        backend._use_c8_reshape_optim = lambda: False
+        backend.k_cache = NS(kv_cache=[torch.empty(4, dtype=torch.float8_e4m3fn)])
+        wrapper.impl = backend
+        self.assertFalse(hasattr(wrapper, "write_cache"))
+        native = backend.write_cache
+        diag = diagnostic("P", verify=False)
+        diag.select("r", "g")
+        diag.context = ("r",)
+        diag.decorate_indexer(wrapper, "l0")
+        decorated = backend.write_cache
+        diag.decorate_indexer(wrapper, "l0")
+        diag.decorate_indexer(backend, "l0")
+        self.assertIs(backend.write_cache, decorated)
+        self.assertEqual(backend.write_cache(torch.empty(4), None, "slots"), 7)
+        native.assert_called_once()
+        self.assertEqual([e["event"] for e in events(diag)], ["INDEXER_WRITE", "INDEXER_WRITE_DONE"])
+
+    def test_unknown_indexer_reports_unsupported_without_write_evidence(self):
+        diag = diagnostic("D", verify=False)
+        diag.decorate_indexer(torch.nn.Module(), "l0")
+        self.assertEqual([e["event"] for e in events(diag)], ["INDEXER_UNSUPPORTED"])
 
 
 if __name__ == "__main__":
