@@ -72,6 +72,37 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
         pc = self.vllm_config.parallel_config
         tp_rank = get_tensor_model_parallel_rank()
         host = get_ip()
+        self.diagnostics = None
+        if self.config.diagnostics_requests:
+            from .diagnostics import Diagnostics
+
+            self.diagnostics = Diagnostics(
+                self.config.diagnostics_requests,
+                self.config.verify_kv,
+                "P" if self.is_producer else "D",
+                worker=f"{host}:DP{pc.data_parallel_rank}:TP{tp_rank}",
+            )
+            self.diagnostics.emit(
+                "WORKER",
+                "startup",
+                host=host,
+                physical_device=physical_id,
+                tp_rank=tp_rank,
+                tp_size=pc.tensor_parallel_size,
+                dp_rank=pc.data_parallel_rank,
+                draft_limit=draft_limit,
+                verify_kv=self.config.verify_kv,
+                cpu_eid=cpu_eid,
+                npu_eid=npu_eid,
+                model=self.vllm_config.model_config.model,
+                model_dtype=str(self.vllm_config.model_config.dtype),
+                quantization=getattr(self.vllm_config.model_config, "quantization", None),
+                kv_dtype=self.vllm_config.cache_config.cache_dtype,
+                indexer_dtype=self.vllm_config.attention_config.indexer_kv_dtype,
+                target_layers=sum(memory.offload_main for memory in memories.values()),
+            )
+            for name, memory in memories.items():
+                self.diagnostics.layout(name, memory)
         self._layer_names = tuple(memories)
         self._external_id = get_external_request_id
 
@@ -106,8 +137,10 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 npu_eid=npu_eid,
                 draft_limit=draft_limit,
                 num_spec_tokens=self.vllm_config.speculative_config.num_speculative_tokens,
+                diagnostics=self.diagnostics,
             )
         else:
+            pool.policy.diagnostics = self.diagnostics
             port = (
                 self.vllm_config.kv_transfer_config.kv_port + pc.data_parallel_rank * pc.tensor_parallel_size + tp_rank
             )
@@ -125,6 +158,7 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 start_immediately=False,
                 draft_limit=draft_limit,
                 num_spec_tokens=self.vllm_config.speculative_config.num_speculative_tokens,
+                diagnostics=self.diagnostics,
             )
 
     def start_pd_control(self):

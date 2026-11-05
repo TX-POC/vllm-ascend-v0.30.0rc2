@@ -14,6 +14,8 @@ class PDConfig:
     cpu_eids: dict[str, str] = field(default_factory=dict)
     npu_eids: dict[str, str] = field(default_factory=dict)
     timeout: float = 120.0
+    diagnostics_requests: int = 0
+    verify_kv: bool = False
 
     def eids(self, physical_device_id):
         key = str(physical_device_id)
@@ -31,6 +33,10 @@ class PDConfig:
         if "decode_endpoints" in values:
             values["decode_endpoints"] = tuple(values["decode_endpoints"])
         result = cls(**values)
+        if type(result.diagnostics_requests) is not int or not 0 <= result.diagnostics_requests <= 16:
+            raise ValueError("diagnostics_requests must be an integer in 0..16 (0 disables diagnostics)")
+        if type(result.verify_kv) is not bool or result.verify_kv and not result.diagnostics_requests:
+            raise ValueError("verify_kv requires diagnostics_requests > 0 and a boolean value")
         for routes in (result.cpu_eids, result.npu_eids):
             if not isinstance(routes, dict) or any(
                 not isinstance(key, str)

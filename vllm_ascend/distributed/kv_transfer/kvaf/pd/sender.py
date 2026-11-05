@@ -33,11 +33,13 @@ class Sender:
         npu_eid="",
         draft_limit=None,
         num_spec_tokens=3,
+        diagnostics=None,
     ):
         self.sdk, self.memories, self.config = sdk, memories, config
         self.producer, self.host, self.device_id = producer, host, device_id
         self.cpu_eid, self.npu_eid = cpu_eid, npu_eid
         self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
+        self.diagnostics = diagnostics
         self.activate, self.stream_factory, self.event_factory = activate, stream_factory, event_factory
         self.external_id, self.tp_rank, self.tp_size, self.dp_rank = external_id, tp_rank, tp_size, dp_rank
         self.registrations, self.peers, self.futures = {}, {}, {}
@@ -68,6 +70,8 @@ class Sender:
             self.num_spec_tokens,
         ):
             raise ValueError("P/D native drafter limits and speculative widths must match")
+        if hello.get("verify_kv", False) != bool(self.diagnostics and self.diagnostics.verify):
+            raise ValueError("P/D verify_kv modes must match; restart both with the same diagnostic configuration")
         self.peers[endpoint] = hello["peer"]
         stream = self.stream_factory()
         for layer, memory in self.memories.items():
@@ -86,6 +90,15 @@ class Sender:
                 hello["ticket"], stream, listen_address="0.0.0.0:0", advertised_address=f"{self.host}:0"
             )
             self._call(endpoint, {"op": "register", "metadata": metadata, "offload": memory.offload_main})
+        if self.diagnostics:
+            self.diagnostics.emit(
+                "REGISTERED",
+                endpoint,
+                peer=hello["peer"],
+                endpoint=endpoint,
+                producer=self.producer,
+                layers=len(self.memories),
+            )
 
     def _call(self, endpoint, message):
         return call(
@@ -98,6 +111,8 @@ class Sender:
         self.draft_skipped = self.draft_completed = False
         self.forward_pending.update(metadata.requests)
         for req_id, request in metadata.requests.items():
+            if self.diagnostics:
+                self.diagnostics.select(self.external_id(req_id), metadata.generations[req_id], alias=req_id)
             self.active_requests[req_id] = (request, metadata.generations[req_id])
             if request.chunk_finish:
                 self.final_submitted.add(req_id)
@@ -186,14 +201,77 @@ class Sender:
                 "draft_skipped": skipped,
             }
             planned = self._call(endpoint, message)
+            if "verify" in planned:
+                expected = self.diagnostics.spans(
+                    memory,
+                    message["tables"],
+                    message["tokens"],
+                    message["first"],
+                    message["final"],
+                    member,
+                    ratio,
+                    skipped,
+                )
+                self.diagnostics.address_check(
+                    expected,
+                    planned["verify"],
+                    planned["job"],
+                    request=message["request"],
+                    generation=generation,
+                    layer=layer,
+                    path="P_source",
+                )
+            replicas = None
+            if self.diagnostics and self.diagnostics.verify and planned.get("trace"):
+                layout = memory.describe(layer)
+                end = message["tokens"] // 128 + int(message["final"] and message["tokens"] % 128 > 0)
+                replicas = []
+                for block in () if skipped else range(message["first"], end):
+                    size = min(128, message["tokens"] - block * 128) * 656
+                    offset = layout.offset("main", message["tables"]["main"], block)
+                    replicas.append((block, size, self.diagnostics.hashes(memory.tensor, (offset,), (size,))[0]))
+            if self.diagnostics and planned.get("trace"):
+                self.diagnostics.emit(
+                    "SEND_PLAN",
+                    planned["job"],
+                    request=message["request"],
+                    generation=generation,
+                    layer=layer,
+                    member=member,
+                    ratio=ratio,
+                    first=message["first"],
+                    tokens=message["tokens"],
+                    final=message["final"],
+                    draft_skipped=skipped,
+                    count=planned["count"],
+                    endpoint=endpoint,
+                )
             registration = self.registrations[endpoint, layer]
             failed = False
             for path in ("npu", "cpu"):
                 for batch in range(planned["count"][path]):
+                    digests = None
+                    if "verify" in planned:
+                        sources, lengths = planned["verify"][path][batch]
+                        digests = self.diagnostics.hashes(memory.tensor, sources, lengths)
                     ready = registration.ready(path, event)
                     operation = dict(
                         op="pull", job=planned["job"], generation=generation, path=path, batch=batch, ready=ready
                     )
+                    if digests is not None:
+                        operation["digests"] = digests
+                    if self.diagnostics and planned.get("trace"):
+                        self.diagnostics.emit(
+                            "SOURCE_READY",
+                            (planned["job"], path, batch),
+                            request=message["request"],
+                            layer=layer,
+                            path=path,
+                            batch=batch,
+                            sequence=ready.sequence,
+                            source=ready.source.source_id,
+                            source_bytes=ready.source.source_bytes,
+                        )
                     try:
                         result = self._call(endpoint, operation)
                     except (ConnectionError, OSError, TimeoutError):
@@ -211,12 +289,23 @@ class Sender:
                             registration.release(path, ready)
                         break
                     registration.release(path, ready)
+                    if self.diagnostics and planned.get("trace"):
+                        self.diagnostics.emit(
+                            "SOURCE_RELEASED",
+                            (planned["job"], path, batch),
+                            request=message["request"],
+                            layer=layer,
+                            path=path,
+                            sequence=ready.sequence,
+                        )
                 if failed:
                     break
-            self._complete_job(endpoint, planned["job"], generation)
+            self._complete_job(endpoint, planned["job"], generation, replicas=replicas)
 
-    def _complete_job(self, endpoint, job_id, generation):
+    def _complete_job(self, endpoint, job_id, generation, *, replicas=None):
         message = dict(job=job_id, generation=generation)
+        if replicas is not None:
+            message["replicas"] = replicas
         for attempt in range(2):
             try:
                 self._call(endpoint, dict(message, op="complete"))

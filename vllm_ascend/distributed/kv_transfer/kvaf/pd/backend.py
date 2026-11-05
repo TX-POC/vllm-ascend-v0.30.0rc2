@@ -23,6 +23,7 @@ class PDCachePolicy(KVCachePolicy):
         )
         self._received_tails = {}
         self._abc_states = {}
+        self.diagnostics = None
         self.receive_slots = {}
         self.receive_blocks = {}
         self._receive_lock = RLock()
@@ -133,6 +134,20 @@ class PDCachePolicy(KVCachePolicy):
                 self.bytes_outputs[layer],
                 synchronize=True,
             )
+            if self.diagnostics:
+                req_id = next(req for req, row in self.owners.items() if row == owner)
+                if self.diagnostics.active(req_id):
+                    self.diagnostics.emit(
+                        "ABC_REPLAY_DDR",
+                        (req_id, layer),
+                        request=req_id,
+                        layer=layer,
+                        start=start,
+                        end=end,
+                        bytes=(end - start) * TOKEN_BYTES,
+                        operator="batch_get",
+                        directory_pages=len(state.keys),
+                    )
         finally:
             runtime.release_access_table(handle)
 
@@ -158,7 +173,92 @@ class PDCachePolicy(KVCachePolicy):
         first = owner * self.slot_capacity + self.history_capacity + start % TAIL
         source = received[1].view(torch.int8).reshape(-1)[: (end - start) * TOKEN_BYTES]
         self.hot[layer].view(-1, TOKEN_BYTES)[first : first + end - start].copy_(source.view(-1, TOKEN_BYTES))
+        if self.diagnostics and self.diagnostics.active(req_id):
+            fields = dict(request=req_id, layer=layer, start=start, end=end, bytes=(end - start) * TOKEN_BYTES)
+            self.diagnostics.emit("ABC_IMPORT", (req_id, layer), **fields, status="DONE")
+            if self.diagnostics.verify:
+                expected = self.diagnostics.hashes(source, (0,), ((end - start) * TOKEN_BYTES,))
+                actual = self.diagnostics.hashes(
+                    self.hot[layer], (first * TOKEN_BYTES,), ((end - start) * TOKEN_BYTES,)
+                )
+                self.diagnostics.compare(
+                    expected, actual, (req_id, layer, "abc"), path="ordinary_tail_to_ABC", **fields
+                )
         self._abc_states[req_id, layer] = state
+
+    def _copy_slots(self, source, destination, count):
+        super()._copy_slots(source, destination, count)
+        if self.diagnostics is None or not count:
+            return
+        row = source if source < self.stage_start else destination
+        owner = row // self.slot_capacity
+        req_id = next((req for req, index in self.owners.items() if index == owner), None)
+        if not self.diagnostics.active(req_id):
+            return
+        direction = "ABC_TO_STAGE" if source < self.stage_start else "STAGE_TO_ABC"
+        for layer, tensor in enumerate(self.hot):
+            key = (req_id, layer, direction)
+            if not self.diagnostics.fresh("copy_check", key):
+                continue
+            self.diagnostics.emit(
+                direction,
+                key,
+                request=req_id,
+                layer=layer,
+                tokens=count,
+                source_slot=source,
+                destination_slot=destination,
+            )
+            if self.diagnostics.verify:
+                expected = self.diagnostics.hashes(tensor, (source * TOKEN_BYTES,), (count * TOKEN_BYTES,))
+                actual = self.diagnostics.hashes(tensor, (destination * TOKEN_BYTES,), (count * TOKEN_BYTES,))
+                self.diagnostics.compare(expected, actual, key, request=req_id, layer=layer, path=direction)
+
+    def attention(self, impl, layer, q, rope, topk, metadata, query_ends, *, full_graph=False):
+        if self.diagnostics:
+            for req_id, plan in self.plans.items():
+                if self.diagnostics.active(req_id) and req_id in self.diagnostics.context:
+                    self.diagnostics.emit(
+                        "SFA_CALL",
+                        (req_id, layer, plan.decode),
+                        request=req_id,
+                        layer=layer,
+                        phase="decode" if plan.decode else "prefill_replay",
+                        start=plan.start,
+                        end=plan.end,
+                        operator="DeviceOperator.execute_sparse_flash_attention_process",
+                        full_graph=full_graph,
+                        cache_dtype=str(self.attention_caches[layer].dtype),
+                    )
+        result = super().attention(impl, layer, q, rope, topk, metadata, query_ends, full_graph=full_graph)
+        if self.diagnostics:
+            for req_id, plan in self.plans.items():
+                if self.diagnostics.active(req_id) and req_id in self.diagnostics.context:
+                    self.diagnostics.emit(
+                        "SFA_DONE",
+                        (req_id, layer, plan.decode),
+                        request=req_id,
+                        layer=layer,
+                        phase="decode" if plan.decode else "prefill_replay",
+                    )
+        return result
+
+    def run(self, layer, topk, metadata, local_layer=0):
+        result = super().run(layer, topk, metadata, local_layer)
+        if self.diagnostics and not metadata.num_prefills:
+            for req_id in self.plans:
+                if self.diagnostics.active(req_id) and req_id in self.diagnostics.context:
+                    self.diagnostics.emit(
+                        "HOT_GET_SUBMITTED",
+                        (req_id, layer),
+                        request=req_id,
+                        layer=layer,
+                        api="batch_get",
+                        completion="stream_ordered",
+                        miss_count="device_resident",
+                        topk_shape=list(topk.shape),
+                    )
+        return result
 
     def release(self, req_id):
         # Worker must drain/resolve DMA before invoking the native release path.

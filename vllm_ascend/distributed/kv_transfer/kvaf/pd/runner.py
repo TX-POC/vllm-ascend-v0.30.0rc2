@@ -22,6 +22,7 @@ class PDKVModelRunner(NPUModelRunner):
     def __init__(self, vllm_config, device):
         self.pd_config = PDConfig.from_vllm(vllm_config)
         self.pd_memories = {}
+        self.pd_diagnostics = None
         self._pd_indexer_names = {}
         super().__init__(vllm_config, device)
         producer = vllm_config.kv_transfer_config.is_kv_producer
@@ -182,8 +183,23 @@ class PDKVModelRunner(NPUModelRunner):
             pool=self.kvaf_cache_state,
             draft_limit=self.effective_drafter_max_model_len,
         )
+        self.pd_diagnostics = connector.diagnostics
+        if self.pd_diagnostics:
+            wrapped = set()
+            for name in self.pd_memories:
+                indexer = getattr(self.compilation_config.static_forward_context[name].impl, "indexer", None)
+                if indexer is not None and id(indexer) not in wrapped:
+                    self.pd_diagnostics.decorate_indexer(indexer, name, draft=not self.pd_memories[name].offload_main)
+                    wrapped.add(id(indexer))
 
     def _run_pd_compute(self, operation, *args, **kwargs):
+        diagnostics = getattr(self, "pd_diagnostics", None)
+        if diagnostics:
+            if args and hasattr(args[0], "num_scheduled_tokens"):
+                diagnostics.context = tuple(args[0].num_scheduled_tokens)
+                diagnostics.draft_skipped = False
+            else:
+                diagnostics.context = tuple(getattr(getattr(self, "input_batch", None), "req_ids", ()))
         if self.kvaf_adapter is None:
             return operation(*args, **kwargs)
         runtime = self.kvaf_adapter.runtimes[656, 128]
@@ -209,18 +225,54 @@ class PDKVModelRunner(NPUModelRunner):
             get_kv_transfer_group().finish_pd_forward()
         return result
 
+    def _model_forward(self, *args, **kwargs):
+        diagnostics = getattr(self, "pd_diagnostics", None)
+        if diagnostics:
+            from vllm.forward_context import get_forward_context
+
+            context = get_forward_context()
+            mode = getattr(context.cudagraph_runtime_mode, "name", str(context.cudagraph_runtime_mode))
+            for req in diagnostics.context:
+                if diagnostics.active(req):
+                    diagnostics.emit(
+                        "MODEL_FORWARD",
+                        (req, mode),
+                        request=req,
+                        graph_mode=mode,
+                        num_tokens_padded=args[0] if args else kwargs.get("num_tokens_padded"),
+                    )
+        result = super()._model_forward(*args, **kwargs)
+        if diagnostics:
+            for req in diagnostics.context:
+                if diagnostics.active(req):
+                    diagnostics.emit("MODEL_FORWARD_DONE", (req, mode), request=req, graph_mode=mode)
+        return result
+
     def _skip_drafting(self, *args, **kwargs):
+        if getattr(self, "pd_diagnostics", None):
+            self.pd_diagnostics.draft_skipped = True
+        self._diagnose_drafting("MTP_SKIP")
         if self.is_kv_producer:
             get_kv_transfer_group().skip_pd_drafting(self.effective_drafter_max_model_len)
         return super()._skip_drafting(*args, **kwargs)
 
     def propose_draft_token_ids(self, *args, **kwargs):
         result = super().propose_draft_token_ids(*args, **kwargs)
+        self._diagnose_drafting("MTP_PROPOSE_DONE")
         if self.is_kv_producer:
             # Captured MTP graphs may omit Python write hooks, just as target
             # graphs do. Only a successful real native proposal proves validity.
             get_kv_transfer_group().complete_pd_drafting()
         return result
+
+    def _diagnose_drafting(self, event):
+        diagnostics = getattr(self, "pd_diagnostics", None)
+        if diagnostics:
+            for req in diagnostics.context:
+                if diagnostics.active(req):
+                    diagnostics.emit(
+                        event, req, request=req, tokens=self.num_spec_tokens, limit=self.effective_drafter_max_model_len
+                    )
 
     def shutdown(self):
         if has_kv_transfer_group():

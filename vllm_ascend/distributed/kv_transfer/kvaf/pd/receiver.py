@@ -31,6 +31,8 @@ class PullJob:
     finished: bool = False
     error: Exception | None = None
     acknowledged: bool = False
+    diagnostic: bool = False
+    replicas_checked: bool = False
 
 
 class Receiver:
@@ -51,11 +53,13 @@ class Receiver:
         start_immediately=True,
         draft_limit=None,
         num_spec_tokens=3,
+        diagnostics=None,
     ):
         self.runtime, self.writer, self.pool, self.memories = runtime, writer, pool, memories
         self.identity = uuid4().hex
         self.timeout, self.local_eid = timeout, local_eid
         self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
+        self.diagnostics = diagnostics
         self.activate, self.stream_factory, self.raw_transfer = activate, stream_factory, raw_transfer
         self.condition = Condition(RLock())
         self.sources, self.requests, self.jobs = {}, {}, {}
@@ -102,6 +106,18 @@ class Receiver:
                 "failed": False,
                 "cancel_votes": set(),
             }
+            if self.diagnostics and self.diagnostics.select(external_id, seed.generation, alias=request_id):
+                self.diagnostics.emit(
+                    "RECEIVE_SEED",
+                    (external_id, seed.generation),
+                    request=request_id,
+                    external=external_id,
+                    generation=seed.generation,
+                    tokens=seed.tokens,
+                    full_blocks=seed.tokens // BLOCK_SIZE,
+                    tail_tokens=seed.tokens % BLOCK_SIZE,
+                    groups=[dict(count=len(group), first=list(group[:4])) for group in seed.blocks],
+                )
             self.condition.notify_all()
 
     def _request(self, external_id, generation):
@@ -125,11 +141,23 @@ class Receiver:
         self.activate()
         operation = message["op"]
         if operation == "hello":
+            ticket = self.runtime.offload_region()
+            if self.diagnostics:
+                self.diagnostics.emit(
+                    "DDR_REGION",
+                    "startup",
+                    peer=self.identity,
+                    region_id=getattr(ticket, "region_id", None),
+                    region_epoch=getattr(ticket, "region_epoch", None),
+                    control_host=self._listen[0],
+                    control_port=self._listen[1],
+                )
             return {
                 "peer": self.identity,
-                "ticket": self.runtime.offload_region(),
+                "ticket": ticket,
                 "draft_limit": self.draft_limit,
                 "num_spec_tokens": self.num_spec_tokens,
+                "verify_kv": bool(self.diagnostics and self.diagnostics.verify),
             }
         if message.get("peer") != self.identity:
             raise ValueError("stale D worker/DDR region")
@@ -207,6 +235,8 @@ class Receiver:
             if operation == "pull":
                 return self._pull(job, message)
             if operation == "complete":
+                if job.diagnostic and self.diagnostics.verify and not job.replicas_checked and job.error is None:
+                    self._check_replicas(job, message.get("replicas"))
                 return self._complete(job)
             if operation == "ack_complete":
                 if not job.finished:
@@ -323,7 +353,51 @@ class Receiver:
                 # new DMA for a receive that will enter native error handling.
                 count.update(cpu=0, npu=0)
                 self.jobs[job_id].error = RuntimeError("an earlier request contribution failed")
-            return {"job": job_id, "count": count}
+            result = {"job": job_id, "count": count}
+            if self.diagnostics and self.diagnostics.active(request["id"]):
+                self.jobs[job_id].diagnostic = True
+                result["trace"] = True
+                self.diagnostics.emit(
+                    "PULL_PLAN",
+                    job_id,
+                    request=request["id"],
+                    generation=message["generation"],
+                    layer=layer,
+                    member=member,
+                    ratio=ratio,
+                    first=first,
+                    tokens=tokens,
+                    final=final,
+                    draft_skipped=skipped,
+                    count=count,
+                    source_tables={k: dict(count=len(v), first=list(v[:4])) for k, v in message["tables"].items()},
+                    destination_tables={k: dict(count=len(v), first=list(v[:4])) for k, v in tables.items()},
+                )
+                if self.diagnostics.verify and plan is not None and not request["failed"]:
+                    expected_destinations = self.diagnostics.spans(memory, tables, tokens, first, final, member, ratio)[
+                        "npu"
+                    ]
+                    destinations = tuple((b.destinations, b.lengths) for b in plan.hbm.batches())
+                    self.diagnostics.address_check(
+                        expected_destinations,
+                        destinations,
+                        job_id,
+                        request=request["id"],
+                        generation=message["generation"],
+                        layer=layer,
+                        path="D_HBM_destination",
+                    )
+                    result["verify"] = {
+                        "npu": tuple((b.sources, b.lengths) for b in plan.hbm.batches()),
+                        "cpu": tuple(
+                            (
+                                plan.main_sources[i : i + MAX_SEGMENTS],
+                                (BLOCK_SIZE * 656,) * len(plan.full_blocks[i : i + MAX_SEGMENTS]),
+                            )
+                            for i in range(0, len(plan.full_blocks), MAX_SEGMENTS)
+                        ),
+                    }
+            return result
 
     def _pull(self, job, message):
         path, batch = message["path"], message["batch"]
@@ -359,10 +433,27 @@ class Receiver:
                             raise
                         transfer.recover()
                 else:
-                    self._cpu_pull(job, batch, ready)
+                    transfer = self._cpu_pull(job, batch, ready)
+                if job.diagnostic:
+                    self._diagnose_pull(job, path, batch, ready, transfer, message.get("digests"))
                 job.completed[key] = ready.sequence
                 return True
             except Exception as exc:
+                if job.diagnostic:
+                    self.diagnostics.emit(
+                        "DIAGNOSTIC_OR_PULL_ERROR",
+                        (job.request_id, job.layer, job.member, path, batch),
+                        request=job.request_id,
+                        generation=job.generation,
+                        layer=job.layer,
+                        path=path,
+                        batch=batch,
+                        status="FAIL",
+                        error=str(exc),
+                    )
+                if self.diagnostics and self.diagnostics.retained is not None:
+                    self.runtime.failure = exc
+                    raise
                 job.error = exc
                 transfer = job.transfers[-1] if job.transfers else None
                 if self._resolve_failure(transfer, job):
@@ -418,6 +509,71 @@ class Receiver:
             # is never replaced with an Abort or a newly prepared transaction.
             transfer.finish(int(self.timeout * 1000))
         transfer.publish(self.writer, group, state)
+        return transfer
+
+    def _diagnose_pull(self, job, path, batch, ready, transfer, expected):
+        diag = self.diagnostics
+        fields = dict(
+            request=job.request_id,
+            generation=job.generation,
+            layer=job.layer,
+            member=job.member,
+            path=path,
+            batch=batch,
+            sequence=ready.sequence,
+        )
+        key = (job.request_id, job.generation, job.layer, job.member, job.first, job.tokens, path, batch)
+        diag.emit(
+            "PULL_DONE",
+            key,
+            **fields,
+            state="COMMITTED_PUBLISHED" if path == "cpu" else "DONE",
+            api="submit_cpu_pull/wait_cpu_pull/commit_put" if path == "cpu" else "batch_get_raw_addr",
+            bytes=sum(transfer.segments.lengths),
+            segments=len(transfer.segments.lengths),
+            source_offsets=list(transfer.segments.sources[:4]),
+            destinations=list(transfer.segments.destinations[:4]),
+        )
+        if diag.verify:
+            if path == "npu":
+                actual = diag.hashes(transfer.output, transfer.segments.destinations, transfer.segments.lengths)
+            else:
+                actual = diag.ddr_hashes(self.runtime, transfer, self.memories[job.layer].tensor.device)
+            diag.compare(expected, actual, key, **fields)
+
+    def _check_replicas(self, job, evidence):
+        request = next(value for value in self.requests.values() if value["id"] == job.request_id)
+        end = job.tokens // BLOCK_SIZE + int(job.final and job.tokens % BLOCK_SIZE > 0)
+        blocks = () if job.plan is None else tuple(range(job.first, end))
+        reference = request.setdefault("diagnostic_replicas", {})
+        mismatches = []
+        if evidence is None or len(evidence) != len(blocks):
+            mismatches.append("missing_evidence")
+        else:
+            for expected_block, item in zip(blocks, evidence):
+                block, size, digest = item
+                wanted = min(BLOCK_SIZE, job.tokens - expected_block * BLOCK_SIZE) * 656
+                if block != expected_block or size != wanted or not isinstance(digest, str) or len(digest) != 64:
+                    mismatches.append(expected_block)
+                    continue
+                key = (job.layer, block, size)
+                if reference.setdefault(key, digest) != digest:
+                    mismatches.append(block)
+        job.replicas_checked = True
+        self.diagnostics.emit(
+            "MAIN_REPLICA_CHECK",
+            (job.request_id, job.generation, job.layer, job.member, job.first, job.tokens),
+            request=job.request_id,
+            generation=job.generation,
+            layer=job.layer,
+            member=job.member,
+            ratio=job.ratio,
+            blocks=len(blocks),
+            status="FAIL" if mismatches else "PASS",
+            mismatches=mismatches[:4],
+        )
+        if mismatches:
+            job.error = RuntimeError("P TP main KV replicas differ or their evidence is incomplete")
 
     def _complete(self, job):
         with self.runtime.lock:
@@ -483,6 +639,23 @@ class Receiver:
         if not gate.decode_ready:
             raise RuntimeError("request completion gate is not satisfied")
         request["published"] = True
+        if self.diagnostics and self.diagnostics.active(req_id):
+            self.diagnostics.emit(
+                "DECODE_READY",
+                (req_id, seed.generation),
+                request=req_id,
+                generation=seed.generation,
+                contributions=len(request["final"]),
+                expected=len(self.memories) * ratio,
+                tokens=seed.tokens,
+                full_blocks=seed.tokens // BLOCK_SIZE,
+                tail_tokens=seed.tokens % BLOCK_SIZE,
+                verify_kv=self.diagnostics.verify,
+                verified_batches=sum(len(job.completed) for job in self.jobs.values() if job.request_id == req_id)
+                if self.diagnostics.verify
+                else 0,
+                replica_checks=sum(job.replicas_checked for job in self.jobs.values() if job.request_id == req_id),
+            )
         self.writer.complete_receive(req_id)
         self.finished.add(req_id)
 
