@@ -1,5 +1,7 @@
 # PD 源码编译与单机联调脚本
 
+当前现场（已有 vLLM、141.62.38.12、P TP2 / D DP2、K 28997）请优先使用[更新后的完整教程](kvaf_pd_existing_vllm_tutorial.md)，包含当天问题汇总、编译检查点和诊断流程。
+
 适用：已下载本仓 v0.30.0rc2-develop、KVAF cpu-pull-hbm-reference，以及匹配的 vLLM v0.30.0 源码。下面用单机 8 卡、已能运行的四层 GLM5.3 W4A4C8 模型联调；生产代码仍支持原始多机拓扑。命令在已验证的 torch/torch_npu/CANN 容器中运行，先加载现场 CANN、ATB、UMDK 环境；安装脚本不会替换匹配的 torch 包，也不下载模型或修改模型层数。
 
 ## 1. 源码安装和编译

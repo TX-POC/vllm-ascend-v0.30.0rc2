@@ -1,5 +1,7 @@
 # 手动字段启动 P / D
 
+当前现场（已有 vLLM、141.62.38.12、P TP2 / D DP2、K 28997）请优先使用[更新后的完整教程](kvaf_pd_existing_vllm_tutorial.md)，包含当天问题汇总、编译检查点和诊断流程。
+
 仓库根目录 p_start.sh、d_start.sh 按标准启动模板编排：环境设置在前，完整原生 vLLM 命令与内联 JSON 在后。参数直接填在字段内，无 Python 配置生成、自动网卡识别、JSON变量或启动包装脚本；无需预先 export 或传参。
 
 默认 P 为物理卡 2/3、TP2/DP1、HTTP 8100；D 为卡 4/5、TP1/DP2、HTTP 8200；模型 /home/models/glm5-mtp-4l，IP 141.62.38.12、网卡 enp34s0f1，K 端口 28997。
