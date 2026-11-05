@@ -1,0 +1,124 @@
+--- /dev/null
++++ b/python/kvip/cache/page_updates.py
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Publish appended DDR pages across all requests/groups in one upload/launch."""
++
++
++class PageUpdates:
++    def __init__(self, torch, addresses, valid, token_to_slot, *, fused=(), widths=(), token_bytes=656, block_size=128):
++        self.torch = torch
++        self.addresses, self.valid, self.token_to_slot = addresses, valid, token_to_slot
++        self.block_size = block_size
++        self.fused = tuple(fused)
++        self.widths, self.token_bytes = tuple(widths), token_bytes
++        self.on_npu = addresses.device.type == "npu"
++        # Each row contains [flat page index, DDR address, old map offset/-1].
++        shape = (addresses.numel(), 3)
++        self.device = torch.empty(shape, dtype=torch.int64, device=addresses.device)
++        self.host = [torch.empty(shape, dtype=torch.int64, pin_memory=self.on_npu) for _ in range(2)]
++        self.fused_table = torch.tensor(
++            [(t.data_ptr(), width * token_bytes) for t, width in zip(self.fused, self.widths)] or [(0, 0)],
++            dtype=torch.int64,
++            device=addresses.device,
++        )
++
++    @property
++    def nbytes(self):
++        return self.device.numel() * self.device.element_size() + self.fused_table.numel() * 8
++
++    def submit(self, rows, ring):
++        if not rows:
++            return
++        count = len(rows)
++        host = self.host[ring][:count]
++        host.numpy()[:] = rows
++        self.device[:count].copy_(host, non_blocking=self.on_npu)
++        if self.on_npu:
++            from kvip.cache._page_updates_kernel import publish_pages_kernel
++
++            publish_pages_kernel[(count,)](
++                self.device,
++                self.addresses,
++                self.valid,
++                self.token_to_slot,
++                self.fused_table,
++                GROUPS=self.addresses.shape[1],
++                PAGES=self.addresses.shape[2],
++                BLOCK=self.block_size,
++                FUSED=bool(self.fused),
++                HISTORY=self.fused[0].shape[1] if self.fused else 0,
++            )
++            return
++        # CPU reference; the production path above has one copy and one launch.
++        for index, address, clear in rows:
++            owner, rem = divmod(index, self.addresses.shape[1] * self.addresses.shape[2])
++            group, page = divmod(rem, self.addresses.shape[2])
++            self.addresses.view(-1)[index] = address
++            self.valid.view(-1)[index] = 1
++            if clear >= 0:
++                self.token_to_slot.view(-1)[clear : clear + self.block_size] = -1
++            if self.fused:
++                offsets = self.torch.arange(self.block_size, dtype=self.torch.int64)
++                self.fused[group][owner, page * self.block_size : (page + 1) * self.block_size] = (
++                    address + offsets * self.widths[group] * self.token_bytes
++                )
+--- /dev/null
++++ b/python/kvip/cache/_page_updates_kernel.py
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: Apache-2.0
++"""One program per appended page; no historical-page upload or KV payload copy."""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def publish_pages_kernel(
++    ROWS,
++    ADDRESSES,
++    VALID,
++    MAP,
++    FUSED_TABLE,
++    GROUPS: tl.constexpr,
++    PAGES: tl.constexpr,
++    BLOCK: tl.constexpr,
++    FUSED: tl.constexpr,
++    HISTORY: tl.constexpr,
++):
++    row = tl.program_id(0)
++    index = tl.load(ROWS + row * 3)
++    address = tl.load(ROWS + row * 3 + 1)
++    clear = tl.load(ROWS + row * 3 + 2)
++    lane = tl.arange(0, BLOCK)
++    tl.store(ADDRESSES + index, address)
++    tl.store(VALID + index, 1)
++    tl.store(MAP + tl.maximum(clear, 0) + lane, -1, clear >= 0)
++    if FUSED:
++        owner = index // (GROUPS * PAGES)
++        group = index // PAGES % GROUPS
++        page = index % PAGES
++        pointer = tl.load(FUSED_TABLE + group * 2).to(tl.pointer_type(tl.int64))
++        token_bytes = tl.load(FUSED_TABLE + group * 2 + 1)
++        token = page * BLOCK + lane
++        tl.store(pointer + owner * HISTORY + token, address + lane * token_bytes, token < HISTORY)
+--- a/python/kvip/cache/abc.py
++++ b/python/kvip/cache/abc.py
+@@ -4,6 +4,8 @@
+ 
+ def update_abc(token_to_slot, slot_to_token, descriptors, requests, history, tail):
+     if token_to_slot.device.type == "npu":
++        import triton
++
+         from kvip.cache._abc_kernel import update_abc_kernel
+ 
+         update_abc_kernel[(descriptors.shape[0], requests)](
+@@ -15,7 +17,7 @@
+             token_to_slot.shape[2],
+             history,
+             tail,
+-            BLOCK=512,
++            BLOCK=triton.next_power_of_2(tail),
+         )
+         return
+     # CPU reference used by byte-level service-path tests.

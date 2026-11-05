@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Own native KVAF sessions and synchronous Target KV writes to DDR."""
+"""Own native KVAF sessions and Target KV writes to DDR."""
 
 import atexit
 import importlib
@@ -205,6 +205,11 @@ class KVAFAdapter:
 
     def close(self) -> None:
         """Release every session on normal shutdown, including partial startup."""
+        if self.writer is not None:
+            try:
+                self.writer.close_put()
+            except Exception:
+                logger.exception("KVAF background Put failed during shutdown")
         if self.writer is not None and self.writer.feedback is not None:
             try:
                 self.writer.feedback.close()

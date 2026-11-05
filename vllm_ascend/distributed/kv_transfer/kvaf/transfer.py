@@ -2,7 +2,9 @@
 """Put/Get execution and address publication; cache policy owns transfer selection."""
 
 import logging
+import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .layout import BLOCK_SIZE, TOKEN_BYTES, KVCacheLayout
@@ -48,6 +50,10 @@ class KVTransfer:
         self._verified: set[str] = set()
         self.put_pages = self.put_bytes = self.released_pages = 0
         self.phase_pages = {"prefill": 0, "decode": 0}
+        self.put_executor = self.put_stream = self.pending_put = None
+        self.put_batches = self.put_waits = 0
+        self.put_seconds = self.put_wait_seconds = 0.0
+        self.put_last_log = time.monotonic()
 
     def configure_slot_regions(self):
         if self._regions_ready:
@@ -75,6 +81,9 @@ class KVTransfer:
 
     def release_requests(self, req_ids: Iterable[str]) -> None:
         """Free native DDR entries before making their slot IDs reusable."""
+        req_ids = tuple(req_ids)
+        if self.pending_put is not None and any(req in self.pending_put[1] for req in req_ids):
+            self.poll_put(wait=True)  # No owner/key reuse while Put reads its ABC.
         for req_id in req_ids:
             if self.feedback is not None:
                 self.feedback.release(req_id)
@@ -114,6 +123,7 @@ class KVTransfer:
 
     def prepare_requests(self, requests, scheduled_tokens):
         """Prepare request metadata before forward; KVCachePolicy owns Target storage."""
+        self.poll_put()
         self.configure_slot_regions()
         if self.feedback is not None:
             self.feedback.poll_feedback()
@@ -147,7 +157,7 @@ class KVTransfer:
                 plans[key] = blocks
             state.progress.prepare(plans[key], request.num_computed_tokens, scheduled)
 
-    def _publish_addresses(self, layer, keys, jobs):
+    def _read_addresses(self, layer, keys):
         """Snapshot native addresses only after Put succeeds; never derive them."""
         runtime = self.runtimes[layer.geometry]
         handle = runtime.prepare_access_table(keys)
@@ -166,6 +176,10 @@ class KVTransfer:
                 raise RuntimeError("KVAF Put succeeded but its DDR address table is invalid")
         finally:
             runtime.release_access_table(handle)
+        return addresses
+
+    @staticmethod
+    def _publish_result(addresses, jobs):
         offset = 0
         for state, count in jobs:
             state.addresses.extend(addresses[offset : offset + count])
@@ -175,63 +189,163 @@ class KVTransfer:
         """Publish stable staging/ABC pages through the serving cache policy."""
         self.policy.after_forward(requests, scheduled_tokens)
 
-    def publish(self, policy, req_id, tokens):
-        phase = "decode" if policy.plans.get(req_id) is None or policy.plans[req_id].decode else "prefill"
-        written = 0
-        for i, (layer, state) in enumerate(zip(self.groups, self.requests[req_id])):
-            count = tokens // BLOCK_SIZE - len(state.keys)
-            if count <= 0:
-                continue
-            pool = self.slots[layer.geometry]
-            if len(state.reserved) < count:
-                prompt = policy.requests[req_id].num_prompt_tokens
-                # Reserve only the unshared prompt suffix. Reservation does not
-                # publish addresses or make unwritten pages readable by Get.
-                desired = max(count, (prompt + BLOCK_SIZE - 1) // BLOCK_SIZE - len(state.keys))
-                previous = state.reserved[-1] if state.reserved else state.keys[-1] if state.keys else None
-                state.reserved.extend(
-                    pool.take(
-                        desired - len(state.reserved),
-                        region=i,
-                        after=None if previous is None else previous + 1,
+    def start_decode_put(self, device):
+        import torch
+
+        if self.verify is not None:
+            logger.info("KVAF Put verification enabled: decode Put remains synchronous for safe Get readback")
+            return
+        if any(not getattr(runtime, "supports_background_put", False) for runtime in self.runtimes.values()):
+            raise RuntimeError("Rebuild KVAF with scripts/install_kvip.sh for GIL-free background Put")
+        self.put_stream = torch.npu.Stream(device=device)
+        self.put_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvaf-put")
+
+    def _prepare_put(self, policy, targets):
+        batches = []
+        for i, layer in enumerate(self.groups):
+            keys, offsets, jobs = [], [], []
+            for req_id, tokens in targets.items():
+                state = self.requests[req_id][i]
+                start = len(state.keys)
+                count = tokens // BLOCK_SIZE - start
+                if count <= 0:
+                    continue
+                pool = self.slots[layer.geometry]
+                if len(state.reserved) < count:
+                    prompt = policy.requests[req_id].num_prompt_tokens
+                    desired = max(count, (prompt + BLOCK_SIZE - 1) // BLOCK_SIZE - start)
+                    previous = state.reserved[-1] if state.reserved else state.keys[-1] if state.keys else None
+                    state.reserved.extend(
+                        pool.take(
+                            desired - len(state.reserved),
+                            region=i,
+                            after=None if previous is None else previous + 1,
+                        )
                     )
+                selected = [state.reserved.popleft() for _ in range(count)]
+                # Reserved/in-flight keys are owned, but addresses stay unpublished.
+                state.keys.extend(selected)
+                keys.extend(selected)
+                offsets.extend(
+                    policy._source_offset(req_id, page) * policy.group_sizes[i] for page in range(start, start + count)
                 )
-            keys = [state.reserved.popleft() for _ in range(count)]
-            # Keep attempted pages owned even if native Put fails partway;
-            # request cleanup must free them before these IDs can be reused.
-            state.keys.extend(keys)
-            offsets = [
-                policy._source_offset(req_id, p) * policy.group_sizes[i]
-                for p in range(len(state.keys) - count, len(state.keys))
-            ]
-            self.runtimes[layer.geometry].batch_put(
-                keys=keys,
-                source=policy.bytes_outputs[i].view(-1),
-                input_offsets=offsets,
-                lengths=[BLOCK_SIZE * TOKEN_BYTES * policy.group_sizes[i]] * count,
+                jobs.append((state, count))
+            if keys:
+                batches.append((i, keys, offsets, jobs))
+        return batches
+
+    def _execute_put(self, policy, batches, phase):
+        results = []
+        for i, keys, offsets, jobs in batches:
+            layer = self.groups[i]
+            runtime = self.runtimes[layer.geometry]
+            source = policy.bytes_outputs[i].view(-1)
+            runtime.batch_put(
+                keys=keys, source=source, input_offsets=offsets, lengths=[BLOCK_SIZE * layer.geometry[0]] * len(keys)
             )
-            self._publish_addresses(layer, keys, [(state, count)])
-            written += count * policy.group_sizes[i]
+            addresses = self._read_addresses(layer, keys)
             if self.verify is not None and phase not in self._verified:
-                self.verify(
-                    self.runtimes[layer.geometry],
-                    policy.bytes_outputs[i].view(-1),
-                    keys[0],
-                    offsets[0],
-                    layer.layout,
-                )
+                self.verify(runtime, source, keys[0], offsets[0], layer.layout)
                 self._verified.add(phase)
                 logger.info(
                     "KVAF BatchPut verified: phase=%s layer=%s; DDR matches HBM", phase, layer.layout.layer_names[0]
                 )
+            results.append((i, addresses, jobs))
+        return results
+
+    def _finish_put(self, results, targets, phase):
+        published = [req for req in targets if any(len(s.keys) > len(s.addresses) for s in self.requests[req])]
+        written = 0
+        for i, addresses, jobs in results:
+            self._publish_result(addresses, jobs)
+            written += len(addresses) * len(self.groups[i].layout.layer_names)
         self.put_pages += written
         self.put_bytes += written * BLOCK_SIZE * TOKEN_BYTES
         self.phase_pages[phase] += written
-        if written and phase not in self._logged.setdefault(req_id, set()):
+        for req_id in published:
+            if written and phase not in self._logged.setdefault(req_id, set()):
+                logger.info("KVAF first BatchPut: request=%s phase=%s; DDR addresses published", req_id, phase)
+                self._logged[req_id].add(phase)
+
+    def publish(self, policy, req_id, tokens):
+        # Prefill and archive retain synchronous semantics and cannot race the
+        # runtime's reusable Put descriptors or request-key cleanup.
+        phase = "decode" if policy.plans.get(req_id) is None or policy.plans[req_id].decode else "prefill"
+        self.publish_batch(policy, {req_id: tokens}, phase)
+
+    def publish_batch(self, policy, targets, phase):
+        self.poll_put(wait=True)
+        batches = self._prepare_put(policy, targets)
+        self._finish_put(self._execute_put(policy, batches, phase), targets, phase)
+
+    def submit_decode(self, policy, targets):
+        self.poll_put()
+        if self.pending_put is not None:
+            return  # Bounded queue; pressure is handled before ABC overwrite.
+        batches = self._prepare_put(policy, targets)
+        if not batches:
+            return
+        targets = {
+            req: tokens
+            for req, tokens in targets.items()
+            if any(len(s.keys) > len(s.addresses) for s in self.requests[req])
+        }
+        if self.put_executor is None:  # CPU reference tests only.
+            self._finish_put(self._execute_put(policy, batches, "decode"), targets, "decode")
+            return
+        import torch
+
+        produced = torch.npu.Event()
+        produced.record(torch.npu.current_stream(self.put_stream.device))
+        future = self.put_executor.submit(self._background_put, policy, batches, produced)
+        self.pending_put = (future, targets)
+
+    def _background_put(self, policy, batches, produced):
+        import torch
+
+        torch.npu.set_device(self.put_stream.device)
+        started = time.monotonic()
+        with torch.npu.stream(self.put_stream):
+            self.put_stream.wait_event(produced)
+            results = self._execute_put(policy, batches, "decode")
+        return results, time.monotonic() - started
+
+    def poll_put(self, *, wait=False):
+        if self.pending_put is None:
+            return
+        future, targets = self.pending_put
+        if not wait and not future.done():
+            return
+        before = time.monotonic()
+        stalled = not future.done()
+        results, elapsed = future.result()  # Failure is fatal; never publish/recycle uncertain keys.
+        self._finish_put(results, targets, "decode")
+        self.pending_put = None
+        now = time.monotonic()
+        self.put_batches += 1
+        self.put_seconds += elapsed
+        self.put_waits += int(stalled)
+        self.put_wait_seconds += now - before if stalled else 0
+        if now - self.put_last_log >= 5:
             logger.info(
-                "KVAF first BatchPut: request=%s phase=%s pages=%s; DDR addresses published", req_id, phase, written
+                "KVAF decode Put: batches=%s background_ms=%.3f waits=%s wait_ms=%.3f; "
+                "ABC source retained until completion; no KV snapshot copy",
+                self.put_batches,
+                1000 * self.put_seconds / self.put_batches,
+                self.put_waits,
+                1000 * self.put_wait_seconds,
             )
-            self._logged[req_id].add(phase)
+            self.put_batches = self.put_waits = 0
+            self.put_seconds = self.put_wait_seconds = 0.0
+            self.put_last_log = now
+
+    def close_put(self):
+        try:
+            self.poll_put(wait=True)
+        finally:
+            if self.put_executor is not None:
+                self.put_executor.shutdown(wait=True)
+                self.put_executor = None
 
 
 def verify_put_block(runtime, source, key, byte_offset, layout) -> None:

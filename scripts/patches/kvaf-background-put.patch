@@ -1,0 +1,19 @@
+--- a/bindings/src/npu_python_runtime.cc
++++ b/bindings/src/npu_python_runtime.cc
+@@ -436,6 +436,8 @@
+     const aclrtStream acl_stream = ResolveStream(stream);
+     batch_put_request_.input =
+         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
++    // No Python objects are accessed while the synchronous native transfer waits.
++    py::gil_scoped_release release;
+     ThrowIfError(native_->core().BatchPut(
+         batch_put_request_, BatchPutExecutionOptions{acl_stream}));
+   }
+@@ -732,6 +734,7 @@
+       .def_property_readonly("batch_get_tokens_per_block",
+                              &NpuPythonRuntime::BatchGetTokensPerBlock)
+       .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
++      .def_property_readonly("supports_background_put", [](const NpuPythonRuntime&) { return true; })
+       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
+            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
+            py::arg("stream") = py::none(),

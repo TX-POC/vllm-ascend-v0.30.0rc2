@@ -13,7 +13,9 @@ class KVAFConfig:
     cpu_addresses: dict[str, str] = field(default_factory=dict)  # Physical NPU ID -> host:port; overrides cpu_address.
     build_dir: str = ""
     ddr_size_gb: float = 1.0
-    hot_tokens: int = 8192  # Per request/layer; excludes the fixed 384-token ABC tail.
+    hot_tokens: int = 8192  # Per request/layer; excludes the computed ABC tail.
+    put_interval_steps: int = 32
+    put_overlap_steps: int = 8
     npu_core_count: int = 2
     jettys_per_core: int = 2
     decode_backend: str = "batch_get"  # batch_get or li_fetch; fixed for the worker lifetime.
@@ -47,11 +49,20 @@ class KVAFConfig:
             raise ValueError("kvaf_config.hot_tokens must be an integer >= 8192 and a multiple of 128")
         if self.decode_backend == "li_fetch" and self.hot_tokens % 256:
             raise ValueError("li_fetch requires hot_tokens aligned to the original kernel's 256-token tiles")
+        for name in ("put_interval_steps", "put_overlap_steps"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"kvaf_config.{name} must be a positive integer")
         # Limits of the pinned KVAF native runtime.
         for name, maximum in (("npu_core_count", 48), ("jettys_per_core", 64)):
             value = getattr(self, name)
             if type(value) is not int or not 0 < value <= maximum:
                 raise ValueError(f"kvaf_config.{name} must be an integer in 1..{maximum}")
+
+    def abc_tokens(self, max_queries):
+        from .layout import BLOCK_SIZE, TAIL
+
+        tokens = TAIL + max_queries * (self.put_interval_steps + self.put_overlap_steps)
+        return (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE * BLOCK_SIZE
 
     @classmethod
     def from_dict(cls, values: Any) -> "KVAFConfig":
