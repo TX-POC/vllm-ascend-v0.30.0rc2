@@ -23,7 +23,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -4398,10 +4398,14 @@ class NPUModelRunner(GPUModelRunner):
     def _initialize_kvaf_cache_state(self):
         if not self.ascend_config.kvaf_config.enabled or self.kvaf_cache_state is not None:
             return
-        from vllm_ascend.distributed.kv_transfer.kvaf.state import DeviceCacheState
-        from vllm_ascend.distributed.kv_transfer.kvaf.layout import index_groups
-        from vllm_ascend.distributed.kv_transfer.kvaf.layout import TOPK
         from vllm_ascend.distributed.kv_transfer.kvaf.cache_policy import TAIL, KVCachePolicy
+        from vllm_ascend.distributed.kv_transfer.kvaf.layout import (
+            FUSED_HISTORY_ALIGNMENT,
+            MAX_QUERIES,
+            TOPK,
+            index_groups,
+        )
+        from vllm_ascend.distributed.kv_transfer.kvaf.state import DeviceCacheState
 
         specs = getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec()
         drafts = frozenset(getattr(self.drafter, "attn_layer_names", ()))
@@ -4416,7 +4420,21 @@ class NPUModelRunner(GPUModelRunner):
         tokens = (tokens + block_size - 1) // block_size * block_size
         tokens = max(TOPK, tokens) + TOPK  # Empty candidates cannot overlap resident KV.
         hot_tokens = self.ascend_config.kvaf_config.hot_tokens
-        tokens = max(tokens, hot_tokens + TAIL)
+        # LIFetch's existing bounded fallback is distinct from LRU hot slots
+        # and the ABC tail; include it before HBM capacity profiling.
+        spill_tokens = MAX_QUERIES * TOPK if self.ascend_config.kvaf_config.decode_backend == "li_fetch" else 0
+        fused_history = (
+            (self.model_config.max_model_len + self.num_spec_tokens + FUSED_HISTORY_ALIGNMENT - 1)
+            // FUSED_HISTORY_ALIGNMENT * FUSED_HISTORY_ALIGNMENT if spill_tokens else 0
+        )
+        if spill_tokens:
+            # Original hot-first tiling needs a cold tile range even when the
+            # configured model length is shorter than the resident capacity.
+            fused_history = max(
+                fused_history,
+                hot_tokens + FUSED_HISTORY_ALIGNMENT * (self.ascend_config.kvaf_config.intermediate_fetches + 1),
+            )
+        tokens = max(tokens, hot_tokens + spill_tokens + TAIL)
         # FIA graph padding can append one dummy request beyond max_num_reqs.
         groups = index_groups(targets, self.compilation_config.static_forward_context)
         self.kvaf_cache_state = DeviceCacheState([g[0] for g in groups], self.max_num_reqs + 1, tokens, self.device)
@@ -4428,7 +4446,21 @@ class NPUModelRunner(GPUModelRunner):
             self.model_config.max_model_len,
             group_sizes=[len(g) for g in groups],
             hot_tokens=hot_tokens,
+            spill_tokens=spill_tokens,
+            fused_history=fused_history,
         )
+        if fused_history:
+            import acl
+
+            # Current wheels record a device family, not the exact compiler SoC.
+            # ACL is initialized on this worker's logical device at this point.
+            soc = acl.get_soc_name()
+            if not soc:
+                raise RuntimeError("KVAF LIFetch: ACL could not query the active SoC name")
+            self.kvaf_cache_state.policy.initialize_fused_workspace(
+                self.ascend_config.kvaf_config, torch.npu.current_device(), soc,
+                index_heads=self.model_config.hf_text_config.index_n_heads,
+            )
         self.kvaf_target_layer_names = set(targets)
         logger.info(
             "KVAF device inputs: layers=%s requests=%s tokens=%s bytes=%s; included in memory profiling",
@@ -4807,6 +4839,10 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.current_device(),
                 layouts,
                 groups=self.kvaf_cache_state.groups,
+                fused_workers=(
+                    self.kvaf_cache_state.policy.fused_setup.workers
+                    if self.kvaf_cache_state.policy.fused_setup is not None else None
+                ),
                 log_dir=self.ascend_config.ascend_log_path,
                 tp_rank=self.tp_rank,
                 dp_rank=self.dp_rank,
@@ -4825,8 +4861,14 @@ class NPUModelRunner(GPUModelRunner):
             self._initialize_kvaf_cache_state()
             self.kvaf_adapter.writer.feedback.bind_device_pool(self.kvaf_cache_state)
             self.kvaf_adapter.writer.feedback.bind(self.compilation_config.static_forward_context)
-            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import RequestSnapshotStore
-            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import AuxiliarySnapshotStore
+            if self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+                from kvip.adapters.vllm.binding import bind_selectors
+
+                bind_selectors(torch, self.kvaf_cache_state.policy, self.ascend_config.kvaf_config)
+            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import (
+                AuxiliarySnapshotStore,
+                RequestSnapshotStore,
+            )
 
             writer = self.kvaf_adapter.writer
             geometry = writer.groups[0].geometry
@@ -6590,7 +6632,14 @@ class NPUModelRunner(GPUModelRunner):
         parent_module_name = _get_gpu_model_runner_module_name(self)
         self._engram_capture_active = True
         try:
-            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+            with (
+                ExitStack() as capture_resources,
+                _torch_cuda_wrapper(),
+                _replace_gpu_model_runner_function_wrapper(parent_module_name),
+            ):
+                if self.kvaf_adapter is not None and self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+                    for runtime in self.kvaf_adapter.runtimes.values():
+                        capture_resources.enter_context(runtime.lease.capture_scope())
                 cuda_graph_size = GPUModelRunner.capture_model(self)
         finally:
             self._engram_capture_active = False
