@@ -37,7 +37,11 @@ def audit(records, require_ddr=False, require_compute=False):
         if not checks or len(checks) != gate.get("verified_batches"):
             raise ValueError("missing transfer byte-check records; log set may be incomplete")
         if not replicas or len(replicas) != gate.get("replica_checks"):
-            raise ValueError("missing P TP main-replica evidence")
+            raise ValueError(
+                "missing P TP main-replica evidence: "
+                f"worker={gate.get('worker')} request={gate.get('request')} "
+                f"expected={gate.get('replica_checks')} observed={len(replicas)}"
+            )
         if any(record.get("status") != "PASS" for record in checks + replicas):
             raise ValueError("KV or main-replica evidence is not PASS")
         current = {record["path"] for record in checks}

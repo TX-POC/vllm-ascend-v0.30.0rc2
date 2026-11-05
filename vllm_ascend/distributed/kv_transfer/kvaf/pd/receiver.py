@@ -236,7 +236,7 @@ class Receiver:
                 return self._pull(job, message)
             if operation == "complete":
                 if job.diagnostic and self.diagnostics.verify and not job.replicas_checked and job.error is None:
-                    self._check_replicas(job, message.get("replicas"))
+                    self._check_replicas(job, message.get("replicas"), key)
                 return self._complete(job)
             if operation == "ack_complete":
                 if not job.finished:
@@ -541,7 +541,7 @@ class Receiver:
                 actual = diag.ddr_hashes(self.runtime, transfer, self.memories[job.layer].tensor.device)
             diag.compare(expected, actual, key, **fields)
 
-    def _check_replicas(self, job, evidence):
+    def _check_replicas(self, job, evidence, job_id):
         request = next(value for value in self.requests.values() if value["id"] == job.request_id)
         end = job.tokens // BLOCK_SIZE + int(job.final and job.tokens % BLOCK_SIZE > 0)
         blocks = () if job.plan is None else tuple(range(job.first, end))
@@ -562,7 +562,11 @@ class Receiver:
         job.replicas_checked = True
         self.diagnostics.emit(
             "MAIN_REPLICA_CHECK",
-            (job.request_id, job.generation, job.layer, job.member, job.first, job.tokens),
+            job_id,
+            job=job_id,
+            first=job.first,
+            tokens=job.tokens,
+            final=job.final,
             request=job.request_id,
             generation=job.generation,
             layer=job.layer,

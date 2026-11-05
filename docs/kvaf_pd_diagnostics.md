@@ -153,3 +153,9 @@ grep 'KVAF_PD_DIAG' /home/c00612283/pd-diag-p.log /home/c00612283/pd-diag-d.log
 停止新请求，正常退出本次 P/D；移除两侧 diagnostics_requests/verify_kv，或显式设为 0/false 后重启。默认关闭时不创建诊断对象，不安装 indexer 装饰器，不进行 SHA256、额外同步或 DDR 回读，也不产生 KVAF_PD_DIAG 日志。已有原生 KVAF 日志遵循其自身配置，不由这两个开关修改。
 
 本轮验证：新增 15 项诊断 UT，全量 215 项 KVAF UT 通过。覆盖独立地址公式错误、HBM/DDR 字节损坏、非发送 TP 主 KV 副本差异、ABC/staging 交接、默认关闭、仅日志模式、诊断数量上限、未决回读保活及审计缺失证据。修改文件静态检查通过；全仓 CI 仍有此前基线问题。未在本云环境执行真实 NPU 诊断、生产全建链或模型精度验证。
+
+## 分块副本日志的审计兼容性
+
+MAIN_REPLICA_CHECK 包含 job、first、tokens、final，用于区分不同 chunk。旧版本只有层、成员与块数，连续等长 chunk 可能生成相同 JSON；审计器跨文件去重后会误报 missing P TP main-replica evidence，即使原始记录全部为 PASS。新版本以实际 Pull job 为事件标识，不放宽副本比较、传输校验或完成数量检查。
+
+遇到该提示时，先查看错误中的 expected/observed，再核对同 worker/request/generation 的原始记录。旧日志缺少唯一 job 字段时不能直接认证通过；更新开发分支，正常排空并重启 P/D/Proxy 后，重新采集一个覆盖完整 block 与 tail 的请求。无需重编 KVAF 或 KVOP。诊断默认关闭，采集时仍需两侧显式配置 diagnostics_requests 和 verify_kv。

@@ -6,6 +6,7 @@ import importlib
 import json
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -84,6 +85,28 @@ class TestPDDiagnosticFlow(unittest.TestCase):
         incomplete = [e for e in events(self.diag) if not (e["event"] == "KV_CHECK" and e.get("path") == "cpu")]
         with self.assertRaisesRegex(ValueError, "missing transfer"):
             AUDIT.audit(incomplete)
+
+    def test_audit_cli_preserves_equal_sized_chunks_and_deduplicates_log_files(self):
+        f = self.fixture
+        f.seed(300)
+        f.chunk(128, final=False)
+        f.chunk(256, previous=128, final=False)
+        f.chunk(300, previous=256)
+        records = events(self.diag)
+        replicas = [r for r in records if r["event"] == "MAIN_REPLICA_CHECK"]
+        gate = next(r for r in records if r["event"] == "DECODE_READY")
+        self.assertEqual(len(replicas), gate["replica_checks"])
+        self.assertEqual(AUDIT.audit(records, require_ddr=True)[0], 1)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "d.log"
+            path.write_text("".join("KVAF_PD_DIAG " + json.dumps(r, sort_keys=True) + "\n" for r in records))
+            with patch("sys.argv", ["audit", str(path), str(path), "--require-ddr"]), patch("builtins.print") as output:
+                AUDIT.main()
+            self.assertTrue(output.call_args.args[0].startswith("PD_DIAGNOSTICS_PASS"))
+            incomplete = records.copy()
+            incomplete.remove(replicas[0])
+            with self.assertRaisesRegex(ValueError, "main-replica evidence"):
+                AUDIT.audit(incomplete, require_ddr=True)
 
     def test_hbm_corruption_fails_request_before_decode(self):
         f = self.fixture
