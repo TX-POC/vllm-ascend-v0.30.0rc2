@@ -19,8 +19,11 @@ KVIP 使用 `main` 分支，固定到 `46c03fcf889a3ab56e62c1dbf5acb60580120142`
 [KVIP 仓库](https://gitcode.com/CacheOS/KVIP/tree/main)维护，不提交到本仓。
 安装脚本调用 KVIP 的构建入口，准备同一份 `third_party/KVAF`、编译并安装 LIDU、
 LIFetch/Index update 与 Python 包。已有 KVIP 工作区有改动时停止，不覆盖实验代码。
+已有 `third_party/KVIP` 会自动删除并重新下载（包含其中的本地改动和构建产物）。
 `--source-only` 只下载固定版本；`--skip-kvaf-build` 仅适用于已按当前补丁构建的 KVAF。
-旧 `install_kvaf.sh` 入口转发到同一个安装流程，不再维护另一套 KVAF 补丁。
+旧 `install_kvaf.sh` 入口转发到同一个安装流程。服务安装额外应用 Put 释放 GIL 和 ABC 可变容量补丁；
+不改 Put/LIDU/LIFetch 的传输或替换算法。升级本改动后需完整运行 `bash scripts/install_kvip.sh`，
+不能使用 `--skip-kvaf-build` 跳过首次重编译。
 
 KVAF 固定基线仍为 `c4375e13d7a9519d907ab6a5d11227795f207286`。
 CPU 服务启动方式不变；已有 UMDK 环境可指定 `KVAF_UMDK_ROOT`、`KVAF_URMA_LIBRARY`。
@@ -41,6 +44,8 @@ kvaf_cpu_address="127.0.0.1:28999"
 kvaf_cpu_addresses='{}'
 kvaf_ddr_size_gb=16
 kvaf_hot_tokens=8192
+kvaf_put_interval_steps=32
+kvaf_put_overlap_steps=8
 kvaf_verify_put=false
 ```
 
@@ -73,7 +78,9 @@ Index update 消费融合输出的变更记录，不搬运 KV。Prefill 历史�
 - Prefill 使用分层 chunk 暂存区，稳定完整块 Put 到 DDR；历史按请求/层组/chunk
   获取一次，四层共享 LI 的组一起读取。混合 prefill/decode 批次按请求分别处理。
 - Decode 直接写入独立 hot 区的 ABC 尾部，不向旧 prefill 页镜像数据。
-  历史 hot 容量为每请求每层 `kvaf_hot_tokens`，默认 8192，另加固定 384 个 ABC 槽位。
+  历史 hot 容量为每请求每层 `kvaf_hot_tokens`，默认 8192。ABC 容量按
+  `align128(384 + 最大每轮query数 × (put_interval_steps + put_overlap_steps))` 计算，
+  默认周期 32 轮、重叠余量 8 轮，MTP3 时为 640 token。
   配置必须至少 8192 且按 128 对齐，并受原 LIDU 映射容量上限约束。
   当前是固定配额，不随实际并发动态均分。
 - 长请求进入 decode 时历史 hot 区为空，按 LI/LIDU miss 从 DDR 填充；prefill 不预热历史 hot。
@@ -85,8 +92,12 @@ Index update 消费融合输出的变更记录，不搬运 KV。Prefill 历史�
 - Target 原始全长 HBM 页已移除；Indexer/MTP draft 仍使用调度器管理的 HBM 页。
   请求结束保留 Target DDR 引用，并保存辅助缓存；只有全部 TP worker 确认后才发布 prefix hit。
   命中后恢复辅助缓存并共享 Target 引用；MTP 末尾匹配块及不完整块会重算。
-- 未提交的 ABC 数据不能被 LRU 驱逐。稳定块按已纠正的长度同步 Put，成功后才发布 DDR 地址。
-  LRU 反馈沿用异步 D2H/FIFO 路径；这里的同步 Put 不等于异步传输。
+- Decode 每 `kvaf_put_interval_steps` 轮统一收集请求的稳定完整块，每层组合并一次 Put。
+  单后台线程/独立流直接读取 ABC，不复制 KV 到额外快照区。完成前保持 HBM 映射，完成后发布 DDR 地址。
+  `kvaf_put_overlap_steps` 用于预留空间，不是定时等待；覆盖未提交槽位前才进行背压。
+  仅允许一批在途 Put；未完成时跳过新窗口。Prefill、请求归档/释放需要排空相关后台传输，仍保持同步语义。
+  长度来自 MTP 修正后的已计算位置，未提交 ABC 不进入 LRU；LRU 异步反馈路径不变。
+  `kvaf_verify_put=true` 诊断模式保持同步 Put，避免验证用 Get 与前台 Get 共享临时缓冲区。
 - DDR 不足时淘汰未被使用的已完成缓存，等待所有 TP 的释放确认后复用空间。
   活跃请求占满预算时新请求等待；单请求自身无法容纳时明确报错。
 
@@ -105,6 +116,9 @@ python scripts/benchmark.py --levels 2 --profile-decode --profile-decode-batch 2
 
 - `KVAF connected`：建链完成；不代表模型 KV 已经传输。
 - `KVAF first BatchPut`：区分 prefill/decode 首次写入。
+- `KVAF decode Put`：约每五秒汇总后台整批耗时 `background_ms`（含生产事件等待）、
+  主线程等待次数 `waits` 和累计 `wait_ms`，包含覆盖背压及 Prefill/归档/释放排空。
+  这些是主机计时，不是纯设备 kernel 时间。用已有 decode profiling 对比 Put 窗口的 forward 空泡。
 - `kvaf_verify_put=true`：每 worker 抽查两阶段各一个块，读回与 HBM 比较；会增加等待，测性能时关闭。
 - `KVAF archive READY/HIT/RESTORED`：归档确认、命中、恢复；`KVAF DDR admission WAIT`：容量等待。
 - `KVAF request released`：释放请求引用；`freed_pages=0` 可能表示仍被 prefix archive 引用。

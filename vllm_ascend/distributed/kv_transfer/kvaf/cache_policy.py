@@ -20,10 +20,20 @@ class DecodeHotCache(NativeCacheAdapter):
     slot_capacity = SLOTS
     history_capacity = HISTORY
 
-    def __init__(self, pool, native=None, staging_tokens=0, group_sizes=None, hot_tokens=HISTORY, spill_tokens=0):
+    def __init__(
+        self,
+        pool,
+        native=None,
+        staging_tokens=0,
+        group_sizes=None,
+        hot_tokens=HISTORY,
+        spill_tokens=0,
+        tail_tokens=TAIL,
+    ):
         self.history_capacity = hot_tokens
+        self.tail_tokens = tail_tokens
         self.tail_start = hot_tokens + spill_tokens
-        self.slot_capacity = self.tail_start + TAIL
+        self.slot_capacity = self.tail_start + self.tail_tokens
         if self.slot_capacity > pool.max_tokens:
             raise ValueError("KVAF hot slots exceed the token/slot map capacity")
         super().__init__(pool, native=native)
@@ -60,7 +70,10 @@ class DecodeHotCache(NativeCacheAdapter):
         self.owners = {}
         self.free = list(range(batch - 1, 0, -1))  # Row zero guards LI's -1 entries.
         self.snapshots = {}
+        self.published_pages = {}
+        self.page_clear_rows = set()
         self.writer = None
+        self.put_targets = {}
         self.bytes_outputs = []
         self.attention_caches = []
         self.abc_descriptors = torch.empty((layers, batch, 4), dtype=torch.int32, device=pool.device)
@@ -107,16 +120,20 @@ class DecodeHotCache(NativeCacheAdapter):
         logging.getLogger("vllm").info(
             "KVAF Get enabled: independent Target hot slots=%s+%s per request",
             self.history_capacity,
-            TAIL,
+            self.tail_tokens,
         )
 
     def release(self, req_id):
+        self.put_targets.pop(req_id, None)
         owner = self.owners.pop(req_id, None)
         if owner is not None:
             self.free.append(owner)
         for key in tuple(self.snapshots):
             if key[0] == req_id:
                 del self.snapshots[key]
+        for key in tuple(self.published_pages):
+            if key[0] == req_id:
+                del self.published_pages[key]
 
     def prepare(self, manager, *, decode, padded_requests):
         frame = manager.groups[0]
@@ -181,7 +198,7 @@ class DecodeHotCache(NativeCacheAdapter):
                 if not 1 <= end - begin <= MAX_QUERIES:
                     raise ValueError("Hot Get supports 1..4 decode queries per request")
                 tokens = np.arange(progress.computed_tokens, progress.write_end)
-                writes[begin:end] = pool_row * self.slot_capacity + self.tail_start + tokens % TAIL
+                writes[begin:end] = pool_row * self.slot_capacity + self.tail_start + tokens % self.tail_tokens
                 bases[begin:end] = pool_row * self.pool.max_tokens
                 table = np.arange(
                     pool_row * (self.slot_capacity // BLOCK_SIZE),
@@ -203,9 +220,9 @@ class DecodeHotCache(NativeCacheAdapter):
                     old = self.snapshots.get(key)
                     committed = len(source_state.addresses)
                     tail_begin = committed * BLOCK_SIZE
-                    if progress.write_end - tail_begin > TAIL:
+                    if progress.write_end - tail_begin > self.tail_tokens:
                         raise RuntimeError(
-                            "ABC tail exceeds three blocks; "
+                            "ABC tail exceeds configured capacity; "
                             f"request={req_id} layer={i} first_hot_round={old is None} "
                             f"computed={progress.computed_tokens} write_end={progress.write_end} "
                             f"scheduled={end - begin} committed_pages={committed} "
@@ -240,13 +257,8 @@ class DecodeHotCache(NativeCacheAdapter):
                                 dense_tokens,
                             )
                         else:
-                            maps.token_to_slot[pool_row, old[0] : tail_begin].fill_(-1)
+                            self.page_clear_rows.add(key)
                     descriptors[i, row_index] = (self.map_groups[i], pool_row, tail_begin, progress.write_end)
-                    if old is None or old[1] != committed:
-                        upload(
-                            ("addresses", i, pool_row), self.addresses[pool_row, i, :committed], source_state.addresses
-                        )
-                        upload(("valid", i, pool_row), self.valid[pool_row, i, :committed], 1)
                     candidates, bitmap = getattr(item.lru, "hot_snapshot", (None, None))
                     if candidates is None:
                         candidates = np.arange(TOPK, dtype=np.int32)
@@ -273,7 +285,7 @@ class DecodeHotCache(NativeCacheAdapter):
                 self.abc_descriptors,
                 len(ids),
                 self.tail_start,
-                TAIL,
+                self.tail_tokens,
             )
             table_owners = tuple(self.owners[req] for req in ids)
             if self.uploaded_table_owners != table_owners:
@@ -360,6 +372,8 @@ class KVCachePolicy(DecodeHotCache):
         hot_tokens=HISTORY,
         spill_tokens=0,
         fused_history=0,
+        tail_tokens=TAIL,
+        put_interval_steps=1,
     ):
         staging = ((max_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + pool.max_requests) * BLOCK_SIZE
         super().__init__(
@@ -369,7 +383,10 @@ class KVCachePolicy(DecodeHotCache):
             group_sizes=group_sizes,
             hot_tokens=hot_tokens,
             spill_tokens=spill_tokens,
+            tail_tokens=tail_tokens,
         )
+        self.put_interval_steps = put_interval_steps
+        self.put_step = 0
         self.stage_start = pool.max_requests * self.slot_capacity
         self.decode_writes = self.write_slots
         self.all_writes = torch.full((max(max_tokens, self.max_queries),), -1, dtype=torch.int64, device=pool.device)
@@ -461,6 +478,41 @@ class KVCachePolicy(DecodeHotCache):
                 device=pool.device,
             )
 
+        from kvip.cache.page_updates import PageUpdates
+
+        self.page_updates = PageUpdates(
+            torch,
+            self.addresses,
+            self.valid,
+            self.pool.storage["token_to_slot"],
+            fused=tuple(storage.addresses for storage in self.fused_index_storage),
+            widths=self.group_sizes,
+            token_bytes=TOKEN_BYTES,
+            block_size=BLOCK_SIZE,
+        )
+
+    def _publish_page_updates(self, ring):
+        rows = []
+        counts = []
+        for plan in self.plans.values():
+            for group, state in enumerate(self.writer.requests[plan.request]):
+                key = (plan.request, group)
+                previous = self.published_pages.get(key, 0)
+                count = len(state.addresses)
+                base = (plan.owner * len(self.group_sizes) + group) * self.qcap
+                map_base = (self.map_groups[group] * self.pool.max_requests + plan.owner) * self.pool.max_tokens
+                for page in range(previous, count):
+                    clear = map_base + page * BLOCK_SIZE if key in self.page_clear_rows else -1
+                    rows.append((base + page, state.addresses[page], clear))
+                counts.append((key, count, plan.owner, group))
+        # Existing done[ring] protects this pinned buffer; compute-stream order
+        # publishes addresses and clears retired ABC mappings before forward.
+        self.page_updates.submit(rows, ring)
+        for key, count, owner, group in counts:
+            self.published_pages[key] = count
+            if self.fused_index_storage:
+                self.fused_index_storage[group].published[owner] = count
+
     @property
     def nbytes(self):
         # context/group_context are counted by NativeCacheAdapter; dictionaries are not.
@@ -479,6 +531,7 @@ class KVCachePolicy(DecodeHotCache):
         return (
             super().nbytes
             + sum(t.numel() * t.element_size() for t in tensors)
+            + self.page_updates.nbytes
             + sum(storage.nbytes for storage in self.fused_index_storage)
             + (0 if self.fused_workspace is None else self.fused_workspace.nbytes)
         )
@@ -581,6 +634,11 @@ class KVCachePolicy(DecodeHotCache):
             self.group_sizes,
             (self.context.numel() + (0 if self.group_context is None else self.group_context.numel())) / (1 << 20),
         )
+        if self.pool.on_npu:
+            self.writer.start_decode_put(self.pool.device)
+        logger.info(
+            "KVAF decode Put schedule: interval_steps=%s ABC_tokens=%s", self.put_interval_steps, self.tail_tokens
+        )
         logger.info(
             "KVAF Target HBM: original full-length pages removed; transient prefill tokens=%s; "
             "shared history tokens=%s; hot slots=%s per request/layer",
@@ -591,6 +649,8 @@ class KVCachePolicy(DecodeHotCache):
 
     def prepare(self, manager, *, decode, padded_requests):
         # Phase is request-local. Never stall/reject a normal mixed batch.
+        self.writer.poll_put()
+        self.page_clear_rows.clear()
         frame = manager.groups[0]
         self.plans = {}
         selected = []
@@ -618,8 +678,16 @@ class KVCachePolicy(DecodeHotCache):
             )
             self.plans[req_id] = plan
             if is_decode:
+                # The high-water end also covers asynchronous MTP correction:
+                # positions may move backwards, but never beyond this scheduled end.
                 committed = min(len(states.addresses) for states in self.writer.requests[req_id]) * BLOCK_SIZE
-                if progress.write_end - committed > TAIL and progress.computed_tokens - committed <= TAIL:
+                if progress.write_end - committed > self.tail_tokens:
+                    self.writer.poll_put(wait=True)
+                    committed = min(len(s.addresses) for s in self.writer.requests[req_id]) * BLOCK_SIZE
+                if (
+                    progress.write_end - committed > self.tail_tokens
+                    and progress.computed_tokens - committed <= self.tail_tokens
+                ):
                     logger.warning(
                         "KVAF ABC backpressure: request=%s committed=%s computed=%s; "
                         "publishing stable tail before the next forward",
@@ -627,7 +695,10 @@ class KVCachePolicy(DecodeHotCache):
                         committed,
                         progress.computed_tokens,
                     )
-                    self.publish(req_id, max(0, progress.computed_tokens // BLOCK_SIZE - 1) * BLOCK_SIZE)
+                    # Use only lengths confirmed after prior MTP corrections;
+                    # prepare-time computed_tokens may still be optimistic.
+                    targets = {req: tokens for req, tokens in self.put_targets.items() if req in frame.request_ids}
+                    self.writer.publish_batch(self, targets, "decode")
                 selected.append(index)
             else:
                 stage += (
@@ -636,7 +707,11 @@ class KVCachePolicy(DecodeHotCache):
                 # Carry only the unfinished prefill page, never full history.
                 prefix = progress.computed_tokens % BLOCK_SIZE
                 if prefix:
-                    source = owner * self.slot_capacity + self.tail_start + (progress.computed_tokens - prefix) % TAIL
+                    source = (
+                        owner * self.slot_capacity
+                        + self.tail_start
+                        + (progress.computed_tokens - prefix) % self.tail_tokens
+                    )
                     self._copy_slots(source, plan.stage, prefix)
         ids = tuple(frame.request_ids[i] for i in selected)
         offsets = np.zeros(len(ids) + 1, np.int32)
@@ -664,18 +739,14 @@ class KVCachePolicy(DecodeHotCache):
         for plan in self.plans.values():
             if plan.decode:
                 values[plan.begin : plan.stop] = (
-                    plan.owner * self.slot_capacity + self.tail_start + np.arange(plan.start, plan.end) % TAIL
+                    plan.owner * self.slot_capacity
+                    + self.tail_start
+                    + np.arange(plan.start, plan.end) % self.tail_tokens
                 )
             else:
                 values[plan.begin : plan.stop] = (
                     plan.stage + plan.start % BLOCK_SIZE + np.arange(plan.stop - plan.begin)
                 )
-                for i, state in enumerate(self.writer.requests[plan.request]):
-                    count = len(state.addresses)
-                    self.addresses[plan.owner, i, :count].copy_(
-                        torch.tensor(state.addresses, dtype=torch.int64, device=self.pool.device)
-                    )
-                    self.valid[plan.owner, i, :count].fill_(1)
         self.all_writes.copy_(host, non_blocking=self.pool.on_npu)
         self.write_slots = self.all_writes
         table_ids = tuple((req, self.owners[req]) for req in ids)
@@ -702,14 +773,7 @@ class KVCachePolicy(DecodeHotCache):
             identity = id(selector.inputs)
             selector.prepare(self.plans.values(), prepare_inputs=identity not in shared_inputs)
             shared_inputs[identity] = selector.inputs
-            if selector.storage is not None:
-                for plan in self.plans.values():
-                    selector.storage.publish(
-                        plan.owner,
-                        self.writer.requests[plan.request][layer].addresses,
-                        block_size=BLOCK_SIZE,
-                        token_bytes=self.group_sizes[layer] * TOKEN_BYTES,
-                    )
+        self._publish_page_updates(ring)
         self.fused_query_inputs = tuple(shared_inputs.values())
         if self.pool.on_npu:
             self.done[ring].record(torch.npu.current_stream(self.pool.device))
@@ -724,7 +788,7 @@ class KVCachePolicy(DecodeHotCache):
         for plan in self.plans.values():
             if plan.decode:
                 slots = self.all_writes[plan.begin : plan.stop]
-                torch.remainder(positions[plan.begin : plan.stop], TAIL, out=slots)
+                torch.remainder(positions[plan.begin : plan.stop], self.tail_tokens, out=slots)
                 slots.add_(plan.owner * self.slot_capacity + self.tail_start)
                 for width, writes in self.group_writes.items():
                     torch.mul(slots[None, :], self.write_factors[width], out=writes[:, plan.begin : plan.stop])
@@ -775,25 +839,32 @@ class KVCachePolicy(DecodeHotCache):
         plan = self.plans.get(req_id)
         if plan is not None and not plan.decode and page >= plan.start // BLOCK_SIZE:
             return (plan.stage + (page - plan.start // BLOCK_SIZE) * BLOCK_SIZE) * TOKEN_BYTES
-        return (self.owners[req_id] * self.slot_capacity + self.tail_start + page * BLOCK_SIZE % TAIL) * TOKEN_BYTES
+        return (
+            self.owners[req_id] * self.slot_capacity + self.tail_start + page * BLOCK_SIZE % self.tail_tokens
+        ) * TOKEN_BYTES
 
     def publish(self, req_id, tokens):
         self.writer.publish(self, req_id, tokens)
 
     def after_forward(self, requests, scheduled):
+        self.put_step += 1
+        decode = {}
         for req_id, plan in self.plans.items():
             request = requests[req_id]
             if plan.decode:
                 safe = max(request.num_prompt_tokens // BLOCK_SIZE, request.num_computed_tokens // BLOCK_SIZE - 1)
+                decode[req_id] = max(0, safe) * BLOCK_SIZE
             else:
-                safe = plan.end // BLOCK_SIZE
-            self.publish(req_id, max(0, safe) * BLOCK_SIZE)
+                self.publish(req_id, plan.end // BLOCK_SIZE * BLOCK_SIZE)
             if not plan.decode and plan.end % BLOCK_SIZE:
                 prefix = plan.end % BLOCK_SIZE
                 page = plan.end // BLOCK_SIZE
                 source = self._source_offset(req_id, page) // TOKEN_BYTES
-                destination = plan.owner * self.slot_capacity + self.tail_start + page * BLOCK_SIZE % TAIL
+                destination = plan.owner * self.slot_capacity + self.tail_start + page * BLOCK_SIZE % self.tail_tokens
                 self._copy_slots(source, destination, prefix)
+        self.put_targets.update(decode)
+        if decode and self.put_step % self.put_interval_steps == 0:
+            self.writer.submit_decode(self, decode)
 
     def attention(self, impl, layer, q, rope, topk, metadata, query_ends, *, full_graph=False):
         from vllm_ascend.device.device_op import DeviceOperator

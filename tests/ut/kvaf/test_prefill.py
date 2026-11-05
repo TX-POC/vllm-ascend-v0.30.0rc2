@@ -71,7 +71,15 @@ class TestWindow(unittest.TestCase):
     def setUp(self):
         spill_tokens = getattr(self, "spill_tokens", 0)
         pool = Pool(("target",), 3, 16384 + spill_tokens, "cpu")
-        self.hot = Window(pool, 512, 8192, native=lambda *args: args[14].zero_(), spill_tokens=spill_tokens)
+        self.hot = Window(
+            pool,
+            512,
+            8192,
+            native=lambda *args: args[14].zero_(),
+            spill_tokens=spill_tokens,
+            tail_tokens=getattr(self, "tail_tokens", 384),
+            put_interval_steps=getattr(self, "put_interval_steps", 1),
+        )
         pool.policy = self.hot
         layout = helpers.layout(656, "target")
         plane = replace(layout.planes[0], shape=tuple(self.hot.hot[0].shape))
@@ -326,6 +334,8 @@ class TestWindow(unittest.TestCase):
         self.run_chunk([("a", 0, 129, 129)])
         owner = self.hot.owners["a"]
         # Delayed Put, but the full uncommitted tail is still resident.
+        # Last after_forward already confirmed this boundary after MTP correction.
+        self.hot.put_targets["a"] = 256
         tokens = torch.arange(128, 510)
         slots = owner * self.hot.slot_capacity + self.hot.tail_start + tokens % 384
         self.hot.hot[0].view(-1, 656)[slots] = tokens.remainder(127).to(torch.int8)[:, None]

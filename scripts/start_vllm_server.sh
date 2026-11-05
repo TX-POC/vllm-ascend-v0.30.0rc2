@@ -29,7 +29,9 @@ kvaf_build_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party/KVA
 kvaf_ddr_size_gb=1 # Per NPU worker; TP8 allocates up to 8 times this amount.
 kvaf_decode_backend=batch_get # batch_get (native LI/LIDU/Get) or li_fetch.
 kvaf_intermediate_fetches=8 # Includes the initial hot window; li_fetch only.
-kvaf_hot_tokens=8192 # History tokens per request/layer; ABC remains 384 tokens.
+kvaf_hot_tokens=8192 # History tokens per request/layer; excludes ABC.
+kvaf_put_interval_steps=32 # One shared decode Put window across requests.
+kvaf_put_overlap_steps=8 # Extra ABC space for forward/Put overlap; wait only before reuse.
 kvaf_verify_put=false # Validation: read back the first prefill/decode block per worker and compare bytes.
 profiler_enabled=true # Configure on-demand /start_profile and /stop_profile; does not start capture.
 profiler_dir="$PWD/profiling/$(date +%Y%m%d_%H%M%S)"
@@ -79,11 +81,11 @@ export HCCL_ASYNC_ERROR_HANDLING=0
 printf 'Starting %s on %s:%s\nModel: %s\nAscend logs: %s\n' \
     "$served_model_name" "$host" "$port" "$model_path" "$ASCEND_PROCESS_LOG_PATH"
 
-additional_config="$(python3 - "$enable_dsa_cp" "$kvaf_enabled" "$kvaf_cpu_address" "$kvaf_build_dir" "$kvaf_ddr_size_gb" "$kvaf_cpu_addresses" "$kvaf_verify_put" "$kvaf_hot_tokens" "$kvaf_decode_backend" "$kvaf_intermediate_fetches" <<'PY'
+additional_config="$(python3 - "$enable_dsa_cp" "$kvaf_enabled" "$kvaf_cpu_address" "$kvaf_build_dir" "$kvaf_ddr_size_gb" "$kvaf_cpu_addresses" "$kvaf_verify_put" "$kvaf_hot_tokens" "$kvaf_decode_backend" "$kvaf_intermediate_fetches" "$kvaf_put_interval_steps" "$kvaf_put_overlap_steps" <<'PY'
 import json
 import sys
 
-dsa_cp, enabled, address, build_dir, ddr_gb, addresses, verify, hot_tokens, backend, windows = sys.argv[1:]
+dsa_cp, enabled, address, build_dir, ddr_gb, addresses, verify, hot_tokens, backend, windows, put_interval, put_overlap = sys.argv[1:]
 if any(value not in ("true", "false") for value in (dsa_cp, enabled, verify)):
     raise SystemExit("enable_dsa_cp, kvaf_enabled and kvaf_verify_put must be true or false")
 config = {"enable_dsa_cp": dsa_cp == "true", "enable_cpu_binding": True,
@@ -92,7 +94,8 @@ if enabled == "true":
     config["kvaf_config"] = {
         "enabled": True, "cpu_address": address, "cpu_addresses": json.loads(addresses),
         "build_dir": build_dir, "ddr_size_gb": float(ddr_gb), "verify_put": verify == "true",
-        "hot_tokens": int(hot_tokens), "decode_backend": backend, "intermediate_fetches": int(windows)
+        "hot_tokens": int(hot_tokens), "decode_backend": backend, "intermediate_fetches": int(windows),
+        "put_interval_steps": int(put_interval), "put_overlap_steps": int(put_overlap)
     }
 print(json.dumps(config))
 PY

@@ -4398,7 +4398,7 @@ class NPUModelRunner(GPUModelRunner):
     def _initialize_kvaf_cache_state(self):
         if not self.ascend_config.kvaf_config.enabled or self.kvaf_cache_state is not None:
             return
-        from vllm_ascend.distributed.kv_transfer.kvaf.cache_policy import TAIL, KVCachePolicy
+        from vllm_ascend.distributed.kv_transfer.kvaf.cache_policy import KVCachePolicy
         from vllm_ascend.distributed.kv_transfer.kvaf.layout import (
             FUSED_HISTORY_ALIGNMENT,
             MAX_QUERIES,
@@ -4434,7 +4434,10 @@ class NPUModelRunner(GPUModelRunner):
                 fused_history,
                 hot_tokens + FUSED_HISTORY_ALIGNMENT * (self.ascend_config.kvaf_config.intermediate_fetches + 1),
             )
-        tokens = max(tokens, hot_tokens + spill_tokens + TAIL)
+        tail_tokens = self.ascend_config.kvaf_config.abc_tokens(
+            self._num_drafter_query_tokens() if self.speculative_config else 1
+        )
+        tokens = max(tokens, hot_tokens + spill_tokens + tail_tokens)
         # FIA graph padding can append one dummy request beyond max_num_reqs.
         groups = index_groups(targets, self.compilation_config.static_forward_context)
         self.kvaf_cache_state = DeviceCacheState([g[0] for g in groups], self.max_num_reqs + 1, tokens, self.device)
@@ -4448,6 +4451,8 @@ class NPUModelRunner(GPUModelRunner):
             hot_tokens=hot_tokens,
             spill_tokens=spill_tokens,
             fused_history=fused_history,
+            tail_tokens=tail_tokens,
+            put_interval_steps=self.ascend_config.kvaf_config.put_interval_steps,
         )
         if fused_history:
             import acl

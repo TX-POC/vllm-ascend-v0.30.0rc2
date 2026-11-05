@@ -20,20 +20,27 @@ class ExternalKvipInstallTest(unittest.TestCase):
             checkout = root / "third_party/KVIP"
             (checkout / "scripts").mkdir(parents=True)
             (checkout / "scripts/build.sh").write_text('printf "BUILD %s\\n" "$@"\n')
+            if dirty:
+                (checkout / "local.py").write_text("local edits")
             binaries = root / "bin"
             binaries.mkdir()
             git = binaries / "git"
+            template = root / "build-template.sh"
+            template.write_text('printf "BUILD %s\\n" "$@"\n')
             git.write_text(
                 '#!/bin/bash\ncase "$*" in\n'
-                '  *"status --porcelain"*) echo "$FAKE_DIRTY" ;;\n'
+                '  clone*) target="${@: -1}"; mkdir -p "$target/scripts"; '
+                'cp "$BUILD_TEMPLATE" "$target/scripts/build.sh"; echo "CLONE" ;;\n'
                 '  *"checkout --detach"*) echo "CHECKOUT $*" ;;\n'
                 "esac\n"
             )
             git.chmod(0o755)
-            env = dict(os.environ, PATH=f"{binaries}:{os.environ['PATH']}", FAKE_DIRTY=" M local.py" if dirty else "")
+            env = dict(os.environ, PATH=f"{binaries}:{os.environ['PATH']}", BUILD_TEMPLATE=str(template))
             args = ["bash", str(root / "scripts/install_kvip.sh")]
             args += ["--source-only"] if source_only else ["--skip-kvaf-build"]
-            return subprocess.run(args, env=env, capture_output=True, text=True)
+            result = subprocess.run(args, env=env, capture_output=True, text=True)
+            self.assertFalse((checkout / "local.py").exists())
+            return result
 
     def test_build_uses_external_checkout_and_explicit_kvaf_root(self):
         result = self.run_install()
@@ -48,9 +55,10 @@ class ExternalKvipInstallTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("BUILD", result.stdout)
 
-    def test_dirty_checkout_is_not_overwritten(self):
+    def test_dirty_checkout_is_recreated_and_built(self):
         result = self.run_install(dirty=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("local changes", result.stderr)
-        self.assertNotIn("CHECKOUT", result.stdout)
-        self.assertNotIn("BUILD", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Removing existing KVIP", result.stdout)
+        self.assertIn("CLONE", result.stdout)
+        self.assertIn("CHECKOUT", result.stdout)
+        self.assertIn("BUILD", result.stdout)

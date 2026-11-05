@@ -27,6 +27,8 @@ class LaunchConfigTest(unittest.TestCase):
                     "16384",
                     backend,
                     "8",
+                    "32",
+                    "8",
                 ],
                 input=body,
                 text=True,
@@ -38,3 +40,5 @@ class LaunchConfigTest(unittest.TestCase):
             self.assertEqual(config["kvaf_config"]["intermediate_fetches"], 8)
             self.assertEqual(config["kvaf_config"]["hot_tokens"], 16384)
             self.assertTrue(config["enable_cpu_binding"])
+            self.assertEqual(config["kvaf_config"]["put_interval_steps"], 32)
+            self.assertEqual(config["kvaf_config"]["put_overlap_steps"], 8)
