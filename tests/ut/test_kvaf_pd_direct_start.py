@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""No-argument entry scripts preserve native PD configuration and roles."""
+"""Manual deployment scripts forward native arguments to the chosen Python."""
 
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,24 +12,46 @@ from pathlib import Path
 
 
 class TestDirectPDStart(unittest.TestCase):
-    def test_both_entries_autodetect_and_build_native_arguments(self):
+    def test_both_manual_entries_preserve_native_config(self):
         root = Path(__file__).resolve().parents[2]
-        for role, tp, dp in (("p", "2", "1"), ("d", "1", "2")):
+        for role, tp, dp, devices in (("p", "2", "1", "2,3"), ("d", "1", "2", "4,5")):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
+                rejected = subprocess.run(
+                    ["bash", str(root / f"{role}_start.sh"), "--dry-run"], text=True, capture_output=True, check=False
+                )
+                self.assertEqual(rejected.returncode, 2)
                 target = Path(tmp)
-                (target / "scripts").mkdir()
-                shutil.copy2(root / "scripts/start_vllm_pd.sh", target / "scripts/start_vllm_pd.sh")
+                model = target / "model"
+                model.mkdir()
+                sdk = target / "sdk"
+                (sdk / "python/kvaf").mkdir(parents=True)
+                (target / "third_party/KVOP").mkdir(parents=True)
+                (target / "third_party/KVOP/env.sh").write_text("# Device environment substituted in CPU UT\n")
+                mock_python = target / "python"
+                mock_python.write_text(
+                    f"#!{sys.executable}\nimport json,sys,os\n"
+                    "print(json.dumps({'args':sys.argv[1:],'devices':os.environ['ASCEND_RT_VISIBLE_DEVICES'],"
+                    "'ip':os.environ['HCCL_IF_IP'],'nic':os.environ['HCCL_SOCKET_IFNAME']}))\n"
+                )
+                mock_python.chmod(0o755)
                 script = target / f"{role}_start.sh"
                 text = (
                     (root / script.name)
                     .read_text()
                     .replace(
-                        "python_bin=/usr/local/python3.12.13/bin/python3", f"python_bin={shlex.quote(sys.executable)}"
+                        "python_bin=/usr/local/python3.12.13/bin/python3", f"python_bin={shlex.quote(str(mock_python))}"
                     )
+                    .replace("model_path=/home/models/glm5-mtp-4l", f"model_path={shlex.quote(str(model))}")
+                )
+                text = text.replace(
+                    "kvaf_build=/home/c00612283/KVAF-Devlop/build-pd-py312", f"kvaf_build={shlex.quote(str(sdk))}"
+                )
+                text = text.replace(
+                    'export PROMETHEUS_MULTIPROC_DIR="/dev/shm/', f'export PROMETHEUS_MULTIPROC_DIR="{target}/'
                 )
                 script.write_text(text)
                 result = subprocess.run(
-                    ["bash", str(script), "--dry-run"],
+                    ["bash", str(script)],
                     cwd="/tmp",
                     env=os.environ.copy(),
                     text=True,
@@ -38,7 +59,12 @@ class TestDirectPDStart(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
-                args = shlex.split(result.stdout.splitlines()[-1])
+                data = json.loads(result.stdout.splitlines()[-1])
+                args = data["args"]
+                self.assertEqual(args[:3], ["-m", "vllm.entrypoints.cli.main", "serve"])
+                self.assertEqual(data["devices"], devices)
+                self.assertEqual(data["ip"], "141.62.38.12")
+                self.assertEqual(data["nic"], "enp34s0f1")
                 self.assertEqual(args[args.index("--tensor-parallel-size") + 1], tp)
                 self.assertEqual(args[args.index("--data-parallel-size") + 1], dp)
                 self.assertIn("--no-enable-prefix-caching", args)
@@ -47,10 +73,11 @@ class TestDirectPDStart(unittest.TestCase):
                 transfer = json.loads(args[args.index("--kv-transfer-config") + 1])
                 self.assertEqual(transfer["kv_connector_extra_config"]["diagnostics_requests"], 0)
                 self.assertEqual(transfer["kv_role"], "kv_producer" if role == "p" else "kv_consumer")
+                self.assertEqual(json.loads(args[args.index("--speculative-config") + 1])["num_speculative_tokens"], 3)
                 if role == "p":
                     self.assertEqual(len(transfer["kv_connector_extra_config"]["decode_endpoints"]), 2)
                 else:
-                    self.assertTrue(additional["kvaf_config"]["cpu_address"].endswith(":28997"))
+                    self.assertEqual(additional["kvaf_config"]["cpu_address"], "141.62.38.12:28997")
 
 
 if __name__ == "__main__":

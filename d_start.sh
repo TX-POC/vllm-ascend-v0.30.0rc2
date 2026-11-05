@@ -1,125 +1,136 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Single-host D: edit this section; no exported variables or arguments required.
+# 手动配置：按现场环境修改本节，无需启动参数。
 set -euo pipefail
-role=d
-python_bin=/usr/local/python3.12.13/bin/python3
-model=/home/models/glm5-mtp-4l
-kvaf_build=/home/c00612283/KVAF-Devlop/build-pd-py312
-devices=4,5
-tp=1
-dp=2
-port=8200
-rpc_port=13489
-decode_workers=2
-kv_port=31000
-k_port=28997
-k_host=""              # Empty: same host's detected local_ip.
-ddr_size_gb=1            # Per D worker, not total server capacity.
-preferred_nic=enp34s0f1
-local_ip=""
-env_file=""
-diagnostics_requests=0
-verify_kv=false
-extra_args=()
-
-# ---- Automatic environment and native launch ----
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-if [[ $# -gt 1 || ( $# == 1 && $1 != --dry-run ) ]]; then
-    echo "Usage: ./${role}_start.sh [--dry-run]" >&2
+if [[ $# -ne 0 ]]; then
+    echo "Usage: ./d_start.sh; edit configuration inside the script" >&2
     exit 2
 fi
+python_bin=/usr/local/python3.12.13/bin/python3
+model_path=/home/models/glm5-mtp-4l
+kvaf_build=/home/c00612283/KVAF-Devlop/build-pd-py312
+nic_name=enp34s0f1
+local_ip=141.62.38.12
+device_ids=4,5
+port=8200
+tensor_parallel_size=1
+data_parallel_size=2
+data_parallel_size_local=2
+data_parallel_rpc_port=13489
+kv_port=31000
+max_model_len=8192
+max_num_seqs=2
+max_num_batched_tokens=4096
+gpu_memory_utilization=0.85
+diagnostics_requests=0   # 日志：改为2；默认关闭。
+verify_kv=false          # 字节校验：P/D均改为true，同时开启上面的日志。
+env_file=""              # 可填现场CANN/ATB环境脚本；空值沿用当前环境。
+k_address=141.62.38.12:28997
+ddr_size_gb=1             # 每个D worker的DDR预算。
+
+# 原生Connector配置：地址、拓扑变化时手动修改上面的字段。
+kv_transfer_config=$(cat <<JSON
+{
+  "kv_connector": "PDKVoffloadConnector",
+  "kv_connector_module_path": "vllm_ascend.distributed.kv_transfer.kvaf.pd.connector",
+  "kv_role": "kv_consumer",
+  "kv_port": $kv_port,
+  "kv_connector_extra_config": {
+    "diagnostics_requests": $diagnostics_requests,
+    "verify_kv": $verify_kv
+  }
+}
+JSON
+)
+additional_config=$(cat <<JSON
+{
+  "enable_cpu_binding": true,
+  "multistream_overlap_shared_expert": true,
+  "c8_enable_reshape_optim": false,
+  "kvaf_config": {
+    "enabled": true,
+    "build_dir": "$kvaf_build",
+    "cpu_address": "$k_address",
+    "ddr_size_gb": $ddr_size_gb
+  }
+}
+JSON
+)
+
+# 加载现场环境，清除代理。
 if [[ -n $env_file ]]; then
     set +u
     # shellcheck disable=SC1090
     source "$env_file"
     set -u
 fi
-unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY all_proxy ALL_PROXY
-export KVAF_PD_PYTHON="$python_bin"
-test -x "$python_bin" || { echo "Python not executable: $python_bin" >&2; exit 1; }
+unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[[ -d "$model_path" ]] || { echo "Model directory missing: $model_path" >&2; exit 1; }
+[[ -d "$kvaf_build/python/kvaf" ]] || { echo "KVAF binding missing: $kvaf_build/python/kvaf" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$script_dir/third_party/KVOP/env.sh"
+export PYTHONPATH="$kvaf_build/python${PYTHONPATH:+:$PYTHONPATH}"
 
-# stdlib-only IPv4 discovery: works even without ip/ss in the container.
-network=$("$python_bin" - "$preferred_nic" "$local_ip" <<'PY'
-import fcntl
-import socket
-import struct
-import sys
-from pathlib import Path
-
-preferred, requested = sys.argv[1:]
-addresses = {}
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-    for _, name in socket.if_nameindex():
-        if name == "lo":
-            continue
-        try:
-            address = socket.inet_ntoa(fcntl.ioctl(sock.fileno(), 0x8915, struct.pack("256s", name.encode()[:15]))[20:24])
-        except OSError:
-            continue
-        addresses[name] = address
-if requested:
-    matches = [name for name, ip in addresses.items() if ip == requested]
-    nic = preferred if preferred in matches else (matches[0] if len(matches) == 1 else None)
-else:
-    routes = []
-    for row in Path("/proc/net/route").read_text().splitlines()[1:]:
-        fields = row.split()
-        if fields[1] == "00000000" and int(fields[3], 16) & 1 and fields[0] in addresses:
-            routes.append((int(fields[6]), fields[0]))
-    nic = preferred if preferred in addresses else (min(routes)[1] if routes else None)
-if not nic:
-    raise SystemExit("Cannot select local IPv4/NIC; set preferred_nic/local_ip in the entry script")
-print(nic, addresses[nic])
-PY
-)
-read -r nic local_ip <<< "$network"
-
-configs=$("$python_bin" - "$role" "$local_ip" "$kvaf_build" "$kv_port" "$decode_workers" \
-    "${k_host:-$local_ip}" "${k_port:-28997}" "${ddr_size_gb:-1}" "$diagnostics_requests" "$verify_kv" <<'PY'
-import json
-import sys
-
-role, ip, build, port, workers, k_host, k_port, ddr, count, verify = sys.argv[1:]
-if verify not in ("true", "false"):
-    raise SystemExit("verify_kv must be true or false")
-extra = {"diagnostics_requests": int(count), "verify_kv": verify == "true"}
-if role == "p":
-    extra["decode_endpoints"] = [f"{ip}:{int(port) + i}" for i in range(int(workers))]
-transfer = {"kv_connector": "PDKVoffloadConnector",
-            "kv_connector_module_path": "vllm_ascend.distributed.kv_transfer.kvaf.pd.connector",
-            "kv_role": "kv_producer" if role == "p" else "kv_consumer",
-            "kv_port": int(port), "kv_connector_extra_config": extra}
-backend = {"enabled": role == "d", "build_dir": build}
-if role == "d":
-    backend.update(cpu_address=f"{k_host or ip}:{k_port}", ddr_size_gb=float(ddr))
-print(json.dumps(transfer))
-print(json.dumps({"enable_cpu_binding": True, "multistream_overlap_shared_expert": True,
-                  "c8_enable_reshape_optim": False, "kvaf_config": backend}))
-PY
-)
-mapfile -t json_configs <<< "$configs"
-args=("$model" --port "$port" --tensor-parallel-size "$tp"
-    --data-parallel-size "$dp" --data-parallel-size-local "$dp"
-    --data-parallel-address "$local_ip" --data-parallel-rpc-port "$rpc_port"
-    --max-num-seqs 2 --max-model-len 8192 --max-num-batched-tokens 4096
-    --gpu-memory-utilization 0.85
-    --kv-transfer-config "${json_configs[0]}" --additional-config "${json_configs[1]}"
-    "${extra_args[@]}")
-if [[ ${1:-} == --dry-run ]]; then
-    printf 'Role=%s IP=%s NIC=%s devices=%s TP=%s DP=%s\n' "$role" "$local_ip" "$nic" "$devices" "$tp" "$dp"
-    exec bash "$root/scripts/start_vllm_pd.sh" --dry-run "$role" "$local_ip" "$nic" -- "${args[@]}"
-fi
-test -d "$model" || { echo "Model directory missing: $model" >&2; exit 1; }
-test -d "$kvaf_build/python/kvaf" || { echo "Build KVAF Python binding first: $kvaf_build/python/kvaf" >&2; exit 1; }
-stamp=$(date +%Y%m%d_%H%M%S)_$$
-log_dir="$root/pd-logs/$role/$stamp"
-mkdir -p "$log_dir/plog"
-export ASCEND_PROCESS_LOG_PATH="$log_dir/plog"
-export PROMETHEUS_MULTIPROC_DIR="/dev/shm/vllm_metrics_pd_${role}_$stamp"
-export ASCEND_RT_VISIBLE_DEVICES="$devices"
+# 通信环境：IP与网卡均使用顶部手动配置。
+export VLLM_HOST_IP="$local_ip"
+export HCCL_IF_IP="$local_ip"
+export GLOO_SOCKET_IFNAME="$nic_name"
+export TP_SOCKET_IFNAME="$nic_name"
+export HCCL_SOCKET_IFNAME="$nic_name"
+export HCCL_DFS_CONFIG="task_exception:off,inconsistent_check:off"
+export HCCL_CONNECT_TIMEOUT=1800
+export HCCL_EXEC_TIMEOUT=1800
+export HCCL_BUFFSIZE=400
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_INTRA_PCIE_ENABLE=1
+export HCCL_INTRA_ROCE_ENABLE=0
+export HCCL_ASYNC_ERROR_HANDLING=0
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
-printf 'Starting %s: IP=%s NIC=%s devices=%s TP=%s DP=%s HTTP=%s\nLog: %s/server.log\n' \
-    "$role" "$local_ip" "$nic" "$devices" "$tp" "$dp" "$port" "$log_dir"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=1
+export ASCEND_RT_VISIBLE_DEVICES="$device_ids"
+export ASCEND_GLOBAL_LOG_LEVEL=3
+
+# 每次启动独立保存日志；P/D的metrics目录分开。
+stamp=$(date +%Y%m%d_%H%M%S)_$$
+log_dir="$script_dir/pd-logs/d/$stamp"
+export ASCEND_PROCESS_LOG_PATH="$log_dir/plog"
+export PROMETHEUS_MULTIPROC_DIR="/dev/shm/vllm_metrics_d_$stamp"
+mkdir -p "$ASCEND_PROCESS_LOG_PATH" "$PROMETHEUS_MULTIPROC_DIR"
+printf 'Starting D: IP=%s NIC=%s devices=%s TP=%s DP=%s HTTP=%s\nLog: %s/server.log\n' \
+  "$local_ip" "$nic_name" "$device_ids" "$tensor_parallel_size" "$data_parallel_size" "$port" "$log_dir"
 exec > >(tee "$log_dir/server.log") 2>&1
-exec bash "$root/scripts/start_vllm_pd.sh" "$role" "$local_ip" "$nic" -- "${args[@]}"
+
+# 原生vLLM启动参数：后续可在这里直接增删参数。
+# 固定使用同一个Python解释器调用vllm CLI，避免SDK ABI混用。
+exec "$python_bin" -m vllm.entrypoints.cli.main serve "$model_path" \
+  --host 0.0.0.0 \
+  --port "$port" \
+  --tensor-parallel-size "$tensor_parallel_size" \
+  --data-parallel-size "$data_parallel_size" \
+  --data-parallel-size-local "$data_parallel_size_local" \
+  --data-parallel-address "$local_ip" \
+  --data-parallel-rpc-port "$data_parallel_rpc_port" \
+  --pipeline-parallel-size 1 \
+  --distributed-executor-backend mp \
+  --enable-expert-parallel \
+  --served-model-name glm \
+  --seed 1024 \
+  --max-model-len "$max_model_len" \
+  --max-num-batched-tokens "$max_num_batched_tokens" \
+  --max-num-seqs "$max_num_seqs" \
+  --gpu-memory-utilization "$gpu_memory_utilization" \
+  --trust-remote-code \
+  --enforce-eager \
+  --quantization ascend \
+  --no-enable-prefix-caching \
+  --worker-cls vllm_ascend.distributed.kv_transfer.kvaf.pd.worker.PDKVWorker \
+  --kv-cache-dtype fp8 \
+  --attention_config.indexer_kv_dtype fp8 \
+  --speculative-config '{"num_speculative_tokens":3,"method":"deepseek_mtp","enforce_eager":true}' \
+  --kv-transfer-config "$kv_transfer_config" \
+  --additional-config "$additional_config"
