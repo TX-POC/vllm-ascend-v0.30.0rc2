@@ -38,13 +38,11 @@ class TestDirectPDStart(unittest.TestCase):
                 text = (
                     (root / script.name)
                     .read_text()
+                    .replace("/usr/local/python3.12.13/bin/python3", shlex.quote(str(mock_python)))
                     .replace(
-                        "python_bin=/usr/local/python3.12.13/bin/python3", f"python_bin={shlex.quote(str(mock_python))}"
+                        "source /home/c00612283/vllm-ascend-v0.30.0rc2/third_party/KVOP/env.sh",
+                        "source " + shlex.quote(str(target / "third_party/KVOP/env.sh")),
                     )
-                    .replace("model_path=/home/models/glm5-mtp-4l", f"model_path={shlex.quote(str(model))}")
-                )
-                text = text.replace(
-                    "kvaf_build=/home/c00612283/KVAF-Devlop/build-pd-py312", f"kvaf_build={shlex.quote(str(sdk))}"
                 )
                 text = text.replace(
                     'export PROMETHEUS_MULTIPROC_DIR="/dev/shm/', f'export PROMETHEUS_MULTIPROC_DIR="{target}/'
@@ -52,7 +50,7 @@ class TestDirectPDStart(unittest.TestCase):
                 script.write_text(text)
                 result = subprocess.run(
                     ["bash", str(script)],
-                    cwd="/tmp",
+                    cwd=target,
                     env=os.environ.copy(),
                     text=True,
                     capture_output=True,
@@ -68,6 +66,7 @@ class TestDirectPDStart(unittest.TestCase):
                 self.assertEqual(args[args.index("--tensor-parallel-size") + 1], tp)
                 self.assertEqual(args[args.index("--data-parallel-size") + 1], dp)
                 self.assertIn("--no-enable-prefix-caching", args)
+                self.assertEqual(args[args.index("--block-size") + 1], "128")
                 additional = json.loads(args[args.index("--additional-config") + 1])
                 self.assertFalse(additional["c8_enable_reshape_optim"])
                 transfer = json.loads(args[args.index("--kv-transfer-config") + 1])
