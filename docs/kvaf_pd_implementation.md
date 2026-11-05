@@ -69,3 +69,13 @@ bash -n scripts/install_kvaf_pd.sh
 先用已能运行的单机四层模型验证实际 cache views、RA/HCCL、双 Pull 和 MTP，再按原始生产拓扑检查全层、多请求、长上下文、并发、图模式、取消/抢占与资源回收。采用 SDK 独立测试、临时单机模型、原始生产部署三个验收层次，分别记录版本和 PASS，不互相替代。
 
 入口：[通用安装测试](kvaf_pd_install_deploy_test.md)、[机头 CPU 测试](kvaf_pd_ascend_host_cpu_test.md)、[临时单机配置](kvaf_pd_single_server_8npu_4layer.md)。
+
+## 6. 现场交接修复：末 prompt token 重算
+
+现场出现 first Decode requires the matching completed PD tail。原生 D 会先重算最后一个 prompt token；此前外部 Backend 直到 Decode 分支才导入普通接收 tail，首轮重算的 staging 前缀尚未初始化，后续 MTP 计算长度也已超过接收长度。
+
+修复只在 PDCachePolicy：计算准备阶段、原生 staging 拷贝之前，将已完成接收的 tail 导入 ABC；按请求/层及状态对象记录初始化，后续保留原生续写，避免再次覆盖或校验旧的接收长度。prompt 恰好满块时，末 token 重算所需的块内前缀从已提交 DDR 目录读取到 ABC。接收缺失仍报错，释放时清理初始化状态；Connector 不计算 Hot 地址，原生核心保持不变。
+
+新增 CPU 回归覆盖 19、127、128、129、256、300 token，上游重算宽度为 1 或 4，再进入 MTP Decode，比较 staging 前缀、ABC 有效字节及释放状态；同时检查缺少 tail 时在重算前阻止读取。现场模型精度和真实数据面仍需重新验证。
+
+本修复验证：全量 200 项 KVAF UT 通过；修改文件的语法、Ruff、导入、文档和拼写检查通过。全仓 format.sh ci 在隔离副本执行，仍存在此前基线检查失败，本次修改文件未被格式化改写。

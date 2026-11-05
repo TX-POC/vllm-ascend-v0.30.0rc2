@@ -110,6 +110,42 @@ class TestPDBackend(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "matching completed PD tail"):
             self.prepare()
 
+    def test_missing_tail_stops_native_last_prompt_replay(self):
+        self.receive(19, bind_tail=False)
+        self.hot.reserve_receive("r")
+        self.requests["r"].num_computed_tokens = 18
+        self.writer.prepare_requests(self.requests, {"r": 1})
+        with self.assertRaisesRegex(RuntimeError, "matching completed PD tail"):
+            self.manager.prepare(("r",), {"r": 1}, decode=False, padded_requests=1)
+
+    def test_native_last_prompt_replay_then_mtp_keeps_received_and_new_bytes(self):
+        for tokens, queries in ((n, q) for n in (19, 127, 128, 129, 256, 300) for q in (1, 4)):
+            with self.subTest(tokens=tokens, queries=queries):
+                self.receive(tokens)
+                self.hot.reserve_receive("r")
+                self.requests["r"].num_computed_tokens = tokens - 1
+                self.writer.prepare_requests(self.requests, {"r": queries})
+                self.manager.prepare(("r",), {"r": queries}, decode=False, padded_requests=1)
+                owner = self.hot.owners["r"]
+                for i, cache in enumerate(self.hot.hot):
+                    plan = self.hot.plans["r"]
+                    prefix = (tokens - 1) % 128
+                    stage = cache.view(-1, 656)[plan.stage : plan.stage + prefix]
+                    expected = self.values(torch.arange(tokens - 1 - prefix, tokens - 1), i)
+                    torch.testing.assert_close(stage[:, 0], expected)
+                    slots = self.hot.write_slots_for(i, 0)[:queries]
+                    cache.view(-1, 656)[slots] = self.values(torch.arange(tokens - 1, tokens - 1 + queries), i)[:, None]
+                self.hot.after_forward(self.requests, {"r": queries})
+                self.requests["r"].num_computed_tokens = tokens - 1 + queries
+                self.writer.prepare_requests(self.requests, {"r": 4})
+                self.prepare()
+                for i, cache in enumerate(self.hot.hot):
+                    committed = len(self.writer.requests["r"][i].keys) * 128
+                    positions = torch.arange(committed, tokens - 1 + queries)
+                    slots = owner * self.hot.slot_capacity + self.hot.history_capacity + positions % 384
+                    torch.testing.assert_close(cache.view(-1, 656)[slots, 0], self.values(positions, i))
+                self.writer.release_requests(("r",))
+
     def test_get_uses_per_layer_directory_and_656_byte_offsets(self):
         self.receive(2300)
         self.prepare()
@@ -159,6 +195,7 @@ class TestPDBackend(unittest.TestCase):
         self.prepare()
         self.writer.release_requests(("r",))
         self.assertFalse(self.hot._received_tails)
+        self.assertFalse(self.hot._abc_states)
         self.assertFalse(self.runtime.pages)
         self.assertFalse(self.writer.slots[(656, 128)].references)
 

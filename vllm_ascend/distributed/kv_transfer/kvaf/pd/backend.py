@@ -13,6 +13,7 @@ import torch
 from ..cache_policy import KVCachePolicy
 from ..layout import BLOCK_SIZE, HISTORY, TAIL, TOKEN_BYTES, TOPK
 from ..state import DeviceCacheState
+from ..transfer import get_tokens
 
 
 class PDCachePolicy(KVCachePolicy):
@@ -21,6 +22,7 @@ class PDCachePolicy(KVCachePolicy):
             pool, max_tokens, max_model_len, native=native, group_sizes=(1,) * len(pool.names), hot_tokens=hot_tokens
         )
         self._received_tails = {}
+        self._abc_states = {}
         self.receive_slots = {}
         self.receive_blocks = {}
         self._receive_lock = RLock()
@@ -56,8 +58,8 @@ class PDCachePolicy(KVCachePolicy):
         """Retain a completed ordinary HBM receive; do not preload Hot here.
 
         The caller owns the DMA completion proof and request generation. The
-        native first-Decode prepare later calls _seed to install the valid tail
-        in its ABC ring. The source remains alive until request release, also
+        native compute preparation installs the tail before last-token replay
+        or Decode. The source remains alive until request release, also
         allowing stream-ordered asynchronous copies on the worker stream.
         """
         if type(tokens) is not int or tokens < 0:
@@ -82,12 +84,66 @@ class PDCachePolicy(KVCachePolicy):
             raise ValueError("tail already bound; do not replace live receive storage")
         self._received_tails[key] = (state, tensor, tokens)
 
+    def prepare(self, manager, *, decode, padded_requests):
+        frame = manager.groups[0]
+        for row, req_id in enumerate(frame.request_ids):
+            if req_id not in self.receive_slots:
+                continue
+            if req_id not in self.owners:
+                self.owners[req_id] = self.free.pop()
+                self.addresses[self.owners[req_id]].zero_()
+                self.valid[self.owners[req_id]].zero_()
+            owner = self.owners[req_id]
+            for layer, inputs in enumerate(manager.groups):
+                state = inputs.rows[row].state
+                if self._abc_states.get((req_id, layer)) is state:
+                    continue
+                tokens = self.requests[req_id].num_prompt_tokens
+                if tokens % BLOCK_SIZE:
+                    self._seed(layer, owner, state, tokens // BLOCK_SIZE * BLOCK_SIZE, tokens, True)
+                elif state.progress.computed_tokens < tokens:
+                    # Native PD replays the final prompt token. For an aligned
+                    # prompt its preceding partial page lives in committed DDR.
+                    end = state.progress.computed_tokens
+                    self._seed_replay_prefix(layer, owner, state, end // BLOCK_SIZE * BLOCK_SIZE, end)
+                self._abc_states[req_id, layer] = state
+        super().prepare(manager, decode=decode, padded_requests=padded_requests)
+        # Native local recomputation after preemption owns its new ABC state.
+        for req_id, plan in self.plans.items():
+            if not plan.decode:
+                for layer, state in enumerate(self.writer.requests[req_id]):
+                    self._abc_states[req_id, layer] = state
+
+    def _seed_replay_prefix(self, layer, owner, state, start, end):
+        if start == end:
+            return
+        runtime = self.writer.runtimes[self.writer.groups[layer].geometry]
+        handle = runtime.prepare_access_table(state.keys)
+        try:
+            table = runtime.access_table_view(handle, device="npu")
+            destinations = self.context_destinations[start:end] - start
+            destinations = destinations + owner * self.slot_capacity + self.history_capacity + start % TAIL
+            get_tokens(
+                runtime,
+                table,
+                self.context_indices[start:end],
+                self.context_offsets[start:end],
+                torch.tensor([end - start], dtype=torch.int32, device=self.pool.device),
+                destinations,
+                self.bytes_outputs[layer],
+                synchronize=True,
+            )
+        finally:
+            runtime.release_access_table(handle)
+
     def _seed(self, layer, owner, state, start, end, tail):
         if not tail:
             return super()._seed(layer, owner, state, start, end, tail)
         if start == end:
             return
         req_id = next(req for req, row in self.owners.items() if row == owner)
+        if self._abc_states.get((req_id, layer)) is state:
+            return  # Native replay/Decode has continued writing this ABC ring.
         received = self._received_tails.get((req_id, layer))
         if (
             received is None
@@ -102,10 +158,14 @@ class PDCachePolicy(KVCachePolicy):
         first = owner * self.slot_capacity + self.history_capacity + start % TAIL
         source = received[1].view(torch.int8).reshape(-1)[: (end - start) * TOKEN_BYTES]
         self.hot[layer].view(-1, TOKEN_BYTES)[first : first + end - start].copy_(source.view(-1, TOKEN_BYTES))
+        self._abc_states[req_id, layer] = state
 
     def release(self, req_id):
         # Worker must drain/resolve DMA before invoking the native release path.
         super().release(req_id)
+        for key in tuple(self._abc_states):
+            if key[0] == req_id:
+                del self._abc_states[key]
         for key in tuple(self._received_tails):
             if key[0] == req_id:
                 del self._received_tails[key]
