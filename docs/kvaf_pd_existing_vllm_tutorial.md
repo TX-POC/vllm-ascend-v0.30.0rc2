@@ -1,5 +1,7 @@
 # 已有 vLLM 容器：Ascend / KVAF 编译与 PD 联调教程
 
+双机完整权重与非 PD 准确度对照请使用[双机全模型教程](kvaf_pd_two_node_full_model_accuracy.md)。
+
 更新：2026-11-05。适用于当前单机四层 GLM5.3 W4A4C8 验证：机头 CPU 运行 K，P 使用卡 2、3（TP2/DP1），D 使用卡 4、5（TP1/DP2）。这是临时联调部署，不改变原始多机 P/DP/EP 与八台远端 K 的生产目标。
 
 ## 1. 本次问题与处理结论

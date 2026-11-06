@@ -87,6 +87,45 @@ class TestPDLauncher(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("unbound variable", result.stderr)
 
+    def test_two_node_templates_keep_baseline_and_pd_native_parameters_aligned(self):
+        templates = ROOT / "examples/disaggregated_prefill_v1/kvaf_two_node"
+        for name in ("p_start.sh", "d_start.sh", "d_baseline.sh"):
+            with self.subTest(script=name):
+                path = templates / name
+                subprocess.run(["bash", "-n", str(path)], check=True, capture_output=True)
+                source = path.read_text()
+                command = source[source.index("exec /usr/local/") :].replace("\\\n", " ")
+                args = shlex.split(command)
+
+                def value(flag, args=args):
+                    self.assertEqual(args.count(flag), 1)
+                    return args[args.index(flag) + 1]
+
+                self.assertEqual(value("--tensor-parallel-size"), "8")
+                self.assertEqual(value("--data-parallel-size"), "1")
+                self.assertEqual(value("--max-model-len"), "8192")
+                self.assertEqual(value("--max-num-seqs"), "1")
+                self.assertEqual(value("--kv-cache-dtype"), "fp8")
+                self.assertEqual(json.loads(value("--speculative-config"))["num_speculative_tokens"], 3)
+                additional = json.loads(value("--additional-config"))
+                self.assertFalse(additional["c8_enable_reshape_optim"])
+                self.assertNotIn("glm5-mtp-4l", source)
+                if name == "d_baseline.sh":
+                    self.assertNotIn("--kv-transfer-config", args)
+                    self.assertNotIn("--worker-cls", args)
+                    self.assertFalse(additional["kvaf_config"]["enabled"])
+                    continue
+                transfer = json.loads(value("--kv-transfer-config"))
+                self.assertEqual(transfer["kv_connector"], "PDKVoffloadConnector")
+                self.assertEqual(transfer["kv_connector_extra_config"]["diagnostics_requests"], 0)
+                self.assertFalse(transfer["kv_connector_extra_config"]["verify_kv"])
+                self.assertEqual(additional["kvaf_config"]["enabled"], name == "d_start.sh")
+                if name == "p_start.sh":
+                    self.assertEqual(
+                        transfer["kv_connector_extra_config"]["decode_endpoints"],
+                        [f"D_NODE_IP:{31000 + i}" for i in range(8)],
+                    )
+
 
 class TestPDSmoke(unittest.TestCase):
     def test_http_payload_and_failure_are_checked(self):
