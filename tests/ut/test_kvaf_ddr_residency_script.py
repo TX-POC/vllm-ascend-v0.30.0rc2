@@ -5,6 +5,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -40,14 +41,20 @@ class TestDDRResidencyScript(unittest.TestCase):
             (root / "torch_npu.py").write_text("")
             (root / "kvaf.py").write_text(
                 "from pathlib import Path\n"
+                "import time\n"
                 "ROOT = Path(__file__).parent\n"
                 "class NpuRuntime:\n"
                 "    def __init__(self, **kw): self.device = kw['device_id']\n"
                 "    def link_to(self, address): self.address = address\n"
                 "    def initialize(self): pass\n"
                 "    def initialize_ddr(self, size, slot):\n"
-                "        self.size = size\n"
-                "        (ROOT / f'ready-{self.device}').touch()\n"
+                "        active = ROOT / 'init-active'\n"
+                "        active.mkdir()\n"
+                "        try:\n"
+                "            time.sleep(0.02)\n"
+                "            self.size = size\n"
+                "            (ROOT / f'ready-{self.device}').touch()\n"
+                "        finally: active.rmdir()\n"
                 "    def offload_region(self):\n"
                 "        return dict(address=self.address, epoch=1, region_id=self.device + 1,\n"
                 "                    base=self.device * self.size, bytes=self.size)\n"
@@ -69,6 +76,42 @@ class TestDDRResidencyScript(unittest.TestCase):
             self.assertEqual(result.stdout.count('"event": "READY"'), 8)
             self.assertEqual(result.stdout.count('"event": "SHUTDOWN_PASS"'), 8)
             self.assertIn('"event": "SERIAL_RESIDENCY_PASS"', result.stdout)
+            for path in root.glob("ready-*"):
+                path.unlink()
+            init_spec = importlib.util.spec_from_file_location(
+                "init_coordinator_for_spawn_test",
+                SCRIPT.parent.parent / "vllm_ascend/distributed/kv_transfer/kvaf/pd/initialization.py",
+            )
+            init_module = importlib.util.module_from_spec(init_spec)
+            init_spec.loader.exec_module(init_module)
+            server = init_module.InitializationServer(("127.0.0.1", 0))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPT),
+                        "--cpu",
+                        "fake:1",
+                        "--build-dir",
+                        str(root),
+                        "--parallel",
+                        "--initialization-coordinator",
+                        f"127.0.0.1:{server.server_address[1]}",
+                    ],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.count('"event": "READY"'), 8)
+            self.assertIn('"event": "PARALLEL_RESIDENCY_PASS"', result.stdout)
 
     def test_regions_must_be_distinct_and_disjoint(self):
         MODULE.validate_tickets([ready(0), ready(1)], 16, "k:1")
@@ -89,7 +132,7 @@ class TestDDRResidencyScript(unittest.TestCase):
             return "RELEASE"
 
         pipe.recv.side_effect = release
-        args = NS(cpu="k:1", ddr_bytes=16, slot_size=4)
+        args = NS(cpu="k:1", ddr_bytes=16, slot_size=4, initialization_coordinator="")
         with (
             patch.object(MODULE, "create_runtime", return_value=runtime),
             patch.object(MODULE.signal, "signal"),
@@ -103,7 +146,7 @@ class TestDDRResidencyScript(unittest.TestCase):
         runtime = Mock()
         runtime.initialize_ddr.side_effect = RuntimeError("control timeout")
         pipe = Mock()
-        args = NS(cpu="k:1", ddr_bytes=16, slot_size=4)
+        args = NS(cpu="k:1", ddr_bytes=16, slot_size=4, initialization_coordinator="")
         with (
             patch.object(MODULE, "create_runtime", return_value=runtime),
             patch.object(MODULE.signal, "signal"),
@@ -128,7 +171,7 @@ class TestDDRResidencyScript(unittest.TestCase):
         runtime.shutdown.side_effect = RuntimeError("unresolved transport")
         pipe = Mock()
         pipe.recv.return_value = "RELEASE"
-        args = NS(cpu="k:1", ddr_bytes=16, slot_size=4)
+        args = NS(cpu="k:1", ddr_bytes=16, slot_size=4, initialization_coordinator="")
         # Stop the intentional retain loop only inside this unit test.
         with (
             patch.object(MODULE, "create_runtime", return_value=runtime),
@@ -163,7 +206,7 @@ class TestDDRResidencyScript(unittest.TestCase):
 
         context.Process.side_effect = process_factory
         context.Pipe.side_effect = pipe_factory
-        args = NS(devices=list(range(8)), init_timeout=1, cleanup_timeout=1, ddr_bytes=16, cpu="k:1")
+        args = NS(devices=list(range(8)), init_timeout=1, cleanup_timeout=1, ddr_bytes=16, cpu="k:1", parallel=False)
         with patch.object(MODULE, "emit") as emit:
             result = MODULE.run(args, context)
         return result, timeline, emit, context

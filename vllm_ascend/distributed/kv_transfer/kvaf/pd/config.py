@@ -4,6 +4,7 @@
 from dataclasses import dataclass, field
 
 from ..config import KVAFConfig
+from .initialization import validate_endpoint
 
 WORKER_CLASS = "vllm_ascend.distributed.kv_transfer.kvaf.pd.worker.PDKVWorker"
 
@@ -14,6 +15,7 @@ class PDConfig:
     cpu_eids: dict[str, str] = field(default_factory=dict)
     npu_eids: dict[str, str] = field(default_factory=dict)
     timeout: float = 120.0
+    initialization_coordinator: str = ""  # Empty disables cross-host initialization admission.
     diagnostics_requests: int = 0
     verify_kv: bool = False
 
@@ -33,6 +35,12 @@ class PDConfig:
         if "decode_endpoints" in values:
             values["decode_endpoints"] = tuple(values["decode_endpoints"])
         result = cls(**values)
+        if not isinstance(result.initialization_coordinator, str):
+            raise ValueError("initialization_coordinator must be an empty string or host:port")
+        if result.initialization_coordinator:
+            validate_endpoint(result.initialization_coordinator)
+            if transfer.is_kv_producer:
+                raise ValueError("initialization_coordinator belongs on D consumers only")
         if type(result.diagnostics_requests) is not int or not 0 <= result.diagnostics_requests <= 16:
             raise ValueError("diagnostics_requests must be an integer in 0..16 (0 disables diagnostics)")
         if type(result.verify_kv) is not bool or result.verify_kv and not result.diagnostics_requests:

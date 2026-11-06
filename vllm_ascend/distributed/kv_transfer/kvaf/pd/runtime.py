@@ -11,6 +11,7 @@ from ..adapter import BYTES_PER_GIB, SLOT_ALIGNMENT, KVAFAdapter
 from ..cache_policy import CacheFeedbackManager
 from ..layout import grouped_layouts
 from ..transfer import KVTransfer, verify_put_block
+from .initialization import initialization_slot
 
 
 class PDTransfer(KVTransfer):
@@ -104,9 +105,11 @@ def load_sdk(build_dir):
 
 
 class PDAdapter(KVAFAdapter):
-    def __init__(self, *args, cpu_eid="", **kwargs):
+    def __init__(self, *args, cpu_eid="", initialization_coordinator="", initialization_timeout=120.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.cpu_eid = cpu_eid
+        self.initialization_coordinator = initialization_coordinator
+        self.initialization_timeout = initialization_timeout
 
     def bind_caches(self, kv_caches):
         self.writer = PDTransfer(
@@ -161,7 +164,12 @@ class PDAdapter(KVAFAdapter):
         self.runtimes[656, 128] = runtime
         self.slot_counts[656, 128] = slots
         try:
-            with self._native_log("PD initialize DDR and dual Pull"):
+            with (
+                initialization_slot(
+                    self.initialization_coordinator, self.cpu_address, timeout=self.initialization_timeout
+                ),
+                self._native_log("PD initialize DDR and dual Pull"),
+            ):
                 runtime.link_to(self.cpu_address)
                 runtime.initialize()
                 runtime.initialize_ddr(slots * slot_size, slot_size)

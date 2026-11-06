@@ -323,6 +323,11 @@ URMA 枚举兼容参数来自已确认的 UMDK 26.06 环境，其他版本先核
 
 K 若在裸机，D 容器使用实际可达的 141.62.38.24:28997；容器部署须同时提供 UB 设备和匹配库。单个 K 支持多个 D 客户端，但各 worker 独立 Runtime/region，不是共享一份请求目录。
 
+DP8 共用一个 K 时，若初始化报 `CPU control response unavailable`，且逐个初始化、
+八份同时驻留通过，按 [多 worker 初始化协调](kvaf_pd_initialization.md) 启动独立协调服务，
+先完成八进程无模型回归，再在 D 的 kv_connector_extra_config 中配置
+`initialization_coordinator`。该功能默认关闭，跨 D 主机必须使用同一协调实例。
+
 ## 8. P/D 启动配置与顺序
 
 现场实际脚本为 /home/c00612283/p_dp1tp8start.sh（16号）、/home/c00612283/d_dp8tp1start.sh（24号）。这些是现场手动保存的脚本，Git 仓库不会自动生成同名文件。

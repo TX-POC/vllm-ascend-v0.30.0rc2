@@ -8,6 +8,10 @@
 这与此前“逐卡初始化后立即释放”不同，可检查八份 DDR/通道同时驻留。
 它只验证初始化与驻留，不验证完整 KV 传输、模型精度或推理性能。
 
+若需要同时启动八个进程并验证初始化协调，可增加 `--parallel` 和
+`--initialization-coordinator host:port`，操作步骤见
+[多 worker 初始化协调](kvaf_pd_initialization.md)。原有默认仍为逐个启动，不连接协调服务。
+
 ## 执行
 
 正常停止本次 P/D，确保八张卡空闲；保留 24 号宿主机上的 K 服务，
@@ -55,6 +59,7 @@ LOG="/home/c00612283/ddr-residency-$(date +%Y%m%d_%H%M%S).log"
 | `ALL_RESIDENT_PASS` | 所有进程存活，region 身份不同且地址范围不重叠；尚未发送释放命令 |
 | `SHUTDOWN_PASS` | 单进程清理返回；需结合 READY 和最终结果判断 |
 | `SERIAL_RESIDENCY_PASS` | 全部驻留检查及所有进程正常退出通过 |
+| `PARALLEL_RESIDENCY_PASS` | parallel 模式下全部驻留及清理通过 |
 | `FAIL` / `RESIDENCY_FAIL` | 初始化或协调失败，停止启动更多进程并请求清理 |
 | `RETAINED` / `CLEANUP_PENDING` | 清理失败或等待超时，不能作为测试通过 |
 
@@ -70,6 +75,7 @@ LOG="/home/c00612283/ddr-residency-$(date +%Y%m%d_%H%M%S).log"
 
 脚本不自动重试、不会强制终止 worker，也不重启 K。
 父进程初始化等待默认 180 秒，清理等待默认 180 秒；这些参数不改变 SDK socket 超时。
+配置协调地址时，初始化等待参数也用于等待准入。
 达到清理期限时打印未退出进程 PID，并继续等待，不把超时当作释放完成。
 若 worker 的 `shutdown()` 抛异常，该进程保持存活，避免通过退出释放可能仍被 DMA 使用的内存。
 

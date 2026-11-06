@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import multiprocessing as mp
 import signal
@@ -40,6 +41,16 @@ def create_runtime(args, device):
     )
 
 
+def admission(args):
+    if not args.initialization_coordinator:
+        return contextlib.nullcontext()
+    path = Path(__file__).resolve().parents[1] / "vllm_ascend/distributed/kv_transfer/kvaf/pd/initialization.py"
+    spec = importlib.util.spec_from_file_location("kvaf_pd_init_admission", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.initialization_slot(args.initialization_coordinator, args.cpu, timeout=args.init_timeout)
+
+
 def worker(args, device, pipe):
     # Parent handles Ctrl+C and requests orderly release, including pending init.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -48,12 +59,14 @@ def worker(args, device, pipe):
     start = time.monotonic()
     try:
         runtime = create_runtime(args, device)
-        stage = "link_to"
-        runtime.link_to(args.cpu)
-        stage = "initialize"
-        runtime.initialize()
-        stage = "initialize_ddr"
-        runtime.initialize_ddr(args.ddr_bytes, args.slot_size)
+        stage = "admission"
+        with admission(args):
+            stage = "link_to"
+            runtime.link_to(args.cpu)
+            stage = "initialize"
+            runtime.initialize()
+            stage = "initialize_ddr"
+            runtime.initialize_ddr(args.ddr_bytes, args.slot_size)
         ticket = runtime.offload_region()
         pipe.send({"event": "READY", "device": device, "ticket": ticket, "elapsed": round(time.monotonic() - start, 3)})
         # Keep the Runtime, region and all transport resources alive until release.
@@ -106,6 +119,18 @@ def run(args, context=None):
     workers = []
     records = []
     passed = False
+
+    def wait_ready(device, pipe):
+        if not pipe.poll(args.init_timeout):
+            raise TimeoutError(f"device {device}: initialization deadline exceeded")
+        record = pipe.recv()
+        emit(record["event"], **{key: value for key, value in record.items() if key != "event"})
+        if record["event"] != "READY":
+            raise RuntimeError(f"device {device}: initialization failed")
+        records.append(record)
+        if not all(process.is_alive() for _, process, _ in workers):
+            raise RuntimeError("a previously started worker exited")
+
     try:
         for device in args.devices:
             parent, child = context.Pipe()
@@ -114,15 +139,11 @@ def run(args, context=None):
             child.close()
             workers.append((device, process, parent))
             emit("START", device=device, pid=process.pid)
-            if not parent.poll(args.init_timeout):
-                raise TimeoutError(f"device {device}: initialization deadline exceeded")
-            record = parent.recv()
-            emit(record["event"], **{key: value for key, value in record.items() if key != "event"})
-            if record["event"] != "READY":
-                raise RuntimeError(f"device {device}: initialization failed")
-            records.append(record)
-            if not all(process.is_alive() for _, process, _ in workers):
-                raise RuntimeError("a previously ready worker exited")
+            if not args.parallel:
+                wait_ready(device, parent)
+        if args.parallel:
+            for device, _, pipe in workers:
+                wait_ready(device, pipe)
         validate_tickets(records, args.ddr_bytes, args.cpu)
         emit(
             "ALL_RESIDENT_PASS",
@@ -156,7 +177,8 @@ def run(args, context=None):
                 passed = False
                 emit("WORKER_EXIT_FAIL", device=device, exitcode=process.exitcode)
             pipe.close()
-    emit("SERIAL_RESIDENCY_PASS" if passed else "SERIAL_RESIDENCY_FAIL")
+    mode = "PARALLEL" if args.parallel else "SERIAL"
+    emit(f"{mode}_RESIDENCY_PASS" if passed else f"{mode}_RESIDENCY_FAIL")
     return 0 if passed else 1
 
 
@@ -166,9 +188,13 @@ def parse_args():
     parser.add_argument("--build-dir", required=True, type=Path)
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
     parser.add_argument("--ddr-size-gb", type=int, default=16, help="GiB per worker")
+    parser.add_argument("--parallel", action="store_true", help="start all workers before waiting for READY")
+    parser.add_argument("--initialization-coordinator", default="", help="opt-in shared admission host:port")
     parser.add_argument("--npu-core-count", type=int, default=2)
     parser.add_argument("--jettys-per-core", type=int, default=2)
-    parser.add_argument("--init-timeout", type=int, default=180, help="parent wait only; does not change SDK timeouts")
+    parser.add_argument(
+        "--init-timeout", type=int, default=180, help="parent/admission wait; does not change SDK timeouts"
+    )
     parser.add_argument("--cleanup-timeout", type=int, default=180)
     args = parser.parse_args()
     if len(set(args.devices)) != len(args.devices) or any(device < 0 for device in args.devices):
