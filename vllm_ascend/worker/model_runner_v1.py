@@ -4401,7 +4401,6 @@ class NPUModelRunner(GPUModelRunner):
         from vllm_ascend.distributed.kv_transfer.kvaf.cache_policy import KVCachePolicy
         from vllm_ascend.distributed.kv_transfer.kvaf.layout import (
             FUSED_HISTORY_ALIGNMENT,
-            MAX_QUERIES,
             TOPK,
             index_groups,
         )
@@ -4420,14 +4419,12 @@ class NPUModelRunner(GPUModelRunner):
         tokens = (tokens + block_size - 1) // block_size * block_size
         tokens = max(TOPK, tokens) + TOPK  # Empty candidates cannot overlap resident KV.
         hot_tokens = self.ascend_config.kvaf_config.hot_tokens
-        # LIFetch's existing bounded fallback is distinct from LRU hot slots
-        # and the ABC tail; include it before HBM capacity profiling.
-        spill_tokens = MAX_QUERIES * TOPK if self.ascend_config.kvaf_config.decode_backend == "li_fetch" else 0
+        li_fetch = self.ascend_config.kvaf_config.decode_backend == "li_fetch"
         fused_history = (
             (self.model_config.max_model_len + self.num_spec_tokens + FUSED_HISTORY_ALIGNMENT - 1)
-            // FUSED_HISTORY_ALIGNMENT * FUSED_HISTORY_ALIGNMENT if spill_tokens else 0
+            // FUSED_HISTORY_ALIGNMENT * FUSED_HISTORY_ALIGNMENT if li_fetch else 0
         )
-        if spill_tokens:
+        if li_fetch:
             # Original hot-first tiling needs a cold tile range even when the
             # configured model length is shorter than the resident capacity.
             fused_history = max(
@@ -4437,7 +4434,7 @@ class NPUModelRunner(GPUModelRunner):
         tail_tokens = self.ascend_config.kvaf_config.abc_tokens(
             self._num_drafter_query_tokens() if self.speculative_config else 1
         )
-        tokens = max(tokens, hot_tokens + spill_tokens + tail_tokens)
+        tokens = max(tokens, hot_tokens + tail_tokens)
         # FIA graph padding can append one dummy request beyond max_num_reqs.
         groups = index_groups(targets, self.compilation_config.static_forward_context)
         self.kvaf_cache_state = DeviceCacheState([g[0] for g in groups], self.max_num_reqs + 1, tokens, self.device)
@@ -4449,7 +4446,6 @@ class NPUModelRunner(GPUModelRunner):
             self.model_config.max_model_len,
             group_sizes=[len(g) for g in groups],
             hot_tokens=hot_tokens,
-            spill_tokens=spill_tokens,
             fused_history=fused_history,
             tail_tokens=tail_tokens,
             put_interval_steps=self.ascend_config.kvaf_config.put_interval_steps,

@@ -87,6 +87,32 @@ class TestFeedback(unittest.TestCase):
             self.manager._commit(frames, np.zeros((1, 4, 1), np.int32), None, device_errors=np.array([[2]], np.int32))
         self.assertEqual(row.lru.version, before)
 
+    def test_fused_failure_reports_existing_device_state_and_padding(self):
+        row = self.prepare().rows[0]
+        frames = ((((row.lru, self.hot.slot_capacity),), np.array([0, 4], np.int32)),)
+        rows = np.zeros((1, 2, 256), np.int32)
+        rows[0, 0, [9, 11, 211, 247, 248]] = [64, 7, 1, 123, 1]
+        before = row.lru.version
+        with self.assertRaises(RuntimeError) as caught:
+            self.manager._commit(
+                frames,
+                np.zeros((1, 4, 1), np.int32),
+                None,
+                miss_counts=rows,
+                device_errors=np.array([[4, 1]], np.int32),
+                traffic=True,
+            )
+        message = str(caught.exception)
+        for expected in (
+            "failed_rows=2",
+            "'status': 4",
+            "'prefetch_error': 7",
+            "'final_reads': 123",
+            "'active': False",
+        ):
+            self.assertIn(expected, message)
+        self.assertEqual(row.lru.version, before)
+
     def test_fused_slot_feedback_does_not_invent_selected_miss_counts(self):
         frame = self.prepare()
         feedback = np.array([[[1, 2], [2, 1], [8192, -1], [1, 2]]], dtype=np.int32)

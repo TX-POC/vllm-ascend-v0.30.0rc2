@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class ExternalKvipInstallTest(unittest.TestCase):
-    def run_install(self, dirty=False, source_only=False):
+    def run_install(self, dirty=False, source_only=False, old_kvaf=False, experimental=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "scripts").mkdir()
@@ -22,6 +22,13 @@ class ExternalKvipInstallTest(unittest.TestCase):
             (checkout / "scripts/build.sh").write_text('printf "BUILD %s\\n" "$@"\n')
             if dirty:
                 (checkout / "local.py").write_text("local edits")
+            if old_kvaf or experimental:
+                (root / "third_party/KVAF").mkdir()
+                (root / "third_party/KVAF/local.txt").write_text("preserve")
+            if experimental:
+                cmake = root / "third_party/KVAF/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt"
+                cmake.parent.mkdir(parents=True)
+                cmake.write_text("function(kvaf_build_isolated_urma_get)\n")
             binaries = root / "bin"
             binaries.mkdir()
             git = binaries / "git"
@@ -30,25 +37,48 @@ class ExternalKvipInstallTest(unittest.TestCase):
             git.write_text(
                 '#!/bin/bash\ncase "$*" in\n'
                 '  clone*) target="${@: -1}"; mkdir -p "$target/scripts"; '
-                'cp "$BUILD_TEMPLATE" "$target/scripts/build.sh"; echo "CLONE" ;;\n'
+                'cp "$BUILD_TEMPLATE" "$target/scripts/build.sh"; echo "CLONE $*" ;;\n'
+                '  *"rev-parse HEAD"*) echo "$TEST_KVAF_REVISION" ;;\n'
                 '  *"checkout --detach"*) echo "CHECKOUT $*" ;;\n'
                 "esac\n"
             )
             git.chmod(0o755)
-            env = dict(os.environ, PATH=f"{binaries}:{os.environ['PATH']}", BUILD_TEMPLATE=str(template))
+            env = dict(
+                os.environ,
+                PATH=f"{binaries}:{os.environ['PATH']}",
+                BUILD_TEMPLATE=str(template),
+                TEST_KVAF_REVISION="1c1310387ebfb6776a07316874e924265b209ada" if experimental else "old",
+            )
             args = ["bash", str(root / "scripts/install_kvip.sh")]
             args += ["--source-only"] if source_only else ["--skip-kvaf-build"]
             result = subprocess.run(args, env=env, capture_output=True, text=True)
             self.assertFalse((checkout / "local.py").exists())
+            if old_kvaf or experimental:
+                backups = list((root / "third_party").glob("KVAF-backup.*/KVAF/local.txt"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_text(), "preserve")
             return result
 
     def test_build_uses_external_checkout_and_explicit_kvaf_root(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("46c03fcf889a3ab56e62c1dbf5acb60580120142", result.stdout)
+        self.assertIn("c5b17ef29287483a65e9d7d4ffe3ce7ac33702ff", result.stdout)
+        self.assertIn("CLONE clone --branch main https://gitcode.com/CacheOS/KVIP.git", result.stdout)
         self.assertIn("BUILD --kvaf-root", result.stdout)
         self.assertIn("/third_party/KVAF", result.stdout)
         self.assertIn("BUILD --skip-kvaf-build", result.stdout)
+
+    def test_upgrade_preserves_checkout_and_forces_rebuild(self):
+        result = self.run_install(old_kvaf=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Previous KVAF preserved", result.stdout)
+        self.assertNotIn("BUILD --skip-kvaf-build", result.stdout)
+
+    def test_experimental_checkout_is_preserved_and_rebuilt(self):
+        result = self.run_install(experimental=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Previous KVAF preserved", result.stdout)
+        self.assertNotIn("BUILD --skip-kvaf-build", result.stdout)
 
     def test_source_only_does_not_build(self):
         result = self.run_install(source_only=True)
