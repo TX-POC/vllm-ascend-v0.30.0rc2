@@ -176,7 +176,11 @@ class PDKVModelRunner(NPUModelRunner):
             runtime = self.kvaf_adapter.runtimes[656, 128]
             runtime.compute_done = torch.npu.Event()
             runtime.compute_done.record()
-        sdk = load_sdk(config.build_dir)
+        # Inactive TP ranks still execute every native forward/cache write and
+        # report local completion, but never load or initialize the KVAF SDK.
+        sdk = None
+        if not (self.pd_config.source_tp0_only and self.is_kv_producer and self.tp_rank != 0):
+            sdk = load_sdk(config.build_dir)
         connector.bind_pd_backend(
             sdk=sdk,
             runtime=runtime,

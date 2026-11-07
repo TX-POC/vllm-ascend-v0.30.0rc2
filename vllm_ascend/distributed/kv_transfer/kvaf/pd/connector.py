@@ -100,6 +100,8 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_dtype=self.vllm_config.cache_config.cache_dtype,
                 indexer_dtype=self.vllm_config.attention_config.indexer_kv_dtype,
                 target_layers=sum(memory.offload_main for memory in memories.values()),
+                source_tp0_only=self.config.source_tp0_only,
+                source_participant=not self.is_producer or not self.config.source_tp0_only or tp_rank == 0,
             )
             for name, memory in memories.items():
                 self.diagnostics.layout(name, memory)
@@ -156,6 +158,7 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 activate=activate,
                 stream_factory=stream,
                 start_immediately=False,
+                source_tp0_only=self.config.source_tp0_only,
                 draft_limit=draft_limit,
                 num_spec_tokens=self.vllm_config.speculative_config.num_speculative_tokens,
                 diagnostics=self.diagnostics,

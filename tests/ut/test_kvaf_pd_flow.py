@@ -141,7 +141,7 @@ class RawTransfer(TRANSFER.NpuPullTransfer):
 
 
 class TestPDFlow(unittest.TestCase):
-    def setUp(self):
+    def setUp(self, *, source_tp0_only=False, tp_size=4):
         self.sdk = SDK()
         self.pool = BACKEND.create_decode_cache(
             ("l0", "l1", "l2", "l3"), 2, 128, 8192, "cpu", native=lambda *a: a[14].zero_()
@@ -175,15 +175,16 @@ class TestPDFlow(unittest.TestCase):
             port=0,
             timeout=3,
             raw_transfer=RawTransfer,
+            source_tp0_only=source_tp0_only,
         )
         self.addCleanup(self.receiver.close)
         endpoint = f"127.0.0.1:{self.receiver.server.port}"
         self.senders = []
-        for rank in range(4):
+        for rank in range(tp_size):
             sender = SENDER.Sender(
                 self.sdk,
                 self.memories_for(decode=False),
-                config=CONFIG.PDConfig(decode_endpoints=(endpoint,), timeout=3),
+                config=CONFIG.PDConfig(decode_endpoints=(endpoint,), timeout=3, source_tp0_only=source_tp0_only),
                 device_id=rank,
                 producer=f"P:0:{rank}",
                 host="127.0.0.1",
@@ -192,7 +193,7 @@ class TestPDFlow(unittest.TestCase):
                 event_factory=lambda: NS(synchronize=lambda: None),
                 external_id=lambda value: value,
                 tp_rank=rank,
-                tp_size=4,
+                tp_size=tp_size,
                 dp_rank=0,
             )
             self.senders.append(sender)
@@ -496,6 +497,12 @@ class TestProductionMesh(unittest.TestCase):
             CONTROL.call(f"127.0.0.1:{server.port}", {"unexpected": Path("/tmp")}, timeout=3)
 
     def test_tp8_dp2_sources_register_with_all_tp1_dp16_regions_on_eight_k_pools(self):
+        self.registration_mesh()
+
+    def test_tp0_sources_from_each_dp_register_with_all_tp1_dp16_regions_on_eight_k_pools(self):
+        self.registration_mesh(source_tp0_only=True)
+
+    def registration_mesh(self, source_tp0_only=False):
         sdk = SDK()
         endpoints, imported = [], []
 
@@ -506,7 +513,11 @@ class TestProductionMesh(unittest.TestCase):
 
             def dispatch(message):
                 if message["op"] == "hello":
-                    return dict(peer=peer, ticket=NS(region_id=worker_id + 1, region_epoch=1, cpu=f"K-{worker_id % 8}"))
+                    return dict(
+                        peer=peer,
+                        ticket=NS(region_id=worker_id + 1, region_epoch=1, cpu=f"K-{worker_id % 8}"),
+                        source_tp0_only=source_tp0_only,
+                    )
                 assert message["peer"] == peer
                 if message["op"] == "register":
                     metadata = message["metadata"]
@@ -528,7 +539,7 @@ class TestProductionMesh(unittest.TestCase):
             sender = SENDER.Sender(
                 sdk,
                 {"l0": memory},
-                config=CONFIG.PDConfig(decode_endpoints=tuple(endpoints), timeout=5),
+                config=CONFIG.PDConfig(decode_endpoints=tuple(endpoints), timeout=5, source_tp0_only=source_tp0_only),
                 device_id=worker % 8,
                 producer=f"P:{worker // 8}:{worker % 8}",
                 host="127.0.0.1",
@@ -541,8 +552,11 @@ class TestProductionMesh(unittest.TestCase):
                 dp_rank=worker // 8,
             )
             self.addCleanup(sender.close)
-        self.assertTrue(all(len(sources) == 16 for sources in imported))
-        self.assertEqual(len(sdk.sources), 16 * 16 * 2)
+        participants = 2 if source_tp0_only else 16
+        self.assertTrue(all(len(sources) == participants for sources in imported))
+        self.assertEqual(len(sdk.sources), participants * 16 * 2)
+        if source_tp0_only:
+            self.assertTrue(all(set(sources) == {"P:0:0", "P:1:0"} for sources in imported))
         self.assertEqual(
             {source.ticket.cpu for source in sdk.sources.values() if not source.npu},
             {f"K-{index}" for index in range(8)},

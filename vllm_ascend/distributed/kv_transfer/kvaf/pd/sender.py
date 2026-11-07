@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """P-side per-layer publication and physical-storage reuse gates."""
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -42,18 +43,34 @@ class Sender:
         self.diagnostics = diagnostics
         self.activate, self.stream_factory, self.event_factory = activate, stream_factory, event_factory
         self.external_id, self.tp_rank, self.tp_size, self.dp_rank = external_id, tp_rank, tp_size, dp_rank
+        self.active = not config.source_tp0_only or tp_rank == 0
         self.registrations, self.peers, self.futures = {}, {}, {}
-        self.executor = ThreadPoolExecutor(max_workers=min(len(memories), 8), thread_name_prefix="kvaf-pd-send")
+        self.executor = None
         self.metadata = None
         self.dispatched, self.draft_written = set(), set()
         self.draft_skipped = self.draft_completed = False
         self.native_finished, self.final_submitted, self.active_requests = set(), set(), {}
         self.forward_pending = set()
         self.closed = False
+        self.bootstrap = None
+        if not self.active:
+            return  # Keep native per-rank completion bookkeeping, without SDK or communication resources.
+        self.executor = ThreadPoolExecutor(max_workers=min(len(memories), 8), thread_name_prefix="kvaf-pd-send")
         self.bootstrap = sdk.NpuRuntime(device_id=device_id, enable_cpu_offload=True)
         self.bootstrap.initialize()
         for endpoint in config.decode_endpoints:
             self._register_peer(endpoint)
+        if config.source_tp0_only:
+            logging.getLogger("vllm").info(
+                "KVAF PD source mode: mode=tp0_only dp_rank=%s tp_rank=%s compute_tp_size=%s "
+                "D_peers=%s layers=%s registrations_per_path=%s",
+                dp_rank,
+                tp_rank,
+                tp_size,
+                len(config.decode_endpoints),
+                len(memories),
+                len(self.registrations),
+            )
 
     def _register_peer(self, endpoint):
         deadline = time.monotonic() + self.config.timeout
@@ -72,6 +89,8 @@ class Sender:
             raise ValueError("P/D native drafter limits and speculative widths must match")
         if hello.get("verify_kv", False) != bool(self.diagnostics and self.diagnostics.verify):
             raise ValueError("P/D verify_kv modes must match; restart both with the same diagnostic configuration")
+        if hello.get("source_tp0_only", False) is not self.config.source_tp0_only:
+            raise ValueError("P/D source_tp0_only modes must match before source registration")
         self.peers[endpoint] = hello["peer"]
         stream = self.stream_factory()
         for layer, memory in self.memories.items():
@@ -101,6 +120,8 @@ class Sender:
             )
 
     def _call(self, endpoint, message):
+        if self.config.source_tp0_only:
+            message = dict(message, source_tp0_only=True, source_tp_rank=self.tp_rank)
         return call(
             endpoint, dict(message, peer=self.peers[endpoint], producer=self.producer), timeout=self.config.timeout
         )
@@ -165,6 +186,8 @@ class Sender:
             return
         self.wait_layer(layer)
         self.dispatched.add(layer)
+        if not self.active:
+            return  # Native writes/graph/MTP still finish before local send-complete is reported.
         event = self.event_factory()
         # Snapshot host metadata: the runner may bind the next scheduler step
         # while this layer is still being read remotely.
@@ -180,9 +203,7 @@ class Sender:
         for req_id, request, generation in requests:
             if request.remote_tp_size is None or request.remote_tp_size < 1 or self.tp_size % request.remote_tp_size:
                 raise ValueError("P TP must be a multiple of D TP")
-            ratio = self.tp_size // request.remote_tp_size
-            member = self.tp_rank % ratio
-            d_rank = self.tp_rank // ratio
+            ratio, member, d_rank = self._contributors(request)
             endpoint = f"{request.remote_host}:{request.remote_port + d_rank}"
             if endpoint not in self.peers:
                 raise ValueError(f"D worker {endpoint} is outside the configured full mesh")
@@ -302,6 +323,15 @@ class Sender:
                     break
             self._complete_job(endpoint, planned["job"], generation, replicas=replicas)
 
+    def _contributors(self, request):
+        if self.config.source_tp0_only:
+            if not self.active or request.remote_tp_size != 1:
+                raise ValueError("TP0-only transport requires P TP0 and D TP=1")
+            # This is the transfer cohort, never a replacement for model TP.
+            return 1, 0, 0
+        ratio = self.tp_size // request.remote_tp_size
+        return ratio, self.tp_rank % ratio, self.tp_rank // ratio
+
     def _complete_job(self, endpoint, job_id, generation, *, replicas=None):
         message = dict(job=job_id, generation=generation)
         if replicas is not None:
@@ -354,19 +384,19 @@ class Sender:
         # its original layer work before letting D discard its allocated blocks.
         eligible = self.native_finished - self.forward_pending
         cancelled = eligible - self.final_submitted
-        for req_id in cancelled & self.active_requests.keys():
+        for req_id in cancelled & self.active_requests.keys() if self.active else ():
             request, generation = self.active_requests[req_id]
-            ratio = self.tp_size // request.remote_tp_size
-            endpoint = f"{request.remote_host}:{request.remote_port + self.tp_rank // ratio}"
+            ratio, member, d_rank = self._contributors(request)
+            endpoint = f"{request.remote_host}:{request.remote_port + d_rank}"
             self._call(
                 endpoint,
                 dict(
                     op="cancel",
                     request=self.external_id(req_id),
                     generation=generation,
-                    member=self.tp_rank % ratio,
+                    member=member,
                     ratio=ratio,
-                    cohort=f"{self.producer.rsplit(':', 1)[0]}:{self.tp_rank // ratio}",
+                    cohort=f"{self.producer.rsplit(':', 1)[0]}:{d_rank}",
                 ),
             )
         done = eligible & self.active_requests.keys()
@@ -378,6 +408,9 @@ class Sender:
 
     def close(self):
         if self.closed:
+            return
+        if not self.active:
+            self.closed = True
             return
         self.executor.shutdown(wait=True)
         for future in self.futures.values():

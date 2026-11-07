@@ -16,6 +16,7 @@ class PDConfig:
     npu_eids: dict[str, str] = field(default_factory=dict)
     timeout: float = 120.0
     initialization_coordinator: str = ""  # Empty disables cross-host initialization admission.
+    source_tp0_only: bool = False  # Temporary single-source transport; model TP remains unchanged.
     diagnostics_requests: int = 0
     verify_kv: bool = False
 
@@ -35,6 +36,8 @@ class PDConfig:
         if "decode_endpoints" in values:
             values["decode_endpoints"] = tuple(values["decode_endpoints"])
         result = cls(**values)
+        if type(result.source_tp0_only) is not bool:
+            raise ValueError("source_tp0_only must be a boolean")
         if not isinstance(result.initialization_coordinator, str):
             raise ValueError("initialization_coordinator must be an empty string or host:port")
         if result.initialization_coordinator:
@@ -77,6 +80,16 @@ class PDConfig:
             for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
         ):
             raise ValueError("PD KVAF requires PP=PCP=DCP=1")
+        if result.source_tp0_only:
+            additional = config.additional_config or {}
+            if config.model_config.hf_config.model_type != "glm_moe_dsa":
+                raise ValueError("source_tp0_only currently requires the GLM DSA model")
+            if not transfer.is_kv_producer and pc.tensor_parallel_size != 1:
+                raise ValueError("source_tp0_only currently requires D TP=1")
+            if additional.get("enable_dsa_cp", False) or additional.get("c8_enable_reshape_optim", True) is not False:
+                raise ValueError("source_tp0_only requires enable_dsa_cp=false and c8_enable_reshape_optim=false")
+            if config.cache_config.cache_dtype != "fp8" or config.attention_config.indexer_kv_dtype != "fp8":
+                raise ValueError("source_tp0_only currently requires fp8 main KV and indexer KV")
         speculative = config.speculative_config
         if (
             speculative is None

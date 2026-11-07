@@ -54,12 +54,14 @@ class Receiver:
         draft_limit=None,
         num_spec_tokens=3,
         diagnostics=None,
+        source_tp0_only=False,
     ):
         self.runtime, self.writer, self.pool, self.memories = runtime, writer, pool, memories
         self.identity = uuid4().hex
         self.timeout, self.local_eid = timeout, local_eid
         self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
         self.diagnostics = diagnostics
+        self.source_tp0_only = source_tp0_only
         self.activate, self.stream_factory, self.raw_transfer = activate, stream_factory, raw_transfer
         self.condition = Condition(RLock())
         self.sources, self.requests, self.jobs = {}, {}, {}
@@ -158,9 +160,17 @@ class Receiver:
                 "draft_limit": self.draft_limit,
                 "num_spec_tokens": self.num_spec_tokens,
                 "verify_kv": bool(self.diagnostics and self.diagnostics.verify),
+                "source_tp0_only": self.source_tp0_only,
             }
         if message.get("peer") != self.identity:
             raise ValueError("stale D worker/DDR region")
+        if message.get("source_tp0_only", False) is not self.source_tp0_only:
+            raise ValueError("P/D source_tp0_only modes must match")
+        if self.source_tp0_only:
+            if type(message.get("source_tp_rank")) is not int or message["source_tp_rank"] != 0:
+                raise ValueError("TP0-only receiver accepts sources from P TP0 only")
+            if operation in ("plan", "cancel") and (message["member"], message["ratio"]) != (0, 1):
+                raise ValueError("TP0-only receiver requires one transfer contributor")
         if operation == "register":
             metadata = message["metadata"]
             memory = self.memories[metadata.layout.name]
@@ -659,6 +669,7 @@ class Receiver:
                 if self.diagnostics.verify
                 else 0,
                 replica_checks=sum(job.replicas_checked for job in self.jobs.values() if job.request_id == req_id),
+                source_tp0_only=self.source_tp0_only,
             )
         self.writer.complete_receive(req_id)
         self.finished.add(req_id)

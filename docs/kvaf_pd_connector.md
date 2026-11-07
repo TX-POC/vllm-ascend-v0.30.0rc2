@@ -153,3 +153,5 @@ ruff format --check vllm_ascend/distributed/kv_transfer/kvaf/pd tests/ut/test_kv
 云环境没有 NPU/CANN/UB，没有执行真实 NPU binding 全量编译、模型精度、生产多机全建链、长稳或性能测试。CPU/mock 通过只代表对应关键逻辑与接口检查通过。现场仍按原设计进行短/长上下文、127/128/129/255/256/300 边界、MTP、并发、取消和生产拓扑验收；单机四层结果不替代生产验收。
 
 单机验证的卡分配和字节标准见 [临时单机教程](kvaf_pd_single_server_8npu_4layer.md)；通用实施状态见 [实施记录](kvaf_pd_implementation.md)。
+
+临时减少 KVAF 连接的配置见 [TP0 单源传输模式](kvaf_pd_tp0_source.md)，默认关闭，不改变现有逐层缓存布局。
