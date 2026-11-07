@@ -16,6 +16,7 @@ class PDConfig:
     npu_eids: dict[str, str] = field(default_factory=dict)
     timeout: float = 120.0
     initialization_coordinator: str = ""  # Empty disables cross-host initialization admission.
+    source_arena_layers: int = 1  # P only; 1 preserves independent layer allocations/registrations.
     diagnostics_requests: int = 0
     verify_kv: bool = False
 
@@ -35,6 +36,10 @@ class PDConfig:
         if "decode_endpoints" in values:
             values["decode_endpoints"] = tuple(values["decode_endpoints"])
         result = cls(**values)
+        if type(result.source_arena_layers) is not int or not 1 <= result.source_arena_layers <= 128:
+            raise ValueError("source_arena_layers must be an integer in 1..128 (1 disables grouping)")
+        if result.source_arena_layers > 1 and not transfer.is_kv_producer:
+            raise ValueError("source_arena_layers belongs on P producers only")
         if not isinstance(result.initialization_coordinator, str):
             raise ValueError("initialization_coordinator must be an empty string or host:port")
         if result.initialization_coordinator:

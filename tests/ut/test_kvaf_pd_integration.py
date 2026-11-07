@@ -377,6 +377,7 @@ class TestExternalRunner(unittest.TestCase):
             else None
         )
         runner.device, runner.max_num_reqs, runner.vllm_config = "cpu", 2, config(producer=not decode)
+        runner.pd_config = CONFIG.PDConfig()
         runner.pd_memories, runner._pd_indexer_names = {}, {}
         cache = NS(num_blocks=8, kv_cache_groups=[NS(layer_names=[name]) for name in runner.specs])
         return runner, cache

@@ -330,6 +330,10 @@ DP8 共用一个 K 时，若初始化报 `CPU control response unavailable`，�
 
 ## 8. P/D 启动配置与顺序
 
+若全模型逐层注册触发 D Jetty 或 K JFC/Jetty 创建失败，develop2 提供默认关闭的
+[P 多层 source arena](kvaf_pd_source_arenas.md)。P/D 同步更新后，只在 P 配置 source_arena_layers，
+以减少实际注册源数量；D 的初始化协调器继续保留。该路径仍需真实硬件和准确度验收。
+
 现场实际脚本为 /home/c00612283/p_dp1tp8start.sh（16号）、/home/c00612283/d_dp8tp1start.sh（24号）。这些是现场手动保存的脚本，Git 仓库不会自动生成同名文件。
 
 仓库 examples/disaggregated_prefill_v1/kvaf_two_node 中仍保留原先同 TP 对照模板，不能不修改就当作本次实际配置运行。按以下表直接修改模板的原生字段，或使用本次已启动的现场脚本：

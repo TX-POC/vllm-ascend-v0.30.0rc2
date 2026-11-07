@@ -141,7 +141,7 @@ class RawTransfer(TRANSFER.NpuPullTransfer):
 
 
 class TestPDFlow(unittest.TestCase):
-    def setUp(self):
+    def setUp(self, source_arena_layers=1):
         self.sdk = SDK()
         self.pool = BACKEND.create_decode_cache(
             ("l0", "l1", "l2", "l3"), 2, 128, 8192, "cpu", native=lambda *a: a[14].zero_()
@@ -182,8 +182,10 @@ class TestPDFlow(unittest.TestCase):
         for rank in range(4):
             sender = SENDER.Sender(
                 self.sdk,
-                self.memories_for(decode=False),
-                config=CONFIG.PDConfig(decode_endpoints=(endpoint,), timeout=3),
+                self.memories_for(decode=False, arena_layers=source_arena_layers),
+                config=CONFIG.PDConfig(
+                    decode_endpoints=(endpoint,), timeout=3, source_arena_layers=source_arena_layers
+                ),
                 device_id=rank,
                 producer=f"P:0:{rank}",
                 host="127.0.0.1",
@@ -201,20 +203,27 @@ class TestPDFlow(unittest.TestCase):
         self.blocks = ((100, 101, 102, 103), (5, 1, 0, 6), (2, 0, 5, 6), (7, 3, 1, 2))
 
     @staticmethod
-    def memories_for(*, decode):
-        result = {}
+    def memories_for(*, decode, arena_layers=1):
+        plans = {}
         for name in ("l0", "l1", "l2", "l3", "mtp"):
             indexer = name in ("l0", "l3", "mtp")
             groups = {"main": 2 if name == "mtp" else 0}
             if indexer:
                 groups.update(indexer=3 if name == "mtp" else 1, scale=3 if name == "mtp" else 1)
-            result[name] = MEMORY.allocate_layer(
+            plans[name] = (
                 2 if decode and name != "mtp" else 8,
                 8 if indexer else 0,
-                device="cpu",
-                groups=groups,
-                offload_main=name != "mtp",
+                groups,
+                name != "mtp",
             )
+        result = MEMORY.allocate_layers(
+            plans,
+            device="cpu",
+            allocator=lambda size: torch.empty(size, dtype=torch.int8),
+            arena_layers=arena_layers,
+            alignment=4096,
+        )
+        for name in result:
             result[name].tensor.fill_(-1)
         return result
 
@@ -496,6 +505,12 @@ class TestProductionMesh(unittest.TestCase):
             CONTROL.call(f"127.0.0.1:{server.port}", {"unexpected": Path("/tmp")}, timeout=3)
 
     def test_tp8_dp2_sources_register_with_all_tp1_dp16_regions_on_eight_k_pools(self):
+        self.registration_mesh()
+
+    def test_tp8_dp2_arenas_register_all_layers_with_all_tp1_dp16_regions_on_eight_k_pools(self):
+        self.registration_mesh(arena_layers=16)
+
+    def registration_mesh(self, arena_layers=1):
         sdk = SDK()
         endpoints, imported = [], []
 
@@ -506,15 +521,21 @@ class TestProductionMesh(unittest.TestCase):
 
             def dispatch(message):
                 if message["op"] == "hello":
-                    return dict(peer=peer, ticket=NS(region_id=worker_id + 1, region_epoch=1, cpu=f"K-{worker_id % 8}"))
+                    return dict(
+                        peer=peer,
+                        ticket=NS(region_id=worker_id + 1, region_epoch=1, cpu=f"K-{worker_id % 8}"),
+                        source_arena_v1=True,
+                    )
                 assert message["peer"] == peer
                 if message["op"] == "register":
                     metadata = message["metadata"]
                     assert metadata.peer == peer
                     assert metadata.cpu_descriptor.region_id == worker_id + 1
-                    sources[message["producer"]] = metadata
+                    sources[message["producer"], metadata.layout.name] = metadata
                 elif message["op"] == "detach":
-                    sources.pop(message["producer"])
+                    for key in tuple(sources):
+                        if key[0] == message["producer"]:
+                            sources.pop(key)
                 return True
 
             return dispatch
@@ -524,11 +545,13 @@ class TestProductionMesh(unittest.TestCase):
             self.addCleanup(server.close)
             endpoints.append(f"127.0.0.1:{server.port}")
         for worker in range(16):
-            memory = TestPDFlow.memories_for(decode=False)["l0"]
+            memories = TestPDFlow.memories_for(decode=False, arena_layers=arena_layers)
+            if arena_layers == 1:
+                memories = {"l0": memories["l0"]}
             sender = SENDER.Sender(
                 sdk,
-                {"l0": memory},
-                config=CONFIG.PDConfig(decode_endpoints=tuple(endpoints), timeout=5),
+                memories,
+                config=CONFIG.PDConfig(decode_endpoints=tuple(endpoints), timeout=5, source_arena_layers=arena_layers),
                 device_id=worker % 8,
                 producer=f"P:{worker // 8}:{worker % 8}",
                 host="127.0.0.1",
@@ -541,8 +564,11 @@ class TestProductionMesh(unittest.TestCase):
                 dp_rank=worker // 8,
             )
             self.addCleanup(sender.close)
-        self.assertTrue(all(len(sources) == 16 for sources in imported))
-        self.assertEqual(len(sdk.sources), 16 * 16 * 2)
+        self.assertTrue(all(len(sources) == 16 * len(memories) for sources in imported))
+        arena_count = len(sender.arena_groups) if arena_layers > 1 else 1
+        self.assertEqual(len(sdk.sources), 16 * 16 * 2 * arena_count)
+        for sources in imported:
+            self.assertEqual(len({source.binding_key for source in sources.values()}), 16 * arena_count)
         self.assertEqual(
             {source.ticket.cpu for source in sdk.sources.values() if not source.npu},
             {f"K-{index}" for index in range(8)},

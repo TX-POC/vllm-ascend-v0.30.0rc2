@@ -14,7 +14,7 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from ..layout import describe_cache_layouts
 from .backend import create_decode_cache
 from .config import PDConfig
-from .memory import allocate_layer
+from .memory import allocate_layers
 from .runtime import PDAdapter, load_sdk
 
 
@@ -74,6 +74,7 @@ class PDKVModelRunner(NPUModelRunner):
             # at the peak of a production-sized initialization.
             self.kvaf_cache_state.storage.pop("pd_receive_reservation", None)
         raw, covered = {}, set()
+        plans = {}
         drafts = frozenset(getattr(self.drafter, "attn_layer_names", ()))
         for name, spec in specs.items():
             if hasattr(spec, "sfa_dcp_replicated_indexer_size"):
@@ -93,16 +94,24 @@ class PDKVModelRunner(NPUModelRunner):
                     raise ValueError("PD requires C8 indexer with 128-byte keys and four-byte scale")
                 plane_groups.update(indexer=groups[indexer_name], scale=groups[indexer_name])
             offload = name in self.kvaf_target_layer_names
-            memory = allocate_layer(
+            plans[name] = (
                 self.max_num_reqs if offload else kv_cache_config.num_blocks,
                 kv_cache_config.num_blocks if indexer_name else 0,
-                device=self.device,
-                groups=plane_groups,
-                offload_main=name not in drafts,
-                allocator=lambda size: self._allocate_int8_cache_tensor(size, 2 * 1024 * 1024),
+                plane_groups,
+                name not in drafts,
             )
+        self.pd_memories = allocate_layers(
+            plans,
+            device=self.device,
+            allocator=lambda size: self._allocate_int8_cache_tensor(size, 2 * 1024 * 1024),
+            arena_layers=self.pd_config.source_arena_layers
+            if self.vllm_config.kv_transfer_config.is_kv_producer
+            else 1,
+        )
+        for name, memory in self.pd_memories.items():
+            indexer_name = self._pd_indexer_names[name]
+            offload = name in self.kvaf_target_layer_names
             memory.describe(name)  # Check the actual storage before registration.
-            self.pd_memories[name] = memory
             main = memory.planes["main"].view(-1)
             if offload:
                 main = self.kvaf_cache_state.policy.hot[self.kvaf_cache_state.indices[name]].view(-1)

@@ -7,10 +7,10 @@ Create a distinct LayerRegistration for each D peer; NPU sources are single-read
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from .layout import LayerLayout
+from .layout import MAX_INT64, LayerLayout
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,36 @@ class SourceMetadata:
     cpu_descriptor: Any
     npu_ticket: Any
     npu_address: str
+    registered_range: tuple[int, int] | None = None  # PA base/bytes of the actual source arena.
+
+    @property
+    def source_bias(self):
+        if self.registered_range is None:
+            return 0
+        base, size = self.registered_range
+        if (
+            type(base) is not int
+            or type(size) is not int
+            or min(base, size) <= 0
+            or base + size > MAX_INT64
+            or self.layout.pa_base < base
+            or self.layout.pa_base + self.layout.nbytes > base + size
+            or self.cpu_descriptor.source_bytes != size
+            or self.npu_ticket["bytes"] != size
+        ):
+            raise ValueError("layer must be contained in the actual CPU/NPU registered source range")
+        return self.layout.pa_base - base
+
+    @property
+    def binding_key(self):
+        return (
+            self.peer,
+            self.cpu_descriptor.region_id,
+            self.cpu_descriptor.region_epoch,
+            self.cpu_descriptor.source_id,
+            self.npu_ticket["source_id"],
+            self.npu_ticket["epoch"],
+        )
 
     def check_ready(self, path: str, ready: Any) -> None:
         source = ready.source
@@ -40,6 +70,7 @@ class SourceMetadata:
     def attach(self, runtime: Any, *, peer: str, local_eid: str) -> None:
         if peer != self.peer:
             raise ValueError("source registration belongs to another D peer")
+        _ = self.source_bias  # Validate the registered range before creating any binding.
         # The SDK verifies CPU region/epoch and the NPU ticket. Never infer
         # UBA from PA, and retain this metadata if attach/detach is uncertain.
         runtime.attach_cpu_source(self.cpu_descriptor)
@@ -144,3 +175,70 @@ class LayerRegistration:
         if not self._cpu_closed:
             self.cpu.shutdown()
             self._cpu_closed = True
+
+
+class ArenaRegistration:
+    """One SDK source pair per arena/D peer, with explicit layer references.
+
+    Sender schedules one arena future at a time. A failed/lost ACK retains the
+    original Ready and this owner; no layer can start a replacement batch.
+    """
+
+    def __init__(self, sdk, peer, name, memory, **kwargs):
+        memory.describe(name)
+        self.registration = LayerRegistration(sdk, peer, name, memory.arena, memory.planes, **kwargs)
+        self.members = set()
+        self.active_layers = {}
+
+    def register(self, *args, **kwargs):
+        return self.registration.register(*args, **kwargs)
+
+    def layer(self, name, memory):
+        if name in self.members:
+            raise ValueError("arena layer already referenced")
+        reference = ArenaLayerRegistration(self, name, memory)
+        self.members.add(name)
+        return reference
+
+
+class ArenaLayerRegistration:
+    def __init__(self, owner, name, memory):
+        self.owner, self.name = owner, name
+        self.tensor = owner.registration.tensor
+        self.metadata = replace(
+            owner.registration.metadata,
+            layout=memory.describe(name),
+            registered_range=(self.tensor.data_ptr(), self.tensor.numel() * self.tensor.element_size()),
+        )
+        _ = self.metadata.source_bias
+        self.closed = False
+
+    def ready(self, path, production_event):
+        if self.closed or path in self.owner.active_layers:
+            raise RuntimeError("arena source has an active batch or a closed layer")
+        ready = self.owner.registration.ready(path, production_event)
+        self.owner.active_layers[path] = self.name
+        return ready
+
+    def _check_layer(self, path):
+        if self.closed or self.owner.active_layers.get(path) != self.name:
+            raise ValueError("arena Ready belongs to another layer")
+
+    def release(self, path, ready):
+        self._check_layer(path)
+        self.owner.registration.release(path, ready)
+        del self.owner.active_layers[path]
+
+    def cancel(self, path, ready):
+        self._check_layer(path)
+        self.owner.registration.cancel(path, ready)
+
+    def close(self):
+        if self.closed:
+            return
+        if self.owner.active_layers:
+            raise RuntimeError("arena retains active layer batches")
+        if len(self.owner.members) == 1:
+            self.owner.registration.close()
+        self.owner.members.remove(self.name)
+        self.closed = True

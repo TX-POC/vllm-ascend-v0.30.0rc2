@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """P-side per-layer publication and physical-storage reuse gates."""
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -9,7 +10,7 @@ from threading import Event
 from types import SimpleNamespace
 
 from .control import call
-from .registration import LayerRegistration
+from .registration import ArenaRegistration, LayerRegistration
 
 
 class Sender:
@@ -43,6 +44,19 @@ class Sender:
         self.activate, self.stream_factory, self.event_factory = activate, stream_factory, event_factory
         self.external_id, self.tp_rank, self.tp_size, self.dp_rank = external_id, tp_rank, tp_size, dp_rank
         self.registrations, self.peers, self.futures = {}, {}, {}
+        self.arenas, self.arena_groups, self.layer_groups = {}, {}, {}
+        self.arena_mode = config.source_arena_layers > 1
+        self.arena_written = set()
+        if self.arena_mode:
+            for layer, memory in memories.items():
+                if memory.arena is None:
+                    raise ValueError("source arena mode requires actual shared allocations from the PD Runner")
+                key = id(memory.arena)
+                self.arena_groups.setdefault(key, []).append(layer)
+                self.layer_groups[layer] = key
+            for names in self.arena_groups.values():
+                if len(names) > config.source_arena_layers or len({memories[name].offload_main for name in names}) != 1:
+                    raise ValueError("source arenas must respect the configured size and split Target from MTP")
         self.executor = ThreadPoolExecutor(max_workers=min(len(memories), 8), thread_name_prefix="kvaf-pd-send")
         self.metadata = None
         self.dispatched, self.draft_written = set(), set()
@@ -52,6 +66,15 @@ class Sender:
         self.closed = False
         self.bootstrap = sdk.NpuRuntime(device_id=device_id, enable_cpu_offload=True)
         self.bootstrap.initialize()
+        if self.arena_mode:
+            logging.getLogger("vllm").info(
+                "KVAF PD source arenas: device=%s layers=%s arenas=%s D_peers=%s registrations_per_path=%s",
+                device_id,
+                len(memories),
+                len(self.arena_groups),
+                len(config.decode_endpoints),
+                len(self.arena_groups) * len(config.decode_endpoints),
+            )
         for endpoint in config.decode_endpoints:
             self._register_peer(endpoint)
 
@@ -72,23 +95,28 @@ class Sender:
             raise ValueError("P/D native drafter limits and speculative widths must match")
         if hello.get("verify_kv", False) != bool(self.diagnostics and self.diagnostics.verify):
             raise ValueError("P/D verify_kv modes must match; restart both with the same diagnostic configuration")
+        if self.arena_mode and hello.get("source_arena_v1") is not True:
+            raise ValueError("D does not support source arenas; update both P and D before enabling grouping")
         self.peers[endpoint] = hello["peer"]
         stream = self.stream_factory()
         for layer, memory in self.memories.items():
-            registration = LayerRegistration(
-                self.sdk,
-                hello["peer"],
-                layer,
-                memory.tensor,
-                memory.planes,
-                device_id=self.device_id,
-                cpu_eid=self.cpu_eid,
-                npu_eid=self.npu_eid,
-            )
-            self.registrations[endpoint, layer] = registration
-            metadata = registration.register(
-                hello["ticket"], stream, listen_address="0.0.0.0:0", advertised_address=f"{self.host}:0"
-            )
+            options = dict(device_id=self.device_id, cpu_eid=self.cpu_eid, npu_eid=self.npu_eid)
+            addresses = dict(listen_address="0.0.0.0:0", advertised_address=f"{self.host}:0")
+            if self.arena_mode:
+                key = (endpoint, self.layer_groups[layer])
+                if key not in self.arenas:
+                    owner = ArenaRegistration(self.sdk, hello["peer"], layer, memory, **options)
+                    self.arenas[key] = owner
+                    owner.register(hello["ticket"], stream, **addresses)
+                registration = self.arenas[key].layer(layer, memory)
+                metadata = registration.metadata
+                self.registrations[endpoint, layer] = registration
+            else:
+                registration = LayerRegistration(
+                    self.sdk, hello["peer"], layer, memory.tensor, memory.planes, **options
+                )
+                self.registrations[endpoint, layer] = registration
+                metadata = registration.register(hello["ticket"], stream, **addresses)
             self._call(endpoint, {"op": "register", "metadata": metadata, "offload": memory.offload_main})
         if self.diagnostics:
             self.diagnostics.emit(
@@ -98,6 +126,7 @@ class Sender:
                 endpoint=endpoint,
                 producer=self.producer,
                 layers=len(self.memories),
+                source_arenas=len(self.arena_groups) if self.arena_mode else len(self.memories),
             )
 
     def _call(self, endpoint, message):
@@ -108,6 +137,7 @@ class Sender:
     def bind(self, metadata):
         self.metadata = deepcopy(metadata)
         self.dispatched, self.draft_written = set(), set()
+        self.arena_written.clear()
         self.draft_skipped = self.draft_completed = False
         self.forward_pending.update(metadata.requests)
         for req_id, request in metadata.requests.items():
@@ -134,6 +164,16 @@ class Sender:
 
     def written(self, layer):
         if self.metadata is None or not self.metadata.requests or layer not in self.memories:
+            return
+        if self.arena_mode:
+            if not self.memories[layer].offload_main:
+                if not self.draft_skipped:
+                    self.draft_written.add(layer)
+                return
+            self.arena_written.add(layer)
+            names = self.arena_groups[self.layer_groups[layer]]
+            if all(name in self.arena_written for name in names):
+                self._dispatch_arena(names)
             return
         if not self.memories[layer].offload_main:
             # Native MTP may write this cache more than once. Dispatch its
@@ -173,6 +213,27 @@ class Sender:
         )
         self.futures[layer] = self.executor.submit(self._send_layer, layer, requests, event, skipped)
 
+    def _dispatch_arena(self, names, *, skipped=False):
+        if any(name in self.dispatched for name in names):
+            if not all(name in self.dispatched for name in names):
+                raise RuntimeError("partially dispatched arena")
+            return
+        for name in names:
+            self.wait_layer(name)
+        event = self.event_factory()  # All group writes precede this event.
+        requests = tuple(
+            (req_id, request, self.metadata.generations[req_id]) for req_id, request in self.metadata.requests.items()
+        )
+        future = self.executor.submit(self._send_arena, tuple(names), requests, event, skipped)
+        self.dispatched.update(names)
+        self.futures.update((name, future) for name in names)
+
+    def _send_arena(self, names, requests, event, skipped):
+        # One future owns a source's complete Ready/Pull/ACK/release sequence.
+        # An exception stops the group and retains its original batch/buffer.
+        for name in names:
+            self._send_layer(name, requests, event, skipped)
+
     def _send_layer(self, layer, requests, event, skipped=False):
         self.activate()
         event.synchronize()
@@ -201,6 +262,7 @@ class Sender:
                 "draft_skipped": skipped,
             }
             planned = self._call(endpoint, message)
+            registration = self.registrations[endpoint, layer]
             if "verify" in planned:
                 expected = self.diagnostics.spans(
                     memory,
@@ -212,6 +274,12 @@ class Sender:
                     ratio,
                     skipped,
                 )
+                bias = registration.metadata.source_bias
+                if bias:
+                    expected = {
+                        path: tuple((tuple(offset + bias for offset in sources), sizes) for sources, sizes in batches)
+                        for path, batches in expected.items()
+                    }
                 self.diagnostics.address_check(
                     expected,
                     planned["verify"],
@@ -246,14 +314,13 @@ class Sender:
                     count=planned["count"],
                     endpoint=endpoint,
                 )
-            registration = self.registrations[endpoint, layer]
             failed = False
             for path in ("npu", "cpu"):
                 for batch in range(planned["count"][path]):
                     digests = None
                     if "verify" in planned:
                         sources, lengths = planned["verify"][path][batch]
-                        digests = self.diagnostics.hashes(memory.tensor, sources, lengths)
+                        digests = self.diagnostics.hashes(registration.tensor, sources, lengths)
                     ready = registration.ready(path, event)
                     operation = dict(
                         op="pull", job=planned["job"], generation=generation, path=path, batch=batch, ready=ready
@@ -325,12 +392,26 @@ class Sender:
     def finalize(self):
         if self.metadata is None or not self.metadata.requests:
             return
+        if self.arena_mode:
+            # MTP can rewrite a shared group; publish only after native sampling
+            # and the final successful proposal (complete_forward below).
+            return
         for layer, memory in self.memories.items():
             if not memory.offload_main and (self.draft_skipped or self.draft_completed or layer in self.draft_written):
                 self._dispatch(layer, skipped=self.draft_skipped)
 
     def complete_forward(self):
         if self.metadata is None or not self.metadata.requests:
+            return
+        if self.arena_mode:
+            for names in self.arena_groups.values():
+                draft = not self.memories[names[0]].offload_main
+                if draft and not (
+                    self.draft_skipped or self.draft_completed or all(n in self.draft_written for n in names)
+                ):
+                    raise RuntimeError("native MTP did not produce every required arena layer")
+                self._dispatch_arena(names, skipped=draft and self.draft_skipped)
+            self.forward_pending.difference_update(self.metadata.requests)
             return
         self.finalize()
         # Called only after successful native sampling/finalization. Captured
@@ -387,5 +468,8 @@ class Sender:
                 self._call(endpoint, {"op": "detach"})
         for registration in self.registrations.values():
             registration.close()
+        for owner in self.arenas.values():
+            # Also covers a partial arena registration with no layer wrappers.
+            owner.registration.close()
         self.bootstrap.shutdown()
         self.closed = True

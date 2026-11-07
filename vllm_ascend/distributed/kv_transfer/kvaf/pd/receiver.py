@@ -2,7 +2,7 @@
 """D-side address planning, dual Pull, directory publication and request gate."""
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Condition, RLock
 from uuid import uuid4
 
@@ -63,6 +63,7 @@ class Receiver:
         self.activate, self.stream_factory, self.raw_transfer = activate, stream_factory, raw_transfer
         self.condition = Condition(RLock())
         self.sources, self.requests, self.jobs = {}, {}, {}
+        self.bindings, self.pending_bindings = {}, set()
         self.terminal_jobs = {}
         self.finished, self.errors = set(), set()
         self.native_finished = set()
@@ -158,6 +159,7 @@ class Receiver:
                 "draft_limit": self.draft_limit,
                 "num_spec_tokens": self.num_spec_tokens,
                 "verify_kv": bool(self.diagnostics and self.diagnostics.verify),
+                "source_arena_v1": True,
             }
         if message.get("peer") != self.identity:
             raise ValueError("stale D worker/DDR region")
@@ -173,7 +175,23 @@ class Receiver:
                 if key in self.sources:
                     raise ValueError("source already registered")
                 self.runtime.wait_compute()
-                metadata.attach(self.runtime, peer=self.identity, local_eid=self.local_eid)
+                _ = metadata.source_bias
+                binding = (message["producer"], metadata.binding_key)
+                if binding in self.pending_bindings:
+                    raise RuntimeError("resolve the original incomplete arena attachment before registration")
+                if binding not in self.bindings:
+                    # Retain descriptors even if attach fails after a remote decision.
+                    self.bindings[binding] = metadata
+                    self.pending_bindings.add(binding)
+                    metadata.attach(self.runtime, peer=self.identity, local_eid=self.local_eid)
+                    self.pending_bindings.remove(binding)
+                elif (
+                    self.bindings[binding].registered_range != metadata.registered_range
+                    or self.bindings[binding].npu_address != metadata.npu_address
+                    or self.bindings[binding].npu_ticket != metadata.npu_ticket
+                    or self.bindings[binding].cpu_descriptor.source_bytes != metadata.cpu_descriptor.source_bytes
+                ):
+                    raise ValueError("shared source identity changed its registered range or address")
                 self.sources[key] = metadata
             return True
         if operation == "detach":
@@ -182,10 +200,7 @@ class Receiver:
                 if any(job.producer == producer and not job.finished for job in self.jobs.values()):
                     raise RuntimeError("drain original source jobs before detaching")
                 self.runtime.wait_compute()
-                for key, source in tuple(self.sources.items()):
-                    if key[0] == producer:
-                        self.runtime.detach_hbm(source.npu_ticket)
-                        self.sources.pop(key)
+                self._detach_sources(producer)
                 self.terminal_jobs = {key: value for key, value in self.terminal_jobs.items() if value[0] != producer}
             return True
         if operation == "plan":
@@ -258,6 +273,18 @@ class Receiver:
                     self.terminal_jobs[key] = (job.producer, job.generation, str(job.error) if job.error else None)
                 self.jobs.pop(key)
 
+    def _detach_sources(self, producer=None):
+        for key, source in tuple(self.bindings.items()):
+            if producer is None or key[0] == producer:
+                self.runtime.detach_hbm(source.npu_ticket)
+                self.sources = {
+                    layer_key: metadata
+                    for layer_key, metadata in self.sources.items()
+                    if (layer_key[0], metadata.binding_key) != key
+                }
+                self.pending_bindings.discard(key)
+                self.bindings.pop(key)
+
     def _plan(self, message):
         request = self._request(message["request"], message["generation"])
         with self.runtime.lock:
@@ -318,6 +345,16 @@ class Receiver:
                     offload_main=memory.offload_main,
                 )
             )
+            if plan is not None:
+                bias = self.sources[producer, layer].source_bias
+                if bias:
+                    # Business block/plane offsets remain layer-relative. Only
+                    # SDK source offsets are rebased to the registered arena.
+                    plan = replace(
+                        plan,
+                        main_sources=tuple(offset + bias for offset in plan.main_sources),
+                        hbm=replace(plan.hbm, sources=tuple(offset + bias for offset in plan.hbm.sources)),
+                    )
             owner = (layer, member)
             previous = [
                 job
@@ -698,15 +735,13 @@ class Receiver:
 
     def close(self):
         with self.runtime.lock:
-            if self.closed:
+            if self.closed and not self.bindings:
                 return
             if any(not job.finished for job in self.jobs.values()):
                 raise RuntimeError("PD receiver retains unfinished transfers; resolve before shutdown")
             self.closed = True
             self.runtime.wait_compute()
-            for source in self.sources.values():
-                self.runtime.detach_hbm(source.npu_ticket)
-            self.sources.clear()
+            self._detach_sources()
         with self.condition:
             self.condition.notify_all()
         if self.server is not None:
