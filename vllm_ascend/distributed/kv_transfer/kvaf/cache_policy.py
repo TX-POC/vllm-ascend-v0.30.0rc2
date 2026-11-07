@@ -27,12 +27,11 @@ class DecodeHotCache(NativeCacheAdapter):
         staging_tokens=0,
         group_sizes=None,
         hot_tokens=HISTORY,
-        spill_tokens=0,
         tail_tokens=TAIL,
     ):
         self.history_capacity = hot_tokens
         self.tail_tokens = tail_tokens
-        self.tail_start = hot_tokens + spill_tokens
+        self.tail_start = hot_tokens
         self.slot_capacity = self.tail_start + self.tail_tokens
         if self.slot_capacity > pool.max_tokens:
             raise ValueError("KVAF hot slots exceed the token/slot map capacity")
@@ -244,7 +243,7 @@ class DecodeHotCache(NativeCacheAdapter):
                         if progress.computed_tokens < TOPK:
                             # Short contexts bypass LIDU: keep committed pages
                             # densely mapped when they leave the ABC ring.
-                            self._seed(i, pool_row, source_state, old[0], tail_begin, False)
+                            self._promote_abc(i, pool_row, old[0], tail_begin)
                             dense_tokens = np.arange(old[0], tail_begin)
                             upload(
                                 ("dense_t", i, pool_row),
@@ -370,7 +369,6 @@ class KVCachePolicy(DecodeHotCache):
         native=None,
         group_sizes=None,
         hot_tokens=HISTORY,
-        spill_tokens=0,
         fused_history=0,
         tail_tokens=TAIL,
         put_interval_steps=1,
@@ -382,7 +380,6 @@ class KVCachePolicy(DecodeHotCache):
             staging_tokens=staging,
             group_sizes=group_sizes,
             hot_tokens=hot_tokens,
-            spill_tokens=spill_tokens,
             tail_tokens=tail_tokens,
         )
         self.put_interval_steps = put_interval_steps
@@ -794,6 +791,19 @@ class KVCachePolicy(DecodeHotCache):
                     torch.mul(slots[None, :], self.write_factors[width], out=writes[:, plan.begin : plan.stop])
                     writes[:, plan.begin : plan.stop].add_(self.local_offsets[width])
 
+    def _promote_abc(self, layer, owner, start, end):
+        """Copy committed ABC bytes before this forward can reuse their ring slots."""
+        if not 0 <= end - start <= self.tail_tokens or end > self.history_capacity:
+            raise ValueError("Retired ABC range exceeds retained ring or hot capacity")
+        flat = self.bytes_outputs[layer]
+        base = owner * self.slot_capacity
+        while start < end:
+            offset = start % self.tail_tokens
+            count = min(end - start, self.tail_tokens - offset)
+            source = base + self.tail_start + offset
+            flat[base + start : base + start + count].copy_(flat[source : source + count])
+            start += count
+
     def _seed(self, layer, owner, state, start, end, tail):
         if tail or start == end:
             return  # Prefill already left its partial page in the ABC ring.
@@ -1195,7 +1205,26 @@ class CacheFeedbackManager:
             ready.synchronize()  # Background thread only, not the model launch thread.
         if device_errors is not None and np.any(device_errors):
             failures = np.argwhere(device_errors != 0)
-            raise RuntimeError(f"LIFetch Index update failed at group/request rows {failures[:8].tolist()}")
+            details = []
+            for group, request in failures[:8]:
+                status = int(device_errors[group, request])
+                item = {"group": int(group), "row": int(request), "status": status}
+                item["active"] = request < len(frames[group][0])
+                if traffic and miss_counts is not None:
+                    row = miss_counts[group, request]
+                    item.update(
+                        prefetch_error=int(row[11]),
+                        prefetch_reads=int(row[9]),
+                        prefetch_pending=int(row[211]),
+                        final_reads=int(row[247]),
+                        final_pending=int(row[248]),
+                    )
+                details.append(item)
+            raise RuntimeError(
+                f"LIFetch Index update failed: failed_rows={len(failures)} details={details}; "
+                "status bits: 1=invalid Index change records, 2=prefetch state, "
+                "4=resolver/transport failure. Counts are from the same feedback copy."
+            )
         if traffic:
             # Original v9 ABI: word 9 counts prefetch requests, 247 final reads.
             # Ignore graph padding; sum on CPU after the existing copy event.

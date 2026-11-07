@@ -107,7 +107,7 @@ class KVAFAdapter:
         kernels = {kind: build_dir / "bin" / f"kvaf_execute_batch_{kind}_kernels.o" for kind in ("get", "put")}
         for path in kernels.values():
             if not path.is_file():
-                raise FileNotFoundError(f"Missing KVAF kernel: {path}; run bash scripts/install_kvaf.sh")
+                raise FileNotFoundError(f"Missing KVAF kernel: {path}; run bash scripts/install_kvip.sh")
         # Worker-isolated imports: the ordinary vLLM startup needs no KVAF SDK.
         importlib.import_module("torch_npu")
         sdk = importlib.import_module("kvaf")

@@ -75,7 +75,7 @@ class TestKVAFAdapter(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.build_dir = Path(directory.name)
         (self.build_dir / "bin").mkdir()
-        for kind in ("get", "put"):
+        for kind in ("get", "get_urma", "put"):
             (self.build_dir / "bin" / f"kvaf_execute_batch_{kind}_kernels.o").touch()
         self.runtimes = []
         self.fail_at = None
@@ -108,6 +108,14 @@ class TestKVAFAdapter(unittest.TestCase):
         )
         self.addCleanup(result.close)
         return result
+
+    def test_default_get_uses_mainline_even_with_isolated_artifact(self):
+        (self.build_dir / "vllm-get-build").write_text("isolated\n")
+        self.adapter((656,)).connect()
+        self.assertEqual(
+            self.sdk.NpuRuntime.call_args.kwargs["batch_get_kernel_object_path"],
+            str((self.build_dir / "bin/kvaf_execute_batch_get_kernels.o").resolve()),
+        )
 
     def test_runtime_borrows_existing_hccl_ra_only_when_requested(self):
         for reuse in (False, True):

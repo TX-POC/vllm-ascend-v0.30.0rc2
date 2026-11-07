@@ -20,6 +20,7 @@ class KVAFConfig:
     jettys_per_core: int = 2
     decode_backend: str = "batch_get"  # batch_get or li_fetch; fixed for the worker lifetime.
     intermediate_fetches: int = 8  # LIFetch windows, including the initial hot window; 1..32.
+    prefetch_tokens: int = 512  # Per request/round; divided equally across LIFetch windows.
     verify_put: bool = False  # Read back one prefill and one decode block per worker for byte comparison.
 
     def __post_init__(self) -> None:
@@ -27,6 +28,13 @@ class KVAFConfig:
             raise ValueError("kvaf_config.decode_backend must be batch_get or li_fetch")
         if type(self.intermediate_fetches) is not int or not 1 <= self.intermediate_fetches <= 32:
             raise ValueError("kvaf_config.intermediate_fetches must be an integer in 1..32")
+        if type(self.prefetch_tokens) is not int or not 0 <= self.prefetch_tokens <= 2048:
+            raise ValueError("kvaf_config.prefetch_tokens must be an integer in 0..2048")
+        if self.decode_backend == "li_fetch" and (
+            self.prefetch_tokens % self.intermediate_fetches
+            or self.prefetch_tokens // self.intermediate_fetches > 480
+        ):
+            raise ValueError("prefetch_tokens must divide evenly into windows, with at most 480 tokens/window")
         if type(self.enabled) is not bool:
             raise ValueError("kvaf_config.enabled must be true or false")
         if type(self.verify_put) is not bool:

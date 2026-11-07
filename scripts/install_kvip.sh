@@ -4,7 +4,8 @@
 set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kvip_dir="$repo_dir/third_party/KVIP"
-revision=46c03fcf889a3ab56e62c1dbf5acb60580120142
+revision=c5b17ef29287483a65e9d7d4ffe3ce7ac33702ff
+kvaf_revision=1c1310387ebfb6776a07316874e924265b209ada
 source_only=false
 build_args=()
 for argument in "$@"; do
@@ -24,16 +25,25 @@ if [[ -e "$kvip_dir" || -L "$kvip_dir" ]]; then
 fi
 mkdir -p "$repo_dir/third_party"
 git clone --branch main https://gitcode.com/CacheOS/KVIP.git "$kvip_dir"
-abc_patch="$repo_dir/scripts/patches/kvip-configurable-abc.patch"
 if ! git -C "$kvip_dir" cat-file -e "$revision^{commit}" 2>/dev/null; then
-    git -C "$kvip_dir" fetch origin main
+    git -C "$kvip_dir" fetch origin "$revision"
 fi
 git -C "$kvip_dir" checkout --detach "$revision"
-git -C "$kvip_dir" apply "$abc_patch"
-git -C "$kvip_dir" apply "$repo_dir/scripts/patches/kvip-batched-page-updates.patch"
 echo "KVIP source ready: $kvip_dir @ $revision (git-ignored external dependency)"
 if [[ "$source_only" == true ]]; then
     exit 0
+fi
+# Preserve a different checkout (including local patches/builds) before switching versions.
+kvaf_dir="$repo_dir/third_party/KVAF"
+if [[ -e "$kvaf_dir" ]] && {
+    [[ "$(git -C "$kvaf_dir" rev-parse HEAD)" != "$kvaf_revision" ]] ||
+    grep -q 'kvaf_build_isolated_urma_get' "$kvaf_dir/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt" 2>/dev/null
+}; then
+    backup="$(mktemp -d "$repo_dir/third_party/KVAF-backup.XXXXXX")"
+    mv "$kvaf_dir" "$backup/KVAF"
+    echo "Previous KVAF preserved: $backup/KVAF"
+    # A changed SDK must be rebuilt even if --skip-kvaf-build was supplied.
+    build_args=()
 fi
 # Prepare upstream patches first; our Put binding change releases the GIL only
 # around native execution. The synchronous API and device algorithm are unchanged.
@@ -44,5 +54,5 @@ if ! git -C "$repo_dir/third_party/KVAF" apply --reverse --check "$put_patch" 2>
     git -C "$repo_dir/third_party/KVAF" apply "$put_patch"
 fi
 # KVIP owns operator builds and Python installation.
-bash "$kvip_dir/scripts/build.sh" --kvaf-root "$repo_dir/third_party/KVAF" "${build_args[@]}"
+bash "$kvip_dir/scripts/build.sh" --kvaf-root "$repo_dir/third_party/KVAF" ${build_args[@]+"${build_args[@]}"}
 echo "KVIP ready. Source $kvip_dir/scripts/env.sh before standalone checks."

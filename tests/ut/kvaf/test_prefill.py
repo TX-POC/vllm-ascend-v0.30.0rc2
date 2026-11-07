@@ -66,17 +66,17 @@ class Runtime:
 
 
 class TestWindow(unittest.TestCase):
-    spill_tokens = 0
+    def test_hot_fallback_has_no_temporary_kv_region(self):
+        self.assertEqual(self.hot.tail_start, self.hot.history_capacity)
+        self.assertEqual(self.hot.slot_capacity, self.hot.history_capacity + self.hot.tail_tokens)
 
     def setUp(self):
-        spill_tokens = getattr(self, "spill_tokens", 0)
-        pool = Pool(("target",), 3, 16384 + spill_tokens, "cpu")
+        pool = Pool(("target",), 3, 16384, "cpu")
         self.hot = Window(
             pool,
             512,
             8192,
             native=lambda *args: args[14].zero_(),
-            spill_tokens=spill_tokens,
             tail_tokens=getattr(self, "tail_tokens", 384),
             put_interval_steps=getattr(self, "put_interval_steps", 1),
         )
@@ -370,13 +370,29 @@ class TestWindow(unittest.TestCase):
 
     def test_short_decode_keeps_dense_history_after_abc_wrap(self):
         self.run_chunk([("a", 0, 260, 260)])
-        for start in range(260, 644, 4):
+        self.run_chunk([("a", 260, 4, 260)])
+        reads = list(self.runtime.get_counts)
+        for start in range(264, 644, 4):
             self.run_chunk([("a", start, 4, 260)])
+        self.assertEqual(self.runtime.get_counts, reads)
         owner = self.hot.owners["a"]
         table = self.hot.pool.views["target"].token_to_slot[owner, :640]
         self.assertTrue(torch.all(table >= 0))
         data = self.hot.hot[0].view(-1, 656)[owner * self.hot.slot_capacity + table.long(), 0]
         torch.testing.assert_close(data, torch.arange(640).remainder(127).to(data.dtype))
+
+    def test_abc_promotion_wraps_and_preserves_other_owner(self):
+        owner = 1
+        flat = self.hot.bytes_outputs[0]
+        flat.fill_(99)
+        base = owner * self.hot.slot_capacity
+        start, end = self.hot.tail_tokens - 20, self.hot.tail_tokens + 30
+        for token in range(start, end):
+            flat[base + self.hot.tail_start + token % self.hot.tail_tokens].fill_(token % 127)
+        self.hot._promote_abc(0, owner, start, end)
+        expected = torch.arange(start, end).remainder(127).to(flat.dtype)
+        torch.testing.assert_close(flat[base + start : base + end, 0], expected)
+        self.assertTrue(torch.all(flat[: self.hot.slot_capacity] == 99))
 
     def test_optional_put_verification_checks_actual_byte_offsets(self):
         verify = importlib.import_module(f"{package}.transfer").verify_put_block
@@ -397,12 +413,6 @@ class TestWindow(unittest.TestCase):
         self.assertEqual(len(self.runtime.pages), 3)
         self.writer.release_requests(("b",))
         self.assertFalse(self.runtime.pages)
-
-
-class TestWindowWithFetchSpill(TestWindow):
-    """The fused fallback must not overlap ABC, Put or restored prefixes."""
-
-    spill_tokens = 8192
 
 
 if __name__ == "__main__":
