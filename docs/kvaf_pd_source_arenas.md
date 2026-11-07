@@ -134,3 +134,5 @@ K 同期不应再出现创建 Jetty/JFC 失败。这只验收资源与建链，�
 CPU UT 覆盖实际 storage 视图、非零 arena 偏移、双 Pull 字节、逐层目录、MTP/graph、
 丢 ACK、引用与释放、一次 attach/detach、版本拒绝和原始 TP8/DP2→TP1/DP16 八 K 目录注册矩阵。
 这些模拟 SDK 的测试尚未验证真实 UB/NPU 上的大 arena 注册和最终输出精度。
+
+控制端口时序、并发连接和失败 RPC 定位见 [PD 控制连接排障](kvaf_pd_control_troubleshooting.md)。

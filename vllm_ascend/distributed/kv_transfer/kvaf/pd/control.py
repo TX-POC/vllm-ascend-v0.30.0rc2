@@ -3,11 +3,11 @@
 
 import importlib
 import io
+import logging
 import pickle
 import socket
 import socketserver
 import struct
-from contextlib import suppress
 from threading import Thread
 from types import SimpleNamespace
 
@@ -16,6 +16,37 @@ from .registration import SourceMetadata
 
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 HEADER = struct.Struct("!I")
+CONTROL_REQUEST_QUEUE_SIZE = 128  # TP workers can publish several arenas concurrently to one D worker.
+
+
+class _EmptyConnection(ConnectionError):
+    """A peer closed before sending any control header (e.g. a TCP probe)."""
+
+
+def _log_failure(side, endpoint, phase, message, exc):
+    # Only bounded identifiers; never log the metadata, descriptors or KV payload.
+    fields = message if isinstance(message, dict) else {}
+
+    def identifier(key):
+        value = fields.get(key, "-")
+        return str(value)[:160] if isinstance(value, (str, int)) else "-"
+
+    logging.getLogger("vllm").error(
+        "KVAF_PD_RPC_FAIL side=%s endpoint=%s phase=%s op=%s producer=%s request=%s "
+        "generation=%s layer=%s member=%s error=%s detail=%s",
+        side,
+        endpoint,
+        phase,
+        identifier("op"),
+        identifier("producer"),
+        identifier("request"),
+        identifier("generation"),
+        identifier("layer"),
+        identifier("member"),
+        type(exc).__name__,
+        str(exc)[:256],
+        exc_info=side == "server" and phase == "dispatch",
+    )
 
 
 class _MetadataUnpickler(pickle.Unpickler):
@@ -30,18 +61,20 @@ class _MetadataUnpickler(pickle.Unpickler):
         raise pickle.UnpicklingError(f"unexpected PD metadata type {module}.{name}")
 
 
-def _read(connection, size):
+def _read(connection, size, *, header=False):
     parts = bytearray()
     while len(parts) < size:
         data = connection.recv(size - len(parts))
         if not data:
+            if header and not parts:
+                raise _EmptyConnection("PD control peer closed without an RPC")
             raise ConnectionError("PD control connection closed before completion")
         parts.extend(data)
     return parts
 
 
 def _receive(connection):
-    size = HEADER.unpack(_read(connection, HEADER.size))[0]
+    size = HEADER.unpack(_read(connection, HEADER.size, header=True))[0]
     if not 0 < size <= MAX_MESSAGE_BYTES:
         raise ValueError("invalid PD control message length")
     # SDK Ready/descriptor types implement pickle. Listen only on the trusted
@@ -58,9 +91,18 @@ def _send(connection, value):
 
 def call(endpoint, message, *, timeout=120.0):
     host, _, port = endpoint.rpartition(":")
-    with socket.create_connection((host, int(port)), timeout=timeout) as connection:
-        _send(connection, message)
-        success, result = _receive(connection)
+    phase = "connect"
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as connection:
+            phase = "send"
+            _send(connection, message)
+            phase = "receive"
+            success, result = _receive(connection)
+    except OSError as exc:
+        # Startup hello polling has its own final timeout; do not log every poll.
+        if message.get("op") != "hello":
+            _log_failure("client", endpoint, phase, message, exc)
+        raise  # Preserve the exception type and the original transfer/recovery ownership.
     if not success:
         raise RuntimeError(f"PD peer rejected operation: {result}")
     return result
@@ -71,15 +113,24 @@ class ControlServer:
         class Handler(socketserver.BaseRequestHandler):
             def handle(self):
                 self.request.settimeout(timeout)
+                message, phase = None, "receive"
                 try:
-                    result = (True, dispatch(_receive(self.request)))
+                    message = _receive(self.request)
+                    phase = "dispatch"
+                    result = (True, dispatch(message))
                 except Exception as exc:
+                    if isinstance(exc, _EmptyConnection):
+                        return  # A connect-only health probe has no RPC to acknowledge.
+                    _log_failure("server", self.server.server_address, phase, message, exc)
                     result = (False, f"{type(exc).__name__}: {exc}")
                 # A lost ACK never permits the caller to reuse its source.
-                with suppress(ConnectionError, OSError):
+                try:
                     _send(self.request, result)
+                except (ConnectionError, OSError) as exc:
+                    _log_failure("server", self.server.server_address, "respond", message, exc)
 
         class Server(socketserver.ThreadingTCPServer):
+            request_queue_size = CONTROL_REQUEST_QUEUE_SIZE
             allow_reuse_address = True
             daemon_threads = True
             block_on_close = False
