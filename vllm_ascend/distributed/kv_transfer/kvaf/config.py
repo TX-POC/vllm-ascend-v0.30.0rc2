@@ -18,12 +18,15 @@ class KVAFConfig:
     put_overlap_steps: int = 8
     npu_core_count: int = 2
     jettys_per_core: int = 2
+    transport: str = "urma"  # KVAF transport, fixed for the worker lifetime.
     decode_backend: str = "batch_get"  # batch_get or li_fetch; fixed for the worker lifetime.
     intermediate_fetches: int = 8  # LIFetch windows, including the initial hot window; 1..32.
     prefetch_tokens: int = 512  # Per request/round; divided equally across LIFetch windows.
     verify_put: bool = False  # Read back one prefill and one decode block per worker for byte comparison.
 
     def __post_init__(self) -> None:
+        if self.transport not in ("urma", "ubmem"):
+            raise ValueError("kvaf_config.transport must be urma or ubmem")
         if self.decode_backend not in ("batch_get", "li_fetch"):
             raise ValueError("kvaf_config.decode_backend must be batch_get or li_fetch")
         if type(self.intermediate_fetches) is not int or not 1 <= self.intermediate_fetches <= 32:

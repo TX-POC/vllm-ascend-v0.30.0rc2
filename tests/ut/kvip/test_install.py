@@ -19,6 +19,7 @@ class ExternalKvipInstallTest(unittest.TestCase):
             shutil.copy(ROOT / "scripts/install_kvip.sh", root / "scripts")
             checkout = root / "third_party/KVIP"
             (checkout / "scripts").mkdir(parents=True)
+            (checkout / ".git").mkdir()
             (checkout / "scripts/build.sh").write_text('printf "BUILD %s\\n" "$@"\n')
             if dirty:
                 (checkout / "local.py").write_text("local edits")
@@ -38,21 +39,29 @@ class ExternalKvipInstallTest(unittest.TestCase):
                 '#!/bin/bash\ncase "$*" in\n'
                 '  clone*) target="${@: -1}"; mkdir -p "$target/scripts"; '
                 'cp "$BUILD_TEMPLATE" "$target/scripts/build.sh"; echo "CLONE $*" ;;\n'
+                '  *"status --porcelain"*) if [ "$TEST_DIRTY" = 1 ]; then echo " M local.py"; fi ;;\n'
                 '  *"rev-parse HEAD"*) echo "$TEST_KVAF_REVISION" ;;\n'
                 '  *"checkout --detach"*) echo "CHECKOUT $*" ;;\n'
                 "esac\n"
             )
             git.chmod(0o755)
+            python = binaries / "python3"
+            python.write_text('#!/bin/bash\necho "URMA_BUILD $*"\n')
+            python.chmod(0o755)
             env = dict(
                 os.environ,
                 PATH=f"{binaries}:{os.environ['PATH']}",
                 BUILD_TEMPLATE=str(template),
+                TEST_DIRTY="1" if dirty else "0",
                 TEST_KVAF_REVISION="1c1310387ebfb6776a07316874e924265b209ada" if experimental else "old",
             )
             args = ["bash", str(root / "scripts/install_kvip.sh")]
             args += ["--source-only"] if source_only else ["--skip-kvaf-build"]
             result = subprocess.run(args, env=env, capture_output=True, text=True)
-            self.assertFalse((checkout / "local.py").exists())
+            backups = list((root / "third_party").glob("KVIP-backup.*/KVIP/local.py"))
+            self.assertEqual(len(backups), int(dirty))
+            if dirty:
+                self.assertEqual(backups[0].read_text(), "local edits")
             if old_kvaf or experimental:
                 backups = list((root / "third_party").glob("KVAF-backup.*/KVAF/local.txt"))
                 self.assertEqual(len(backups), 1)
@@ -62,11 +71,13 @@ class ExternalKvipInstallTest(unittest.TestCase):
     def test_build_uses_external_checkout_and_explicit_kvaf_root(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("c5b17ef29287483a65e9d7d4ffe3ce7ac33702ff", result.stdout)
-        self.assertIn("CLONE clone --branch main https://gitcode.com/CacheOS/KVIP.git", result.stdout)
+        self.assertIn("81b1472809b7a5f3469e26467feee0ca1c61d71a", result.stdout)
         self.assertIn("BUILD --kvaf-root", result.stdout)
         self.assertIn("/third_party/KVAF", result.stdout)
-        self.assertIn("BUILD --skip-kvaf-build", result.stdout)
+        self.assertIn("Previous UBmem KVAF build not verified; rebuilding KVAF.", result.stdout)
+        self.assertNotIn("BUILD --skip-kvaf-build", result.stdout)
+        self.assertIn("BUILD ubmem", result.stdout)
+        self.assertIn("URMA_BUILD", result.stdout)
 
     def test_upgrade_preserves_checkout_and_forces_rebuild(self):
         result = self.run_install(old_kvaf=True)
@@ -85,10 +96,8 @@ class ExternalKvipInstallTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("BUILD", result.stdout)
 
-    def test_dirty_checkout_is_recreated_and_built(self):
+    def test_dirty_checkout_is_preserved_and_built(self):
         result = self.run_install(dirty=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Removing existing KVIP", result.stdout)
-        self.assertIn("CLONE", result.stdout)
-        self.assertIn("CHECKOUT", result.stdout)
+        self.assertIn("Previous KVIP preserved", result.stdout)
         self.assertIn("BUILD", result.stdout)

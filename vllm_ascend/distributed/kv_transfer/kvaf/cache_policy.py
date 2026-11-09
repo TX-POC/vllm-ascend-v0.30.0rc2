@@ -535,6 +535,11 @@ class KVCachePolicy(DecodeHotCache):
 
     def initialize_fused_workspace(self, config, device_id, soc, index_heads=64):
         """Allocate shared LI work memory before the runner profiles HBM."""
+        if config.transport == "ubmem":
+            from kvip.adapters.vllm.binding import prepare_workspace
+
+            prepare_workspace(torch, self, config, device_id, soc, index_heads=index_heads)
+            return
         from kvip.operators.lifetch import geometry
         from kvip.operators.lifetch.workspace import LIFetchWorkspace
         from kvip.runtime.build import kvaf_build_paths

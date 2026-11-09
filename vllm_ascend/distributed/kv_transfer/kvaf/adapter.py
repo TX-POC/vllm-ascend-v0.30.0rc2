@@ -42,7 +42,7 @@ class KVAFAdapter:
         if fused_workers is not None:
             if config.decode_backend != "li_fetch" or type(fused_workers) is not int or fused_workers < 1:
                 raise ValueError("Fused worker allocation requires li_fetch and a positive worker count")
-            if config.jettys_per_core != 2:
+            if config.transport == "urma" and config.jettys_per_core != 2:
                 raise ValueError("LIFetch requires two jettys per transport worker")
         self.transport_workers = config.npu_core_count if fused_workers is None else fused_workers
         self.device_id = device_id  # Logical NPU ID; KVAF resolves the physical device itself.
@@ -152,6 +152,7 @@ class KVAFAdapter:
                         batch_put_kernel_object_path=str(kernels["put"]),
                         jettys_per_core=self.config.jettys_per_core,
                         reuse_device_ra=self.reuse_device_ra,
+                        **({"transport": "ubmem"} if self.config.transport == "ubmem" else {}),
                     )
                     self.runtimes[token_bytes, block_size] = runtime
                     runtime.link_to(self.cpu_address)

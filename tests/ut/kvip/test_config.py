@@ -30,6 +30,7 @@ class LaunchConfigTest(unittest.TestCase):
                     "32",
                     "8",
                     "512",
+                    "ubmem",
                 ],
                 input=body,
                 text=True,
@@ -38,6 +39,7 @@ class LaunchConfigTest(unittest.TestCase):
             )
             config = json.loads(result.stdout)
             self.assertEqual(config["kvaf_config"]["decode_backend"], backend)
+            self.assertEqual(config["kvaf_config"]["transport"], "ubmem")
             self.assertEqual(config["kvaf_config"]["intermediate_fetches"], 8)
             self.assertEqual(config["kvaf_config"]["hot_tokens"], 16384)
             self.assertEqual(config["kvaf_config"]["prefetch_tokens"], 512)
