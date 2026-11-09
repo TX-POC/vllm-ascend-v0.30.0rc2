@@ -125,6 +125,22 @@ class TestKVAFAdapter(unittest.TestCase):
                 self.assertIs(self.sdk.NpuRuntime.call_args.kwargs["reuse_device_ra"], reuse)
                 adapter.close()
 
+    def test_transport_selects_runtime_without_changing_urma_default(self):
+        for transport in ("urma", "ubmem"):
+            with self.subTest(transport=transport):
+                config = KVAFConfig(enabled=True, build_dir=str(self.build_dir), ddr_size_gb=0.001, transport=transport)
+                adapter = adapter_module.KVAFAdapter(
+                    config, 3, (layout(656, "target"),), log_dir=self.build_dir, tp_rank=3, dp_rank=0
+                )
+                self.addCleanup(adapter.close)
+                adapter.connect()
+                kwargs = self.sdk.NpuRuntime.call_args.kwargs
+                if transport == "ubmem":
+                    self.assertEqual(kwargs["transport"], "ubmem")
+                else:
+                    self.assertNotIn("transport", kwargs)
+                adapter.close()
+
     def test_fused_worker_budget_reaches_runtime_without_changing_config(self):
         config = KVAFConfig(enabled=True, build_dir=str(self.build_dir), ddr_size_gb=0.001, decode_backend="li_fetch")
         adapter = adapter_module.KVAFAdapter(
@@ -158,6 +174,7 @@ class TestKVAFAdapter(unittest.TestCase):
             {"ddr_size_gb": -1},
             {"npu_core_count": True},
             {"decode_backend": "unknown"},
+            {"transport": "unknown"},
             {"intermediate_fetches": 0},
             {"intermediate_fetches": 33},
             {"intermediate_fetches": True},

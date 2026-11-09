@@ -50,6 +50,7 @@ def policy(fused):
         history_capacity=4096,
         slot_capacity=4480,
         tail_start=4096,
+        tail_tokens=384,
         inputs=inputs,
         write_slots=torch.empty(12, dtype=torch.int64),
         query_bases=torch.empty(12, 1, 1, dtype=torch.int64),
@@ -165,7 +166,9 @@ def test_service_workspace_uses_external_kvip():
         pool=SimpleNamespace(max_requests=3, device="cpu"),
         history_capacity=2048,
     )
-    config = SimpleNamespace(build_dir="/external/KVAF/build-npu", intermediate_fetches=4, npu_core_count=4)
+    config = SimpleNamespace(
+        build_dir="/external/KVAF/build-npu", intermediate_fetches=4, npu_core_count=4, transport="urma"
+    )
 
     def cpu_workspace(*args, **kwargs):
         return LIFetchWorkspace(*args, **kwargs, pin_memory=False)
@@ -180,3 +183,18 @@ def test_service_workspace_uses_external_kvip():
     assert state.fused_workspace.topk.shape == (2, 4, 2048)
     assert state.fused_workspace.scratch["reserved_hot"].shape == (2, 2048)
     assert state.fused_setup.batch == 2
+
+
+def test_ubmem_workspace_dispatches_before_memory_profiling():
+    path = ROOT / "vllm_ascend/distributed/kv_transfer/kvaf/cache_policy.py"
+    tree = ast.parse(path.read_text())
+    method = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "initialize_fused_workspace"
+    )
+    scope = dict(torch=torch)
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope)
+    state = SimpleNamespace()
+    config = SimpleNamespace(transport="ubmem")
+    with patch("kvip.adapters.vllm.binding.prepare_workspace") as prepare:
+        scope["initialize_fused_workspace"](state, config, 5, "Ascend950PR_9599", index_heads=32)
+    prepare.assert_called_once_with(torch, state, config, 5, "Ascend950PR_9599", index_heads=32)
