@@ -43,6 +43,7 @@ PD 是显式选择的外部 Worker / Runner / Connector，不在导入包时注�
 | source_tp0_only | false | P/D 一致 | true 时每个 P DP 实例仅自己的逻辑 TP0 注册和发送全部所需 KV |
 | initialization_coordinator | 空字符串 | D | 统一协调器 host:port；空字符串关闭初始化准入；P 禁止配置非空值 |
 | timeout | 120 秒 | P/D | 1～3600 秒，PD 控制操作及初始化等待预算；不修改 SDK 内部 socket 超时 |
+| control_backlog | 128 | 仅 D | 框架控制端口的 TCP 监听队列；整数 1～4096，拒绝 bool/字符串；不是并发线程或 Jetty 数 |
 | diagnostics_requests | 0 | P/D | 整数 0～16；D 每 worker 限定请求代数，P 配合对应请求；0 不安装诊断对象 |
 | verify_kv | false | P/D 一致 | 对已选诊断请求做有效字节 SHA256 比较；true 必须配 diagnostics_requests>0 |
 | cpu_eids | {} | P/D | 物理 NPU ID 字符串到 32 位十六进制 EID 的覆盖，选择 CPU 路径的本地 NPU EID |
@@ -75,11 +76,33 @@ EID 映射键使用规范十进制字符串，如 "0"、"7"，不接受 "07"；�
 {
   "source_tp0_only": true,
   "initialization_coordinator": "141.62.38.24:28998",
+  "control_backlog": 128,
   "timeout": 600,
   "diagnostics_requests": 1,
   "verify_kv": true
 }
 ```
+
+### D 控制连接突发与监听队列
+
+control_backlog 只放在 D 的 kv_connector_extra_config，不放在 additional-config 或 kvaf_config，
+P 不配置此字段；P 显式传入会报错。省略时 D 默认 128，无需两侧同步这个值。
+这是现有 PD 控制服务的队列参数，不是额外功能开关，不改变 source_tp0_only 或全建链选择。
+
+Python 3.12 TCPServer 原默认监听队列为 5。全建链时多个 P TP rank 会短时集中连接同一 D 控制端口；
+默认 128 用来容纳尚未被 accept 的突发连接。不是“第六个请求必失败”，实际排队取决于接收速度与内核行为。
+该值不是活动 RPC、推理请求、线程、SDK source 或 Jetty 数量上限，也不会提高原生计算并行度。
+ThreadingTCPServer 的处理方式、Runtime 锁、RPC timeout、Ready/Commit/取消/ACK 规则均不改变。
+
+配置在 D 启动监听前生效，不热更新；每个 D worker 的框架控制端口独立应用。
+不修改 K:28997、初始化协调器:28998、HTTP:8200 或 SDK 动态 HBM listener 的队列。
+它也不能修复 RunAicpuCommInit 缺符号等 HCCL/AICPU 配套问题。
+
+Linux 实际队列可能受 net.core.somaxconn 等系统设置限制；1～4096 是本配置允许范围，不是硬件容量声明。
+先在 D 所在网络命名空间读取 `/proc/sys/net/core/somaxconn`，再决定是否需要单独调整系统配置，
+框架不会自动修改 sysctl。要观察效果，比较受控突发测试前后的 ListenOverflows/ListenDrops 增量，
+不能把系统累计值或其他监听端口的丢包认定为本次 D 的溢出；同时记录连接失败率和 RPC 延迟。
+CPU 回环测试验证 32 个排队连接及控制响应，不能代替真实多机网络和 NPU 数据面验收。
 
 ## 3. additional-config 和 KVAF Runtime
 

@@ -188,6 +188,8 @@ tail -n 10 "$COORD_LOG"
 这条命令在当前终端前台运行，另开终端检查就绪；不要使用 Ctrl+Z 暂停服务或 tee。
 先在实际启动 shell 检查 `ulimit -Sn`、`ulimit -Hn`，硬限制不足时先调整该 shell 或容器配置。
 profiling 目录 `/home/d00843668/profiling_no_pooling` 须存在或可由运行用户创建、写入。
+本次在保留该 D 模型执行参数的基础上，显式增加 control_backlog=128；省略也使用同一默认值。
+该参数仅作用于 D 框架控制端口，不影响 KVAF/模型协议，详见 [监听队列说明](kvaf_pd_configuration.md#d-控制连接突发与监听队列)。
 
 ```bash
 (
@@ -272,6 +274,7 @@ exec /usr/local/python3.12.13/bin/python3 \
     "kv_connector_extra_config": {
       "timeout": 600,
       "initialization_coordinator": "141.62.38.24:28998",
+      "control_backlog": 128,
       "source_tp0_only": true,
       "diagnostics_requests": 1,
       "verify_kv": true
@@ -314,6 +317,23 @@ netstat -lntp 2>/dev/null | grep -E ':3100[0-7][[:space:]]'
 ```
 
 应为 HTTP 200 且八个控制端口均监听。`/health` 响应体为空正常。
+
+### 监听队列更新与复测
+
+仅此 Python 优化无需重编译 vLLM、Ascend、KVOP 或 KVAF；健康 K 和协调器可保留。
+先停止 Proxy 新请求，排空并正常停止 P/D，更新源码和 D JSON，再按 D → P → Proxy 重启。
+只有已更新代码的 D 才接受 control_backlog；旧 D 会因未知字段拒绝启动，不能只改 JSON 不更新代码。
+不需要在 P 添加该字段。当前代码的 D 即使不添加字段，也默认使用 128。
+
+在 D 所在的网络命名空间读取系统上限，检查全部控制端口，并保留同一轮连接突发测试的时间和日志：
+
+```bash
+cat /proc/sys/net/core/somaxconn
+netstat -lntp 2>/dev/null | grep -E ':3100[0-7][[:space:]]'
+```
+
+比较请求前后的 ListenOverflows/ListenDrops 增量及控制 RPC 失败率，不能仅凭历史累计值判断优化有效。
+队列只吸收短时连接突发，不替代硬件精度验证，也不保证所有超时均能消除。
 
 ## 6. 启动 P：12 号容器
 

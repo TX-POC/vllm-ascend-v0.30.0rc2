@@ -75,6 +75,9 @@ K 启动脚本为每服务使用 numactl 绑定 CPU 和内存 NUMA 节点；NUMA
 
 配置集中在 `examples/disaggregated_prefill_v1/kvaf_pooled/config.sh`：编辑地址、网卡、
 Python、模型、源码/build 路径及 NUMA 集合，再分发到所有节点。
+CONTROL_BACKLOG=128 由模板仅写入 D 的 kv_connector_extra_config.control_backlog，P 不写入。
+可配置整数 1～4096；四个 D/P 入口的 --dry-run 可核对最终命令。该值是每个 D 控制监听器的队列容量，
+不是 EP/TP 并行度或 Jetty 数；系统 somaxconn 仍可能限制实际排队容量。
 脚本无需修改框架源码。脚本修改仅对下一次启动生效，不支持热更新路由。
 容器需具备 NPU/HCCL/UB 所需设备权限和网络；以下按业务地址在容器内可绑定的部署环境编写。
 
@@ -115,6 +118,11 @@ bash scripts/kvaf_pd_k.sh build \
 K0 另需宿主机 Python3 和框架目录中的协调器脚本，仅依赖标准库。
 证书、离线依赖和原生扩展问题按基础指南处理。RunAicpuCommInit 缺符号属于 HCCL/AICPU
 配套问题，先解决再扩容，不能靠修改 PD endpoint 修复。
+
+仅更新监听队列配置时，更新框架 Python 和模板即可，无需重编译 SDK 或 K；
+健康 K/协调器可保留。先排空并停止旧 P/D，再 D 两机 → P 两机 → Proxy 启动。
+原 D 控制端口 D0:31000～31007、D1:31008～31015 不变；P 不需要同步配置队列值。
+配置只在 D 创建 listener 时生效，不支持在线热更新；旧代码不能识别显式传入的新字段。
 
 ## 4. 网络和启动前检查
 

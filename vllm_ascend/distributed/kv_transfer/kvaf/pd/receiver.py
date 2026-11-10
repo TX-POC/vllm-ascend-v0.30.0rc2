@@ -7,6 +7,7 @@ from threading import Condition, RLock
 from uuid import uuid4
 
 from ..state import RequestCacheState, RequestGroupState
+from .config import DEFAULT_CONTROL_BACKLOG, validate_control_backlog
 from .control import ControlServer
 from .layout import BLOCK_SIZE, MAX_SEGMENTS, Segments, plan_layer
 from .registration import PULL_API_VERSION
@@ -48,6 +49,7 @@ class Receiver:
         port,
         local_eid="",
         timeout=120,
+        control_backlog=DEFAULT_CONTROL_BACKLOG,
         activate=lambda: None,
         stream_factory=lambda: None,
         raw_transfer=NpuPullTransfer,
@@ -57,9 +59,11 @@ class Receiver:
         diagnostics=None,
         source_tp0_only=False,
     ):
+        validate_control_backlog(control_backlog)
         self.runtime, self.writer, self.pool, self.memories = runtime, writer, pool, memories
         self.identity = uuid4().hex
         self.timeout, self.local_eid = timeout, local_eid
+        self.control_backlog = control_backlog
         self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
         self.diagnostics = diagnostics
         self.source_tp0_only = source_tp0_only
@@ -87,7 +91,9 @@ class Receiver:
             self.hbm_receiver = self.runtime.listen_hbm(
                 "0.0.0.0:0", advertise_address=f"{host}:0", local_eid=self.local_eid
             )
-            self.server = ControlServer(*self._listen, self.dispatch, timeout=self.timeout)
+            self.server = ControlServer(
+                *self._listen, self.dispatch, timeout=self.timeout, backlog=self.control_backlog
+            )
 
     def seed(self, request_id, external_id, seed):
         with self.condition:

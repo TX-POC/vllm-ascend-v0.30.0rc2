@@ -2,9 +2,12 @@
 """Byte-level P/4 x D/1 flow over real TCP, with SDK/NPU boundaries substituted."""
 
 import importlib
+import socket
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier, Event, Lock, Thread
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -530,6 +533,7 @@ class TestPDFlow(unittest.TestCase):
             host="127.0.0.1",
             port=0,
             timeout=3,
+            control_backlog=64,
             start_immediately=False,
         )
         self.addCleanup(receiver.close)
@@ -537,14 +541,64 @@ class TestPDFlow(unittest.TestCase):
         receiver.start()
         self.runtime.compute_done.synchronize.assert_called_once()
         self.assertGreater(receiver.server.port, 0)
+        self.assertEqual(receiver.server.server.request_queue_size, 64)
 
 
 class TestProductionMesh(unittest.TestCase):
     def test_control_codec_rejects_unregistered_python_globals(self):
         server = CONTROL.ControlServer("127.0.0.1", 0, lambda message: True, timeout=3)
         self.addCleanup(server.close)
+        self.assertEqual(server.server.request_queue_size, 128)
         with self.assertRaisesRegex(RuntimeError, "unexpected PD metadata type"):
             CONTROL.call(f"127.0.0.1:{server.port}", {"unexpected": Path("/tmp")}, timeout=3)
+
+    def test_control_listener_queues_connection_burst_before_accepting(self):
+        clients = 32
+        connected = Barrier(clients + 1)
+        accept = Event()
+        lock = Lock()
+        dispatched = []
+
+        def delayed_thread(*, target, **kwargs):
+            def serve():
+                accept.wait()
+                target()
+
+            return Thread(target=serve, **kwargs)
+
+        def dispatch(message):
+            with lock:
+                dispatched.append(message["index"])
+            if message["index"] == 0:
+                raise ValueError("rejected control message")
+            return message["index"]
+
+        with patch.object(CONTROL, "Thread", delayed_thread):
+            server = CONTROL.ControlServer("127.0.0.1", 0, dispatch, timeout=5)
+        self.addCleanup(server.close)
+
+        def client(index):
+            with socket.create_connection(("127.0.0.1", server.port), timeout=5) as connection:
+                CONTROL._send(connection, {"index": index})
+                connected.wait(timeout=5)
+                return CONTROL._receive(connection)
+
+        try:
+            with ThreadPoolExecutor(max_workers=clients) as executor:
+                futures = [executor.submit(client, index) for index in range(clients)]
+                try:
+                    # No accept() has run: every client must fit in the
+                    # listener queue before any RPC handler is allowed to run.
+                    connected.wait(timeout=5)
+                    self.assertFalse(dispatched)
+                finally:
+                    accept.set()
+                results = [future.result(timeout=5) for future in futures]
+        finally:
+            accept.set()  # Also let close() finish if a connect/assertion failed.
+        self.assertEqual(results[0], (False, "ValueError: rejected control message"))
+        self.assertEqual(results[1:], [(True, index) for index in range(1, clients)])
+        self.assertEqual(sorted(dispatched), list(range(clients)))
 
     def test_tp8_dp2_sources_register_with_all_tp1_dp16_regions_on_eight_k_pools(self):
         self.registration_mesh()

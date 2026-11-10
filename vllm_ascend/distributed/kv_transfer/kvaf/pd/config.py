@@ -7,6 +7,13 @@ from ..config import KVAFConfig
 from .initialization import validate_endpoint
 
 WORKER_CLASS = "vllm_ascend.distributed.kv_transfer.kvaf.pd.worker.PDKVWorker"
+DEFAULT_CONTROL_BACKLOG = 128
+MAX_CONTROL_BACKLOG = 4096
+
+
+def validate_control_backlog(value):
+    if type(value) is not int or not 1 <= value <= MAX_CONTROL_BACKLOG:
+        raise ValueError(f"control_backlog must be an integer in 1..{MAX_CONTROL_BACKLOG}")
 
 
 @dataclass(frozen=True)
@@ -19,6 +26,7 @@ class PDConfig:
     source_tp0_only: bool = False  # Temporary single-source transport; model TP remains unchanged.
     diagnostics_requests: int = 0
     verify_kv: bool = False
+    control_backlog: int = DEFAULT_CONTROL_BACKLOG  # D listener queue, not an RPC concurrency limit.
 
     def eids(self, physical_device_id):
         key = str(physical_device_id)
@@ -36,6 +44,9 @@ class PDConfig:
         if "decode_endpoints" in values:
             values["decode_endpoints"] = tuple(values["decode_endpoints"])
         result = cls(**values)
+        validate_control_backlog(result.control_backlog)
+        if "control_backlog" in values and transfer.is_kv_producer:
+            raise ValueError("control_backlog belongs on D consumers only")
         if type(result.source_tp0_only) is not bool:
             raise ValueError("source_tp0_only must be a boolean")
         if not isinstance(result.initialization_coordinator, str):

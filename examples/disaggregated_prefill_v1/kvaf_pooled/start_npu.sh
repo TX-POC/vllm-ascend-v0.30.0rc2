@@ -15,14 +15,15 @@ else
     tp=1; dp=16; local_dp=8; start_rank=$((node * 8)); port=8200; rpc=13489
 fi
 # Build only native JSON; this does not import vLLM, CANN or KVAF.
-transfer=$("$PYTHON" - "$role" "$DIAGNOSTICS_REQUESTS" "$VERIFY_KV" "$COORDINATOR" "${D_HOSTS[@]}" <<'JSON'
+transfer=$("$PYTHON" - "$role" "$DIAGNOSTICS_REQUESTS" "$VERIFY_KV" "$COORDINATOR" "$CONTROL_BACKLOG" "${D_HOSTS[@]}" <<'JSON'
 import json, sys
-role, budget, verify, coordinator, *hosts = sys.argv[1:]
+role, budget, verify, coordinator, backlog, *hosts = sys.argv[1:]
 extra = dict(source_tp0_only=True, timeout=600, diagnostics_requests=int(budget), verify_kv=json.loads(verify))
 if role == 'p':
     extra['decode_endpoints'] = [f'{host}:{31000 + node * 8 + local}' for node, host in enumerate(hosts) for local in range(8)]
 else:
     extra['initialization_coordinator'] = coordinator
+    extra['control_backlog'] = int(backlog)
 print(json.dumps(dict(kv_connector='PDKVoffloadConnector', kv_connector_module_path='vllm_ascend.distributed.kv_transfer.kvaf.pd.connector', kv_role='kv_producer' if role == 'p' else 'kv_consumer', kv_port=31000, kv_connector_extra_config=extra)))
 JSON
 )

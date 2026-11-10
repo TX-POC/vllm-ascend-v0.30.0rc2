@@ -17,6 +17,7 @@ HOST_PYTHON=python3
 MODEL=/home/models/GLM-5.3-w4a4c8-mxfp4
 LOG_ROOT=/home/c00612283/pd-pool-logs
 COORDINATOR=${K_HOSTS[0]}:28998
+CONTROL_BACKLOG=128  # D framework listener queue; not a Jetty/thread limit.
 PROFILER_DIR=/home/d00843668/profiling_no_pooling
 DIAGNOSTICS_REQUESTS=1
 VERIFY_KV=true

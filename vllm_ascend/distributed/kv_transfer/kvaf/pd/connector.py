@@ -156,6 +156,7 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 port=port,
                 local_eid=npu_eid,
                 timeout=self.config.timeout,
+                control_backlog=self.config.control_backlog,
                 activate=activate,
                 stream_factory=stream,
                 start_immediately=False,

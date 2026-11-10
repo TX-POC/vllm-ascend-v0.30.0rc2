@@ -8,6 +8,7 @@ import sys
 import unittest
 from enum import Enum
 from pathlib import Path
+from threading import RLock
 from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -127,6 +128,22 @@ SCHEDULER, NATIVE, CONNECTOR = load_scheduler()
 
 
 class TestPDConfig(unittest.TestCase):
+    def test_control_backlog_is_bounded_and_configured_on_consumers_only(self):
+        value = config()
+        self.assertEqual(CONFIG.PDConfig.from_vllm(value).control_backlog, 128)
+        for backlog in (1, 64, 4096):
+            value.kv_transfer_config.kv_connector_extra_config = {"control_backlog": backlog}
+            self.assertEqual(CONFIG.PDConfig.from_vllm(value).control_backlog, backlog)
+        for backlog in (True, False, None, "128", 128.0, 0, -1, 4097):
+            value.kv_transfer_config.kv_connector_extra_config = {"control_backlog": backlog}
+            with self.subTest(backlog=backlog), self.assertRaisesRegex(ValueError, "control_backlog"):
+                CONFIG.PDConfig.from_vllm(value)
+        value = config(producer=True)
+        self.assertEqual(CONFIG.PDConfig.from_vllm(value).control_backlog, 128)
+        value.kv_transfer_config.kv_connector_extra_config["control_backlog"] = 128
+        with self.assertRaisesRegex(ValueError, "D consumers only"):
+            CONFIG.PDConfig.from_vllm(value)
+
     def test_cpu_and_fullmesh_eids_resolve_by_physical_device_independently(self):
         value = config()
         cpu, raw = "1" * 32, "2" * 32
@@ -188,6 +205,39 @@ class TestPDConfig(unittest.TestCase):
 
 
 class TestConnectorHooks(unittest.TestCase):
+    def test_consumer_passes_backlog_to_listener_after_native_warmup(self):
+        value = config(rank=8)
+        value.kv_transfer_config.kv_connector_extra_config = {"control_backlog": 64}
+        connector = CONNECTOR.PDKVoffloadConnector(value, Role.WORKER)
+        connector.register_kv_caches({})
+        runtime = NS(lock=RLock(), compute_done=Mock(), wait_compute=Mock(), listen_hbm=Mock(return_value={}))
+        receiver_module = importlib.import_module(f"{PACKAGE}.pd.receiver")
+        modules = {
+            "vllm.distributed": module("vllm.distributed", get_tensor_model_parallel_rank=lambda: 0),
+            "vllm.platforms": module(
+                "vllm.platforms", current_platform=NS(visible_device_id_to_physical_device_id=lambda device: device)
+            ),
+            "vllm.utils.network_utils": module("vllm.utils.network_utils", get_ip=lambda: "127.0.0.1"),
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol": module(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol",
+                get_external_request_id=lambda req: req,
+            ),
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(torch, "npu", NS(current_device=lambda: 0), create=True),
+            patch.object(receiver_module, "ControlServer") as control,
+        ):
+            connector.bind_pd_backend(
+                sdk=Mock(), runtime=runtime, memories={}, writer=Mock(), pool=Mock(), draft_limit=None
+            )
+            self.addCleanup(connector.shutdown)
+            control.assert_not_called()
+            runtime.listen_hbm.assert_not_called()
+            connector.start_pd_control()
+            control.assert_called_once_with("127.0.0.1", 31008, connector.worker.dispatch, timeout=120.0, backlog=64)
+            connector.shutdown()
+
     def test_sender_owner_is_retained_when_initialization_raises(self):
         connector = CONNECTOR.PDKVoffloadConnector(config(producer=True, tp=8), Role.WORKER)
         connector.register_kv_caches({})

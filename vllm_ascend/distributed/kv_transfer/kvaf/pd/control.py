@@ -11,6 +11,7 @@ from contextlib import suppress
 from threading import Thread
 from types import SimpleNamespace
 
+from .config import DEFAULT_CONTROL_BACKLOG, validate_control_backlog
 from .layout import LayerLayout, Plane
 from .registration import SourceMetadata
 
@@ -67,7 +68,9 @@ def call(endpoint, message, *, timeout=120.0):
 
 
 class ControlServer:
-    def __init__(self, host, port, dispatch, *, timeout=120.0):
+    def __init__(self, host, port, dispatch, *, timeout=120.0, backlog=DEFAULT_CONTROL_BACKLOG):
+        validate_control_backlog(backlog)
+
         class Handler(socketserver.BaseRequestHandler):
             def handle(self):
                 self.request.settimeout(timeout)
@@ -83,6 +86,9 @@ class ControlServer:
             allow_reuse_address = True
             daemon_threads = True
             block_on_close = False
+            # Applied by TCPServer before listen(); queued connections do not
+            # change dispatch threads, Runtime locks or transfer completion.
+            request_queue_size = backlog
 
         self.server = Server((host, port), Handler)
         self.thread = Thread(target=self.server.serve_forever, name="kvaf-pd-control", daemon=True)
