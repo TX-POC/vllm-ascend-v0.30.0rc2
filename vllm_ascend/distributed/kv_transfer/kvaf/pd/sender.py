@@ -15,6 +15,24 @@ from .registration import PULL_API_VERSION, PeerRegistration
 INITIALIZATION_CLEANUP_TIMEOUT = 5.0
 
 
+class _ProductionEvent:
+    """Wait once for one layer dispatch's freshly recorded event.
+
+    Owned by a single send task, never shared across tasks or re-recorded.
+    Registration.ready keeps its normal wait contract; repeated batches use
+    this task's completed wait without another native synchronization.
+    """
+
+    def __init__(self, event):
+        self._event = event
+        self._complete = False
+
+    def synchronize(self):
+        if not self._complete:
+            self._event.synchronize()
+            self._complete = True
+
+
 class Sender:
     def __init__(
         self,
@@ -284,6 +302,7 @@ class Sender:
 
     def _send_layer(self, layer, requests, event, skipped=False):
         self.activate()
+        event = _ProductionEvent(event)
         event.synchronize()
         memory = self.memories[layer]
         for req_id, request, generation in requests:

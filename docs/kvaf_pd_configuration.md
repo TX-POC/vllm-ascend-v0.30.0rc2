@@ -236,6 +236,12 @@ D 每 Runtime 启动一个 SDK HBM listener，端口通过 receiver ticket 发�
 
 ## 6. 完成、取消与初始化协调
 
+每次层发送任务使用独立的生产事件，首次确认完成后，CPU/NPU 各批次共享本任务的完成确认，
+不重复调用原生事件同步。完成状态不保存在层注册对象或源组中，不跨层、请求或 chunk 复用。
+直接调用 LayerRegistration.ready 并传入原始事件时，仍须先同步生产事件再发布 Ready。
+此优化不改变 SDK Ready/release、源组锁及目录发布规则，也不增加配置开关；
+只减少重复原生同步调用，实际精度和性能仍须在目标 NPU 上做回归验证。
+
 只有全部必需层/贡献方完成、DDR Commit 与目录发布、HBM 就绪，才能放行 D 首次 Decode。
 原生实际跳过 MTP 时使用原有跳过贡献，不读取 dummy KV；普通 tail 在末 prompt token 重放前导入。
 P 物理源复用必须等 SDK release 与原有完成确认，不以 RPC 已发送或 HTTP 200 代替 DMA 完成。

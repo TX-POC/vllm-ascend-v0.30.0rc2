@@ -6,7 +6,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import test_kvaf_adapter as helpers
 import torch
@@ -305,8 +305,28 @@ class TestPDFlow(unittest.TestCase):
                     self.assertTrue(torch.all(tensor[table[token // 128], token % 128] == self.value(i, plane, token)))
 
     def test_four_layer_mtp_two_paths_match_bytes_and_continue_native_decode(self):
+        events = {}
+        for sender in self.senders:
+            memories = iter(sender.memories.values())
+
+            def event_factory(memories=memories):
+                event = Mock()
+                events[id(next(memories).tensor)] = event
+                return event
+
+            sender.event_factory = event_factory
+        native_ready = Source.ready
+
+        def ready(source, tensor=None):
+            # Every CPU/NPU Ready must follow exactly one completed production
+            # wait, including repeated batches on the same layer's source MR.
+            events[id(tensor)].synchronize.assert_called_once()
+            return native_ready(source, tensor)
+
         self.seed(300)
-        self.chunk(300)
+        with patch.object(Source, "ready", ready):
+            self.chunk(300)
+        self.assertEqual(len(events), len(self.senders) * len(self.memories))
         self.assertEqual(self.receiver.get_finished(), {"r"})
         self.assert_payload(300)
         self.assertEqual(len(self.native.pages), 4 * 2)
@@ -328,6 +348,15 @@ class TestPDFlow(unittest.TestCase):
                 self.assertTrue(torch.all(hot.view(-1, 656)[start + token] == self.value(i, 0, 256 + token)))
 
     def test_partial_chunks_and_empty_contributors_do_not_release_early(self):
+        events = []
+
+        def event_factory():
+            event = Mock()
+            events.append(event)
+            return event
+
+        for sender in self.senders:
+            sender.event_factory = event_factory
         self.seed(129)
         self.chunk(65, final=False)
         self.assertFalse(self.receiver.get_finished())
@@ -337,6 +366,9 @@ class TestPDFlow(unittest.TestCase):
         self.chunk(129, previous=128)
         self.assertEqual(self.receiver.get_finished(), {"r"})
         self.assert_payload(129)
+        self.assertEqual(len(events), 3 * len(self.senders) * len(self.memories))
+        for event in events:
+            event.synchronize.assert_called_once()
 
     def test_full_block_prompt_has_no_main_hbm_tail(self):
         self.seed(256)
