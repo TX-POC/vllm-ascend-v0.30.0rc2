@@ -31,6 +31,17 @@ P 的 TP8 × DP2 = 16 个 rank，开启 EP 后预期 EP16；D 的 TP1 × DP16 = 
 每个活跃 P TP0 每路径 16 个源组，79 层时 1264 个逐层 MR；不是 Jetty 实测数量。
 多机 EP 通信、初始化时间、队列资源和长请求稳定性需要重新测量。
 
+上述 true 是临时 TP0 单源模式，不是原始全建链的必要设置。原始全建链可在 P/D 同时省略
+source_tp0_only 或设置 false，默认就是 false；全部 P TP rank 将对全部 16 个 D 注册多 MR 源组，
+主 KV/Indexer/Scale 按原传输规则分工，P 的 16 个 decode_endpoints 不减少。
+
+本目录 start_npu.sh 当前在生成 extra 时显式写入 source_tp0_only=True，
+仅从其他 JSON 示例删除字段不会改变该脚本。要用这些模板运行全建链，须将该赋值改为
+source_tp0_only=False，或从 extra 构造中删除此参数，并同步到四个 P/D 容器。
+不要在 config.sh 中添加未被脚本读取的同名变量后假定已经生效。
+启动前用四个入口的 --dry-run 核对最终命令，确保两侧一致，再按本文顺序启动；
+已有实例切换须先排空并停止 P/D。全建链新增的源组及硬件资源需求需要重新验收。
+
 ## 2. K 固定映射与池化边界
 
 | D 主机 / 物理 NPU | K 主机 | CPU/socket 服务 |

@@ -182,6 +182,30 @@ D 没有显式传 enable_dsa_cp，当前默认 false；c8_enable_reshape_optim �
 
 ## 5. TP0、多 MR 与实际数据流
 
+### 原始全建链与临时 TP0 单源模式
+
+原始需求是全建链：`source_tp0_only` 默认 false，P、D 两侧均可省略此字段，
+或均显式设置为以下值；无需设置 true：
+
+```json
+{"source_tp0_only": false}
+```
+
+`true` 是此前为减少通信参与 rank、缓解连接资源压力引入的临时妥协方案，不是启用 PD 的必要条件。
+本文和部署指南中保留 true 的启动示例，用于记录已有验收配置，不表示原始全建链必须开启它。
+P/D 握手校验该模式，两侧必须一致；省略与显式 false 等价，不能只在 P 或 D 单侧更改。
+
+恢复 false 后，所有 P TP rank 都对全部目标 D 注册 CPU/NPU 多 MR 源组；主 KV 仍按原规则
+取 member 0，Indexer KV/Scale 恢复原 TP 区间分工，不是每个 rank 都重复发送完整 KV。
+P 的 decode_endpoints 仍必须列出全部 D worker。D 的 K endpoint、初始化协调器、
+原生 TP/DP/EP 及其他配置继续保留；不因切换此字段而自动改变其他能力开关。
+关闭 TP0-only 不代表 DSA CP、其他布局或并行组合已获得兼容性和精度验证。
+
+切换时先停止新请求和 Proxy，排空并停止两侧 P/D；同步删除字段或设为 false，
+再按 D → P → Proxy 启动。健康且无遗留会话的 K/协调器可保留，不能在线混用两种模式。
+全建链会增加参与 rank 及源组数量，使用当前多 MR SDK 后仍需重新验证注册资源、初始化、
+长请求、MTP、取消及基线精度；源组/MR 数不等于硬件 Jetty 的实测数量。
+
 | source_tp0_only | P 计算 | P 参与通信的 rank | 数据来源 |
 | --- | --- | --- | --- |
 | false | 原生 TP/DP/EP 不变 | 原有各 TP | 主 KV 按 member 0，indexer/scale 按原 TP 区间分工 |
