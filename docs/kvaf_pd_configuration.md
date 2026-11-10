@@ -29,7 +29,8 @@ PD 是显式选择的外部 Worker / Runner / Connector，不在导入包时注�
 不自动兼容其他模型、量化布局、拆分策略或 SDK 版本。
 
 `source_tp0_only=true` 另要求 glm_moe_dsa、D TP=1、主 KV 与 indexer 均 fp8，
-`enable_dsa_cp=false` 且 `c8_enable_reshape_optim=false`。本次验收使用 eager、P TP8/DP1、D TP1/DP8。
+`enable_dsa_cp=false` 且 `c8_enable_reshape_optim=false`。P 示例使用 eager、TP8/DP1；用户最新确认可跑通的 D 使用 TP1/DP8 和 FULL_DECODE_ONLY，
+主模型不设置 enforce-eager，MTP 子模型保持 enforce_eager=true。
 关闭 TP0-only 不代表任意 TP/布局都已通过硬件验收。
 
 ## 2. Connector 扩展字段
@@ -63,8 +64,8 @@ EID 映射键使用规范十进制字符串，如 "0"、"7"，不接受 "07"；�
   ],
   "source_tp0_only": true,
   "timeout": 600,
-  "diagnostics_requests": 0,
-  "verify_kv": false
+  "diagnostics_requests": 1,
+  "verify_kv": true
 }
 ```
 
@@ -75,8 +76,8 @@ EID 映射键使用规范十进制字符串，如 "0"、"7"，不接受 "07"；�
   "source_tp0_only": true,
   "initialization_coordinator": "141.62.38.24:28998",
   "timeout": 600,
-  "diagnostics_requests": 0,
-  "verify_kv": false
+  "diagnostics_requests": 1,
+  "verify_kv": true
 }
 ```
 
@@ -89,6 +90,10 @@ EID 映射键使用规范十进制字符串，如 "0"、"7"，不接受 "07"；�
 | enable_cpu_binding | true | 使用框架原有 CPU 绑核能力 |
 | enable_dsa_cp | false | DSA 上下文并行计算路由；不是 DSA 总开关或 KVAF 开关；TP0-only 要求关闭 |
 | multistream_overlap_shared_expert | true | 原生共享专家多流重叠配置 |
+| ascend_compilation_config | 见下文 D 配置 | D 的图扩展和 kernel 编译配置 |
+| recompute_scheduler_enable | D: "True" | 保留成功配置的兼容字段及字符串取值；当前日志可能提示迁移到 scheduler_config，P 不沿用 |
+| finegrained_tp_config | D: lmhead_tensor_parallel_size=8 | D 的细粒度 lmhead 配置，不改变命令中的主 TP=1 / DP=8 |
+| enable_mlapo | D: true | 保留 D 已验证的 MLAPO 配置，P 示例不新增此字段 |
 | c8_enable_reshape_optim | false | 选择相应 C8 缓存布局路径；TP0-only 要求显式关闭 |
 
 `enable_dsa_cp=true` 会启用 TP 组内的 DSA CP 计算/通信路径，并自动启用所需 FlashComm。
@@ -149,6 +154,31 @@ TP、DP、最大长度和内存预算由部署命令显式填写，不由 helper
 部署脚本使用 `KVAF_PD_PYTHON` 选择解释器，默认 python3；`KVAF_PD_BUILD_JOBS` 控制构建并发，默认 8。
 helper 设置网卡、HCCL、KVOP、SDK PYTHONPATH、独立 metrics/plog 路径等运行环境。
 `KVAF_REUSE_DEVICE_RA` 是 PD loader 显式借用 HCCL device RA 的 SDK 内部接入开关，不是用户新增的建链模式。
+
+### 当前 D 的直接启动配置
+
+部署指南中的 D 直接运行 Python CLI，不使用 helper 的 eager 默认值；P 仍使用 helper。
+以下配置按用户确认可跑通的命令记录，不扩展为任意硬件/模型均支持的承诺：
+
+| D 配置 | 实际取值 |
+| --- | --- |
+| async-scheduling | 显式启用 |
+| compilation-config.cudagraph_mode | FULL_DECODE_ONLY |
+| 主模型 enforce-eager | 不传入 |
+| speculative-config.enforce_eager | true，仅 draft |
+| ascend_compilation_config.enable_npugraph_ex | true |
+| ascend_compilation_config.enable_static_kernel | false |
+| ascend_compilation_config.enable_super_kernel | false |
+| recompute_scheduler_enable | 字符串 "True"，保留兼容入口 |
+| finegrained_tp_config.lmhead_tensor_parallel_size | 8 |
+| enable_mlapo | true |
+| profiler-config | torch，输出 /home/d00843668/profiling_no_pooling，with_stack=false |
+| TORCH_HCCL_ASYNC_ERROR_HANDLING | 0，按 D 命令设置 |
+| diagnostics_requests / verify_kv | 1 / true，P 同步配置；性能测量时两侧一起恢复 0 / false |
+
+D 没有显式传 enable_dsa_cp，当前默认 false；c8_enable_reshape_optim 显式 false。
+保持这些区别，不能让启动包装脚本自动添加主模型 enforce-eager 后声称等价。
+前台日志通过 tee 写入 server.log；保持日志消费者运行，避免 Ctrl+Z 造成阻塞。
 
 ## 5. TP0、多 MR 与实际数据流
 

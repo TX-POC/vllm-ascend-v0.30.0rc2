@@ -174,59 +174,128 @@ tail -n 10 "$COORD_LOG"
 
 ## 5. 启动 D：24 号容器
 
-以下直接使用原生 CLI 参数；`start_vllm_pd.sh` 负责 KVOP 环境、网卡、Python 路径和默认参数。
-先在实际启动 shell 检查 `ulimit -Sn`、`ulimit -Hn`；硬限制不足时需在宿主机调整该 shell
-或容器启动配置，再在此 shell 启动。修改另一终端不会影响本次子进程。
-若硬限制已达到 65536，可执行 `ulimit -Sn 65536`。
+以下为用户在 2026-11-10 确认可跑通的 D 配置，直接调用原生 CLI，不经过会默认添加
+`--enforce-eager` 的启动 helper。保留异步调度、FULL_DECODE_ONLY、MLAPO 和 profiling 配置。
+这条命令在当前终端前台运行，另开终端检查就绪；不要使用 Ctrl+Z 暂停服务或 tee。
+先在实际启动 shell 检查 `ulimit -Sn`、`ulimit -Hn`，硬限制不足时先调整该 shell 或容器配置。
+profiling 目录 `/home/d00843668/profiling_no_pooling` 须存在或可由运行用户创建、写入。
 
 ```bash
 (
 set -euo pipefail
+
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
-export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY
+unset http_proxy HTTP_PROXY all_proxy ALL_PROXY
+source third_party/KVOP/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+
+local_ip=141.62.38.24
+nic_name=enp34s0f1
+export VLLM_HOST_IP="$local_ip"
+export HCCL_IF_IP="$local_ip"
+export GLOO_SOCKET_IFNAME="$nic_name"
+export TP_SOCKET_IFNAME="$nic_name"
+export HCCL_SOCKET_IFNAME="$nic_name"
+export HCCL_DFS_CONFIG="task_exception:off,inconsistent_check:off"
+export HCCL_CONNECT_TIMEOUT=1800
+export HCCL_EXEC_TIMEOUT=1800
+export HCCL_BUFFSIZE=400
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_INTRA_PCIE_ENABLE=1
+export HCCL_INTRA_ROCE_ENABLE=0
+export TORCH_HCCL_ASYNC_ERROR_HANDLING=0
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
-LOG_DIR="$PWD/pd-logs/d/$(date +%Y%m%d_%H%M%S)_$$"
-mkdir -p "$LOG_DIR"
-export ASCEND_PROCESS_LOG_PATH="$LOG_DIR/plog"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=1
+export ASCEND_GLOBAL_LOG_LEVEL=3
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+dir="$PWD/pd-logs/d/$(date +%Y%m%d_%H%M%S)_$$"
+export ASCEND_PROCESS_LOG_PATH="$dir/plog"
 export PROMETHEUS_MULTIPROC_DIR="/dev/shm/vllm_metrics_d_$$"
-nohup bash scripts/start_vllm_pd.sh d 141.62.38.24 enp34s0f1 -- \
+mkdir -p "$ASCEND_PROCESS_LOG_PATH" "$PROMETHEUS_MULTIPROC_DIR"
+printf 'D server log: %s/server.log\n' "$dir"
+exec > >(tee "$dir/server.log") 2>&1
+
+exec /usr/local/python3.12.13/bin/python3 \
+  -m vllm.entrypoints.cli.main serve \
   /home/models/GLM-5.3-w4a4c8-mxfp4 \
-  --port 8200 --tensor-parallel-size 1 \
-  --data-parallel-size 8 --data-parallel-size-local 8 \
-  --data-parallel-address 141.62.38.24 --data-parallel-rpc-port 13489 \
-  --pipeline-parallel-size 1 --max-model-len 131072 \
-  --max-num-batched-tokens 4096 --max-num-seqs 1 --gpu-memory-utilization 0.85 \
+  --host 0.0.0.0 \
+  --port 8200 \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --data-parallel-size-local 8 \
+  --data-parallel-address "$local_ip" \
+  --data-parallel-rpc-port 13489 \
+  --pipeline-parallel-size 1 \
+  --distributed-executor-backend mp \
+  --enable-expert-parallel \
+  --served-model-name glm \
+  --seed 1024 \
+  --max-model-len 131072 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 1 \
+  --gpu-memory-utilization 0.85 \
+  --trust-remote-code \
+  --quantization ascend \
+  --no-enable-prefix-caching \
+  --worker-cls vllm_ascend.distributed.kv_transfer.kvaf.pd.worker.PDKVWorker \
+  --block-size 128 \
+  --kv-cache-dtype fp8 \
+  --attention_config.indexer_kv_dtype fp8 \
+  --async-scheduling \
+  --profiler-config '{"profiler":"torch","torch_profiler_dir":"/home/d00843668/profiling_no_pooling","torch_profiler_with_stack":false}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --speculative-config '{
+    "num_speculative_tokens": 3,
+    "method": "deepseek_mtp",
+    "enforce_eager": true
+  }' \
   --kv-transfer-config '{
     "kv_connector": "PDKVoffloadConnector",
     "kv_connector_module_path": "vllm_ascend.distributed.kv_transfer.kvaf.pd.connector",
     "kv_role": "kv_consumer",
     "kv_port": 31000,
     "kv_connector_extra_config": {
-      "source_tp0_only": true,
-      "initialization_coordinator": "141.62.38.24:28998",
       "timeout": 600,
-      "diagnostics_requests": 0,
-      "verify_kv": false
+      "initialization_coordinator": "141.62.38.24:28998",
+      "source_tp0_only": true,
+      "diagnostics_requests": 1,
+      "verify_kv": true
     }
   }' \
   --additional-config '{
     "enable_cpu_binding": true,
-    "enable_dsa_cp": false,
     "multistream_overlap_shared_expert": true,
+    "ascend_compilation_config": {
+      "enable_npugraph_ex": true,
+      "enable_static_kernel": false,
+      "enable_super_kernel": false
+    },
+    "recompute_scheduler_enable": "True",
+    "finegrained_tp_config": {"lmhead_tensor_parallel_size": 8},
+    "enable_mlapo": true,
     "c8_enable_reshape_optim": false,
     "kvaf_config": {
+      "npu_core_count": 1,
+      "jettys_per_core": 1,
       "enabled": true,
       "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312",
       "cpu_address": "141.62.38.24:28997",
-      "ddr_size_gb": 16,
-      "npu_core_count": 1,
-      "jettys_per_core": 1
+      "ddr_size_gb": 16
     }
-  }' > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-echo "D_PID=$! D_LOG=$LOG_DIR/server.log"
+  }'
 )
 ```
+
+D 主模型不传 `--enforce-eager`；MTP 子配置中的 `enforce_eager=true` 仅作用于 draft，
+不能据此将 D 主模型解释为 eager。未显式配置的 `enable_dsa_cp` 使用当前默认 false。
+`recompute_scheduler_enable` 保留用户成功命令中的字符串 "True" 和兼容字段位置，
+不在本文档更新中转换为其他类型或配置结构。
 
 等待初始化、warmup 和控制监听全部完成：
 
@@ -271,8 +340,8 @@ nohup bash scripts/start_vllm_pd.sh p 141.62.38.12 enp34s0f1 -- \
       ],
       "source_tp0_only": true,
       "timeout": 600,
-      "diagnostics_requests": 0,
-      "verify_kv": false
+      "diagnostics_requests": 1,
+      "verify_kv": true
     }
   }' \
   --additional-config '{
@@ -295,8 +364,9 @@ curl --fail --noproxy '*' --max-time 10 -i http://141.62.38.24:8200/health
 ```
 
 P 的 `enabled=false` 仅关闭原混部卸载入口，不关闭显式选中的 PD Connector。
-以上使用 helper 默认的 FP8、block128、MTP3、seed1024、eager、禁用 prefix 和 EP 等参数，
-完整默认值见配置说明。已有自定义启动脚本可以保留，但须逐项对齐这些配置。
+本节 P 使用 helper 默认的 FP8、block128、MTP3、seed1024、eager、禁用 prefix 和 EP 等参数，
+完整默认值见配置说明。P 的 diagnostics_requests=1、verify_kv=true 与上述 D 对齐。
+已有自定义启动脚本可以保留，但须逐项对齐这些配置；不要把 D 的图模式参数直接套用到 P。
 仓库根目录四层脚本、`examples/.../kvaf_two_node` 的历史模板仍保留兼容用途；
 其默认 TP/DP、8192 长度和占位 IP 不等同于本次验收配置，不直接套用于全模型。
 
@@ -331,7 +401,7 @@ curl --noproxy '*' --connect-timeout 3 --max-time 180 \
 
 ## 8. 诊断与精度验收
 
-需要字节证据时，两侧同时改为 `diagnostics_requests=1, verify_kv=true` 后重启 P/D，
+上述 P/D 示例已经配置 `diagnostics_requests=1, verify_kv=true`，重启 P/D 后
 发送一份固定采样长请求。完成后恢复 `0/false`，校验模式不用于性能测量。
 使用本轮明确的日志路径，不把不同启动代的日志混合；P/D 分机时先把本次日志复制到同一机器。
 
@@ -383,7 +453,7 @@ TP 拓扑不同可能引入数值差异，不能仅凭文本差异断定传输�
 协调器封锁状态在内存中，不会因 D 重启或延长 timeout 自动清除。K 重启使旧 ticket 全部失效，
 不能继续使用原 D/P 实例。不要在旧 initializer 存活时重启协调器放行新一批初始化。
 
-K/协调器/服务日志直接重定向到文件。`STAT=T` 使用明确 PID 恢复或正常结束，避免暂停 tee
+K/协调器日志直接重定向到文件；本节 D 的前台 tee 需保持运行。`STAT=T` 使用明确 PID 恢复或正常结束，避免暂停 tee
 造成 `pipe_write`。只清理确认属于本次部署的进程，不使用全局 pkill python 或盲目重置设备。
 
 ## 10. 辅助工具与归档
