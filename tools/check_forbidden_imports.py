@@ -42,6 +42,9 @@ CHECK_IMPORTS = {
         allowed_files={
             "vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload/metadata.py",
             "vllm_ascend/distributed/weight_transfer/npu_ipc_engine.py",
+            # KVAF Ready/descriptor bindings expose only pickle constructors.
+            # This transport restricts deserialization to its metadata types.
+            "vllm_ascend/distributed/kv_transfer/kvaf/pd/control.py",
             "tests/ut/distributed/test_hccl_weight_transfer.py",
         },
     ),

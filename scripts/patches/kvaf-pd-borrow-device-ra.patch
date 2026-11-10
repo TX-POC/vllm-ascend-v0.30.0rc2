@@ -1,0 +1,19 @@
+--- a/access_operator/src/direct_hccp/direct_hccp_session.cc
++++ b/access_operator/src/direct_hccp/direct_hccp_session.cc
+@@ -196,2 +196,10 @@
+   }
++  // Explicitly borrowed device RA is already owned by HCCL. Calling
++  // RaInit again can reset its live HDC synchronization resources.
++  const char *borrow = std::getenv("KVAF_REUSE_DEVICE_RA");
++  if (borrow != nullptr && std::strcmp(borrow, "1") == 0) {
++    session->device_ra_owned = false;
++    VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_RA_REUSED source=explicit_hccl\n");
++    return true;
++  }
+   const int ret = CallRaInitWithRetry(session, kOfflineHdc, "device_aiv");
+--- a/bindings/src/python_module.cpp
++++ b/bindings/src/python_module.cpp
+@@ -351,2 +351,3 @@
+ PYBIND11_MODULE(_kvaf, m) {
++  m.attr("reuse_device_ra_supported") = true;
+   kvaf::BindConnectorTypes(m);
