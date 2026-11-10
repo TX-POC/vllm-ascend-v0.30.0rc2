@@ -247,3 +247,5 @@ verify_kv 会同步设备、拷贝数据到 CPU，并对 DDR 做额外回读，�
 默认 0/false 不创建 PD 诊断对象或装饰器，也不进行额外哈希/回读；SDK 自有日志不受这两个字段控制。
 仅日志模式使用 diagnostics_requests>0、verify_kv=false；不能通过要求字节证据的审计。
 完整日志中任意诊断 FAIL 不能由 HTTP 成功覆盖；缺少证据也不能解释为校验成功。
+
+四智算节点与八鲲鹏节点的扩容模板及脚本见 [池化部署指南](kvaf_pd_pooled_deployment.md)。
