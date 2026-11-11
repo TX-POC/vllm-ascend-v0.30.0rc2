@@ -1,87 +1,82 @@
 # 四智算节点与八鲲鹏节点的 PD 部署指南
 
-本方案在当前多 MR PD Connector 上配置两个跨机 DP/EP 集群，不修改框架、KVAF 或内存布局。
-它是新的扩容部署模板，尚未做该规模的硬件联调；单 P/单 D 的成功不能替代本方案验收。
-基础安装排障见 [PD 部署指南](kvaf_pd_deployment.md)，字段见 [配置说明](kvaf_pd_configuration.md)。
-启动脚本位于 [kvaf_pooled](../examples/disaggregated_prefill_v1/kvaf_pooled)。
+本方案使用两个跨机 DP/EP 集群和八台 K 通算服务器，不修改框架计算、KVAF SDK 或 KV 内存布局。
+这是扩容部署模板，尚未完成该规模的硬件联调；单 P/单 D 的成功不能替代本方案验收。
+基础安装排障见 [PD 部署指南](kvaf_pd_deployment.md)，字段含义见 [配置说明](kvaf_pd_configuration.md)。
 
-## 1. 拓扑及资源假设
+## 1. 拓扑与独立脚本
 
-以下 IP 按已有地址尾号递增，均为可编辑示例；使用前确认属于对应服务器。
-每台智算节点 8 张 950DT，每台 K 服务器假定两个 CPU socket。
-“一个 NPU 对应一个 CPU”在本方案中特指每个 D NPU 独占一个 K 服务、对应一个 CPU socket 的内存分区。
-P 的 NPU 不另分配 K Runtime；P 将源注册到请求目标 D 所拥有的 K region。
-若希望全部 32 个 P/D NPU 各独占一个 CPU socket，则需要 32 个 socket，八台双路 K 不足。
+每台智算服务器有 8 张 950DT，每台 K 服务器假定两个 CPU socket。
+以下 IP 按已有地址尾号递增，使用前确认本机地址、网卡和 NUMA 拓扑。
 
-| 角色 | 地址 | 本地 DP / TP | 全局 DP rank | HTTP |
-| --- | --- | --- | --- | --- |
-| P0 | 141.62.38.12 | DP1 / TP8 | 0 | 8100，P 集群入口 |
-| P1 | 141.62.38.13 | DP1 / TP8 | 1 | headless，不对 Proxy 注册 |
-| D0 | 141.62.38.24 | DP8 / TP1 | 0～7 | 8200，D 集群入口 |
-| D1 | 141.62.38.25 | DP8 / TP1 | 8～15 | headless，不对 Proxy 注册 |
-| K0～K7 | 141.62.38.26～33 | 每机两个服务 | 每服务一个 D NPU | 28997 / 28999 |
-| 协调器 | K0:141.62.38.26 | 一个实例 | 以实际 K endpoint 为门控键 | 28998 |
-| Proxy | P0:141.62.38.12 | 一个实例 | 路由到两个集群主入口 | 8000 |
+| 角色 | 示例地址 | 全局 TP / DP / EP | 本地 DP；全局起始 rank | HTTP | 独立脚本 |
+| --- | --- | --- | --- | --- | --- |
+| P0 | 141.62.38.12 | TP8 / DP2 / EP16 | 1；0 | 8100 | [p0_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/p0_start.sh) |
+| P1 | 141.62.38.13 | TP8 / DP2 / EP16 | 1；1 | headless | [p1_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/p1_start.sh) |
+| D0 | 141.62.38.24 | TP1 / DP16 / EP16 | 8；0 | 8200 | [d0_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/d0_start.sh) |
+| D1 | 141.62.38.25 | TP1 / DP16 / EP16 | 8；8 | headless | [d1_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/d1_start.sh) |
+| K0 | 141.62.38.26 | 两个 CPU/socket 服务 | 对应 D0 NPU 0、1 | 28997 / 28999 | [k0_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k0_start.sh) |
+| K1 | 141.62.38.27 | 两个 CPU/socket 服务 | 对应 D0 NPU 2、3 | 28997 / 28999 | [k1_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k1_start.sh) |
+| K2 | 141.62.38.28 | 两个 CPU/socket 服务 | 对应 D0 NPU 4、5 | 28997 / 28999 | [k2_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k2_start.sh) |
+| K3 | 141.62.38.29 | 两个 CPU/socket 服务 | 对应 D0 NPU 6、7 | 28997 / 28999 | [k3_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k3_start.sh) |
+| K4 | 141.62.38.30 | 两个 CPU/socket 服务 | 对应 D1 NPU 0、1 | 28997 / 28999 | [k4_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k4_start.sh) |
+| K5 | 141.62.38.31 | 两个 CPU/socket 服务 | 对应 D1 NPU 2、3 | 28997 / 28999 | [k5_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k5_start.sh) |
+| K6 | 141.62.38.32 | 两个 CPU/socket 服务 | 对应 D1 NPU 4、5 | 28997 / 28999 | [k6_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k6_start.sh) |
+| K7 | 141.62.38.33 | 两个 CPU/socket 服务 | 对应 D1 NPU 6、7 | 28997 / 28999 | [k7_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/k7_start.sh) |
+| 协调器 | K0：141.62.38.26 | 单实例 | 初始化门控 | 28998 | [coordinator_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/coordinator_start.sh) |
+| Proxy | P0：141.62.38.12 | 单实例 | P0:8100 → D0:8200 | 8000 | [proxy_start.sh](../examples/disaggregated_prefill_v1/kvaf_pooled/proxy_start.sh) |
 
-P 的 TP8 × DP2 = 16 个 rank，开启 EP 后预期 EP16；D 的 TP1 × DP16 = 16 个 rank，预期 EP16。
-没有额外的 `--expert-parallel-size 16` 参数。两个集群各自形成 EP 组，P 与 D 不组成同一个 EP32。
-不能把两台机器分别运行 DP1 或 DP8 独立实例后，声称已经组成跨机 EP16。
+共 14 份完整脚本，每份直接声明本机环境、路径、启动命令和配置。
+P/D 使用原生 CLI 和内联 JSON；K、协调器、Proxy 包含各自后台启动与就绪检查。
+可将单份脚本复制到对应服务器后独立执行，不需要同目录的其他模板文件。
+运行仍需要本机已安装的框架、KVOP、SDK 和模型。
 
-本次继续使用 source_tp0_only=true：P0/P1 各自逻辑 TP0 向全部 16 个 D 建源组，其他 P TP 仍计算。
-每个活跃 P TP0 每路径 16 个源组，79 层时 1264 个逐层 MR；不是 Jetty 实测数量。
-多机 EP 通信、初始化时间、队列资源和长请求稳定性需要重新测量。
+本版本移除了旧的 config.sh、start_npu.sh、k_start.sh；不再通过共享配置或编号参数转发。
+已有用户先备份本地脚本，再将配置填写到对应新脚本。所有入口均不接收参数，也不支持 --dry-run。
+直接编辑并用 `bash -n` 检查语法，JSON 可复制给 `python3 -m json.tool` 单独校验。
 
-上述 true 是临时 TP0 单源模式，不是原始全建链的必要设置。原始全建链可在 P/D 同时省略
-source_tp0_only 或设置 false，默认就是 false；全部 P TP rank 将对全部 16 个 D 注册多 MR 源组，
-主 KV/Indexer/Scale 按原传输规则分工，P 的 16 个 decode_endpoints 不减少。
+P 的 TP8 × DP2 和 D 的 TP1 × DP16 分别形成各自的 EP16；没有额外的 --expert-parallel-size 参数。
+P1/D1 必须通过全局 DP 大小、start-rank 和主地址加入对应集群。
+将两机分别运行成独立 DP1/DP8 实例不会形成所需跨机 EP16。
 
-本目录 start_npu.sh 当前在生成 extra 时显式写入 source_tp0_only=True，
-仅从其他 JSON 示例删除字段不会改变该脚本。要用这些模板运行全建链，须将该赋值改为
-source_tp0_only=False，或从 extra 构造中删除此参数，并同步到四个 P/D 容器。
-不要在 config.sh 中添加未被脚本读取的同名变量后假定已经生效。
-启动前用四个入口的 --dry-run 核对最终命令，确保两侧一致，再按本文顺序启动；
-已有实例切换须先排空并停止 P/D。全建链新增的源组及硬件资源需求需要重新验收。
+## 2. K 映射、全建链与容量
 
-## 2. K 固定映射与池化边界
+“一个 NPU 对应一个 CPU”在本方案中特指每个 D NPU 独占一个 K 服务，对应一个 CPU socket 的内存分区。
+P 不另分配 K Runtime；P 将源注册到目标 D 拥有的 K region。
+若要求全部 32 个 P/D NPU 各独占一个 CPU socket，需要 32 个 socket，八台双路 K 不足。
 
-| D 主机 / 物理 NPU | K 主机 | CPU/socket 服务 |
-| --- | --- | --- |
-| D0 / 0、1 | K0 .26 | 0:28997、1:28999 |
-| D0 / 2、3 | K1 .27 | 0:28997、1:28999 |
-| D0 / 4、5 | K2 .28 | 0:28997、1:28999 |
-| D0 / 6、7 | K3 .29 | 0:28997、1:28999 |
-| D1 / 0、1 | K4 .30 | 0:28997、1:28999 |
-| D1 / 2、3 | K5 .31 | 0:28997、1:28999 |
-| D1 / 4、5 | K6 .32 | 0:28997、1:28999 |
-| D1 / 6、7 | K7 .33 | 0:28997、1:28999 |
+每台 D 的 additional-config.kvaf_config.cpu_addresses 显式列出本机物理 NPU ID 0～7 的完整映射。
+D1 全局 DP rank 从 8 开始，但物理 NPU 键仍是本机 0～7。
+每服务 16 GiB、每 K 主机约 32 GiB，总计约 256 GiB，另预留 SDK 开销。
+这是固定分区接入；当前没有跨 K 的全局分配、容量均衡、故障接管或自动数据迁移。
+一个 D 的 region 用满时不会自动借用其他 K 的空闲 region。
 
-通过每台 D 的 kvaf_config.cpu_addresses，按本机物理 NPU ID 0～7 精确映射。
-D1 的全局 DP rank=8 不表示物理 NPU ID=8；仍使用本机键 0～7。
-每个 D worker 分配 16 GiB，合计约 256 GiB；每 K 服务约 16 GiB、每双路服务器约 32 GiB，加 SDK 开销。
-预算不是自动共享的统一容量。当前没有跨 K 的全局 key 分配、容量均衡、故障接管或自动数据迁移。
-某 D 的 region 用满时，不能自动借用其他 K 的空闲 region；这里是池化资源的固定分区接入。
+八份 K 脚本各自有 `numa_nodes=(0 1)`。先在对应宿主机检查：
 
-K 启动脚本为每服务使用 numactl 绑定 CPU 和内存 NUMA 节点；NUMA 节点号不等于 socket 号。
-先执行 `lscpu -e=CPU,SOCKET,NODE`、`numactl --hardware`，将 config.sh 的 K_NUMA_NODES
-改成每个完整 socket 对应的节点集合，例如 `("0-3" "4-7")`，不能盲用默认 `(0 1)`。
-此绑定不等同于固定 SDK 的 URMA/EID 候选，仍需逐 endpoint 验证实际 CPU Pull、内存归属及 UB 路径。
-八台 K 若拓扑不同，分别调整本机配置中的 K_NUMA_NODES。
+```bash
+lscpu -e=CPU,SOCKET,NODE
+numactl --hardware
+```
 
-## 3. 安装与版本
+NUMA 节点号不等于 socket 号。将本机脚本改为两个完整 socket 的节点集合，例如
+`numa_nodes=("0-3" "4-7")`，不能盲用默认值；不同 K 可以填写不同集合。
+numactl 绑定不等同于固定 SDK 的 URMA/EID 候选，仍需验证实际内存归属和 CPU Pull 的 UB 路径。
 
-四台智算节点容器使用相同模型、tokenizer、CANN/torch_npu、框架提交和 SDK 构建版本。
-八台 K 宿主机也使用同一 SDK 提交。基准 SDK 为 codex/cpu-pull-hbm-reference 的
+四份 P/D 脚本显式使用 source_tp0_only=false，采用原始全建链模式；省略字段也默认为 false。
+全部 P TP rank 按原规则连接全部 16 个 D endpoint，主 KV、Indexer 和 Scale 继续按原传输规则分工。
+这与旧扩容模板中的 true 不同。临时 TP0 单源模式仍可使用，但须在四份脚本同时改为 true 后重启 P/D。
+切换不会改变原生 KV 内存布局；全建链的队列资源、初始化时间和稳定性须按新规模重新验收。
+
+按 79 层估算，全建链中每个 P rank 每路径 16 个源组、1264 个逐层 MR；不是 Jetty 实测数量。
+多 MR 通道复用依赖匹配 SDK，不能把逐层 MR 数当作实际队列数。
+
+## 3. 安装与启动前修改
+
+四个智算容器保持相同模型、tokenizer、CANN/torch_npu、框架提交及 SDK 构建版本。
+八个 K 宿主机使用同一 SDK 提交。基准 SDK 为 codex/cpu-pull-hbm-reference 的
 `74c3fc491a257bae73356da54eafb08e1e9e4e45`，不可混用旧 Pull 协议。
 
-配置集中在 `examples/disaggregated_prefill_v1/kvaf_pooled/config.sh`：编辑地址、网卡、
-Python、模型、源码/build 路径及 NUMA 集合，再分发到所有节点。
-CONTROL_BACKLOG=128 由模板仅写入 D 的 kv_connector_extra_config.control_backlog，P 不写入。
-可配置整数 1～4096；四个 D/P 入口的 --dry-run 可核对最终命令。该值是每个 D 控制监听器的队列容量，
-不是 EP/TP 并行度或 Jetty 数；系统 somaxconn 仍可能限制实际排队容量。
-脚本无需修改框架源码。脚本修改仅对下一次启动生效，不支持热更新路由。
-容器需具备 NPU/HCCL/UB 所需设备权限和网络；以下按业务地址在容器内可绑定的部署环境编写。
-
-在四个 NPU 容器，加载匹配 CANN 环境后各执行：
+四个 NPU 容器加载匹配 CANN 环境后，各执行：
 
 ```bash
 (
@@ -96,11 +91,11 @@ bash scripts/install_kvaf_pd_source.sh - \
 )
 ```
 
-若同版本 Ascend 原生扩展和 KVOP 已成功构建，只需沿用基础指南的 SDK-only 构建命令。
-检查实际导入目录，以及 listen_hbm、cancel_raw_addr、ReadyToken.mr_id 等新接口。
-安装入口仍沿用已有 HCCL device RA 借用补丁。该示例不新增 SDK 修改。
+同版本 Ascend 原生扩展和 KVOP 已成功构建时，可用基础指南的 SDK-only 构建步骤。
+检查实际导入路径及 listen_hbm、cancel_raw_addr、ReadyToken.mr_id 等接口。
+安装入口保留现有 HCCL device RA 借用补丁，本次模板调整不修改 SDK。
 
-在八个 K 宿主机各执行，需已安装匹配 UMDK、liburma、编译工具、numactl：
+八个 K 宿主机需有匹配 UMDK、liburma、编译工具、numactl、Python3，以及框架脚本目录。各执行：
 
 ```bash
 (
@@ -115,130 +110,162 @@ bash scripts/kvaf_pd_k.sh build \
 )
 ```
 
-K0 另需宿主机 Python3 和框架目录中的协调器脚本，仅依赖标准库。
-证书、离线依赖和原生扩展问题按基础指南处理。RunAicpuCommInit 缺符号属于 HCCL/AICPU
-配套问题，先解决再扩容，不能靠修改 PD endpoint 修复。
+K0 的协调器及后台就绪检查只依赖 Python 标准库，使用宿主机实际 python3。
+证书、离线依赖、原生扩展问题按基础指南处理；RunAicpuCommInit 缺符号属于 HCCL/AICPU 配套问题。
 
-仅更新监听队列配置时，更新框架 Python 和模板即可，无需重编译 SDK 或 K；
-健康 K/协调器可保留。先排空并停止旧 P/D，再 D 两机 → P 两机 → Proxy 启动。
-原 D 控制端口 D0:31000～31007、D1:31008～31015 不变；P 不需要同步配置队列值。
-配置只在 D 创建 listener 时生效，不支持在线热更新；旧代码不能识别显式传入的新字段。
+逐份编辑以下内容，不会从其他脚本自动继承：
 
-## 4. 网络和启动前检查
+| 脚本 | 需核对的配置 |
+| --- | --- |
+| p0/p1 | 本机 IP/网卡；P0 DP 主地址；16 个 decode_endpoints；Python、模型、KVOP、SDK 路径 |
+| d0/d1 | 本机 IP/网卡；D0 DP 主地址；协调器地址；本机完整 cpu_addresses；相同模型和 SDK 路径 |
+| k0～k7 | 本机 local_ip、numa_nodes、两个端口、K_BIN、日志路径 |
+| coordinator | K0 local_ip、port、COORDINATOR 路径；使用宿主机 command -v python3 |
+| proxy | 本机地址、Python/框架路径、P0:8100、D0:8200 |
 
-- P 两机之间、D 两机之间均需可进行跨机 HCCL/EP 通信；检查驱动、固件、CANN 和网络配套。
-- P 集群主地址为 P0:13389，D 集群为 D0:13489，远端启动进程必须可达各自主地址。
-  HCCL、原生 DP 数据通信还会使用其他端口，不能只放行这两个控制端口。
-- 所有 P worker 必须访问 D0:31000～31007、D1:31008～31015，及 SDK ticket 返回的动态 HBM 监听端口。
-- P/D 访问所有对应 K endpoint；所有 D 访问 K0:28998。Proxy 访问 P0:8100 和 D0:8200。
-- 所有 NPU 进程在实际启动 shell 检查 soft/hard nofile，建议至少 65536；不要只提升其他 shell。
-- 启动前排空旧 Proxy/P/D；替换 K 或旧状态不明时，等旧 DMA 停止再清理/重启。
-- K 启动脚本每次启动两个后台实例，不自动替换旧服务。先确认 28997/28999 未被占用。
+D 保留已验证单机配置中的 FULL_DECODE_ONLY、异步调度、MLAPO、LMHead TP8、npugraph_ex、MTP eager 和 profiler。
+profiler 输出 `/home/d00843668/profiling_no_pooling` 须可创建和写入；扩容到 EP16 后仍需重新验证。
+P 使用 eager。两侧均关闭 enable_dsa_cp 和 c8_enable_reshape_optim，禁用 prefix caching；MTP tokens=3。
+四份脚本 diagnostics_requests=1、verify_kv=true，用于验收；性能测试前应同时改为 0/false。
 
-所有脚本和配置以相同相对目录分发。下面命令均以源码目录为当前目录。
+D 的 control_backlog=128 是每个框架控制监听器的 TCP 等待队列，允许整数 1～4096；P 不配置。
+它不代表并行度或 Jetty 数，内核 somaxconn 仍可能限制实际容量；修改后须重启 D listener。
+本次仅调整脚本无需重编译框架或 SDK；健康 K/协调器可保留。改变 K 映射或服务时必须排空旧会话。
 
-## 5. 启动顺序与命令
+## 4. 网络及进程检查
 
-### K0～K7：八个通算宿主机
+- P 两机之间、D 两机之间均需支持跨机 HCCL/EP 通信，并具备所需 NPU/UB 权限和配套驱动。
+- P DP 主地址 P0:13389，D DP 主地址 D0:13489；HCCL 及原生 DP 通信还会使用其他端口。
+- 所有 P worker 可访问 D0:31000～31007、D1:31008～31015，以及 SDK ticket 返回的动态 HBM 端口。
+- P/D 可访问对应 K 的 28997/28999；全部 D 可访问 K0:28998。
+- Proxy 可访问 P0:8100 和 D0:8200；P1/D1 为 headless，不填写独立 HTTP endpoint。
+- 在实际启动 NPU 的 shell 检查 soft/hard nofile，建议至少 65536；修改其他 shell 不会影响本终端。
+- 先排空并停止旧 Proxy/P/D。替换 K 前确认全部旧 DMA 已停止，且对应端口已释放。
 
-分别在 K0 到 K7 执行对应编号，例如 K0：
+K/协调器在宿主机运行，P/D/Proxy 在智算容器运行。下文命令均从框架源码目录执行。
+业务 IP 必须属于当前网络命名空间；Cannot assign requested address 需检查宿主机/容器及地址配置。
+
+## 5. 按节点启动
+
+### 5.1 八台 K 宿主机
+
+在表中对应的服务器执行一条命令；八条命令分别属于八台主机：
+
+| 主机 | 启动命令 |
+| --- | --- |
+| K0 .26 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k0_start.sh` |
+| K1 .27 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k1_start.sh` |
+| K2 .28 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k2_start.sh` |
+| K3 .29 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k3_start.sh` |
+| K4 .30 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k4_start.sh` |
+| K5 .31 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k5_start.sh` |
+| K6 .32 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k6_start.sh` |
+| K7 .33 | `bash examples/disaggregated_prefill_v1/kvaf_pooled/k7_start.sh` |
+
+每份脚本启动本机两个独立服务，均打印 SERVICE_READY 后返回 0。检查实际绑定与内存归属。
+仅在 K0 再运行一个协调器：
 
 ```bash
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
-bash examples/disaggregated_prefill_v1/kvaf_pooled/k_start.sh 0
-netstat -lntp 2>/dev/null | grep -E ':28997[[:space:]]|:28999[[:space:]]'
-```
-
-其余七台将末尾编号换为 1～7。检查日志实际 LISTEN、进程状态和 numactl 绑定；后台 PID 不代表成功。
-只在 K0 启动一个协调器：
-
-```bash
 bash examples/disaggregated_prefill_v1/kvaf_pooled/coordinator_start.sh
-netstat -lntp 2>/dev/null | grep ':28998[[:space:]]'
+netstat -lntp 2>/dev/null | grep -E ':28997[[:space:]]|:28998[[:space:]]|:28999[[:space:]]'
 ```
 
-### D0、D1：智算容器
+### 5.2 D0 与 D1 容器
 
-两个终端先后启动，不等待单个主节点独自 ready；跨机集群需要两侧加入：
+两个终端先后启动，使两机均加入集群，然后等待就绪。不要等 D0 独自 ready 才启动 D1。
 
 ```bash
 # D0 容器
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
 bash examples/disaggregated_prefill_v1/kvaf_pooled/d0_start.sh
 ```
 
 ```bash
-# D1 容器（headless，全局 start-rank=8）
+# D1 容器；headless，全局 DP start-rank=8
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
 bash examples/disaggregated_prefill_v1/kvaf_pooled/d1_start.sh
 ```
 
-D0 对外监听 8200；D1 不要求出现独立 HTTP API。D0/D1 控制端口采用全局 DP rank，
-不是两机都从 31000 开始。等待全部 16 个 worker 完成初始化、图 warmup：
+另开终端等全部 16 个 worker 完成初始化和图 warmup：
 
 ```bash
-curl --fail --noproxy '*' --max-time 10 -i http://141.62.38.24:8200/health
-# 在 D0 宿主机
+curl --fail --noproxy '*' --connect-timeout 3 --max-time 10 -i http://141.62.38.24:8200/health
+# D0 宿主机
 netstat -lntp 2>/dev/null | grep -E ':3100[0-7][[:space:]]'
-# 在 D1 宿主机
+# D1 宿主机
 netstat -lntp 2>/dev/null | grep -E ':310(0[89]|1[0-5])[[:space:]]'
 ```
 
-D 配置沿用用户已确认的单机 D 参数：FULL_DECODE_ONLY、async-scheduling、MLAPO、
-LMHead TP8、npugraph_ex、MTP eager、profiling；扩大到 DP16 后仍须重新验证这些组合。
+D1 不需要独立 HTTP API；控制端口按全局 DP rank 计算，两机不会都从 31000 开始。
 
-### P0、P1：智算容器
+### 5.3 P0 与 P1 容器
 
 ```bash
 # P0 容器
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
 bash examples/disaggregated_prefill_v1/kvaf_pooled/p0_start.sh
 ```
 
 ```bash
-# P1 容器（headless，全局 start-rank=1）
+# P1 容器；headless，全局 DP start-rank=1
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
 bash examples/disaggregated_prefill_v1/kvaf_pooled/p1_start.sh
 ```
 
-P 两端同样必须加入后再等 P0 的 8100 健康。P 使用 eager，不能自动沿用 D 的图编译参数。
-P/D 默认均采集 1 个请求的 KV 字节诊断。全部 4 个容器中的 config.sh 保持相同设置。
-
-### Proxy：P0 容器
+两机均加入后，另开终端检查 P0：
 
 ```bash
+curl --fail --noproxy '*' --connect-timeout 3 --max-time 10 -i http://141.62.38.12:8100/health
+```
+
+### 5.4 Proxy：P0 容器
+
+```bash
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
 bash examples/disaggregated_prefill_v1/kvaf_pooled/proxy_start.sh
-curl --noproxy '*' --connect-timeout 3 --max-time 180 \
+curl --fail --noproxy '*' --max-time 5 http://141.62.38.12:8000/healthcheck
+curl --fail --noproxy '*' --connect-timeout 3 --max-time 180 \
   http://141.62.38.12:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"glm","messages":[{"role":"user","content":"请回复测试成功"}],"temperature":0,"max_tokens":32,"stream":false}'
 ```
 
-Proxy 只配置 P0 和 D0 的集群 HTTP 入口，内部多机 DP 路由由原生 vLLM 处理。
-不要向 Proxy 填写 headless 的 P1/D1 HTTP endpoint。
+Proxy 只连接两个集群的主 HTTP 入口，跨机 DP 路由由原生 vLLM 处理。
+/healthcheck 仅证明 Proxy 已启动并完成自身客户端初始化；不替代 P/D 的 /health 或实际推理请求。
 
-## 6. 脚本预览、日志和验收
+## 6. 退出码、日志和恢复
 
-`p0_start.sh`、`p1_start.sh`、`d0_start.sh`、`d1_start.sh` 支持 `--dry-run`：
-只需要 config.sh 中的 Python 可执行，不加载 CANN/KVAF，不创建服务，输出完整原生命令。
+P/D 脚本前台 exec 原生 vLLM，失败退出码直接传递；输出与 plog 位于仓库 pd-logs/p0、p1、d0、d1。
+保持运行终端和 tee 正常，不使用 Ctrl+Z 暂停。metrics 目录为每次启动单独创建。
 
-```bash
-bash examples/disaggregated_prefill_v1/kvaf_pooled/p1_start.sh --dry-run
-bash examples/disaggregated_prefill_v1/kvaf_pooled/d1_start.sh --dry-run
-```
+K、协调器、Proxy 用 nohup 直接写日志文件，标准输入来自 /dev/null，不通过后台 tee。
+K/协调器日志位于 `/home/c00612283/pd-pool-logs/`，Proxy 位于仓库 pd-logs/proxy。
+每次独立目录保存 server.pid 或 socket-0.pid/socket-1.pid，并打印完整日志路径。
 
-日志统一保存在 config.sh 的 LOG_ROOT：p0/p1/d0/d1 为每次启动独立目录，K 按主机/socket 分开。
-NPU 服务前台 tee 需持续运行，不使用 Ctrl+Z；K/协调器/Proxy 直接后台写文件。
-保留各脚本打印的 PID、日志路径；只停止明确属于此部署的进程。
+后台启动后的 PID 只表示创建了进程，不能作为成功依据。脚本检查：
 
-验收至少包含：
+1. 新进程仍存活且未暂停，启动期间 PID 没有被复用。
+2. 就绪日志已出现，且目标 IPv4 监听 socket 确实属于这个新进程。
+3. Proxy 额外要求自己的 /healthcheck 返回 HTTP 200 和 status=ok。
 
-1. 从原生 rank 日志确认 P DP2/TP8/EP16、D DP16/TP1/EP16，且跨机 EP 组实际建成。
-2. 检查 16 个 D 的 KVAF CPU route，与映射表一一对应，不能因缺少键回退到同一默认 K。
-3. 检查全部 16 个 K region 驻留，内存实际落在指定 socket；每个 K 服务仅对应预期 D owner。
-4. 发送足够多的新请求覆盖两 P DP 和全部 D DP，不能由单个短请求证明全部路径可用。
-5. 固定长请求覆盖 DDR 满 block、NPU indexer/scale/tail、MTP，按 worker/request/generation 关联日志；
-   汇总两 P/两 D 日志运行 check_kvaf_pd_diagnostics.py，要求 DDR/compute 证据。
-6. 做非 PD 同模型、同采样基线精度对比；记录拓扑差异，再测取消、重复请求、并发及持续运行资源。
-7. 性能测试前在四容器同时将 DIAGNOSTICS_REQUESTS=0、VERIFY_KV=false 并重启 P/D；
-   profiling 是否继续保留按测量目标决定，不能把带字节校验的时延当作稳态性能。
+K 每服务等待最多 60 秒，协调器 20 秒，Proxy 180 秒；可在对应独立脚本修改 startup_timeout。
+K 两个服务依次检查，因此最坏等待约 120 秒。
+进程退出、暂停、端口冲突或超时均返回非零、输出失败日志，不会因为旧进程占端口就误报成功。
+K/协调器就绪检查只观察日志与本地 /proc，不发额外控制协议请求。
 
-恢复顺序：停止新请求和 Proxy，排空并停止 P 两机，再 D 两机；需要重启 K 时确认全部旧会话静止。
-协调器 failed/disconnected 时仍按基础指南处理，不能在旧 initializer 还活着时重启放行。
-本方案没有 K 自动故障迁移；K 服务或主入口故障需按该集群的恢复步骤重新建链。
+K 仅一个 socket 服务成功时，脚本也返回非零。已启动服务及 PID/日志保留，不自动重试、替换或杀进程。
+超时的服务可能稍后就绪，不要立即重复执行；先核对打印的 PID、监听者和日志。
+需要清理时先停止请求、Proxy、P 两机、D 两机，确认 DMA 静止，再停止明确属于本次部署的 K。
+协调器失联/failed 时按基础指南恢复，不能在旧 initializer 仍活着时重启协调器放行。
+
+## 7. 验收
+
+1. 从原生 rank 日志确认 P DP2/TP8/EP16、D DP16/TP1/EP16，且两组跨机 EP 实际建成。
+2. 检查 16 个 D worker 的 CPU route 与映射表一一对应；检查 16 个 K region 驻留及 socket 内存归属。
+3. 发送足够多的新请求覆盖两个 P DP 和全部 D DP；一个短请求无法证明所有路径可用。
+4. 固定长请求覆盖 DDR 满 block、NPU Indexer/Scale/tail、MTP；按 worker/request/generation 关联日志。
+5. 汇总两 P/两 D 日志运行 check_kvaf_pd_diagnostics.py，检查 DDR/compute 和字节诊断证据。
+6. 与非 PD 同模型、同采样基线比较精度，再验证取消、重复请求、并发、持续运行和资源释放。
+7. 性能测试前，四份 P/D 脚本同时改为 diagnostics_requests=0、verify_kv=false 并重启；
+   profiler 是否保留按测量目标决定，带字节校验的时延不能当作稳态性能。
