@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """PD launcher validation without importing or executing the NPU runtime."""
 
+import gc
 import json
 import os
 import shlex
@@ -11,13 +12,17 @@ import sys
 import tempfile
 import time
 import unittest
+import weakref
 from pathlib import Path
+from queue import Full
+from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 
 import test_kvaf_pd_integration as helpers
 
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE = helpers.load_file("pd_smoke_for_ut", "scripts/kvaf_pd_smoke.py")
+TRANSFER_STATS = helpers.load_file("pd_transfer_stats_for_ut", "scripts/kvaf_pd_transfer_stats.py")
 
 
 class TestPDLauncher(unittest.TestCase):
@@ -302,6 +307,206 @@ class TestPooledBackgroundStart(unittest.TestCase):
                 result = self.launch("proxy_start.sh", mode=mode)
                 self.assertEqual(result.returncode == 0, mode == "ready", result.stderr)
                 self.assertLess(time.monotonic() - started, 5)
+
+
+class TestPDTransferStats(unittest.TestCase):
+    def test_capture_writer_does_not_retain_native_sender_or_its_tensors(self):
+        class Sender:
+            tp_rank = 0
+            memories = {}
+
+            def _call(self, endpoint, message, **kwargs):
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            sender = Sender()
+            reference = weakref.ref(sender)
+            observer = TRANSFER_STATS.PullObserver(sender, dict(role="P"), directory=directory)
+            del sender
+            gc.collect()
+            try:
+                self.assertIsNone(reference())
+            finally:
+                observer.capture.close()
+
+    def row(self, *, member=0, factor=1, layer="layer0"):
+        return dict(
+            kind="layer",
+            request="r",
+            generation="g",
+            layer=layer,
+            peer="D:31000",
+            member=member,
+            ratio=2,
+            errors=[],
+            input_tokens=256,
+            chunks=[
+                dict(first=0, tokens=128, final=False, spans=dict(npu=[1_000_000, 2_000_000 * factor], cpu=None)),
+                dict(first=1, tokens=256, final=True, spans=dict(npu=[10_000_000, 11_000_000 * factor], cpu=None)),
+            ],
+        )
+
+    def test_parallel_envelopes_sum_chunks_without_compute_gaps(self):
+        first, second = self.row(), self.row(member=1)
+        second["chunks"][0]["spans"]["npu"] = [1_500_000, 3_000_000]
+        second["chunks"][1]["spans"]["npu"] = [10_500_000, 12_000_000]
+        result = TRANSFER_STATS.merge_layer([first, second], 256)
+        self.assertEqual(result["t1_ms"], 4)
+        self.assertIsNone(result["t2_ms"])
+        self.assertAlmostEqual(TRANSFER_STATS.distribution([1, 3])["p90_ms"], 2.8)
+
+    def test_missing_rank_chunk_and_invalid_pull_are_rejected(self):
+        for case in ("rank", "chunk", "error", "time"):
+            with self.subTest(case=case):
+                rows = [self.row(), self.row(member=1)]
+                if case == "rank":
+                    rows.pop()
+                elif case == "chunk":
+                    rows[0]["chunks"].pop()
+                elif case == "error":
+                    rows[0]["errors"].append("lost_ack")
+                else:
+                    rows[0]["chunks"][0]["spans"]["npu"] = [10, 5]
+                with self.assertRaises(ValueError):
+                    TRANSFER_STATS.merge_layer(rows, 256)
+
+    def test_all_layers_are_required_and_request_totals_are_not_layer_means(self):
+        header = dict(role="P", host="p", boot_id="b", engine="e", layers=["layer0", "layer1"])
+        rows = [self.row(member=member, layer=layer) for layer in header["layers"] for member in range(2)]
+        checkpoint = dict(enqueued=4, written=4, dropped=0, errors=0, pending_jobs=0, pending_layers=0)
+        layers, requests, rejected, _, problems = TRANSFER_STATS.collect_samples([(header, checkpoint, rows, "p")], 256)
+        self.assertEqual(len(layers), 2)
+        self.assertEqual(requests[0]["t1_ms"], 4)
+        self.assertFalse(rejected or problems)
+        _, requests, rejected, _, _ = TRANSFER_STATS.collect_samples([(header, checkpoint, rows[:2], "p")], 256)
+        self.assertFalse(requests)
+        self.assertTrue(rejected)
+
+    def test_observer_preserves_return_exception_and_rejects_lost_ack_samples(self):
+        state = {"lost": False}
+
+        def original(endpoint, message, **kwargs):
+            if message["op"] == "plan":
+                return dict(job="j", count=dict(npu=1, cpu=0))
+            if message["op"] == "pull" and state["lost"]:
+                raise TimeoutError("original error")
+            return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            observer = TRANSFER_STATS.PullObserver(
+                NS(_call=original, tp_rank=0, memories={"layer0": None}),
+                dict(role="P", host="p", boot_id="b", engine="e"),
+                directory=directory,
+            )
+            try:
+                observer(
+                    "D",
+                    dict(
+                        op="plan",
+                        request="r",
+                        generation="g",
+                        layer="layer0",
+                        first=0,
+                        tokens=128,
+                        final=True,
+                        member=0,
+                        ratio=1,
+                    ),
+                )
+                state["lost"] = True
+                with self.assertRaisesRegex(TimeoutError, "original error"):
+                    observer("D", dict(op="pull", job="j", path="npu", batch=0))
+                self.assertTrue(observer("D", dict(op="complete", job="j")))
+            finally:
+                observer.capture.close()
+            captures = TRANSFER_STATS.read_captures(Path(directory).glob("*.jsonl"))
+            _, requests, rejected, _, _ = TRANSFER_STATS.collect_samples(captures, 128)
+            self.assertFalse(requests)
+            self.assertTrue(rejected)
+
+    def test_full_buffer_drops_measurements_without_waiting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = TRANSFER_STATS.BufferedCapture(dict(role="P"), lambda: {}, directory=directory)
+            try:
+                with patch.object(capture.queue, "put_nowait", side_effect=Full):
+                    capture.emit(dict(kind="layer"))
+                self.assertEqual(capture.dropped, 1)
+                self.assertEqual(capture.enqueued, 0)
+            finally:
+                capture.close()
+            self.assertEqual(TRANSFER_STATS.read_captures([capture.path])[0][1]["dropped"], 1)
+
+    def test_performance_comparison_reports_regressions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "baseline.json").write_text(json.dumps(dict(output_throughput_tps=100, mean_tpot_ms=10)))
+            argv = [
+                "compare",
+                "--baseline",
+                str(root / "baseline.json"),
+                "--sampled",
+                str(root / "sampled.json"),
+                "--max-regression-percent",
+                "1",
+                "--output",
+                str(root / "comparison.json"),
+            ]
+            with patch("builtins.print"):
+                (root / "sampled.json").write_text(json.dumps(dict(output_throughput_tps=99.5, mean_tpot_ms=10.05)))
+                self.assertEqual(TRANSFER_STATS.main(argv), 0)
+                (root / "sampled.json").write_text(json.dumps(dict(output_throughput_tps=95, mean_tpot_ms=10.05)))
+                self.assertEqual(TRANSFER_STATS.main(argv), 2)
+
+    def test_offline_cli_outputs_four_aggregated_distributions_and_checks_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for member in range(2):
+                header = dict(
+                    kind="header", schema=1, role="P", host="p", boot_id="b", engine="e", layers=["layer0", "layer1"]
+                )
+                rows = [self.row(member=member, layer=layer) for layer in header["layers"]]
+                if member == 0:
+                    for row in rows:
+                        row["chunks"][0]["spans"]["cpu"] = [2_000_000, 3_000_000]
+                        row["chunks"][1]["spans"]["cpu"] = [12_000_000, 14_000_000]
+                checkpoint = dict(
+                    kind="checkpoint", enqueued=2, written=2, dropped=0, errors=0, pending_jobs=0, pending_layers=0
+                )
+                (root / f"P{member}.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in [header, *rows, checkpoint])
+                )
+                d_header = dict(kind="header", schema=1, role="D_scheduler", dp_rank=member, max_num_seqs=16)
+                d_checkpoint = dict(
+                    kind="checkpoint", enqueued=0, written=0, dropped=0, errors=0, batch_histogram={"16": 5}
+                )
+                (root / f"D{member}.jsonl").write_text(json.dumps(d_header) + "\n" + json.dumps(d_checkpoint) + "\n")
+            argv = [
+                str(root),
+                "--output-dir",
+                str(root / "report"),
+                "--expected-requests",
+                "1",
+                "--input-tokens",
+                "256",
+                "--expected-dp",
+                "2",
+            ]
+            with patch("builtins.print"):
+                self.assertEqual(TRANSFER_STATS.main(argv), 0)
+                report = json.loads((root / "report/summary.json").read_text())
+                means = {(row["metric"], row["scope"]): row["mean_ms"] for row in report["summary"]}
+                self.assertEqual(
+                    means,
+                    {
+                        ("t1", "request_layer"): 2,
+                        ("t1", "request"): 4,
+                        ("t2", "request_layer"): 3,
+                        ("t2", "request"): 6,
+                    },
+                )
+                (root / "P1.jsonl").unlink()
+                self.assertEqual(TRANSFER_STATS.main(argv), 2)
+            self.assertEqual(json.loads((root / "report/summary.json").read_text())["status"], "INCOMPLETE")
 
 
 class TestPDSmoke(unittest.TestCase):

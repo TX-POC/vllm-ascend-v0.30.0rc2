@@ -3,6 +3,7 @@
 
 import importlib
 import socket
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -379,6 +380,49 @@ class TestPDFlow(unittest.TestCase):
         self.assertEqual(self.receiver.get_finished(), {"r"})
         self.assert_payload(256)
         self.assertFalse(self.pool.policy._received_tails)
+
+    def test_temporary_transfer_observer_keeps_native_chunks_bytes_and_waits(self):
+        from test_kvaf_pd_scripts import TRANSFER_STATS
+
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            observers = []
+            for sender in self.senders:
+                observer = TRANSFER_STATS.PullObserver(
+                    sender,
+                    dict(role="P", host="p", boot_id="boot", engine="e"),
+                    directory=directory,
+                )
+                observers.append(observer)
+                sender._call = observer
+
+                def event_factory():
+                    event = Mock()
+                    events.append(event)
+                    return event
+
+                sender.event_factory = event_factory
+            try:
+                self.seed(129)
+                self.chunk(65, final=False)
+                self.chunk(128, previous=65, final=False)
+                self.chunk(129, previous=128)
+                self.assertEqual(self.receiver.get_finished(), {"r"})
+                self.assert_payload(129)
+            finally:
+                for observer in observers:
+                    observer.capture.close()
+            captures = TRANSFER_STATS.read_captures(Path(directory).glob("*.jsonl"))
+            layers, requests, rejected, _, problems = TRANSFER_STATS.collect_samples(captures, 129)
+            self.assertFalse(rejected)
+            self.assertFalse(problems)
+            self.assertEqual(len(layers), len(self.memories))
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["t1_layers"], len(self.memories))
+            self.assertEqual(requests[0]["t2_layers"], 4)
+        self.assertEqual(len(events), 3 * len(self.senders) * len(self.memories))
+        for event in events:
+            event.synchronize.assert_called_once()
 
     def test_target_graph_replay_without_python_layer_hooks_uses_successful_forward_fence(self):
         self.seed(129)
