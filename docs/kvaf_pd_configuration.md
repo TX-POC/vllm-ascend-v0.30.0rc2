@@ -160,6 +160,22 @@ TP、DP、最大长度和内存预算由部署命令显式填写，不由 helper
 `gpu-memory-utilization=0.85`。最后一项是 HBM 预算，不是 DDR 比例。
 `max-model-len` 包括输入与输出总 token，HTTP usage 数量不能替代实际字节校验。
 
+编译环境与入口按用户 2026-11-11 验证命令记录，完整步骤见
+[部署指南第 3、4 节](kvaf_pd_deployment.md#3-pd-容器编译与检查)。
+
+| 项目 | P/D 容器 | K 宿主机 |
+| --- | --- | --- |
+| Python | /usr/local/python3.12.13/bin/python3 | K 编译不启用 Python；协调器使用 command -v python3 |
+| CANN / SOC | cann-9.2.0 / ascend950dt_9582 | 不使用容器 CANN/Python 编译 NPU kernel |
+| 主入口 | install_kvaf_pd_source.sh -，保留现有 vLLM | cmake -S SDK -B build-hostcpu-k |
+| SDK 构建 | CPU_OFFLOAD、AIV Get/Put、Python ON；REMOTE_CPU_SERVICE OFF | REMOTE_CPU_SERVICE ON；CPU_OFFLOAD、AIV Get/Put、Python OFF |
+| 单独重建 | 原生 pip editable 安装 Ascend；KVOP/build.sh 8 Python | cmake --build --parallel 8，检查二进制和 ldd |
+| 成功标记 | ASCEND_KVOP_KVAF_BUILD_OK，并检查 ASCEND_EXTENSION_OK / PD_SDK_IMPORT_OK | K_SERVICE_BUILD_OK；运行时另查 LISTEN |
+
+完整容器安装已包含 Ascend、KVOP、SDK，不要求随后再各重建一遍。
+编译 shell 中的 source 不会跨括号保留；启动脚本仍须加载自己的 KVOP 环境。
+当前确认 K 和协调器分别是 141.62.38.24:28997、141.62.38.24:28998，D 的 cpu_address 与 K 一致。
+
 主要脚本职责如下，均保留现有调用接口：
 
 | 工具 | 用途 |

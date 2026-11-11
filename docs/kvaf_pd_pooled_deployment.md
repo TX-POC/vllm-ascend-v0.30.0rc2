@@ -76,18 +76,56 @@ numactl 绑定不等同于固定 SDK 的 URMA/EID 候选，仍需验证实际内
 八个 K 宿主机使用同一 SDK 提交。基准 SDK 为 codex/cpu-pull-hbm-reference 的
 `74c3fc491a257bae73356da54eafb08e1e9e4e45`，不可混用旧 Pull 协议。
 
-四个 NPU 容器加载匹配 CANN 环境后，各执行：
+四个 NPU 容器分别执行用户在 2026-11-11 验证过的完整编译命令。
+该块自行加载 CANN，保留现有 vLLM，并保存完整构建日志：
 
 ```bash
 (
 set -euo pipefail
-cd /home/c00612283/vllm-ascend-v0.30.0rc2
+
 export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
+export ASCEND_REPO=/home/c00612283/vllm-ascend-v0.30.0rc2
+export KVAF_PD_SRC=/home/c00612283/KVAF-Devlop
+export KVAF_PD_BUILD=/home/c00612283/KVAF-Devlop/build-pd-py312
+export MODEL=/home/models/GLM-5.3-w4a4c8-mxfp4
 export SOC_VERSION=ascend950dt_9582
-export COMPILE_CUSTOM_KERNELS=1 MAX_JOBS=8
-bash scripts/install_kvaf_pd_source.sh - \
-  /home/c00612283/KVAF-Devlop \
-  /home/c00612283/KVAF-Devlop/build-pd-py312
+
+CANN_ROOT=/usr/local/Ascend/cann-9.2.0
+set +u
+if [ -f "$CANN_ROOT/set_env.sh" ]; then
+    source "$CANN_ROOT/set_env.sh"
+elif [ -f "$CANN_ROOT/bin/setenv.bash" ]; then
+    source "$CANN_ROOT/bin/setenv.bash"
+else
+    echo "未找到 CANN 环境脚本：$CANN_ROOT"
+    exit 1
+fi
+set -u
+
+cd "$ASCEND_REPO"
+test -x "$KVAF_PD_PYTHON"
+test -f "$KVAF_PD_SRC/CMakeLists.txt"
+test -f "$KVAF_PD_SRC/docs/connector_pull_api_design.md"
+
+"$KVAF_PD_PYTHON" -c \
+'import sys, torch, torch_npu, vllm; print(sys.executable); print(torch.__version__, torch_npu.__version__); print(vllm.__version__, vllm.__file__)'
+command -v cmake
+command -v ninja
+command -v g++
+
+if bash scripts/install_kvaf_pd_source.sh - \
+    "$KVAF_PD_SRC" "$KVAF_PD_BUILD" \
+    2>&1 | tee /home/c00612283/full-model-pd-build.log
+then
+    echo "ASCEND_KVOP_KVAF_BUILD_OK"
+else
+    echo "构建失败，提取具体错误："
+    grep -n -B 15 -A 40 -m 1 \
+      -E 'CMake Error|fatal error:|Traceback|ModuleNotFoundError|No such file|not found' \
+      /home/c00612283/full-model-pd-build.log \
+      || tail -n 150 /home/c00612283/full-model-pd-build.log
+    exit 1
+fi
 )
 ```
 
@@ -95,18 +133,45 @@ bash scripts/install_kvaf_pd_source.sh - \
 检查实际导入路径及 listen_hbm、cancel_raw_addr、ReadyToken.mr_id 等接口。
 安装入口保留现有 HCCL device RA 借用补丁，本次模板调整不修改 SDK。
 
-八个 K 宿主机需有匹配 UMDK、liburma、编译工具、numactl、Python3，以及框架脚本目录。各执行：
+八个 K 宿主机需有匹配 UMDK、liburma、CMake、C++ 编译器、numactl 和 Python3。
+分别放置对应的独立 K 启动脚本；K0 另保留协调器所需的框架脚本目录。
+K 编译直接使用 SDK CMake，不需要容器 Python 或完整 Ascend 构建环境。各执行：
 
 ```bash
 (
 set -euo pipefail
-cd /home/c00612283/vllm-ascend-v0.30.0rc2
-bash scripts/kvaf_pd_k.sh build \
-  /home/c00612283/KVAF-Devlop \
-  /home/c00612283/KVAF-Devlop/build-hostcpu-k \
+
+SRC=/home/c00612283/KVAF-Devlop
+BUILD="$SRC/build-hostcpu-k"
+
+if [ ! -f "$SRC/CMakeLists.txt" ] ||
+   [ ! -f "$SRC/docs/connector_pull_api_design.md" ]; then
+    echo "KVAF 源码不完整或分支不匹配，请检查 cpu-pull-hbm-reference 分支。"
+    exit 1
+fi
+
+test -f /usr/include/ub/umdk/urma/urma_api.h
+test -f /usr/lib64/liburma.so
+
+cmake -S "$SRC" -B "$BUILD" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+  -DKVAF_BUILD_PYTHON=OFF \
+  -DKVAF_ENABLE_CPU_OFFLOAD=OFF \
+  -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+  -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
+  -DBUILD_TESTING=OFF \
   -DKVAF_URMA_INCLUDE_DIR=/usr/include/ub/umdk/urma \
   -DKVAF_URMA_LIBRARY=/usr/lib64/liburma.so \
-  '-DCMAKE_CXX_FLAGS=-DURMA_ACCESS_REMOTE_READ=URMA_ACCESS_READ -DURMA_ACCESS_REMOTE_WRITE=URMA_ACCESS_WRITE -DURMA_ACCESS_REMOTE_ATOMIC=URMA_ACCESS_ATOMIC'
+  '-DCMAKE_CXX_FLAGS=-DURMA_ACCESS_REMOTE_READ=URMA_ACCESS_READ -DURMA_ACCESS_REMOTE_WRITE=URMA_ACCESS_WRITE -DURMA_ACCESS_REMOTE_ATOMIC=URMA_ACCESS_ATOMIC' \
+  2>&1 | tee /home/c00612283/kvaf-k-configure.log
+
+cmake --build "$BUILD" --parallel 8 \
+  2>&1 | tee /home/c00612283/kvaf-k-build.log
+
+test -x "$BUILD/runtime/kvaf_cpu_service"
+ldd "$BUILD/runtime/kvaf_cpu_service"
+echo "K_SERVICE_BUILD_OK"
 )
 ```
 

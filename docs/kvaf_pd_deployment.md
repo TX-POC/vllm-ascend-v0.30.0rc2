@@ -1,6 +1,8 @@
 # KVAF PD 分离部署操作指南
 
 本文替代此前分散的安装、单机四层、双机、TP0、多 MR、初始化和诊断操作说明。
+编译和 P/D/K/协调器/Proxy 命令以用户在 2026-11-11 提供的已验证环境为准；
+K 服务地址经用户再次确认，统一为 24 号宿主机 141.62.38.24:28997。
 配置含义见 [PD 配置说明](kvaf_pd_configuration.md)。命令中的路径、IP 和网卡按实际环境修改。
 
 ## 1. 验收拓扑与版本
@@ -58,48 +60,164 @@ git log -1 --oneline
 
 ## 3. P/D 容器编译与检查
 
-以下操作在两侧各执行一次。CANN 脚本不一定兼容 nounset，加载时暂时关闭 `set -u`。
+本节按用户在 2026-11-11 提供的已验证命令整理。P、D 容器各执行一次，
+使用容器内 `/usr/local/python3.12.13/bin/python3`、CANN 9.2.0 和 ascend950dt_9582。
+K 侧的宿主机编译另见第 4 节，不使用容器 Python 路径。
+
+### 3.1 完整安装：Ascend、KVOP、KVAF
+
+完整安装会依次构建 Ascend 原生扩展、KVOP 和 KVAF SDK，成功后无需立即再执行单独重建。
+`-` 表示保留现有 vLLM；不是跳过 vLLM-Ascend 编译。
 
 ```bash
 (
-set -Eeuo pipefail
-trap 'rc=$?; printf "失败：行=%s 命令=%s 退出码=%s\n" "$LINENO" "$BASH_COMMAND" "$rc" >&2' ERR
-cd /home/c00612283/vllm-ascend-v0.30.0rc2
+set -euo pipefail
+
 export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
+export ASCEND_REPO=/home/c00612283/vllm-ascend-v0.30.0rc2
+export KVAF_PD_SRC=/home/c00612283/KVAF-Devlop
+export KVAF_PD_BUILD=/home/c00612283/KVAF-Devlop/build-pd-py312
+export MODEL=/home/models/GLM-5.3-w4a4c8-mxfp4
 export SOC_VERSION=ascend950dt_9582
+
+CANN_ROOT=/usr/local/Ascend/cann-9.2.0
 set +u
-source /usr/local/Ascend/cann-9.2.0/set_env.sh
+if [ -f "$CANN_ROOT/set_env.sh" ]; then
+    source "$CANN_ROOT/set_env.sh"
+elif [ -f "$CANN_ROOT/bin/setenv.bash" ]; then
+    source "$CANN_ROOT/bin/setenv.bash"
+else
+    echo "未找到 CANN 环境脚本：$CANN_ROOT"
+    exit 1
+fi
 set -u
+
+cd "$ASCEND_REPO"
 test -x "$KVAF_PD_PYTHON"
-"$KVAF_PD_PYTHON" -c 'import sys, torch, torch_npu, vllm; print(sys.executable, torch.__version__, torch_npu.__version__, vllm.__version__)'
+test -f "$KVAF_PD_SRC/CMakeLists.txt"
+test -f "$KVAF_PD_SRC/docs/connector_pull_api_design.md"
+
+"$KVAF_PD_PYTHON" -c \
+'import sys, torch, torch_npu, vllm; print(sys.executable); print(torch.__version__, torch_npu.__version__); print(vllm.__version__, vllm.__file__)'
 command -v cmake
 command -v ninja
 command -v g++
+
+if bash scripts/install_kvaf_pd_source.sh - \
+    "$KVAF_PD_SRC" "$KVAF_PD_BUILD" \
+    2>&1 | tee /home/c00612283/full-model-pd-build.log
+then
+    echo "ASCEND_KVOP_KVAF_BUILD_OK"
+else
+    echo "构建失败，提取具体错误："
+    grep -n -B 15 -A 40 -m 1 \
+      -E 'CMake Error|fatal error:|Traceback|ModuleNotFoundError|No such file|not found' \
+      /home/c00612283/full-model-pd-build.log \
+      || tail -n 150 /home/c00612283/full-model-pd-build.log
+    exit 1
+fi
 )
 ```
 
-首次安装，或 Ascend 扩展、KVOP 尚未成功构建时，在同一匹配 CANN 环境执行：
+`connector_pull_api_design.md` 是这组安装入口检查的分支标识；缺失时核对 SDK 版本和路径，
+不要创建空文件绕过。安装脚本不下载或切换 SDK 分支；保留现有 HCCL device RA 借用补丁，
+会检查/应用匹配 SDK 中的既有补丁目标，这不是本次文档更新新增的 SDK 修改。
+
+### 3.2 单独重建的环境边界
+
+完整安装括号内 source 的环境不会保留到父终端。下面每个单独重建和导入检查块都在
+自己的子 shell 加载同一套 CANN，不依赖上一个括号的环境；同时沿用容器已有 ATB 配套环境。
+
+### 3.3 单独重建 vLLM-Ascend 原生扩展
+
+仅在完整安装未完成或原生扩展缺失时执行。保留现有 vLLM、torch 和 torch_npu，
+使用原生 editable 安装流程，并通过实际扩展导入确认结果：
 
 ```bash
 (
 set -euo pipefail
+
+CANN_ROOT=/usr/local/Ascend/cann-9.2.0
+set +u
+if [ -f "$CANN_ROOT/set_env.sh" ]; then
+    source "$CANN_ROOT/set_env.sh"
+elif [ -f "$CANN_ROOT/bin/setenv.bash" ]; then
+    source "$CANN_ROOT/bin/setenv.bash"
+else
+    echo "未找到 CANN 环境脚本：$CANN_ROOT"
+    exit 1
+fi
+set -u
+
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
-export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
+
 export SOC_VERSION=ascend950dt_9582
-export COMPILE_CUSTOM_KERNELS=1 MAX_JOBS=8
-bash scripts/install_kvaf_pd_source.sh - \
-  /home/c00612283/KVAF-Devlop \
-  /home/c00612283/KVAF-Devlop/build-pd-py312 \
-  2>&1 | tee /home/c00612283/pd-source-build.log
+export COMPILE_CUSTOM_KERNELS=1
+export MAX_JOBS=8
+
+/usr/local/python3.12.13/bin/python3 -m pip install \
+  --no-deps --no-build-isolation -v -e . \
+  2>&1 | tee /home/c00612283/ascend-native-extension-build.log
+
+/usr/local/python3.12.13/bin/python3 -c \
+'import torch, torch_npu; import vllm_ascend.vllm_ascend_C as m; print("ASCEND_EXTENSION_OK", m.__file__)'
 )
 ```
 
-`-` 表示保留已有 vLLM，仍构建 Ascend 原生扩展、KVOP 和 KVAF。
-若扩展/KVOP 已存在，仅更新本次 SDK 接口适配，在已加载 CANN 的终端执行：
+### 3.4 单独重建 KVOP
+
+KVOP 与 KVAF 是两个不同组件。这里使用用户验证过的 KVOP 原生 build.sh 参数，
+并发 8、Python 3.12.13；原记录中的 KVOF 指这里的 KVOP。
 
 ```bash
 (
 set -euo pipefail
+
+CANN_ROOT=/usr/local/Ascend/cann-9.2.0
+set +u
+if [ -f "$CANN_ROOT/set_env.sh" ]; then
+    source "$CANN_ROOT/set_env.sh"
+elif [ -f "$CANN_ROOT/bin/setenv.bash" ]; then
+    source "$CANN_ROOT/bin/setenv.bash"
+else
+    echo "未找到 CANN 环境脚本：$CANN_ROOT"
+    exit 1
+fi
+set -u
+
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
+
+bash third_party/KVOP/build.sh \
+  8 /usr/local/python3.12.13/bin/python3 \
+  2>&1 | tee /home/c00612283/kvop-build.log
+
+source third_party/KVOP/env.sh
+echo "KVOP_ENV_OK"
+)
+```
+
+括号内加载的 KVOP 环境也不会传回父终端；P/D 启动脚本仍须各自 source third_party/KVOP/env.sh。
+
+### 3.5 仅更新 SDK 及最终导入检查
+
+若 Ascend 原生扩展和 KVOP 已正确构建，仅更新 SDK 时可继续使用 SDK-only 安装入口：
+
+```bash
+(
+set -euo pipefail
+
+CANN_ROOT=/usr/local/Ascend/cann-9.2.0
+set +u
+if [ -f "$CANN_ROOT/set_env.sh" ]; then
+    source "$CANN_ROOT/set_env.sh"
+elif [ -f "$CANN_ROOT/bin/setenv.bash" ]; then
+    source "$CANN_ROOT/bin/setenv.bash"
+else
+    echo "未找到 CANN 环境脚本：$CANN_ROOT"
+    exit 1
+fi
+set -u
+
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
 export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
 bash scripts/install_kvaf_pd.sh \
@@ -108,15 +226,24 @@ bash scripts/install_kvaf_pd.sh \
 )
 ```
 
-安装脚本保留已有的 HCCL device RA 借用补丁并校验接口，不下载或切换 SDK 分支。
-它会修改匹配 SDK 中的补丁目标文件；这不是本次新增的 SDK 修改。
-框架采用 editable 安装时，纯 Python 更新无需重新编译 vLLM、Ascend 扩展或 KVOP。
-
 检查原生扩展及 SDK，不能只以 binding 链接成功作为整体安装成功的依据：
 
 ```bash
 (
 set -euo pipefail
+
+CANN_ROOT=/usr/local/Ascend/cann-9.2.0
+set +u
+if [ -f "$CANN_ROOT/set_env.sh" ]; then
+    source "$CANN_ROOT/set_env.sh"
+elif [ -f "$CANN_ROOT/bin/setenv.bash" ]; then
+    source "$CANN_ROOT/bin/setenv.bash"
+else
+    echo "未找到 CANN 环境脚本：$CANN_ROOT"
+    exit 1
+fi
+set -u
+
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
 source third_party/KVOP/env.sh
 export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
@@ -132,63 +259,149 @@ CHECK
 )
 ```
 
-## 4. K 编译与后台启动：24 号宿主机
+框架采用 editable 安装时，纯 Python 或文档更新无需重编译 vLLM、Ascend 扩展、KVOP 或 SDK。
 
-宿主机需有同版本 SDK 源码、UMDK 头文件及 liburma；不是在 P/D 容器内运行 K。
+## 4. K 编译与启动：24 号宿主机
+
+K 在宿主机编译、运行，需有同版本 SDK 源码、CMake、C++ 编译器、UMDK 头文件及 liburma。
+这里直接使用 SDK 的 CMake 入口，不依赖宿主机存在完整 vLLM/Ascend 容器环境或容器 Python。
+协调器另需框架目录中的 Python 脚本和宿主机 Python3。
+
+### 4.1 K 侧机头编译
 
 ```bash
 (
 set -euo pipefail
-cd /home/c00612283/vllm-ascend-v0.30.0rc2
+
+SRC=/home/c00612283/KVAF-Devlop
+BUILD="$SRC/build-hostcpu-k"
+
+if [ ! -f "$SRC/CMakeLists.txt" ] ||
+   [ ! -f "$SRC/docs/connector_pull_api_design.md" ]; then
+    echo "KVAF 源码不完整或分支不匹配，请检查 cpu-pull-hbm-reference 分支。"
+    exit 1
+fi
+
 test -f /usr/include/ub/umdk/urma/urma_api.h
 test -f /usr/lib64/liburma.so
-bash scripts/kvaf_pd_k.sh build \
-  /home/c00612283/KVAF-Devlop \
-  /home/c00612283/KVAF-Devlop/build-hostcpu-k \
+
+cmake -S "$SRC" -B "$BUILD" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+  -DKVAF_BUILD_PYTHON=OFF \
+  -DKVAF_ENABLE_CPU_OFFLOAD=OFF \
+  -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+  -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
+  -DBUILD_TESTING=OFF \
   -DKVAF_URMA_INCLUDE_DIR=/usr/include/ub/umdk/urma \
   -DKVAF_URMA_LIBRARY=/usr/lib64/liburma.so \
-  '-DCMAKE_CXX_FLAGS=-DURMA_ACCESS_REMOTE_READ=URMA_ACCESS_READ -DURMA_ACCESS_REMOTE_WRITE=URMA_ACCESS_WRITE -DURMA_ACCESS_REMOTE_ATOMIC=URMA_ACCESS_ATOMIC'
+  '-DCMAKE_CXX_FLAGS=-DURMA_ACCESS_REMOTE_READ=URMA_ACCESS_READ -DURMA_ACCESS_REMOTE_WRITE=URMA_ACCESS_WRITE -DURMA_ACCESS_REMOTE_ATOMIC=URMA_ACCESS_ATOMIC' \
+  2>&1 | tee /home/c00612283/kvaf-k-configure.log
+
+cmake --build "$BUILD" --parallel 8 \
+  2>&1 | tee /home/c00612283/kvaf-k-build.log
+
+test -x "$BUILD/runtime/kvaf_cpu_service"
+ldd "$BUILD/runtime/kvaf_cpu_service"
+echo "K_SERVICE_BUILD_OK"
 )
 ```
 
-先确认旧监听者已退出，再启动 K；直接写文件，避免 tee 被暂停后阻塞 K 的日志输出：
+K 的 KVAF_ENABLE_CPU_OFFLOAD=OFF 关闭的是构建 NPU 侧 offload Runtime，不是关闭远程 CPU 服务；
+远程服务由 KVAF_BUILD_REMOTE_CPU_SERVICE=ON 单独启用。K 不构建 Python binding 或 AIV Get/Put kernel。
+ldd 输出须没有 not found；K_SERVICE_BUILD_OK 还不能代替后续实际启动检查。
+
+### 4.2 K 服务：24 号宿主机前台运行
+
+用户已确认 K 在 24 号，因此统一监听 141.62.38.24:28997，D 的 cpu_address 保持同一个地址。
+早先命令中的 141.62.38.12 不能在 24 号上直接绑定。先确认旧监听者已退出，另开专用终端执行：
 
 ```bash
-K_LOG="/home/c00612283/kvaf-k-$(date +%Y%m%d_%H%M%S).log"
-nohup /home/c00612283/KVAF-Devlop/build-hostcpu-k/runtime/kvaf_cpu_service \
-  --listen 141.62.38.24 --port 28997 --memory-page-mode default \
-  > "$K_LOG" 2>&1 < /dev/null &
-echo "K_PID=$! K_LOG=$K_LOG"
+(
+set -euo pipefail
+
+K_BIN=/home/c00612283/KVAF-Devlop/build-hostcpu-k/runtime/kvaf_cpu_service
+test -x "$K_BIN"
+
+stdbuf -oL -eL "$K_BIN" \
+  --listen 141.62.38.24 \
+  --port 28997 \
+  --memory-page-mode default \
+  2>&1 | tee "/home/c00612283/kvaf-k-$(date +%Y%m%d_%H%M%S).log"
+)
 ```
 
-协调器只依赖 Python 标准库，用宿主机实际 Python，不使用容器内解释器路径：
+这是前台服务，保持终端及 tee 正常运行，不使用 Ctrl+Z 暂停。
+如需后台驻留，使用直接重定向到文件的 nohup 方式，避免后台 tee 被暂停后造成 pipe_write。
+
+### 4.3 K 初始化协调器：24 号宿主机
+
+只运行一个协调器。使用宿主机实际 command -v python3，不使用容器解释器路径。
+先检查 28998；已有健康实例可保留，暂停或残留实例按第 9 节处理。
 
 ```bash
+(
+set -euo pipefail
+
+REPO=/home/c00612283/vllm-ascend-v0.30.0rc2
+PYTHON=$(command -v python3)
 COORD_LOG="/home/c00612283/kvaf-coordinator-$(date +%Y%m%d_%H%M%S).log"
-nohup "$(command -v python3)" -u \
-  /home/c00612283/vllm-ascend-v0.30.0rc2/scripts/kvaf_pd_init_coordinator.py \
-  --host 141.62.38.24 --port 28998 \
+
+test -f "$REPO/scripts/kvaf_pd_init_coordinator.py"
+
+nohup "$PYTHON" "$REPO/scripts/kvaf_pd_init_coordinator.py" \
+  --host 141.62.38.24 \
+  --port 28998 \
   > "$COORD_LOG" 2>&1 < /dev/null &
-echo "COORD_PID=$! COORD_LOG=$COORD_LOG"
+
+COORD_PID=$!
+echo "COORD_PID=$COORD_PID"
+echo "COORD_LOG=$COORD_LOG"
+
+ready=0
+for attempt in {1..20}; do
+    if ! kill -0 "$COORD_PID" 2>/dev/null; then
+        cat "$COORD_LOG" >&2
+        exit 1
+    fi
+    if [ -s "$COORD_LOG" ] &&
+       grep -Fq 'KVAF_INIT_COORDINATOR_LISTEN address=141.62.38.24:28998' "$COORD_LOG" &&
+       kill -0 "$COORD_PID" 2>/dev/null; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+    tail -n 30 "$COORD_LOG" >&2
+    echo "协调器未在20秒内就绪，请先检查已打印的PID和日志，不要重复启动。" >&2
+    exit 1
+fi
+)
 ```
+
+启动命令保留原有参数，补充新进程存活和就绪日志检查；超时不自动杀进程，先查状态。
+后台 PID 本身不是成功依据。然后在同一宿主机核对实际监听者和命令：
 
 ```bash
-netstat -lntp 2>/dev/null | grep -E ':28997[[:space:]]|:28998[[:space:]]'
-tail -n 10 "$K_LOG"
-tail -n 10 "$COORD_LOG"
+netstat -lntp 2>/dev/null \
+  | grep -E ':28997[[:space:]]|:28998[[:space:]]'
+ps -ww -eo pid,ppid,stat,etime,args \
+  | grep -E '[k]vaf_cpu_service|[k]vaf_pd_init_coordinator.py'
 ```
 
-必须看到 K 的 `LISTEN` 和协调器的 `KVAF_INIT_COORDINATOR_LISTEN`，不能只看后台 PID。
-已有健康服务可复用，不重复启动。同一部署只运行一个初始化协调器。
+必须看到 K 的 LISTEN、协调器的 KVAF_INIT_COORDINATOR_LISTEN 和正确进程持有的监听端口。
+启动顺序为 K → 协调器 → D → P → Proxy。
 
 ## 5. 启动 D：24 号容器
 
-以下为用户在 2026-11-10 确认可跑通的 D 配置，直接调用原生 CLI，不经过会默认添加
+以下为用户在 2026-11-11 再次提供的已验证 D 配置，直接调用原生 CLI，不经过会默认添加
 `--enforce-eager` 的启动 helper。保留异步调度、FULL_DECODE_ONLY、MLAPO 和 profiling 配置。
 这条命令在当前终端前台运行，另开终端检查就绪；不要使用 Ctrl+Z 暂停服务或 tee。
 先在实际启动 shell 检查 `ulimit -Sn`、`ulimit -Hn`，硬限制不足时先调整该 shell 或容器配置。
 profiling 目录 `/home/d00843668/profiling_no_pooling` 须存在或可由运行用户创建、写入。
-本次在保留该 D 模型执行参数的基础上，显式增加 control_backlog=128；省略也使用同一默认值。
+按用户本次命令保留 control_backlog=128；省略也使用同一默认值。它位于 kv_connector_extra_config，
+不能放进 additional_config.kvaf_config。
 该参数仅作用于 D 框架控制端口，不影响 KVAF/模型协议，详见 [监听队列说明](kvaf_pd_configuration.md#d-控制连接突发与监听队列)。
 
 ```bash
@@ -337,24 +550,88 @@ netstat -lntp 2>/dev/null | grep -E ':3100[0-7][[:space:]]'
 
 ## 6. 启动 P：12 号容器
 
+以下按用户本次提供的 P 命令展开原生 CLI，保留 TP8/DP1/EP8、eager、MTP3、
+8 个 decode_endpoints、TP0 单源、1 个诊断请求和 KV 字节校验。
+同样前台运行，另开终端检查健康；不经过启动 helper 自动补参。
+
 ```bash
 (
 set -euo pipefail
+
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
-export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# 沿用容器已有 CANN / ATB 环境。
+unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY
+unset http_proxy HTTP_PROXY all_proxy ALL_PROXY
+
+source third_party/KVOP/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+
+local_ip=141.62.38.12
+nic_name=enp34s0f1
+export VLLM_HOST_IP="$local_ip"
+export HCCL_IF_IP="$local_ip"
+export GLOO_SOCKET_IFNAME="$nic_name"
+export TP_SOCKET_IFNAME="$nic_name"
+export HCCL_SOCKET_IFNAME="$nic_name"
+
+export HCCL_DFS_CONFIG="task_exception:off,inconsistent_check:off"
+export HCCL_CONNECT_TIMEOUT=1800
+export HCCL_EXEC_TIMEOUT=1800
+export HCCL_BUFFSIZE=400
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_INTRA_PCIE_ENABLE=1
+export HCCL_INTRA_ROCE_ENABLE=0
+export TORCH_HCCL_ASYNC_ERROR_HANDLING=0
+
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
+export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1
+export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
-LOG_DIR="$PWD/pd-logs/p/$(date +%Y%m%d_%H%M%S)_$$"
-mkdir -p "$LOG_DIR"
-export ASCEND_PROCESS_LOG_PATH="$LOG_DIR/plog"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=1
+export ASCEND_GLOBAL_LOG_LEVEL=3
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+dir="$PWD/pd-logs/p/$(date +%Y%m%d_%H%M%S)_$$"
+export ASCEND_PROCESS_LOG_PATH="$dir/plog"
 export PROMETHEUS_MULTIPROC_DIR="/dev/shm/vllm_metrics_p_$$"
-nohup bash scripts/start_vllm_pd.sh p 141.62.38.12 enp34s0f1 -- \
+mkdir -p "$ASCEND_PROCESS_LOG_PATH" "$PROMETHEUS_MULTIPROC_DIR"
+printf 'P server log: %s/server.log\n' "$dir"
+exec > >(tee "$dir/server.log") 2>&1
+
+exec /usr/local/python3.12.13/bin/python3 \
+  -m vllm.entrypoints.cli.main serve \
   /home/models/GLM-5.3-w4a4c8-mxfp4 \
-  --port 8100 --tensor-parallel-size 8 \
-  --data-parallel-size 1 --data-parallel-size-local 1 \
-  --data-parallel-address 141.62.38.12 --data-parallel-rpc-port 13389 \
-  --pipeline-parallel-size 1 --max-model-len 131072 \
-  --max-num-batched-tokens 4096 --max-num-seqs 1 --gpu-memory-utilization 0.85 \
+  --host 0.0.0.0 \
+  --port 8100 \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 1 \
+  --data-parallel-size-local 1 \
+  --data-parallel-address "$local_ip" \
+  --data-parallel-rpc-port 13389 \
+  --pipeline-parallel-size 1 \
+  --distributed-executor-backend mp \
+  --enable-expert-parallel \
+  --served-model-name glm \
+  --seed 1024 \
+  --max-model-len 131072 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 1 \
+  --gpu-memory-utilization 0.85 \
+  --trust-remote-code \
+  --enforce-eager \
+  --quantization ascend \
+  --no-enable-prefix-caching \
+  --worker-cls vllm_ascend.distributed.kv_transfer.kvaf.pd.worker.PDKVWorker \
+  --block-size 128 \
+  --kv-cache-dtype fp8 \
+  --attention_config.indexer_kv_dtype fp8 \
+  --speculative-config '{
+    "num_speculative_tokens": 3,
+    "method": "deepseek_mtp",
+    "enforce_eager": true
+  }' \
   --kv-transfer-config '{
     "kv_connector": "PDKVoffloadConnector",
     "kv_connector_module_path": "vllm_ascend.distributed.kv_transfer.kvaf.pd.connector",
@@ -362,10 +639,14 @@ nohup bash scripts/start_vllm_pd.sh p 141.62.38.12 enp34s0f1 -- \
     "kv_port": 31000,
     "kv_connector_extra_config": {
       "decode_endpoints": [
-        "141.62.38.24:31000", "141.62.38.24:31001",
-        "141.62.38.24:31002", "141.62.38.24:31003",
-        "141.62.38.24:31004", "141.62.38.24:31005",
-        "141.62.38.24:31006", "141.62.38.24:31007"
+        "141.62.38.24:31000",
+        "141.62.38.24:31001",
+        "141.62.38.24:31002",
+        "141.62.38.24:31003",
+        "141.62.38.24:31004",
+        "141.62.38.24:31005",
+        "141.62.38.24:31006",
+        "141.62.38.24:31007"
       ],
       "source_tp0_only": true,
       "timeout": 600,
@@ -376,44 +657,51 @@ nohup bash scripts/start_vllm_pd.sh p 141.62.38.12 enp34s0f1 -- \
   --additional-config '{
     "enable_cpu_binding": true,
     "enable_dsa_cp": false,
-    "multistream_overlap_shared_expert": true,
     "c8_enable_reshape_optim": false,
     "kvaf_config": {
       "enabled": false,
       "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312"
     }
-  }' > "$LOG_DIR/server.log" 2>&1 < /dev/null &
-echo "P_PID=$! P_LOG=$LOG_DIR/server.log"
+  }'
 )
 ```
 
 ```bash
 curl --fail --noproxy '*' --max-time 10 -i http://141.62.38.12:8100/health
-curl --fail --noproxy '*' --max-time 10 -i http://141.62.38.24:8200/health
 ```
 
-P 的 `enabled=false` 仅关闭原混部卸载入口，不关闭显式选中的 PD Connector。
-本节 P 使用 helper 默认的 FP8、block128、MTP3、seed1024、eager、禁用 prefix 和 EP 等参数，
-完整默认值见配置说明。P 的 diagnostics_requests=1、verify_kv=true 与上述 D 对齐。
-已有自定义启动脚本可以保留，但须逐项对齐这些配置；不要把 D 的图模式参数直接套用到 P。
-仓库根目录四层脚本、`examples/.../kvaf_two_node` 的历史模板仍保留兼容用途；
-其默认 TP/DP、8192 长度和占位 IP 不等同于本次验收配置，不直接套用于全模型。
+本次 P/D 命令记录的是已验证部署基线：max-model-len=131072、max-num-seqs=1、
+source_tp0_only=true、diagnostics_requests=1、verify_kv=true。
+它不是 131072 输入/125 输出、D 单卡 batch=16 的性能采样配置；切换负载时须另核算总长度、
+HBM/DDR 预算及诊断成本，不能把两套配置混用。没有在本次安装文档中自动启用临时采样 Connector。
+
+已有自定义启动脚本可继续使用，但须逐项对齐上述已验证参数。
+仓库根目录四层脚本和 examples/.../kvaf_two_node 的历史模板保留兼容用途，
+其默认 TP/DP、8192 长度和占位 IP 不等同于本次全模型基线，不直接套用。
 
 ## 7. Proxy 与请求：12 号容器
 
-确认 8000 没有旧 Proxy。先核对监听进程参数，再结束明确属于旧部署的进程。
+确认 8000 没有旧 Proxy，先核对监听者和进程参数。
+按用户已验证方式，在 12 号容器先检查 P/D 健康，再以前台方式启动 Proxy：
 
 ```bash
+(
+set -euo pipefail
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
-PROXY_LOG="/home/c00612283/kvaf-proxy-$(date +%Y%m%d_%H%M%S).log"
+
+curl --fail --noproxy '*' http://141.62.38.12:8100/health
+curl --fail --noproxy '*' http://141.62.38.24:8200/health
+
 KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3 \
-nohup bash scripts/kvaf_pd_proxy.sh \
+bash /home/c00612283/vllm-ascend-v0.30.0rc2/scripts/kvaf_pd_proxy.sh \
   --host 141.62.38.12 --port 8000 \
   --prefiller-hosts 141.62.38.12 --prefiller-ports 8100 \
-  --decoder-hosts 141.62.38.24 --decoder-ports 8200 \
-  > "$PROXY_LOG" 2>&1 < /dev/null &
-echo "PROXY_PID=$! PROXY_LOG=$PROXY_LOG"
+  --decoder-hosts 141.62.38.24 --decoder-ports 8200
+)
 ```
+
+本节 Proxy 前台运行，保持终端正常，另开终端发送请求。
+/health 返回 HTTP 200 且 body 为空是正常行为；端口占用时不要暂停旧服务后直接起第二个。
 
 ```bash
 curl --noproxy '*' --connect-timeout 3 --max-time 180 \
@@ -424,9 +712,9 @@ curl --noproxy '*' --connect-timeout 3 --max-time 180 \
 ```
 
 响应应包含 choices 和 usage。流式请求的访问日志 200 可能只表示响应头已发送；
-以客户端完整收到内容为准。`finish_reason=length` 表示达到输出 token 上限。
+以客户端完整收到内容为准。finish_reason=length 表示达到输出 token 上限。
 短请求不覆盖满块 DDR 路径，继续使用已保存的 41510-token 请求做长请求回归，
-输入 token 加输出上限必须小于等于 131072，不能重新拼写 prompt 后假定仍是同一用例。
+输入 token 加输出上限必须小于等于本基线的 131072，不能重新拼写 prompt 后假定仍是同一用例。
 
 ## 8. 诊断与精度验收
 
@@ -463,6 +751,7 @@ TP 拓扑不同可能引入数值差异，不能仅凭文本差异断定传输�
 | patch 询问 File to patch | 停止交互，核对依赖版本、解包目录和补丁工作目录，不反复套补丁 |
 | 缺少 `_build_info` 或 `vllm_ascend_C` | 完整安装对应 Ascend 原生扩展，再验证 import；KVAF binding 成功不能替代它 |
 | Build KVOP first | 在同一容器、Python/CANN 环境运行 third_party/KVOP/build.sh |
+| Free memory on device … less than desired GPU memory utilization | 启动前 HBM 空闲不足；在宿主机用 npu-smi info 和 ps 查旧实例/其他容器占用，确认归属后释放；只剩 1.11 GiB 时把 0.85 降成 0.8 也无法解决 |
 | Available KV cache memory: 0.00 GiB | 查实际 NPU 占用、遗留进程及 profiling 预算；不是物理 HBM 必然为零，不能盲目提高利用率 |
 | shared memory broadcast 等待 | 找 worker 的首个异常或长耗时操作，不能据此直接认定共享内存不足 |
 | CPU control response unavailable | 同时检查 K 日志、服务状态、初始化并发和协议版本；TCP 可连不等于协议处理正常 |
@@ -482,7 +771,8 @@ TP 拓扑不同可能引入数值差异，不能仅凭文本差异断定传输�
 协调器封锁状态在内存中，不会因 D 重启或延长 timeout 自动清除。K 重启使旧 ticket 全部失效，
 不能继续使用原 D/P 实例。不要在旧 initializer 存活时重启协调器放行新一批初始化。
 
-K/协调器日志直接重定向到文件；本节 D 的前台 tee 需保持运行。`STAT=T` 使用明确 PID 恢复或正常结束，避免暂停 tee
+本次已验证命令中 K/P/D 使用前台 tee，协调器后台直接重定向文件，Proxy 前台运行。
+采用后台运行替代方案时，K/协调器优先直接写文件；前台 tee 需保持运行。`STAT=T` 使用明确 PID 恢复或正常结束，避免暂停 tee
 造成 `pipe_write`。只清理确认属于本次部署的进程，不使用全局 pkill python 或盲目重置设备。
 
 ## 10. 辅助工具与归档
