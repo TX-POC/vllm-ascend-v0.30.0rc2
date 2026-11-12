@@ -3,7 +3,7 @@
 本文替代此前分散的安装、单机四层、双机、TP0、多 MR、初始化和诊断操作说明。
 编译和 P/D/K/协调器/Proxy 命令以用户在 2026-11-11 提供的已验证环境为准；
 K 服务地址经用户再次确认，统一为 24 号宿主机 141.62.38.24:28997。
-配置含义见 [PD 配置说明](kvaf_pd_configuration.md)。命令中的路径、IP 和网卡按实际环境修改。
+配置含义见 [双机 PD 配置说明](kvaf_pd_2nodes_configuration.md)。命令中的路径、IP 和网卡按实际环境修改。
 
 ## 1. 验收拓扑与版本
 
@@ -39,7 +39,7 @@ P、D 框架版本必须一致；P/D binding 与 K 必须来自同一 SDK 版本
 所有 P TP 恢复参与向全部 D 的多 MR 注册与原传输分工，P 的完整 decode_endpoints 清单仍须保留。
 不要只修改一侧，也不要把关闭 TP0-only 当作开启 DSA CP 的兼容性证明。
 切换前排空并停止 P/D，更新两侧配置后按 D → P → Proxy 启动；
-重新验证通信资源占用和精度，详见 [两种模式及切换说明](kvaf_pd_configuration.md#原始全建链与临时-tp0-单源模式)。
+重新验证通信资源占用和精度，详见 [TP0-only 的适用范围及切换说明](kvaf_pd_2nodes_configuration.md#43-tp0-only-的适用范围)。
 
 ## 2. 更新前保存现场
 
@@ -402,7 +402,7 @@ ps -ww -eo pid,ppid,stat,etime,args \
 profiling 目录 `/home/d00843668/profiling_no_pooling` 须存在或可由运行用户创建、写入。
 按用户本次命令保留 control_backlog=128；省略也使用同一默认值。它位于 kv_connector_extra_config，
 不能放进 additional_config.kvaf_config。
-该参数仅作用于 D 框架控制端口，不影响 KVAF/模型协议，详见 [监听队列说明](kvaf_pd_configuration.md#d-控制连接突发与监听队列)。
+该参数仅作用于 D 框架控制端口，不影响 KVAF/模型协议，详见 [Connector 扩展字段](kvaf_pd_2nodes_configuration.md#41-connector-扩展字段)。
 
 ```bash
 (

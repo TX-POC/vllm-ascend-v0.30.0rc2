@@ -2,7 +2,7 @@
 
 本方案使用两个跨机 DP/EP 集群和八台 K 通算服务器，不修改框架计算、KVAF SDK 或 KV 内存布局。
 这是扩容部署模板，尚未完成该规模的硬件联调；单 P/单 D 的成功不能替代本方案验收。
-基础安装排障见 [PD 部署指南](kvaf_pd_deployment.md)，字段含义见 [配置说明](kvaf_pd_configuration.md)。
+基础安装排障见 [PD 部署指南](kvaf_pd_deployment.md)，字段含义见 [配置说明](kvaf_pd_2nodes_configuration.md)。
 
 ## 1. 拓扑与独立脚本
 
