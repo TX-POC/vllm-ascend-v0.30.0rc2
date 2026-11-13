@@ -15,10 +15,13 @@ from ..layout import describe_cache_layouts
 from .backend import create_decode_cache
 from .config import PDConfig
 from .memory import allocate_layer
+from .observation import observed_call
 from .runtime import PDAdapter, load_sdk
 
 
 class PDKVModelRunner(NPUModelRunner):
+    pd_request_observer = None
+
     def __init__(self, vllm_config, device):
         self.pd_config = PDConfig.from_vllm(vllm_config)
         self.pd_memories = {}
@@ -189,6 +192,7 @@ class PDKVModelRunner(NPUModelRunner):
             pool=self.kvaf_cache_state,
             draft_limit=self.effective_drafter_max_model_len,
         )
+        self.pd_request_observer = getattr(connector, "request_observer", None)
         self.pd_diagnostics = connector.diagnostics
         if self.pd_diagnostics:
             wrapped = set()
@@ -247,7 +251,17 @@ class PDKVModelRunner(NPUModelRunner):
                         graph_mode=mode,
                         num_tokens_padded=args[0] if args else kwargs.get("num_tokens_padded"),
                     )
-        result = super()._model_forward(*args, **kwargs)
+        if self.pd_request_observer is None:
+            result = super()._model_forward(*args, **kwargs)
+        else:
+            result = observed_call(
+                self.pd_request_observer,
+                "P.target_host_forward" if self.is_kv_producer else "D.target_host_forward",
+                super()._model_forward,
+                *args,
+                context=dict(request_ids=tuple(self.input_batch.req_ids)),
+                **kwargs,
+            )
         if diagnostics:
             for req in diagnostics.context:
                 if diagnostics.active(req):
@@ -263,7 +277,17 @@ class PDKVModelRunner(NPUModelRunner):
         return super()._skip_drafting(*args, **kwargs)
 
     def propose_draft_token_ids(self, *args, **kwargs):
-        result = super().propose_draft_token_ids(*args, **kwargs)
+        if self.pd_request_observer is None:
+            result = super().propose_draft_token_ids(*args, **kwargs)
+        else:
+            result = observed_call(
+                self.pd_request_observer,
+                "P.mtp_host_propose" if self.is_kv_producer else "D.mtp_host_propose",
+                super().propose_draft_token_ids,
+                *args,
+                context=dict(request_ids=tuple(self.input_batch.req_ids)),
+                **kwargs,
+            )
         self._diagnose_drafting("MTP_PROPOSE_DONE")
         if self.is_kv_producer:
             # Captured MTP graphs may omit Python write hooks, just as target

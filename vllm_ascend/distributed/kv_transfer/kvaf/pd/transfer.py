@@ -9,6 +9,7 @@ and key lifetime. SDK Put/Ready handles remain the authority for DMA state.
 from typing import Any
 
 from .layout import Segments
+from .observation import notify, observed_call
 
 
 def _exact_cover(segments: Segments, entries) -> None:
@@ -44,6 +45,7 @@ class CpuPullTransfer:
         segments.validate_call(ready.source.mr_length)
         _exact_cover(segments, put.entries)
         self.runtime, self.ready, self.put, self.segments = runtime, ready, put, segments
+        self.request_observer = self.observer_context = None
         base = runtime.remote_region["base"]
         self.dst_offsets = tuple(address - base for address in segments.destinations)
         if base <= 0 or any(offset < 0 for offset in self.dst_offsets):
@@ -59,9 +61,22 @@ class CpuPullTransfer:
         if self.attempted or self.decision is not None:
             raise RuntimeError("recover the original Put; do not resubmit READ")
         self.attempted = True
-        self.runtime.submit_cpu_pull(
-            self.ready, self.put, self.segments.sources, self.dst_offsets, self.segments.lengths
-        )
+        if self.request_observer is None:
+            self.runtime.submit_cpu_pull(
+                self.ready, self.put, self.segments.sources, self.dst_offsets, self.segments.lengths
+            )
+        else:
+            observed_call(
+                self.request_observer,
+                "D.cpu_submit",
+                self.runtime.submit_cpu_pull,
+                self.ready,
+                self.put,
+                self.segments.sources,
+                self.dst_offsets,
+                self.segments.lengths,
+                context=self.observer_context,
+            )
 
     def finish(self, timeout_ms: int = 30000) -> None:
         if self.decision == "abort":
@@ -72,14 +87,33 @@ class CpuPullTransfer:
             if not self.attempted or not self.put.submitted:
                 raise RuntimeError("CPU Pull was not submitted")
             # Wait can raise on timeout or IN_DOUBT; no Abort/Prepare in except.
-            state = self.runtime.wait_cpu_pull(self.put, timeout_ms)
+            if self.request_observer is None:
+                state = self.runtime.wait_cpu_pull(self.put, timeout_ms)
+            else:
+                state = observed_call(
+                    self.request_observer,
+                    "D.cpu_wait",
+                    self.runtime.wait_cpu_pull,
+                    self.put,
+                    timeout_ms,
+                    context=self.observer_context,
+                )
             if state.name not in ("DONE", "COMMITTED"):
                 raise RuntimeError("CPU Pull has not completed")
             self.decision = "commit"
-        result = self.runtime.commit_put(self.put)
+            if self.request_observer is not None:
+                notify(self.request_observer, "point", name="CPU_PULL_DONE", context=self.observer_context)
+        if self.request_observer is None:
+            result = self.runtime.commit_put(self.put)
+        else:
+            result = observed_call(
+                self.request_observer, "D.cpu_commit", self.runtime.commit_put, self.put, context=self.observer_context
+            )
         if result.name != "COMMITTED":
             raise RuntimeError("CPU Pull Commit has not completed")
         self.committed = True
+        if self.request_observer is not None:
+            notify(self.request_observer, "point", name="DDR_COMMITTED", context=self.observer_context)
 
     def abort(self) -> None:
         if self.decision == "commit":
@@ -125,8 +159,21 @@ class CpuPullTransfer:
         if not self.published:
             if len(state.addresses) != start:
                 raise ValueError("request addresses changed during publication")
-            writer._publish_addresses(group, list(keys), [(state, len(keys))])
+            if self.request_observer is None:
+                writer._publish_addresses(group, list(keys), [(state, len(keys))])
+            else:
+                observed_call(
+                    self.request_observer,
+                    "D.cpu_publish",
+                    writer._publish_addresses,
+                    group,
+                    list(keys),
+                    [(state, len(keys))],
+                    context=self.observer_context,
+                )
             self.published = True
+            if self.request_observer is not None:
+                notify(self.request_observer, "point", name="DDR_PUBLISHED", context=self.observer_context)
 
 
 class NpuPullTransfer:
@@ -137,6 +184,7 @@ class NpuPullTransfer:
             raise ValueError("raw READ output must be contiguous")
         segments.validate_call(source_bytes, output.numel() * output.element_size())
         self.runtime, self.ready, self.segments = runtime, ready, segments
+        self.request_observer = self.observer_context = None
         self.output, self.stream = output, stream
         self.arrays = None
         self.attempted = False
@@ -160,10 +208,24 @@ class NpuPullTransfer:
             raise RuntimeError("recover this Ready; never replay raw READ")
         self.arrays = self._make_arrays()
         self.attempted = True
-        result = self.runtime.batch_get_raw_addr(self.ready, *self.arrays, self.output, self.stream)
+        if self.request_observer is None:
+            result = self.runtime.batch_get_raw_addr(self.ready, *self.arrays, self.output, self.stream)
+        else:
+            result = observed_call(
+                self.request_observer,
+                "D.npu_read",
+                self.runtime.batch_get_raw_addr,
+                self.ready,
+                *self.arrays,
+                self.output,
+                self.stream,
+                context=self.observer_context,
+            )
         if result != {"state": "done", "sequence": self.ready.sequence}:
             raise RuntimeError("unexpected raw READ completion")
         self.done = True
+        if self.request_observer is not None:
+            notify(self.request_observer, "point", name="HBM_PULL_DONE", context=self.observer_context)
 
     def recover(self) -> None:
         if self.done:
@@ -172,7 +234,18 @@ class NpuPullTransfer:
             raise RuntimeError("no recoverable raw READ; do not report output ready")
         # This SDK returns None on successful resolve, and raises if recovery
         # merely cancels/cleans up a failed operation. None is not a Tensor.
-        self.runtime.resolve_raw_addr(self.ready)
+        if self.request_observer is None:
+            self.runtime.resolve_raw_addr(self.ready)
+        else:
+            observed_call(
+                self.request_observer,
+                "D.npu_recovery",
+                self.runtime.resolve_raw_addr,
+                self.ready,
+                context=self.observer_context,
+            )
         if self.runtime.pending_raw_addr:
             raise RuntimeError("raw READ is still pending")
         self.done = True
+        if self.request_observer is not None:
+            notify(self.request_observer, "point", name="HBM_PULL_DONE", context=self.observer_context)

@@ -10,6 +10,7 @@ from threading import Event
 from types import SimpleNamespace
 
 from .control import call
+from .observation import notify, observed_call
 from .registration import PULL_API_VERSION, PeerRegistration
 
 INITIALIZATION_CLEANUP_TIMEOUT = 5.0
@@ -61,6 +62,7 @@ class Sender:
         self.cpu_eid, self.npu_eid = cpu_eid, npu_eid
         self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
         self.diagnostics = diagnostics
+        self.request_observer = None
         self.activate, self.stream_factory, self.event_factory = activate, stream_factory, event_factory
         self.external_id, self.tp_rank, self.tp_size, self.dp_rank = external_id, tp_rank, tp_size, dp_rank
         self.active = not config.source_tp0_only or tp_rank == 0
@@ -239,6 +241,16 @@ class Sender:
             if self.diagnostics:
                 self.diagnostics.select(self.external_id(req_id), metadata.generations[req_id], alias=req_id)
             self.active_requests[req_id] = (request, metadata.generations[req_id])
+            if self.request_observer is not None:
+                notify(
+                    self.request_observer,
+                    "request_bound",
+                    request_id=req_id,
+                    external_id=self.external_id(req_id),
+                    generation=metadata.generations[req_id],
+                    tokens=request.prompt_len,
+                    name="P_REQUEST_BOUND",
+                )
             if request.chunk_finish:
                 self.final_submitted.add(req_id)
         for req_id, params in getattr(metadata, "cancellations", {}).items():
@@ -298,12 +310,24 @@ class Sender:
         requests = tuple(
             (req_id, request, self.metadata.generations[req_id]) for req_id, request in self.metadata.requests.items()
         )
+        if self.request_observer is not None:
+            notify(self.request_observer, "p_task", name="P_SEND_QUEUED", layer=layer, requests=requests)
         self.futures[layer] = self.executor.submit(self._send_layer, layer, requests, event, skipped)
 
     def _send_layer(self, layer, requests, event, skipped=False):
+        if self.request_observer is not None:
+            notify(self.request_observer, "p_task", name="P_SEND_STARTED", layer=layer, requests=requests)
         self.activate()
         event = _ProductionEvent(event)
-        event.synchronize()
+        if self.request_observer is None:
+            event.synchronize()
+        else:
+            observed_call(
+                self.request_observer,
+                "P.production_wait",
+                event.synchronize,
+                context=dict(layer=layer, requests=requests),
+            )
         memory = self.memories[layer]
         for req_id, request, generation in requests:
             if request.remote_tp_size is None or request.remote_tp_size < 1 or self.tp_size % request.remote_tp_size:
@@ -313,6 +337,20 @@ class Sender:
             if endpoint not in self.peers:
                 raise ValueError(f"D worker {endpoint} is outside the configured full mesh")
             registration = self.registrations[endpoint, layer]
+            if self.request_observer is not None:
+                # The original production wait has completed; request, source
+                # and route metadata exist. Includes subsequent owner/plan waits.
+                notify(
+                    self.request_observer,
+                    "p_eligible",
+                    layer=layer,
+                    request_id=req_id,
+                    request=request,
+                    generation=generation,
+                    member=member,
+                    ratio=ratio,
+                    peer=endpoint,
+                )
             with registration.owner.operation(self.config.timeout):
                 message = {
                     "op": "plan",
@@ -511,6 +549,8 @@ class Sender:
         done = eligible & self.active_requests.keys()
         self.native_finished.difference_update(done)
         for req_id in done:
+            if self.request_observer is not None:
+                notify(self.request_observer, "request_released", request_id=req_id)
             self.active_requests.pop(req_id)
             self.final_submitted.discard(req_id)
         return done

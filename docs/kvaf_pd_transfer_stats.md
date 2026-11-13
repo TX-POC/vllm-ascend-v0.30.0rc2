@@ -1,5 +1,12 @@
 # KVAF PD 传输时延临时统计工具
 
+当前已开始逐步实现 v1.6 性能工具：可配置采集、服务环境内 `summary`、单 `export-trace` 和离线查看器已在本地落地。
+请优先按 [本批配置、命令与边界](kvaf_pd_performance_tool/IMPLEMENTATION_STATUS.md) 使用。
+新版采样 Connector 需要同目录 `kvaf_pd_performance.json` 中显式 `enabled=true`，随仓默认关闭。
+下文的原无子命令统计流程保留用于旧 schema 1 文件；新版 schema 3 采用 summary/export-trace，两种新命令均可读 schema 1/2/3。
+正式测试请使用 summary/export-trace：默认仅选择显式 request_phase=measure，预热、profiling 和未知用途均排除。
+仅 P/D 文件需同时提供带标签的 --client-records；历史无子命令分析不提供用途识别。
+
 本工具仅采集和离线统计，不发送推理请求、不修改 KVAF SDK 或框架核心，也不自动修改现有启动脚本。
 文件为 [统计脚本](../scripts/kvaf_pd_transfer_stats.py) 和
 [采样 Connector](../scripts/kvaf_pd_transfer_stats_connector.py)。通过原生 Connector 配置显式启用，

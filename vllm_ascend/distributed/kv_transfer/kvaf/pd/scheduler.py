@@ -11,6 +11,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import (
     SFAPDRD2HScheduler,
 )
 
+from .observation import notify
+
 
 def native_draft_limit(vllm_config):
     """Match the native Runner's effective drafter context limit."""
@@ -109,6 +111,7 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._pd_requests = {}
+        self.request_observer = None
 
     @staticmethod
     def _try_create_copy_sfa_slot_allocator(vllm_config):
@@ -137,6 +140,15 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
                 tuple(tuple(group) for group in blocks.get_block_ids()),
             )
             self._pd_requests[request.request_id] = seed
+            if self.request_observer is not None:
+                notify(
+                    self.request_observer,
+                    "request_bound",
+                    request_id=request.request_id,
+                    generation=seed.generation,
+                    tokens=seed.tokens,
+                    name="D_REQUEST_BLOCKS_READY",
+                )
             # Reuse the native deferred-cancellation lifecycle for *all* PD
             # receives, including ordinary MTP. No DSpark protocol is enabled.
             self._dspark_pending_recv.add(request.request_id)
@@ -155,4 +167,6 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
 
     def _cleanup_finished_request(self, request_id):
         self._pd_requests.pop(request_id, None)
+        if self.request_observer is not None:
+            notify(self.request_observer, "request_released", request_id=request_id)
         return super()._cleanup_finished_request(request_id)

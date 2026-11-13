@@ -10,6 +10,7 @@ from ..state import RequestCacheState, RequestGroupState
 from .config import DEFAULT_CONTROL_BACKLOG, validate_control_backlog
 from .control import ControlServer
 from .layout import BLOCK_SIZE, MAX_SEGMENTS, Segments, plan_layer
+from .observation import ObservedLock, job_context, notify, observed_call
 from .registration import PULL_API_VERSION
 from .state import CompletionGate, Contribution
 from .transfer import CpuPullTransfer, NpuPullTransfer
@@ -66,6 +67,7 @@ class Receiver:
         self.control_backlog = control_backlog
         self.draft_limit, self.num_spec_tokens = draft_limit, num_spec_tokens
         self.diagnostics = diagnostics
+        self.request_observer = None
         self.source_tp0_only = source_tp0_only
         self.activate, self.stream_factory, self.raw_transfer = activate, stream_factory, raw_transfer
         self.condition = Condition(RLock())
@@ -133,6 +135,16 @@ class Receiver:
                     full_blocks=seed.tokens // BLOCK_SIZE,
                     tail_tokens=seed.tokens % BLOCK_SIZE,
                     groups=[dict(count=len(group), first=list(group[:4])) for group in seed.blocks],
+                )
+            if self.request_observer is not None:
+                notify(
+                    self.request_observer,
+                    "request_bound",
+                    request_id=request_id,
+                    external_id=external_id,
+                    generation=seed.generation,
+                    tokens=seed.tokens,
+                    name="D_RECEIVE_SEEDED",
                 )
             self.condition.notify_all()
 
@@ -235,8 +247,19 @@ class Receiver:
                 self.terminal_jobs = {key: value for key, value in self.terminal_jobs.items() if value[0] != producer}
             return True
         if operation == "plan":
+            if self.request_observer is not None:
+                return observed_call(self.request_observer, "D.control.plan", self._plan, message, context=message)
             return self._plan(message)
         if operation in ("pull", "complete", "status", "ack_complete"):
+            if self.request_observer is not None:
+                return observed_call(
+                    self.request_observer,
+                    f"D.control.{operation}",
+                    self._job_operation,
+                    operation,
+                    message,
+                    context=message,
+                )
             return self._job_operation(operation, message)
         if operation == "cancel":
             request = self._request(message["request"], message["generation"])
@@ -256,7 +279,10 @@ class Receiver:
         raise ValueError("unknown PD control operation")
 
     def _job_operation(self, operation, message):
-        with self.runtime.lock:
+        lock = self.runtime.lock
+        if self.request_observer is not None:
+            lock = ObservedLock(lock, self.request_observer, message)
+        with lock:
             key = message["job"]
             identity = message["producer"], message["generation"]
             job = self.jobs.get(key)
@@ -305,8 +331,21 @@ class Receiver:
                 self.jobs.pop(key)
 
     def _plan(self, message):
-        request = self._request(message["request"], message["generation"])
-        with self.runtime.lock:
+        if self.request_observer is None:
+            request = self._request(message["request"], message["generation"])
+        else:
+            request = observed_call(
+                self.request_observer,
+                "D.seed_wait",
+                self._request,
+                message["request"],
+                message["generation"],
+                context=message,
+            )
+        lock = self.runtime.lock
+        if self.request_observer is not None:
+            lock = ObservedLock(lock, self.request_observer, message)
+        with lock:
             if request["cancelled"] or request["published"]:
                 raise ValueError("request no longer accepts Pull plans")
             producer, layer = message["producer"], message["layer"]
@@ -474,7 +513,15 @@ class Receiver:
                         self._cancel_npu_ready(ready)
                     job.completed[key] = ready.sequence
                     return {"error": str(job.error)}
-                self.runtime.wait_compute()
+                if self.request_observer is None:
+                    self.runtime.wait_compute()
+                else:
+                    observed_call(
+                        self.request_observer,
+                        "D.compute_dependency_wait",
+                        self.runtime.wait_compute,
+                        context=dict(job_context(job), path=path, batch=batch),
+                    )
                 if path == "npu":
                     transfer = self.raw_transfer(
                         self.runtime,
@@ -485,6 +532,9 @@ class Receiver:
                         source_bytes=metadata.layout.nbytes,
                     )
                     job.transfers.append(transfer)
+                    if self.request_observer is not None:
+                        transfer.request_observer = self.request_observer
+                        transfer.observer_context = dict(job_context(job), path="npu", batch=batch)
                     try:
                         transfer.run()
                     except Exception:
@@ -568,10 +618,23 @@ class Receiver:
         # Retain reserved keys even if Prepare raises after a remote decision.
         reservation = {"keys": keys, "put": None}
         job.transfers.append(reservation)
-        put = self.runtime.prepare_put(keys, [BLOCK_SIZE * 656] * len(keys))
+        if self.request_observer is None:
+            put = self.runtime.prepare_put(keys, [BLOCK_SIZE * 656] * len(keys))
+        else:
+            put = observed_call(
+                self.request_observer,
+                "D.cpu_prepare",
+                self.runtime.prepare_put,
+                keys,
+                [BLOCK_SIZE * 656] * len(keys),
+                context=dict(job_context(job), path="cpu", batch=batch),
+            )
         reservation["put"] = put
         partial = type(job.plan)(tuple(blocks), job.plan.main_sources[begin : begin + len(blocks)], Segments())
         transfer = CpuPullTransfer(self.runtime, ready, put, partial.ddr_segments(put.entries, keys))
+        if self.request_observer is not None:
+            transfer.request_observer = self.request_observer
+            transfer.observer_context = dict(job_context(job), path="cpu", batch=batch)
         job.transfers[-1] = transfer
         try:
             transfer.submit()
@@ -739,6 +802,8 @@ class Receiver:
             )
         self.writer.complete_receive(req_id)
         self.finished.add(req_id)
+        if self.request_observer is not None:
+            notify(self.request_observer, "gate_ready", request_id=req_id, generation=seed.generation)
 
     def _fail_request(self, request):
         if any(not job.finished for job in self.jobs.values() if job.request_id == request["id"]):
@@ -771,6 +836,8 @@ class Receiver:
                     self.writer.release_requests((request["id"],))
                     self.native_finished.discard(request["id"])
                     self.requests.pop(external_id)
+                    if self.request_observer is not None:
+                        notify(self.request_observer, "request_released", request_id=request["id"])
                     self._forget_request_jobs(request["id"])
 
     def close(self):

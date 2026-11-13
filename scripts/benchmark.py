@@ -47,6 +47,10 @@ class Config:
     dataset_length_policy: str = "truncate"  # or strict; short inputs fail.
     repeat_prompt: bool = False
     prefix_warmup: bool = True  # Requires APC + cached_tokens telemetry.
+    warmup_rounds: int = 0  # Full-length request warmup, independent of APC.
+    warmup_batch_size: int = 1  # Requests per DP in each warmup round.
+    request_phase: str = "measure"  # Set warmup for a warmup-only run.
+    tag_request_phase: bool = False  # Optional Proxy observation header; result records are always labelled.
     cache_block_size: int = 128  # For APC verification; match the service setting.
     request_timeout: int = 3000
     result_dir: str = "scripts/result"
@@ -84,7 +88,9 @@ class Http:
         proxies = {} if config.ignore_env_proxy or hostname in ("localhost", "127.0.0.1", "::1") else None
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
 
-    def request(self, path, payload=None, *, dp_rank=None, request_id=None, timeout=CONTROL_TIMEOUT):
+    def request(
+        self, path, payload=None, *, dp_rank=None, request_id=None, request_phase=None, timeout=CONTROL_TIMEOUT
+    ):
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
@@ -92,6 +98,10 @@ class Http:
             headers["X-data-parallel-rank"] = str(dp_rank)
         if request_id:
             headers["X-Request-Id"] = request_id
+        if request_phase is not None:
+            if request_phase not in ("measure", "warmup", "profile"):
+                raise BenchmarkError("request_phase must be measure, warmup or profile")
+            headers["X-KVAF-Request-Phase"] = request_phase
         body = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else None
         request = urllib.request.Request(self.config.base_url.rstrip("/") + path, data=body, headers=headers)
         try:
@@ -111,12 +121,18 @@ class Http:
             raise BenchmarkError(f"{path}: invalid response: {result!r}")
         return result
 
-    def complete(self, prompt, max_tokens, request_id, dp_rank, observer=None):
+    def complete(self, prompt, max_tokens, request_id, dp_rank, observer=None, *, request_phase=None):
         """Return raw HTTP times and counts; SSE packets are never tokens."""
         if self.config.pd_proxy:
             dp_rank = None  # The proxy chooses the backend; its actual rank is unknown.
+        request_phase = self.config.request_phase if request_phase is None else request_phase
         result = {
             "request_id": request_id,
+            "request_phase": request_phase,
+            "response_id": None,
+            "response_id_consistent": True,
+            "endpoint": "/v1/completions",
+            "completion_prompt_index": 0,  # This client sends exactly one list[int] prompt.
             "dp_rank": dp_rank,
             "status": "error",
             "error": None,
@@ -142,10 +158,17 @@ class Http:
         }
         try:
             done = False
+            if request_phase not in ("measure", "warmup", "profile"):
+                raise BenchmarkError("request_phase must be measure, warmup or profile")
             # Constructing the request body is included in HTTP latency consistently.
             result["start_ns"] = time.perf_counter_ns()
             with self.request(
-                "/v1/completions", payload, dp_rank=dp_rank, request_id=request_id, timeout=self.config.request_timeout
+                "/v1/completions",
+                payload,
+                dp_rank=dp_rank,
+                request_id=request_id,
+                request_phase=request_phase if self.config.tag_request_phase else None,
+                timeout=self.config.request_timeout,
             ) as response:
                 for data in sse_events(response):
                     now = time.perf_counter_ns()
@@ -155,6 +178,12 @@ class Http:
                     event = json.loads(data)
                     if event.get("error"):
                         raise BenchmarkError(str(event["error"]))
+                    response_id = event.get("id")
+                    if isinstance(response_id, str) and response_id:
+                        if result["response_id"] is None:
+                            result["response_id"] = response_id
+                        elif result["response_id"] != response_id:
+                            result["response_id_consistent"] = False
                     usage = event.get("usage") or {}
                     for key in ("prompt_tokens", "completion_tokens"):
                         if key in usage:
@@ -338,7 +367,13 @@ class Reporter:
         self.directory.mkdir(parents=True)
         public_config = dataclasses.asdict(config)
         public_config["api_key"] = "***" if config.api_key else ""
-        self.report = {"config": public_config, "levels": [], "profiles": [], "status": "running"}
+        self.report = {
+            "config": public_config,
+            "levels": [],
+            "profiles": [],
+            "status": "running",
+            "request_phase_version": 1,
+        }
         self.last_lines = 0
 
     def save(self, *, final=False):
@@ -417,6 +452,15 @@ def validate_config(config):
         raise BenchmarkError("levels must not repeat")
     if config.dataset_length_policy not in ("truncate", "strict"):
         raise BenchmarkError("dataset_length_policy must be truncate or strict")
+    if config.request_phase not in ("measure", "warmup"):
+        raise BenchmarkError("request_phase must be measure or warmup")
+    if (
+        type(config.warmup_rounds) is not int
+        or config.warmup_rounds < 0
+        or type(config.warmup_batch_size) is not int
+        or not 0 < config.warmup_batch_size < 65536
+    ):
+        raise BenchmarkError("warmup_rounds must be nonnegative; warmup_batch_size must be between 1 and 65535")
 
 
 def preflight(http, config, *, output_tokens=None):
@@ -458,7 +502,10 @@ def prefix_probe(config, http, source, block_size, results):
     for rank in range(config.data_parallel_size):
         print(f"Checking native prefix-cache replay on DP{rank}...", flush=True)
         prompt = source.build(2**32 - 1 - rank, length, synthetic=True)
-        pair = [http.complete(prompt, 1, f"probe-{uuid.uuid4().hex}-{phase}", rank) for phase in range(2)]
+        pair = [
+            http.complete(prompt, 1, f"probe-{uuid.uuid4().hex}-{phase}", rank, request_phase="warmup")
+            for phase in range(2)
+        ]
         results.extend(pair)
         if pair[0]["status"] != "ok":
             raise BenchmarkError("prefix capability warmup failed: " + str(pair[0]["error"]))
@@ -488,7 +535,9 @@ def warm_prefixes(config, http, source, batch, warmed, reporter):
     # Bound prefill concurrency independently of the measured simultaneous wave.
     with futures.ThreadPoolExecutor(max_workers=config.data_parallel_size) as pool:
         pending = [
-            pool.submit(http.complete, source.build(variant), 1, f"warm-{uuid.uuid4().hex}", rank)
+            pool.submit(
+                http.complete, source.build(variant), 1, f"warm-{uuid.uuid4().hex}", rank, request_phase="warmup"
+            )
             for rank, variant in jobs
         ]
         for future in pending:
@@ -582,7 +631,17 @@ class ProfileCoordinator:
         return self.result
 
 
-def run_level(config, http, source, batch, reporter, *, profile_tokens=None, prefix_extra_recompute_blocks=None):
+def run_level(
+    config,
+    http,
+    source,
+    batch,
+    reporter,
+    *,
+    profile_tokens=None,
+    prefix_extra_recompute_blocks=None,
+    request_phase=None,
+):
     """One synchronized wave; profiling waves are stored outside baseline results."""
     run_id = uuid.uuid4().hex
     jobs = [
@@ -592,17 +651,22 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None, pre
     ]
     barrier = threading.Barrier(len(jobs) + 1)
     profile = ProfileCoordinator(http, "decode", profile_tokens, [job[0] for job in jobs]) if profile_tokens else None
+    request_phase = "profile" if profile else config.request_phase if request_phase is None else request_phase
+    if request_phase not in ("measure", "warmup", "profile"):
+        raise BenchmarkError("request_phase must be measure, warmup or profile")
     row = {
         "batch": batch,
         "concurrency": len(jobs),
         "routing": "proxy_balanced" if config.pd_proxy else "dp_header",
         "run_id": run_id,
+        "request_phase": request_phase,
         "requests": [],
         "scheduler": [],
         "errors": [],
         "status": "running",
     }
-    reporter.report["profiles" if profile else "levels"].append(row)
+    group = "profiles" if profile else "request_warmups" if request_phase == "warmup" else "levels"
+    reporter.report.setdefault(group, []).append(row)
     progress_lock = threading.Lock()
     counts, completed = dict.fromkeys((job[0] for job in jobs), 0), set()
 
@@ -617,7 +681,9 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None, pre
 
     def invoke(request_id, rank, prompt):
         barrier.wait(timeout=CONTROL_TIMEOUT)
-        return http.complete(prompt, config.output_tokens, request_id, rank, observer=observe)
+        return http.complete(
+            prompt, config.output_tokens, request_id, rank, observer=observe, request_phase=request_phase
+        )
 
     try:
         with futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
@@ -634,7 +700,8 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None, pre
                 row["scheduler"].append({"time_ns": time.perf_counter_ns(), **scheduler_metrics(http)})
                 row["requests"] = [future.result() for future in pending if future.done()]
                 workload = f"concurrency={len(jobs)}" if config.pd_proxy else f"BS/DP={batch}"
-                reporter.display(f"{'Profiling' if profile else 'Running'} {workload}: {row['progress']}")
+                action = "Profiling" if profile else "Warmup" if request_phase == "warmup" else "Measuring"
+                reporter.display(f"{action} {workload}: {row['progress']}")
                 reporter.save()
                 futures.wait(pending, timeout=REFRESH_SECONDS, return_when=futures.ALL_COMPLETED)
             row["requests"] = [future.result() for future in pending]
@@ -650,14 +717,14 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None, pre
         reporter.save()
     row["http"] = summarize_http(row["requests"])
     row["errors"].extend(r["error"] for r in row["requests"] if r["status"] != "ok")
-    if config.prefix_warmup:
+    if config.prefix_warmup and request_phase != "warmup":
         for result in row["requests"]:
             try:
                 extra = prefix_extra_recompute_blocks[result["dp_rank"]] if prefix_extra_recompute_blocks else 0
                 verify_cached(result, config.input_tokens, config.cache_block_size, extra)
             except BenchmarkError as exc:
                 row["errors"].append(str(exc))
-    if not profile:
+    if not profile and request_phase == "measure":
         row["overlap"] = summarize_overlap(
             row["requests"], batch, config.data_parallel_size, dp_routing=not config.pd_proxy
         )
@@ -676,7 +743,9 @@ def run_prefill_profile(config, http, source, reporter):
     try:
         profile.start()
         variant = int(uuid.uuid4().hex[:8], 16)
-        row["request"] = http.complete(source.build(variant), 1, f"prefill-{uuid.uuid4().hex}", 0)
+        row["request"] = http.complete(
+            source.build(variant), 1, f"prefill-{uuid.uuid4().hex}", 0, request_phase="profile"
+        )
         profile.result["status"] = row["request"]["status"]
         if row["request"].get("error"):
             profile.result["error"] = row["request"]["error"]
@@ -705,6 +774,8 @@ def parse_args(argv=None):
             options["type"] = type(field.default)
         if field.name == "dataset_length_policy":
             options["choices"] = ("truncate", "strict")
+        if field.name == "request_phase":
+            options["choices"] = ("measure", "warmup")
         if field.name == "prefix_warmup":
             options.update(default=None, help="APC verification (default: on for direct vLLM, off for PD Proxy)")
         if field.name == "pd_proxy":
@@ -760,6 +831,10 @@ def main(argv=None):
         source = PromptSource(config, metadata_http)
         reporter.report["input_source"] = "JSONL first record" if source.dataset is not None else "synthetic token IDs"
         print("Primary TPOT/TPS: real token arrivals after every request starts and before any request's final token.")
+        print(
+            f"Request phase={config.request_phase}; request warmup rounds={config.warmup_rounds}, "
+            f"warmup BS/DP={config.warmup_batch_size}; only measure requests belong to baseline levels."
+        )
         if args.profile_prefill:
             run_prefill_profile(config, http, source, reporter)
         else:
@@ -771,6 +846,10 @@ def main(argv=None):
                     config, http, source, config.cache_block_size, reporter.report["prefix_probe"]
                 )
                 reporter.report["prefix_extra_recompute_blocks"] = prefix_extra_recompute_blocks
+            for _ in range(config.warmup_rounds):
+                row = run_level(config, http, source, config.warmup_batch_size, reporter, request_phase="warmup")
+                if row["status"] != "ok":
+                    raise BenchmarkError("request warmup failed: " + str(row["errors"]))
             for batch in config.levels:
                 if config.prefix_warmup:
                     warm_prefixes(config, http, source, batch, warmed, reporter)
@@ -787,7 +866,12 @@ def main(argv=None):
                         profile_tokens=args.profile_decode_tokens,
                         prefix_extra_recompute_blocks=prefix_extra_recompute_blocks,
                     )
-        failed = any(row["status"] != "ok" for row in reporter.report["levels"] + reporter.report["profiles"])
+        failed = any(
+            row["status"] != "ok"
+            for row in reporter.report["levels"]
+            + reporter.report["profiles"]
+            + reporter.report.get("request_warmups", [])
+        )
         reporter.report["status"] = "error" if failed else "ok"
         return 1 if failed else 0
     except (Exception, KeyboardInterrupt) as exc:

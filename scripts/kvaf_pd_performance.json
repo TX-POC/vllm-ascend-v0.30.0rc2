@@ -1,0 +1,20 @@
+{
+  "enabled": false,
+  "sample_rate": 0.1,
+  "sample_seed": 0,
+  "detail_level": "layer",
+  "buffer": {
+    "max_events": 2048,
+    "max_bytes": 16777216,
+    "overflow_policy": "drop_new"
+  },
+  "writer": {
+    "enabled": true,
+    "output_dir": "./pd-perf",
+    "batch_events": 256,
+    "flush_interval_ms": 5000,
+    "file_buffer_bytes": 1048576,
+    "max_file_bytes": 67108864,
+    "max_total_bytes": 268435456
+  }
+}

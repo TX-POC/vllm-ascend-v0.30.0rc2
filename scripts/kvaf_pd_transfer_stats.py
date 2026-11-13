@@ -112,7 +112,7 @@ class BufferedCapture:
 
 
 def capture_header(config, role):
-    """Startup-only metadata; no prompts, tensors or memory addresses."""
+    """Static request-correlation labels; no timings, prompts, tensors or addresses."""
     pc = config.parallel_config
     return dict(
         role=role,
@@ -476,6 +476,10 @@ def main(argv=None):
     INCOMPLETE status and nonzero exit code instead of a successful full-run claim.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("summary", "export-trace"):
+        from kvaf_pd_performance_report import main as report_main
+
+        return report_main(argv, sys.modules[__name__])
     if argv and argv[0] == "compare":
         return compare_performance(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)

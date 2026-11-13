@@ -77,29 +77,66 @@ Proxy 模式默认关闭 APC 预热与命中校验，适配现有 `--no-enable-p
 不会把 SSE 包数当成 token 数。鉴权参数 `--api-key` 同时用于 Proxy 和元数据后端。
 去掉 `--pd-proxy` 和 `--metadata-base-url` 即恢复直接压测 vLLM 的方式。
 
+每条原始请求还保存实际 SSE `response_id`、`response_id_consistent`、`endpoint` 和单 prompt 的
+`completion_prompt_index=0`，供 [请求性能工具](../docs/kvaf_pd_performance_tool/IMPLEMENTATION_STATUS.md) 导入 `result.json`。
+Proxy 会生成自己的 ID，客户端发送的 `request_id` 不一定等于 P/D 原生请求 ID；分析只按实际服务端 ID 和仓库的子请求规则精确匹配。
+响应未提供 ID、ID 改变或匹配有歧义时不补造关联，也不影响原有压测结果的成功判定。
+
 ## 功能
 
-| 功能 | 用法/行为 |
-| --- | --- |
-| 合成定长输入 | `/tokenize` 获取合法 token IDs；不同请求使用不同前缀 |
-| 相同输入 | `--repeat-prompt`，每个 DP 内重复使用输入 |
-| JSONL | `--prompt-jsonl input.jsonl --prompt-field question`，读取首个非空记录 |
-| 长度控制 | `--dataset-length-policy truncate` 截断过长输入；`strict` 要求完全相等；过短均报错 |
-| 并发阶梯 | `--levels 1,2,4,8,16`，每档同步发起一波请求；直连按 DP 路由，Proxy 模式由后端调度 |
-| 性能指标 | 全请求重叠区间 TPS/TPOT，以及 HTTP TTFT、E2E、请求 TPOT 和分位数 |
-| 调度观测 | 直连读取 `/metrics` 的 running/waiting；Proxy 模式明确标记不可用 |
-| 预热/APC 校验 | `--prefix-warmup`，分档补充尚未预热的输入并检查 cached_tokens |
-| Profiling | 通过服务已有的 `/start_profile`、`/stop_profile` 接口控制 |
-| 展示/保存 | 实时终端表格、`live.json` 和 `result.json`，保存原始到达事件及错误 |
+### 请求预热与正式测试
+
+`--warmup-rounds` 默认 `0`，不会额外发送预热请求。需要请求级预热时，例如先预热两轮再正式压测：
+
+```bash
+python3 scripts/benchmark.py \
+  --pd-proxy --base-url http://141.62.38.12:8000 \
+  --metadata-base-url http://141.62.38.24:8200 --model glm --ignore-env-proxy \
+  --input-tokens 130947 --output-tokens 125 \
+  --data-parallel-size 8 --tensor-parallel-size 1 \
+  --warmup-rounds 2 --warmup-batch-size 1 --levels 16 \
+  --result-dir scripts/result/pd-measure
+```
+
+每轮请求预热总并发为 `warmup_batch_size × DP`，上例先发两轮各 8 个请求，全部结束后再发正式的 128 并发。
+请求预热使用同样的输入/输出长度，与 APC 前缀预热独立；Proxy 模式也支持，不要求开启 prefix caching。
+预热失败时停止本次运行，不继续将尚未就绪的结果当作正式压测。
+若只执行预热，可指定 `--request-phase warmup`；普通阶梯请求默认 `--request-phase measure`。
+
+每条结果明确标记用途：普通正式请求为 `measure`，
+请求预热、APC 前缀预热和 prefix 探针为 `warmup`，profiling 请求为 `profile`。
+默认不增加 HTTP 请求头；需要采样 Proxy 直接保存用途时显式加 `--tag-request-phase`，才发送 `X-KVAF-Request-Phase`。
+标签不进入模型请求正文，不改变推理参数。预热保存在 `request_warmups`、`prefix_warmups`、`prefix_probe`；
+`levels` 与终端正式性能表只含 `measure`，profiling 仍单独保存在 `profiles`。
+
+性能工具 `summary` / `export-trace` 默认只分析明确标记的 `measure`。
+仅有 P/D 采集文件时，同时传入该次 `result.json`，按服务端响应 ID 和原生代次关联标签；
+采样 Proxy 可直接保存 HTTP 标签，供 P/D 事件离线关联。不会按请求先后、名称前缀或耗时猜测预热。
+旧文件没有标签时视为 `unknown`，默认排除；诊断全部原始请求须显式选择分析端 `--request-phase all`。
+
+### 其他能力
+
+| 功能          | 用法/行为                                                                          |
+| ------------- | ---------------------------------------------------------------------------------- |
+| 合成定长输入  | `/tokenize` 获取合法 token IDs；不同请求使用不同前缀                               |
+| 相同输入      | `--repeat-prompt`，每个 DP 内重复使用输入                                          |
+| JSONL         | `--prompt-jsonl input.jsonl --prompt-field question`，读取首个非空记录             |
+| 长度控制      | `--dataset-length-policy truncate` 截断过长输入；`strict` 要求完全相等；过短均报错 |
+| 并发阶梯      | `--levels 1,2,4,8,16`，每档同步发起一波请求；直连按 DP 路由，Proxy 模式由后端调度  |
+| 性能指标      | 全请求重叠区间 TPS/TPOT，以及 HTTP TTFT、E2E、请求 TPOT 和分位数                   |
+| 调度观测      | 直连读取 `/metrics` 的 running/waiting；Proxy 模式明确标记不可用                   |
+| 预热/APC 校验 | `--prefix-warmup`，分档补充尚未预热的输入并检查 cached_tokens                      |
+| Profiling     | 通过服务已有的 `/start_profile`、`/stop_profile` 接口控制                          |
+| 展示/保存     | 实时终端表格、`live.json` 和 `result.json`，保存原始到达事件及错误                 |
 
 APC 校验要求服务已开启 prefix caching 和 prompt token 统计。`--cache-block-size`
 需与服务一致，默认 128。探针通过 HTTP 回放识别每个 DP 是否额外重算一个尾块
 （兼容 MTP），并将结果记录在 `prefix_extra_recompute_blocks` 中，按 DP rank 排列。
 正式请求的最低命中数为 `floor((输入长度 - 1) / 块大小) × 块大小 - 额外重算块数 × 块大小`；
 例如块大小 128、额外重算一块时，4096-token 探针要求命中 3840，130000-token 输入要求命中 129792。
-探针输入必须大于两个块；零命中、低于校准阈值或缺少 cached_tokens 时仍会报错。
+探针输入必须大于两个块；零命中、低于校准阈值或缺少 cached*tokens 时仍会报错。
 校准只允许额外回退一块，不代表识别出了服务的 MTP 配置。结果默认保存到客户端
-`scripts/result/<时间戳_标识>/`，API key 会隐藏。
+`scripts/result/<时间戳*标识>/`，API key 会隐藏。
 
 ## TPOT / TPS 口径
 

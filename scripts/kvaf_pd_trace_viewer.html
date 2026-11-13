@@ -1,0 +1,1326 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:"
+    />
+    <title>KVAF PD 请求阶段耗时</title>
+    <style>
+      :root {
+        font:
+          14px system-ui,
+          sans-serif;
+        color: #192b42;
+        background: #f3f6fa;
+        color-scheme: light;
+      }
+      body {
+        max-width: 1600px;
+        margin: auto;
+        padding: 24px;
+      }
+      h1 {
+        font-size: 25px;
+        margin: 0 0 8px;
+      }
+      h2 {
+        font-size: 17px;
+      }
+      p {
+        line-height: 1.7;
+      }
+      header,
+      section {
+        background: white;
+        border: 1px solid #dce4ef;
+        border-radius: 10px;
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+      .muted {
+        color: #53647a;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        margin: 12px 0;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+        border: 1px solid #bdcbdc;
+        border-radius: 5px;
+        padding: 7px;
+        background: white;
+        color: inherit;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover {
+        background: #eaf1fc;
+      }
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 2px solid #2457a8;
+      }
+      input[type="file"] {
+        max-width: 90%;
+      }
+      #status {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .warning {
+        color: #90460b;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-variant-numeric: tabular-nums;
+      }
+      td,
+      th {
+        padding: 8px;
+        border-bottom: 1px solid #e5ebf2;
+        text-align: right;
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      #canvasBox {
+        overflow: auto;
+      }
+      .svgBox {
+        overflow: auto;
+        max-height: 800px;
+      }
+      .svgBox svg {
+        display: block;
+      }
+      canvas {
+        display: block;
+        touch-action: none;
+        cursor: crosshair;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        max-height: 420px;
+        overflow: auto;
+        font:
+          12px ui-monospace,
+          monospace;
+      }
+      .legend {
+        display: flex;
+        gap: 18px;
+        flex-wrap: wrap;
+      }
+      .legend span::before {
+        content: "■";
+        margin-right: 6px;
+        color: var(--color);
+      }
+    </style>
+  </head>
+  <body>
+    <header id="drop">
+      <h1>KVAF PD 请求阶段耗时</h1>
+      <p class="muted">
+        选择或拖入一个
+        .trace.json。数据仅在本机浏览器中读取，不上传。色块来自真实采集记录；主机
+        RPC 时长包含控制与等待，不代表纯 DMA 或 NPU 计算。
+      </p>
+      <input
+        id="file"
+        type="file"
+        accept=".json"
+        aria-label="选择 Trace 文件"
+      />
+      <p id="status" role="status">等待 Trace 文件。</p>
+    </header>
+    <section>
+      <h2>导出集合统计 · mean / P90 / P99 / 有效 N</h2>
+      <p class="muted">
+        以下统计对应整个导出集合；下方的请求或文本筛选只改变阶段耗时视图。t1/t2
+        主表口径：<strong id="basis">等待文件</strong>。兼容 RPC
+        及阶段明细保存在覆盖情况中。 请求范围：<strong id="requestPhaseScope"
+          >等待文件</strong
+        >。
+      </p>
+      <label
+        >层类型
+        <select id="layerRole" aria-label="统计层类型">
+          <option value="all">全部层</option>
+        </select>
+      </label>
+      <table>
+        <thead>
+          <tr>
+            <th>路径 / 粒度</th>
+            <th>mean ms</th>
+            <th>P90 ms</th>
+            <th>P99 ms</th>
+            <th>有效 N</th>
+          </tr>
+        </thead>
+        <tbody id="summary"></tbody>
+      </table>
+      <details>
+        <summary>请求阶段耗时 · mean / P90 / P99 / 有效 N</summary>
+        <p class="muted">
+          每请求同名区间取并集，共享 batch 不除以 batch
+          size。显示当前时间域，每页 12
+          项，与阶段图表同页。阶段可重叠，不能将各阶段分位数相加。
+        </p>
+        <div class="controls">
+          <button id="stageTablePrevious">上一组阶段</button
+          ><button id="stageTableNext">下一组阶段</button
+          ><span id="stageTablePage"></span>
+        </div>
+        <div style="max-height: 360px; overflow: auto">
+          <table>
+            <thead>
+              <tr>
+                <th>观察阶段 / 时间域</th>
+                <th>mean ms</th>
+                <th>P90 ms</th>
+                <th>P99 ms</th>
+                <th>有效 N</th>
+              </tr>
+            </thead>
+            <tbody id="stageSummary"></tbody>
+          </table>
+        </div>
+      </details>
+      <details id="stageCharts">
+        <summary>阶段分布图 · 当前时间域的导出集合</summary>
+        <p class="muted">
+          三个并列条分别是 mean、P90、P99，单位
+          ms；不是顺序时间轴。图中包含的阶段可能重叠。
+        </p>
+        <div class="controls">
+          <button id="stagePrevious">上一组阶段</button
+          ><button id="stageNext">下一组阶段</button><span id="stagePage"></span
+          ><button id="stageSvg">导出阶段 SVG</button
+          ><button id="stagePng">导出阶段 PNG</button>
+        </div>
+        <div id="stageChart" class="svgBox"></div>
+      </details>
+      <details>
+        <summary>覆盖情况、阶段分布与未采集指标</summary>
+        <pre id="quality"></pre>
+      </details>
+      <div id="clientStatistics" hidden>
+        <h3>客户端接收指标 · 独立客户端时间域</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>指标</th>
+              <th>mean ms</th>
+              <th>P90 ms</th>
+              <th>P99 ms</th>
+              <th>有效 N</th>
+            </tr>
+          </thead>
+          <tbody id="clientSummary"></tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <h2>请求时间轴</h2>
+      <div class="controls">
+        <label
+          >时间域
+          <select id="clock" aria-label="时间域"></select
+        ></label>
+        <label
+          >请求
+          <input
+            id="request"
+            list="requests"
+            placeholder="精确请求 ID；留空显示全部"
+            aria-label="请求 ID" /></label
+        ><datalist id="requests"></datalist>
+        <label
+          >代次
+          <select id="generation" aria-label="请求代次">
+            <option value="">全部代次</option>
+          </select></label
+        >
+        <label
+          >阶段耗时视图
+          <select id="laneView" aria-label="阶段耗时视图">
+            <option value="phase">按阶段折叠层</option>
+            <option value="layer">原始逐层阶段耗时</option>
+          </select></label
+        >
+        <label
+          >按请求累计选样
+          <select id="representative" aria-label="请求累计分位数附近真实请求">
+            <option value="">手动选择</option>
+          </select></label
+        >
+        <label
+          >筛选
+          <input
+            id="filter"
+            placeholder="层 / 路径 / 阶段"
+            aria-label="筛选层路径阶段"
+        /></label>
+        <button id="reset">适应范围</button><button id="zoomIn">放大</button
+        ><button id="zoomOut">缩小</button>
+        <button id="previous">上一组阶段耗时</button
+        ><button id="next">下一组阶段耗时</button><span id="page"></span>
+        <button id="svg">导出 SVG</button><button id="png">导出 PNG</button>
+      </div>
+      <p id="clockNote" class="warning"></p>
+      <div class="legend">
+        <span style="--color: #2775cf">t1 / NPU Pull RPC</span
+        ><span style="--color: #108574">t2 / CPU Pull RPC</span
+        ><span style="--color: #8260ba">Connector 控制</span
+        ><span style="--color: #c44747">失败 / 未确认</span>
+      </div>
+      <p class="muted">
+        滚轮缩放，拖动平移，点击色块看详情。一次绘制最多 64
+        行阶段耗时。阶段折叠只合并显示行，保留每段原始时间和层身份。未对齐时间域独立显示，不比较其横向位置。
+      </p>
+      <div id="canvasBox">
+        <canvas id="timeline" aria-label="请求阶段耗时图"></canvas>
+      </div>
+    </section>
+    <section>
+      <h2>请求关联图 · 独立于时间轴</h2>
+      <p class="muted">
+        实线表示同域程序顺序，虚线表示跨域或控制身份关联。列位置没有时延含义；跨主机关系不计算网络耗时。缺失观察点不会被补成完整路径。
+      </p>
+      <div class="controls">
+        <label
+          >关系
+          <select id="relationKind">
+            <option value="all">全部已知关系</option>
+            <option value="control">控制 RPC</option>
+            <option value="program_order">同域程序顺序</option>
+            <option value="handoff">元数据交接</option>
+            <option value="identity">客户端身份关联</option>
+          </select></label
+        ><button id="graphPrevious">上一组关系</button
+        ><button id="graphNext">下一组关系</button><span id="graphPage"></span
+        ><button id="graphSvg">导出关联 SVG</button>
+      </div>
+      <div id="requestGraph" class="svgBox"></div>
+    </section>
+    <section>
+      <h2>选中阶段详情</h2>
+      <pre id="details">
+点击色块查看实际耗时、请求/层身份及对应阶段总体统计。</pre
+      >
+    </section>
+    <script>
+      "use strict";
+      const $ = (id) => document.getElementById(id),
+        canvas = $("timeline"),
+        ctx = canvas.getContext("2d");
+      const MAX_BYTES = 256 * 1024 * 1024,
+        MAX_EVENTS = 200000,
+        MAX_RECORDS = 1000000,
+        MAX_LINKS = 200000,
+        ROWS = 64,
+        LEFT = 350,
+        ROW = 27;
+      let trace = null,
+        domains = [],
+        selected = [],
+        lanes = [],
+        laneEvents = new Map(),
+        page = 0,
+        origin = 0,
+        span = 1,
+        hits = [],
+        shapes = [],
+        labels = [],
+        eventsById = new Map(),
+        linksByEvent = new Map(),
+        requestsIndex = new Map(),
+        graphPage = 0,
+        stagePage = 0,
+        drag = null;
+      const number = (v) => typeof v === "number" && Number.isFinite(v),
+        format = (v) => (number(v) ? v.toFixed(3) : "UNAVAILABLE");
+      const xml = (v) =>
+        String(v).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&apos;",
+            })[c],
+        );
+      function status(message, error = false) {
+        $("status").textContent = message;
+        $("status").className = error ? "warning" : "";
+      }
+      function cell(row, value) {
+        const td = document.createElement("td");
+        td.textContent = String(value);
+        row.append(td);
+      }
+      function colour(e) {
+        if (e.args.success === false) return "#c44747";
+        if (e.args.path === "cpu") return "#108574";
+        if (e.args.path === "npu") return "#2775cf";
+        return "#8260ba";
+      }
+      function membersOf(e) {
+        return Array.isArray(e.args.members)
+          ? e.args.members
+          : [{ request: e.args.request, generation: e.args.generation }];
+      }
+      function renderSummary() {
+        $("summary").replaceChildren();
+        const summary = trace?.kvaf_pd.summary;
+        if (!summary) return;
+        const role = $("layerRole").value;
+        const items =
+          role === "all"
+            ? summary.summary
+            : (summary.layer_role_summary || []).find(
+                (item) => item.role === role,
+              )?.summary;
+        for (const item of items || []) {
+          const row = document.createElement("tr");
+          const scope =
+            { request_layer: "请求×层", request: "请求累计" }[item.scope] ||
+            item.scope;
+          cell(row, item.metric + " / " + scope);
+          for (const key of ["mean_ms", "p90_ms", "p99_ms"])
+            cell(row, format(item[key]));
+          cell(row, item.samples);
+          $("summary").append(row);
+        }
+      }
+      $("layerRole").onchange = renderSummary;
+      function save(blob, name) {
+        const a = document.createElement("a"),
+          url = URL.createObjectURL(blob);
+        a.href = url;
+        a.download = name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      function svgElement(tag, attributes = {}, text) {
+        const node = document.createElementNS(
+          "http://www.w3.org/2000/svg",
+          tag,
+        );
+        for (const [key, value] of Object.entries(attributes))
+          node.setAttribute(key, String(value));
+        if (text !== undefined) node.textContent = String(text);
+        return node;
+      }
+      function newSvg(width, height, title) {
+        const svg = svgElement("svg", {
+          xmlns: "http://www.w3.org/2000/svg",
+          width,
+          height,
+          viewBox: `0 0 ${width} ${height}`,
+          style: "font:12px system-ui; background:white",
+        });
+        svg.append(svgElement("title", {}, title));
+        if (trace)
+          svg.append(
+            svgElement(
+              "metadata",
+              {},
+              JSON.stringify({
+                scope: trace.kvaf_pd.summary.scope,
+                status: trace.kvaf_pd.summary.status,
+                clock: domains[Number($("clock").value) || 0]?.domain,
+                request: $("request").value,
+                generation: $("generation").value,
+                unit: "ms",
+              }),
+            ),
+          );
+        svg.append(svgElement("rect", { width, height, fill: "white" }));
+        return svg;
+      }
+      function showDetails(item) {
+        const links = linksByEvent.get(item.args.event_id) || [];
+        $("details").textContent = JSON.stringify(
+          {
+            actual_duration_ms: item.ph === "i" ? null : item.dur / 1000,
+            milestone_time_us: item.ph === "i" ? item.ts : null,
+            event: item,
+            export_cohort_stage_statistics: (
+              trace.kvaf_pd.summary.stages || []
+            ).filter(
+              (stage) =>
+                stage.name === item.name &&
+                stage.clock_domain === item.args.domain,
+            ),
+            related_rpc_events: links.slice(0, 128).map((link) => ({
+              relation: link,
+              other_event: eventsById.get(
+                link.source === item.args.event_id ? link.target : link.source,
+              ),
+            })),
+            related_events_total: links.length,
+          },
+          null,
+          2,
+        );
+      }
+      function renderStages() {
+        const container = $("stageChart");
+        container.replaceChildren();
+        $("stageSummary").replaceChildren();
+        if (!trace) return;
+        const domain = domains[Number($("clock").value) || 0]?.domain;
+        const rows = (trace.kvaf_pd.summary.stages || []).filter(
+          (stage) => stage.clock_domain === domain,
+        );
+        stagePage = Math.max(
+          0,
+          Math.min(stagePage, Math.ceil(rows.length / 12) - 1),
+        );
+        const visible = rows.slice(stagePage * 12, (stagePage + 1) * 12);
+        $("stagePage").textContent =
+          `阶段 ${visible.length ? stagePage * 12 + 1 : 0}–${Math.min((stagePage + 1) * 12, rows.length)} / ${rows.length}`;
+        $("stageTablePage").textContent = $("stagePage").textContent;
+        for (const item of visible) {
+          const row = document.createElement("tr");
+          cell(row, item.name + " / " + item.clock_domain);
+          for (const field of ["mean_ms", "p90_ms", "p99_ms"])
+            cell(row, format(item[field]));
+          cell(row, item.samples);
+          $("stageSummary").append(row);
+        }
+        if (!visible.length) {
+          container.textContent = "当前时间域没有已完成的阶段统计。";
+          return;
+        }
+        let maximum = 1;
+        for (const item of rows)
+          for (const key of ["mean_ms", "p90_ms", "p99_ms"])
+            if (number(item[key])) maximum = Math.max(maximum, item[key]);
+        const svg = newSvg(
+          1120,
+          80 + visible.length * 68,
+          "导出集合阶段分布，独立条形，单位 ms",
+        );
+        const colours = ["#2775cf", "#108574", "#8260ba"];
+        ["mean", "P90", "P99"].forEach((name, index) =>
+          svg.append(
+            svgElement(
+              "text",
+              { x: 380 + index * 120, y: 20, fill: colours[index] },
+              name + " · ms",
+            ),
+          ),
+        );
+        visible.forEach((item, index) => {
+          const y = 55 + index * 68,
+            label = svgElement(
+              "text",
+              { x: 5, y: y + 16, fill: "#192b42" },
+              item.name.slice(0, 46),
+            );
+          label.append(svgElement("title", {}, item.name + " / " + domain));
+          svg.append(label);
+          svg.append(
+            svgElement(
+              "text",
+              { x: 5, y: y + 36, fill: "#53647a" },
+              "有效 N = " + item.samples,
+            ),
+          );
+          ["mean_ms", "p90_ms", "p99_ms"].forEach((key, offset) => {
+            const width = number(item[key]) ? (item[key] / maximum) * 600 : 0;
+            svg.append(
+              svgElement("rect", {
+                x: 380,
+                y: y + offset * 15,
+                width,
+                height: 10,
+                fill: colours[offset],
+              }),
+            );
+            svg.append(
+              svgElement(
+                "text",
+                { x: 390 + width, y: y + offset * 15 + 9, fill: "#253954" },
+                format(item[key]),
+              ),
+            );
+          });
+        });
+        container.append(svg);
+      }
+      function renderGraph() {
+        const container = $("requestGraph");
+        container.replaceChildren();
+        const request = $("request").value.trim(),
+          generation = $("generation").value,
+          query = $("filter").value.trim().toLowerCase();
+        if (!trace || !request) {
+          container.textContent = "选择具体请求后显示已记录的关系。";
+          $("graphPage").textContent = "";
+          return;
+        }
+        const matches = (event) =>
+          membersOf(event).some(
+            (member) =>
+              member.request === request &&
+              (!generation || member.generation === generation),
+          );
+        const candidates = new Set();
+        for (const event of requestsIndex.get(request) || [])
+          if (matches(event))
+            for (const link of linksByEvent.get(event.args.event_id) || [])
+              candidates.add(link);
+        const kind = $("relationKind").value;
+        const links = [...candidates].filter((link) => {
+          const left = eventsById.get(link.source),
+            right = eventsById.get(link.target);
+          return (
+            (kind === "all" || (link.kind || "control") === kind) &&
+            matches(left) &&
+            matches(right) &&
+            (!query ||
+              [left.name, right.name, left.args.layer, right.args.layer]
+                .join(" ")
+                .toLowerCase()
+                .includes(query))
+          );
+        });
+        graphPage = Math.max(
+          0,
+          Math.min(graphPage, Math.ceil(links.length / 30) - 1),
+        );
+        const visible = links.slice(graphPage * 30, (graphPage + 1) * 30);
+        $("graphPage").textContent =
+          `关系 ${visible.length ? graphPage * 30 + 1 : 0}–${Math.min((graphPage + 1) * 30, links.length)} / ${links.length}`;
+        if (!visible.length) {
+          container.textContent =
+            "没有可唯一确认的关系；原始事件仍可在阶段耗时图中查看。";
+          return;
+        }
+        const nodes = [
+          ...new Set(visible.flatMap((link) => [link.source, link.target])),
+        ].map((identity) => eventsById.get(identity));
+        const role = (event) =>
+          event.args.role ||
+          (event.name.startsWith("CLIENT_") || event.name.startsWith("client.")
+            ? "Client"
+            : "未知观察端");
+        const order = ["Client", "Proxy", "P", "D_scheduler", "D_worker"];
+        const roles = [...new Set(nodes.map(role))].sort(
+          (a, b) => order.indexOf(a) - order.indexOf(b),
+        );
+        const positions = new Map();
+        let maxRows = 1;
+        for (const [column, name] of roles.entries()) {
+          const rows = nodes
+            .filter((event) => role(event) === name)
+            .sort(
+              (a, b) =>
+                a.args.domain.localeCompare(b.args.domain) || a.ts - b.ts,
+            );
+          maxRows = Math.max(maxRows, rows.length);
+          rows.forEach((event, row) =>
+            positions.set(event.args.event_id, {
+              x: 15 + column * 250,
+              y: 50 + row * 76,
+            }),
+          );
+        }
+        const svg = newSvg(
+          Math.max(700, roles.length * 250),
+          maxRows * 76 + 65,
+          "请求身份及程序关系；没有公共时间轴",
+        );
+        const defs = svgElement("defs"),
+          marker = svgElement("marker", {
+            id: "graphArrow",
+            viewBox: "0 0 10 10",
+            refX: 9,
+            refY: 5,
+            markerWidth: 7,
+            markerHeight: 7,
+            orient: "auto-start-reverse",
+          });
+        marker.append(
+          svgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#687f9b" }),
+        );
+        defs.append(marker);
+        svg.append(defs);
+        roles.forEach((name, column) =>
+          svg.append(
+            svgElement(
+              "text",
+              {
+                x: 15 + column * 250,
+                y: 25,
+                fill: "#192b42",
+                "font-weight": 600,
+              },
+              name + " · 观察端",
+            ),
+          ),
+        );
+        for (const link of visible) {
+          const first = positions.get(link.source),
+            last = positions.get(link.target);
+          const path = svgElement("path", {
+            d: `M ${first.x + 220} ${first.y + 25} C ${first.x + 245} ${first.y + 25},${last.x - 25} ${last.y + 25},${last.x} ${last.y + 25}`,
+            fill: "none",
+            stroke: "#687f9b",
+            "stroke-width": 1.5,
+            "stroke-dasharray":
+              link.kind === "program_order" && link.aligned ? "" : "5 4",
+            "marker-end": "url(#graphArrow)",
+            "data-source": link.source,
+            "data-target": link.target,
+          });
+          path.append(
+            svgElement(
+              "title",
+              {},
+              link.relation +
+                (link.aligned ? " · 同一时间域" : " · 跨域关系，时差未知"),
+            ),
+          );
+          svg.append(path);
+        }
+        for (const event of nodes) {
+          const position = positions.get(event.args.event_id),
+            group = svgElement("g", {
+              "data-event-id": event.args.event_id,
+              tabindex: 0,
+              role: "button",
+              style: "cursor:pointer",
+            });
+          group.append(
+            svgElement("rect", {
+              x: position.x,
+              y: position.y,
+              width: 220,
+              height: 54,
+              rx: 6,
+              fill: "#f4f7fc",
+              stroke: colour(event),
+            }),
+          );
+          group.append(
+            svgElement(
+              "text",
+              { x: position.x + 8, y: position.y + 20, fill: "#192b42" },
+              event.name.slice(0, 30),
+            ),
+          );
+          group.append(
+            svgElement(
+              "text",
+              { x: position.x + 8, y: position.y + 40, fill: "#53647a" },
+              (event.args.layer || "请求") +
+                " · " +
+                (event.ph === "i"
+                  ? "里程碑"
+                  : format(event.dur / 1000) + " ms"),
+            ),
+          );
+          group.append(
+            svgElement("title", {}, event.name + " / " + event.args.domain),
+          );
+          group.onclick = () => showDetails(event);
+          group.onkeydown = (key) => {
+            if (key.key === "Enter" || key.key === " ") {
+              key.preventDefault();
+              showDetails(event);
+            }
+          };
+          svg.append(group);
+        }
+        container.append(svg);
+      }
+      function exportSvg(container, name) {
+        const svg = $(container).querySelector("svg");
+        if (!svg) return;
+        save(
+          new Blob([new XMLSerializer().serializeToString(svg)], {
+            type: "image/svg+xml",
+          }),
+          name,
+        );
+      }
+      $("stageSvg").onclick = () =>
+        exportSvg("stageChart", "kvaf-pd-stages.svg");
+      $("graphSvg").onclick = () =>
+        exportSvg("requestGraph", "kvaf-pd-relations.svg");
+      $("stagePng").onclick = () => {
+        const svg = $("stageChart").querySelector("svg");
+        if (!svg) return;
+        const url = URL.createObjectURL(
+            new Blob([new XMLSerializer().serializeToString(svg)], {
+              type: "image/svg+xml",
+            }),
+          ),
+          picture = new Image();
+        picture.onload = () => {
+          const output = document.createElement("canvas");
+          output.width = svg.width.baseVal.value;
+          output.height = svg.height.baseVal.value;
+          output.getContext("2d").drawImage(picture, 0, 0);
+          URL.revokeObjectURL(url);
+          output.toBlob((blob) => {
+            if (blob) save(blob, "kvaf-pd-stages.png");
+          });
+        };
+        picture.onerror = () => {
+          URL.revokeObjectURL(url);
+          status("阶段 PNG 导出失败。", true);
+        };
+        picture.src = url;
+      };
+      $("stagePrevious").onclick = () => {
+        stagePage = Math.max(0, stagePage - 1);
+        renderStages();
+      };
+      $("stageNext").onclick = () => {
+        stagePage++;
+        renderStages();
+      };
+      $("stageTablePrevious").onclick = $("stagePrevious").onclick;
+      $("stageTableNext").onclick = $("stageNext").onclick;
+      $("graphPrevious").onclick = () => {
+        graphPage = Math.max(0, graphPage - 1);
+        renderGraph();
+      };
+      $("graphNext").onclick = () => {
+        graphPage++;
+        renderGraph();
+      };
+      $("relationKind").onchange = () => {
+        graphPage = 0;
+        renderGraph();
+      };
+      $("representative").onchange = () => {
+        const value = $("representative").value;
+        if (!value) return;
+        const item =
+          trace.kvaf_pd.summary.representative_requests[Number(value)];
+        $("request").value = item.request;
+        $("filter").value = "";
+        choose();
+        $("generation").value = item.generation;
+        choose();
+      };
+      async function load(file) {
+        if (!file) return;
+        try {
+          if (file.size > MAX_BYTES)
+            throw Error("Trace 超过 256 MiB，请在服务侧缩小导出范围。");
+          const candidate = JSON.parse(await file.text()),
+            meta = candidate.kvaf_pd;
+          if (
+            !meta ||
+            ![1, 2].includes(meta.format_version) ||
+            !meta.summary ||
+            !Array.isArray(candidate.traceEvents) ||
+            !Array.isArray(meta.clocks) ||
+            !Array.isArray(meta.unaligned_domains)
+          )
+            throw Error("不支持的 KVAF Trace 格式或版本。");
+          const events = [...candidate.traceEvents];
+          for (const domain of meta.unaligned_domains) {
+            if (!Array.isArray(domain.events))
+              throw Error("无效的时间域事件。");
+            for (const event of domain.events) events.push(event);
+          }
+          if (events.length > MAX_RECORDS)
+            throw Error("Trace 记录超过浏览器预算，请缩小导出范围。");
+          const useful = events.filter((e) => e.ph === "X" || e.ph === "i");
+          if (useful.length > MAX_EVENTS)
+            throw Error("事件超过浏览器预算，请缩小导出范围。");
+          for (const e of useful) {
+            if (e.ph === "i") e.dur = 0;
+            if (
+              !number(e.ts) ||
+              !number(e.dur) ||
+              !number(e.ts + e.dur) ||
+              e.ts < 0 ||
+              e.dur < 0 ||
+              typeof e.name !== "string" ||
+              !e.args ||
+              typeof e.args.domain !== "string" ||
+              !membersOf(e).length ||
+              !membersOf(e).every(
+                (m) =>
+                  m &&
+                  typeof m.request === "string" &&
+                  typeof m.generation === "string",
+              )
+            )
+              throw Error("Trace 含无效时间或身份字段。");
+          }
+          trace = candidate;
+          eventsById = new Map();
+          linksByEvent = new Map();
+          requestsIndex = new Map();
+          domains = meta.clocks.map((clock) => ({
+            ...clock,
+            events: [],
+            requests: new Map(),
+          }));
+          const clockIndex = new Map(
+            domains.map((domain) => [domain.domain, domain]),
+          );
+          if (clockIndex.size !== domains.length) throw Error("重复时间域");
+          for (const [index, event] of useful.entries()) {
+            event.args.event_id ??= "legacy-" + index;
+            const identity = event.args.event_id;
+            if (typeof identity !== "string" || eventsById.has(identity))
+              throw Error("重复或无效事件 ID");
+            eventsById.set(identity, event);
+            const domain = clockIndex.get(event.args.domain);
+            if (!domain) throw Error("事件没有对应时间域");
+            domain.events.push(event);
+            for (const request of new Set(
+              membersOf(event).map((member) => member.request),
+            )) {
+              if (!domain.requests.has(request))
+                domain.requests.set(request, []);
+              domain.requests.get(request).push(event);
+              if (!requestsIndex.has(request)) requestsIndex.set(request, []);
+              requestsIndex.get(request).push(event);
+            }
+          }
+          if (meta.links !== undefined && !Array.isArray(meta.links))
+            throw Error("无效关系数据");
+          if ((meta.links || []).length > MAX_LINKS)
+            throw Error("关系超过浏览器预算");
+          for (const link of meta.links || []) {
+            if (!eventsById.has(link.source) || !eventsById.has(link.target))
+              throw Error("关系引用了不存在的事件");
+            for (const identity of [link.source, link.target]) {
+              if (!linksByEvent.has(identity)) linksByEvent.set(identity, []);
+              linksByEvent.get(identity).push(link);
+            }
+          }
+          $("clock").replaceChildren();
+          for (const [i, domain] of domains.entries()) {
+            const option = document.createElement("option");
+            option.value = i;
+            option.textContent =
+              (domain.domain === meta.reference_clock
+                ? "参考域 "
+                : "未对齐本地域 ") + domain.domain;
+            $("clock").append(option);
+          }
+          const ids = [...requestsIndex.keys()].sort();
+          $("requests").replaceChildren();
+          for (const id of ids.slice(0, 1000)) {
+            const option = document.createElement("option");
+            option.value = id;
+            $("requests").append(option);
+          }
+          $("request").value = ids[0] || "";
+          $("filter").value = "";
+          $("generation").replaceChildren(new Option("全部代次", ""));
+          $("representative").replaceChildren(new Option("手动选择", ""));
+          for (const [index, item] of (
+            meta.summary.representative_requests || []
+          ).entries()) {
+            $("representative").append(
+              new Option(
+                `${item.metric} P${Math.round(item.quantile * 100)} 附近 · 实际 ${format(item.actual_ms)} ms`,
+                String(index),
+              ),
+            );
+          }
+          $("basis").textContent =
+            meta.summary.summary_basis === "transfer_eligible_to_ack"
+              ? "允许发起 → 完成回执"
+              : "Pull RPC 发起 → 完成回执（兼容）";
+          const phase = meta.summary.selection?.request_phase;
+          $("requestPhaseScope").textContent =
+            {
+              measure: "仅正式请求",
+              warmup: "仅预热（诊断）",
+              profile: "仅 profiling（诊断）",
+              unknown: "仅未知用途（诊断）",
+              all: "全部用途（诊断，含预热）",
+            }[phase] || "旧版未区分用途，请重新分析导出";
+          $("requestPhaseScope").className =
+            phase === "measure" ? "" : "warning";
+          $("layerRole").replaceChildren();
+          for (const value of [
+            "all",
+            ...(meta.summary.layer_role_summary || []).map((item) => item.role),
+          ]) {
+            const option = document.createElement("option");
+            option.value = value;
+            option.textContent =
+              {
+                all: "全部层",
+                target: "Target 层",
+                mtp: "MTP 层",
+                unknown: "类型未知",
+              }[value] || value;
+            $("layerRole").append(option);
+          }
+          renderSummary();
+          $("quality").textContent = JSON.stringify(meta.summary, null, 2);
+          $("clientSummary").replaceChildren();
+          $("clientStatistics").hidden = !meta.summary.client;
+          if (meta.summary.client) {
+            for (const key of ["e2e", "ttft"]) {
+              const item = meta.summary.client[key],
+                row = document.createElement("tr");
+              cell(row, key.toUpperCase());
+              for (const field of ["mean_ms", "p90_ms", "p99_ms"])
+                cell(row, format(item[field]));
+              cell(row, item.samples);
+              $("clientSummary").append(row);
+            }
+          }
+          $("details").textContent = "点击色块查看详情。";
+          status(
+            file.name +
+              " | " +
+              meta.summary.status +
+              " | " +
+              useful.length +
+              " 个事件（含里程碑） | " +
+              meta.summary.valid_requests +
+              " 个完整 KV 请求\n" +
+              meta.summary.scope,
+          );
+          choose();
+        } catch (error) {
+          trace = null;
+          domains = [];
+          selected = [];
+          lanes = [];
+          laneEvents.clear();
+          eventsById.clear();
+          linksByEvent.clear();
+          requestsIndex.clear();
+          $("requestGraph").replaceChildren();
+          $("stageChart").replaceChildren();
+          $("graphPage").textContent = "";
+          $("stagePage").textContent = "";
+          $("stageTablePage").textContent = "";
+          $("summary").replaceChildren();
+          $("stageSummary").replaceChildren();
+          $("clientStatistics").hidden = true;
+          $("basis").textContent = "等待文件";
+          $("requestPhaseScope").textContent = "等待文件";
+          $("quality").textContent = "";
+          $("details").textContent = "";
+          status("无法打开 Trace：" + error.message, true);
+          draw();
+        }
+      }
+      function choose() {
+        const domain = domains[Number($("clock").value) || 0],
+          req = $("request").value.trim(),
+          query = $("filter").value.trim().toLowerCase();
+        const choices = [
+          ...new Set(
+            (requestsIndex.get(req) || []).flatMap((event) =>
+              membersOf(event)
+                .filter((member) => member.request === req)
+                .map((member) => member.generation),
+            ),
+          ),
+        ].sort();
+        const oldGeneration = $("generation").value;
+        $("generation").replaceChildren(new Option("全部代次", ""));
+        for (const value of choices)
+          $("generation").append(new Option(value, value));
+        if (choices.includes(oldGeneration))
+          $("generation").value = oldGeneration;
+        const generation = $("generation").value;
+        selected = (
+          req ? domain?.requests.get(req) || [] : domain?.events || []
+        ).filter(
+          (e) =>
+            membersOf(e).some(
+              (member) =>
+                (!req || member.request === req) &&
+                (!generation || member.generation === generation),
+            ) &&
+            (!query ||
+              [
+                e.name,
+                e.args.layer,
+                e.args.layer_role,
+                e.args.path,
+                e.args.actor,
+              ]
+                .join(" ")
+                .toLowerCase()
+                .includes(query)),
+        );
+        laneEvents = new Map();
+        for (const event of selected) {
+          const key =
+            event.pid +
+            "/" +
+            ($("laneView").value === "phase" ? event.name : event.tid);
+          if (!laneEvents.has(key)) laneEvents.set(key, []);
+          laneEvents.get(key).push(event);
+        }
+        lanes = [...laneEvents.keys()];
+        page = 0;
+        graphPage = 0;
+        stagePage = 0;
+        $("clockNote").textContent = domain
+          ? domain.domain === trace.kvaf_pd.reference_clock
+            ? "仅参考主机时钟域内可比较先后；不代表完整请求时间。"
+            : "未对齐的本地时钟域：只看本域持续时间，不能与其他主机位置相减。"
+          : "此 Trace 暂无可绘制的完整区间。";
+        fit();
+        renderGraph();
+        renderStages();
+      }
+      function fit() {
+        origin = 0;
+        if (selected.length) {
+          origin = selected[0].ts;
+          for (const e of selected) origin = Math.min(origin, e.ts);
+        }
+        let end = origin;
+        for (const e of selected) end = Math.max(end, e.ts + e.dur);
+        span = Math.max(1, end - origin) * 1.03;
+        draw();
+      }
+      function draw() {
+        const width = Math.max(900, $("canvasBox").clientWidth),
+          visible = lanes.slice(page * ROWS, (page + 1) * ROWS),
+          height = 100 + Math.max(1, visible.length) * ROW;
+        const ratio = window.devicePixelRatio || 1;
+        canvas.width = width * ratio;
+        canvas.height = height * ratio;
+        canvas.style.width = width + "px";
+        canvas.style.height = height + "px";
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, width, height);
+        ctx.font = "12px system-ui";
+        ctx.textBaseline = "middle";
+        hits = [];
+        shapes = [];
+        labels = [];
+        const available = width - LEFT - 20;
+        for (let i = 0; i <= 5; i++) {
+          const x = LEFT + (available * i) / 5;
+          ctx.strokeStyle = "#e3eaf3";
+          ctx.beginPath();
+          ctx.moveTo(x, 35);
+          ctx.lineTo(x, height - 30);
+          ctx.stroke();
+          ctx.fillStyle = "#53647a";
+          ctx.fillText(
+            ((origin + (span * i) / 5) / 1000).toFixed(3) + " ms",
+            x - 20,
+            20,
+          );
+        }
+        for (const [index, key] of visible.entries()) {
+          const y = 45 + index * ROW,
+            events = laneEvents.get(key),
+            first = events[0];
+          const label = [
+            $("laneView").value === "phase"
+              ? "跨层原始事件"
+              : first.args.layer || "request",
+            first.name,
+            first.args.actor,
+          ].join(" / ");
+          labels.push({ label, y: y + 14 });
+          ctx.fillStyle = "#253954";
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(0, y, LEFT - 8, ROW);
+          ctx.clip();
+          ctx.fillText(label, 5, y + 10);
+          ctx.restore();
+          for (const e of events) {
+            let x = LEFT + ((e.ts - origin) / span) * available,
+              w = Math.max(2, (e.dur / span) * available);
+            if (x + w < LEFT || x > width - 20) continue;
+            w = Math.min(w, width - 20 - Math.max(LEFT, x));
+            x = Math.max(x, LEFT);
+            const colourValue = colour(e);
+            ctx.fillStyle = colourValue;
+            if (e.ph === "i") {
+              ctx.strokeStyle = colourValue;
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(x, y);
+              ctx.lineTo(x, y + 20);
+              ctx.stroke();
+            } else {
+              ctx.fillRect(x, y, w, 20);
+            }
+            hits.push({
+              x: x - (e.ph === "i" ? 3 : 0),
+              y,
+              w: e.ph === "i" ? 6 : w,
+              h: 20,
+              e,
+            });
+            shapes.push({
+              x,
+              y,
+              w,
+              colour: colourValue,
+              name: e.name,
+              instant: e.ph === "i",
+            });
+          }
+        }
+        ctx.fillStyle = "#53647a";
+        ctx.fillText(
+          ($("clock").selectedIndex > 0 ? "未对齐本地域 | " : "参考主机域 | ") +
+            "scope: " +
+            (trace?.kvaf_pd.summary.scope || "无数据") +
+            " | 请求: " +
+            ($("request").value || "全部") +
+            " | 单位 ms",
+          5,
+          height - 14,
+        );
+        $("page").textContent = lanes.length
+          ? "阶段耗时行 " +
+            (page * ROWS + 1) +
+            "–" +
+            Math.min((page + 1) * ROWS, lanes.length) +
+            " / " +
+            lanes.length
+          : "无匹配事件";
+      }
+      function zoom(factor, anchor = 0.5) {
+        const next = Math.min(1e15, Math.max(0.001, span * factor));
+        origin = Math.max(0, origin + (span - next) * anchor);
+        span = next;
+        draw();
+      }
+      $("file").addEventListener("change", (e) => load(e.target.files[0]));
+      $("drop").addEventListener("dragover", (e) => e.preventDefault());
+      $("drop").addEventListener("drop", (e) => {
+        e.preventDefault();
+        load(e.dataTransfer.files[0]);
+      });
+      for (const id of ["clock", "request", "filter", "generation", "laneView"])
+        $(id).addEventListener("change", choose);
+      $("reset").onclick = fit;
+      $("zoomIn").onclick = () => zoom(0.5);
+      $("zoomOut").onclick = () => zoom(2);
+      $("previous").onclick = () => {
+        page = Math.max(0, page - 1);
+        draw();
+      };
+      $("next").onclick = () => {
+        page = Math.min(
+          Math.max(0, Math.ceil(lanes.length / ROWS) - 1),
+          page + 1,
+        );
+        draw();
+      };
+      canvas.addEventListener(
+        "wheel",
+        (e) => {
+          e.preventDefault();
+          zoom(
+            e.deltaY > 0 ? 1.2 : 1 / 1.2,
+            Math.max(
+              0,
+              Math.min(
+                1,
+                (e.offsetX - LEFT) / (canvas.clientWidth - LEFT - 20),
+              ),
+            ),
+          );
+        },
+        { passive: false },
+      );
+      canvas.addEventListener("pointerdown", (e) => {
+        drag = { x: e.offsetX, origin, moved: false };
+        canvas.setPointerCapture(e.pointerId);
+      });
+      canvas.addEventListener("pointermove", (e) => {
+        if (drag) {
+          if (Math.abs(e.offsetX - drag.x) > 3) drag.moved = true;
+          origin = Math.max(
+            0,
+            drag.origin -
+              ((e.offsetX - drag.x) * span) / (canvas.clientWidth - LEFT - 20),
+          );
+          draw();
+        }
+      });
+      canvas.addEventListener("pointerup", (e) => {
+        if (!drag?.moved) {
+          const hit = [...hits]
+            .reverse()
+            .find(
+              (h) =>
+                e.offsetX >= h.x &&
+                e.offsetX <= h.x + h.w &&
+                e.offsetY >= h.y &&
+                e.offsetY <= h.y + h.h,
+            );
+          if (hit) showDetails(hit.e);
+        }
+        drag = null;
+      });
+      canvas.addEventListener("pointercancel", () => {
+        drag = null;
+      });
+      $("svg").onclick = () => {
+        if (!trace) return;
+        const width = canvas.clientWidth,
+          height = canvas.clientHeight;
+        let content = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="white"/><title>${xml($("clockNote").textContent)}</title><metadata>${xml(JSON.stringify({ scope: trace.kvaf_pd.summary.scope, request: $("request").value, filter: $("filter").value, clock: $("clock").selectedOptions[0]?.textContent, unit: "ms", summary: trace.kvaf_pd.summary.summary }))}</metadata><defs><clipPath id="labels"><rect width="${LEFT - 8}" height="${height}"/></clipPath></defs>`;
+        for (const label of labels)
+          content += `<text x="5" y="${label.y}" font-size="12" clip-path="url(#labels)">${xml(label.label)}</text>`;
+        for (const h of shapes)
+          content += h.instant
+            ? `<line x1="${h.x}" x2="${h.x}" y1="${h.y}" y2="${h.y + 20}" stroke="${h.colour}" stroke-width="2"><title>${xml(h.name)}</title></line>`
+            : `<rect x="${h.x}" y="${h.y}" width="${h.w}" height="20" fill="${h.colour}"><title>${xml(h.name)}</title></rect>`;
+        for (let i = 0; i <= 5; i++)
+          content += `<text x="${LEFT + ((width - LEFT - 20) * i) / 5}" y="20" font-size="12">${((origin + (span * i) / 5) / 1000).toFixed(3)} ms</text>`;
+        content += `<text x="5" y="${height - 10}" font-size="12">${xml("请求: " + ($("request").value || "全部") + " | " + $("clockNote").textContent)}</text></svg>`;
+        save(
+          new Blob([content], { type: "image/svg+xml" }),
+          "kvaf-pd-view.svg",
+        );
+      };
+      $("png").onclick = () => {
+        if (trace)
+          canvas.toBlob((blob) => {
+            if (blob) save(blob, "kvaf-pd-view.png");
+          });
+      };
+      window.addEventListener("resize", draw);
+      draw();
+    </script>
+  </body>
+</html>
