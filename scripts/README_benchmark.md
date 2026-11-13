@@ -14,16 +14,17 @@ python3 scripts/benchmark.py \
   --data-parallel-size 1 --tensor-parallel-size 8
 ```
 
-默认连接本机 8080，TP=8、DP=1；输入 130816、输出 256，总计 131072 tokens。
+默认连接本机 8080，TP=8、DP=1；输入 130560、输出 512，总计 131072 tokens。
 压测前会用 `/v1/models` 返回的 `max_model_len` 校验实际请求总长；接口未提供该字段时跳过此检查。
-本机 `localhost`、`127.0.0.1`、`::1` 请求显式绕过环境代理，远端保留环境代理，HTTPS 仍校验证书。
+本机 `localhost`、`127.0.0.1`、`::1` 请求显式绕过环境代理，远端默认保留环境代理；
+`--ignore-env-proxy` 可让所有请求绕过环境 HTTP(S) 代理，HTTPS 仍校验证书。
 
 客户端 DP/TP 应与服务配置一致。每档 batch 是每个 DP 的请求数：
 `TP=8, DP=1, BS/DP=16` 共 16 个请求；`TP=1, DP=8, BS/DP=16` 共 128 个请求。
 TP 只用于说明卡数，不会把相同输出乘以 TP。可见八张卡不代表服务已使用全部八张卡。
 
 可将 `benchmark.py` 和 `benchmark_metrics.py` 一起复制到任意客户端机器运行。
-服务需要支持流式 `token_ids`、最终 usage；多 DP 压测需要支持 DP 定向请求。
+服务需要支持流式 `token_ids`、最终 usage；直连模式的多 DP 压测需要支持 DP 定向请求。
 鉴权使用 `--api-key`，无需安装服务端扩展；此前运行过带自定义 benchmark 扩展的版本，
 应先用更新后的启动脚本重启服务。
 
@@ -38,6 +39,44 @@ python3 scripts/benchmark.py
 宿主机若输出 `ask: session error: ...`，这不是本脚本的错误前缀；用 `type -a python python3`
 确认解释器是否被别名或其他程序替代，建议先在容器内使用 `python3`。
 
+## PD Proxy 压测
+
+适用于仓库 `scripts/kvaf_pd_proxy.sh` 启动的 PD Proxy。推理请求发送到 Proxy 的
+`/v1/completions`；Proxy 不提供 `/v1/models`、`/tokenize`，因此通过
+`--metadata-base-url` 指定使用相同模型、分词器的 P 或 D 后端，仅获取模型信息和 token IDs。
+所有压测生成请求均经过 Proxy，不会直接发送给这个元数据后端。
+
+以下示例对应 P/Proxy=`141.62.38.12`、D=`141.62.38.24`，D 为 TP1/DP8：
+
+```bash
+python3 scripts/benchmark.py \
+  --pd-proxy \
+  --base-url http://141.62.38.12:8000 \
+  --metadata-base-url http://141.62.38.24:8200 \
+  --model glm --ignore-env-proxy \
+  --input-tokens 130947 --output-tokens 125 \
+  --data-parallel-size 8 --tensor-parallel-size 1 \
+  --levels 1,2,4,8,16 \
+  --result-dir scripts/result/pd-proxy
+```
+
+`input_tokens + output_tokens` 必须不超过模型上下文上限；上例为 131072。
+输入 131072 再输出 125，需要服务、模型及容量都支持更大的上下文。
+
+Proxy 模式下 `--levels` 仍按 `level × data_parallel_size` 计算每波总并发，上例为
+8、16、32、64、128 个请求。终端显示 `Concurrency`，结果保存 `concurrency` 和
+`routing=proxy_balanced`。客户端不发送 `X-data-parallel-rank`，后端 rank 记录为 `null`，
+`overlap.per_dp` 为空；由 Proxy 和 D 服务调度请求，不能据此声称每卡实际 batch 为 16。
+服务的 `--max-num-seqs`、token 预算和内存容量会约束实际 batch；特别是
+`--max-num-seqs 1` 不会因为客户端发送 128 并发就变成每卡 batch 16。
+
+Proxy 模式默认关闭 APC 预热与命中校验，适配现有 `--no-enable-prefix-caching` 部署；
+显式指定 `--prefix-warmup` 或 profiling 时，在发送请求前报错。
+不请求 Proxy 的 `/metrics`、`/start_profile`、`/stop_profile`，调度观测明确标记不可用。
+推理响应仍必须包含真实流式 `token_ids`、usage 和终止标记；缺失、传输中断或长度不符均报错，
+不会把 SSE 包数当成 token 数。鉴权参数 `--api-key` 同时用于 Proxy 和元数据后端。
+去掉 `--pd-proxy` 和 `--metadata-base-url` 即恢复直接压测 vLLM 的方式。
+
 ## 功能
 
 | 功能 | 用法/行为 |
@@ -46,9 +85,9 @@ python3 scripts/benchmark.py
 | 相同输入 | `--repeat-prompt`，每个 DP 内重复使用输入 |
 | JSONL | `--prompt-jsonl input.jsonl --prompt-field question`，读取首个非空记录 |
 | 长度控制 | `--dataset-length-policy truncate` 截断过长输入；`strict` 要求完全相等；过短均报错 |
-| 并发阶梯 | `--levels 1,2,4,8,16`，每档同步发起一波请求，使用 `X-data-parallel-rank` 路由 |
+| 并发阶梯 | `--levels 1,2,4,8,16`，每档同步发起一波请求；直连按 DP 路由，Proxy 模式由后端调度 |
 | 性能指标 | 全请求重叠区间 TPS/TPOT，以及 HTTP TTFT、E2E、请求 TPOT 和分位数 |
-| 调度观测 | `/metrics` 的 running/waiting；缺失明确标注 |
+| 调度观测 | 直连读取 `/metrics` 的 running/waiting；Proxy 模式明确标记不可用 |
 | 预热/APC 校验 | `--prefix-warmup`，分档补充尚未预热的输入并检查 cached_tokens |
 | Profiling | 通过服务已有的 `/start_profile`、`/stop_profile` 接口控制 |
 | 展示/保存 | 实时终端表格、`live.json` 和 `result.json`，保存原始到达事件及错误 |
@@ -82,6 +121,9 @@ TPS × Effective TPOT / 1000 = B
 边界上的整个返回事件均排除，不按比例切分；不会把一个 SSE 包当成一个 token。
 各 DP 使用同一时间窗，TP 卡不重复计数。短窗口的边界误差更明显，建议增加输出长度。
 这是客户端可观察的并发区间，包含网络传输和合包影响，不表示设备 kernel 利用率或实际调度 batch。
+Proxy 模式中 B 为该波总并发 `level × DP`，仅统计全局与逐请求指标，不推断实际 DP 分布。
+TTFT、E2E 和请求 TPOT 均提供 mean、P90、P99 和有效 count，时间包含 Proxy、排队、
+P 计算、KV 传输及 D 解码对客户端响应造成的影响，不能据此单独拆出 Connector 或 KV 传输耗时。
 
 HTTP 请求 TPOT 单独统计：首个到最后一个返回事件的时间，除以首个事件之后的 token 数。
 它与主表的 Effective TPOT 口径不同；不使用分位数倒数计算吞吐。

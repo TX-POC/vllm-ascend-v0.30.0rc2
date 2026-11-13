@@ -32,6 +32,9 @@ from benchmark_metrics import summarize_overlap
 @dataclasses.dataclass
 class Config:
     base_url: str = "http://127.0.0.1:8080"
+    pd_proxy: bool = False
+    metadata_base_url: str = ""  # Matching P/D backend for /v1/models and /tokenize only.
+    ignore_env_proxy: bool = False  # Bypass HTTP_PROXY etc.; unrelated to the PD Proxy.
     model: str = "glm"
     api_key: str = ""
     input_tokens: int = 130560  # Leave 512 output tokens within a 131072-token context.
@@ -78,14 +81,14 @@ class Http:
     def __init__(self, config: Config):
         self.config = config
         hostname = urllib.parse.urlparse(config.base_url).hostname
-        proxies = {} if hostname in ("localhost", "127.0.0.1", "::1") else None
+        proxies = {} if config.ignore_env_proxy or hostname in ("localhost", "127.0.0.1", "::1") else None
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
 
     def request(self, path, payload=None, *, dp_rank=None, request_id=None, timeout=CONTROL_TIMEOUT):
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
-        if dp_rank is not None:
+        if dp_rank is not None and not self.config.pd_proxy:
             headers["X-data-parallel-rank"] = str(dp_rank)
         if request_id:
             headers["X-Request-Id"] = request_id
@@ -110,6 +113,8 @@ class Http:
 
     def complete(self, prompt, max_tokens, request_id, dp_rank, observer=None):
         """Return raw HTTP times and counts; SSE packets are never tokens."""
+        if self.config.pd_proxy:
+            dp_rank = None  # The proxy chooses the backend; its actual rank is unknown.
         result = {
             "request_id": request_id,
             "dp_rank": dp_rank,
@@ -305,6 +310,8 @@ def summarize_http(requests):
 
 
 def scheduler_metrics(http: Http):
+    if http.config.pd_proxy:
+        return {"unavailable": "PD Proxy has no scheduler metrics endpoint"}
     try:
         with http.request("/metrics", timeout=2) as response:
             lines = response.read().decode().splitlines()
@@ -341,7 +348,9 @@ class Reporter:
         temporary.replace(destination)
 
     def display(self, progress=None):
-        lines = ["BS/DP | success | TTFT mean ms | E2E mean ms | overlap TPOT ms | global TPS"]
+        proxy = self.report["config"].get("pd_proxy", False)
+        label = "Concurrency" if proxy else "BS/DP"
+        lines = [f"{label} | success | TTFT mean ms | E2E mean ms | overlap TPOT ms | global TPS"]
 
         def value(item, key=None):
             if key and isinstance(item, dict):
@@ -351,7 +360,7 @@ class Reporter:
         for row in self.report["levels"]:
             http, overlap = row.get("http", {}), row.get("overlap", {})
             lines.append(
-                f"{row['batch']:5} | {http.get('success', 0):7} | "
+                f"{row.get('concurrency', row['batch']) if proxy else row['batch']:5} | {http.get('success', 0):7} | "
                 f"{value(http.get('ttft_ms'), 'mean'):>12} | {value(http.get('e2e_ms'), 'mean'):>11} | "
                 f"{value(overlap.get('tpot_ms')):>18} | {value(overlap.get('tps')):>10}"
             )
@@ -371,9 +380,27 @@ class Reporter:
 
 
 def validate_config(config):
-    parsed = urllib.parse.urlparse(config.base_url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.path not in ("", "/"):
-        raise BenchmarkError("base_url must be an HTTP(S) origin without /v1 or other path")
+    for name in ("base_url", "metadata_base_url"):
+        value = getattr(config, name)
+        if name == "metadata_base_url" and not value:
+            continue
+        parsed = urllib.parse.urlparse(value)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+        ):
+            raise BenchmarkError(f"{name} must be an HTTP(S) origin without credentials, /v1 or other path")
+    if config.pd_proxy:
+        if not config.metadata_base_url:
+            raise BenchmarkError("--pd-proxy requires --metadata-base-url pointing to a matching P/D backend")
+        if config.prefix_warmup:
+            raise BenchmarkError("PD Proxy does not support DP-directed prefix verification; use --no-prefix-warmup")
+    elif config.metadata_base_url:
+        raise BenchmarkError("--metadata-base-url requires --pd-proxy")
     for name in (
         "input_tokens",
         "output_tokens",
@@ -565,7 +592,16 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None, pre
     ]
     barrier = threading.Barrier(len(jobs) + 1)
     profile = ProfileCoordinator(http, "decode", profile_tokens, [job[0] for job in jobs]) if profile_tokens else None
-    row = {"batch": batch, "run_id": run_id, "requests": [], "scheduler": [], "errors": [], "status": "running"}
+    row = {
+        "batch": batch,
+        "concurrency": len(jobs),
+        "routing": "proxy_balanced" if config.pd_proxy else "dp_header",
+        "run_id": run_id,
+        "requests": [],
+        "scheduler": [],
+        "errors": [],
+        "status": "running",
+    }
     reporter.report["profiles" if profile else "levels"].append(row)
     progress_lock = threading.Lock()
     counts, completed = dict.fromkeys((job[0] for job in jobs), 0), set()
@@ -597,7 +633,8 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None, pre
                     }
                 row["scheduler"].append({"time_ns": time.perf_counter_ns(), **scheduler_metrics(http)})
                 row["requests"] = [future.result() for future in pending if future.done()]
-                reporter.display(f"{'Profiling' if profile else 'Running'} BS/DP={batch}: {row['progress']}")
+                workload = f"concurrency={len(jobs)}" if config.pd_proxy else f"BS/DP={batch}"
+                reporter.display(f"{'Profiling' if profile else 'Running'} {workload}: {row['progress']}")
                 reporter.save()
                 futures.wait(pending, timeout=REFRESH_SECONDS, return_when=futures.ALL_COMPLETED)
             row["requests"] = [future.result() for future in pending]
@@ -621,7 +658,9 @@ def run_level(config, http, source, batch, reporter, *, profile_tokens=None, pre
             except BenchmarkError as exc:
                 row["errors"].append(str(exc))
     if not profile:
-        row["overlap"] = summarize_overlap(row["requests"], batch, config.data_parallel_size)
+        row["overlap"] = summarize_overlap(
+            row["requests"], batch, config.data_parallel_size, dp_routing=not config.pd_proxy
+        )
         if row["overlap"]["status"] != "ready":
             row["errors"].append("client full-batch window unavailable: " + str(row["overlap"].get("reason")))
     row["status"] = "error" if row["errors"] else "ok"
@@ -658,11 +697,22 @@ def parse_args(argv=None):
         if isinstance(field.default, bool):
             options["action"] = argparse.BooleanOptionalAction
         elif field.name == "levels":
-            options.update(type=lambda text: tuple(map(int, text.split(","))), help="batch sizes per DP: 1,2,4,8,16")
+            options.update(
+                type=lambda text: tuple(map(int, text.split(","))),
+                help="nominal batch sizes per DP; proxy concurrency=level*DP: 1,2,4,8,16",
+            )
         else:
             options["type"] = type(field.default)
         if field.name == "dataset_length_policy":
             options["choices"] = ("truncate", "strict")
+        if field.name == "prefix_warmup":
+            options.update(default=None, help="APC verification (default: on for direct vLLM, off for PD Proxy)")
+        if field.name == "pd_proxy":
+            options["help"] = "send inference through PD Proxy; routing and per-card batch are backend controlled"
+        if field.name == "metadata_base_url":
+            options["help"] = "P/D backend origin used only for model validation and tokenization in PD Proxy mode"
+        if field.name == "ignore_env_proxy":
+            options["help"] = "bypass environment HTTP(S) proxies for both inference and metadata requests"
         parser.add_argument("--" + field.name.replace("_", "-"), **options)
     profile_group = parser.add_mutually_exclusive_group()
     profile_group.add_argument("--profile-prefill", action="store_true")
@@ -670,8 +720,12 @@ def parse_args(argv=None):
     parser.add_argument("--profile-decode-batch", type=int)
     parser.add_argument("--profile-decode-tokens", type=int, default=8)
     args = parser.parse_args(argv)
+    if args.prefix_warmup is None:
+        args.prefix_warmup = Config.prefix_warmup and not args.pd_proxy
     config = Config(**{field.name: getattr(args, field.name) for field in dataclasses.fields(Config)})
     validate_config(config)
+    if config.pd_proxy and (args.profile_prefill or args.profile_decode):
+        raise BenchmarkError("PD Proxy does not expose /start_profile or /stop_profile; profile a backend directly")
     if args.profile_decode_batch is not None and not args.profile_decode:
         raise BenchmarkError("--profile-decode-batch requires --profile-decode")
     if args.profile_decode_batch is not None and args.profile_decode_batch not in config.levels:
@@ -695,8 +749,15 @@ def main(argv=None):
             flush=True,
         )
         http = Http(config)
-        preflight(http, config, output_tokens=1 if args.profile_prefill else config.output_tokens)
-        source = PromptSource(config, http)
+        metadata_http = http
+        if config.pd_proxy:
+            metadata_http = Http(dataclasses.replace(config, base_url=config.metadata_base_url, pd_proxy=False))
+            print(
+                f"PD Proxy mode: metadata={config.metadata_base_url}; "
+                "concurrency=level*DP; actual D rank/batch unknown; APC and profiling disabled."
+            )
+        preflight(metadata_http, config, output_tokens=1 if args.profile_prefill else config.output_tokens)
+        source = PromptSource(config, metadata_http)
         reporter.report["input_source"] = "JSONL first record" if source.dataset is not None else "synthetic token IDs"
         print("Primary TPOT/TPS: real token arrivals after every request starts and before any request's final token.")
         if args.profile_prefill:
