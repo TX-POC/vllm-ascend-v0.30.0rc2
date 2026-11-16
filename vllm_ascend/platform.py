@@ -1403,6 +1403,10 @@ def _setup_worker_and_scheduler(
             )
 
 
+    # Benchmark: preserve all native scheduler selection above.
+    from pd_barrier.integration import configure
+    configure(vllm_config)
+
 def _validate_sfa_dcp_kv_sp(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     cache_config = vllm_config.cache_config
@@ -1786,3 +1790,4 @@ def _validate_draft_decode_context_parallel_config(vllm_config: VllmConfig) -> N
             f"parallel for GQA draft model "
             f"({decode_context_parallel_size})."
         )
+

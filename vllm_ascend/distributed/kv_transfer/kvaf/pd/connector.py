@@ -166,6 +166,13 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 diagnostics=self.diagnostics,
             )
 
+        # Benchmark observers are opt-in; PDKVWorker and native data plane stay intact.
+        from pd_barrier.kvaf_observer import attach_receiver, attach_sender
+        if self.is_producer:
+            attach_sender(self.worker, pc.data_parallel_rank)
+        else:
+            attach_receiver(self.worker, pc.data_parallel_rank)
+
     def start_pd_control(self):
         if not self.is_producer and self.worker is not None:
             # Called only after native warmup/capture. No attach/probe can race
@@ -244,3 +251,4 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def close(self):
         self.shutdown()
+
