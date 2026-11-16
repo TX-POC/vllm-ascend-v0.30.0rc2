@@ -95,6 +95,7 @@ import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -104,6 +105,7 @@ from vllm.logger import init_logger
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     BATCH_KV_TRANSFER_PARAMS,
 )
+from vllm_ascend.distributed.kv_transfer.kvaf.pd.observation import notify
 
 logger = init_logger(__name__)
 
@@ -162,6 +164,9 @@ class ProxyState:
         self.metaserver_ready_events = {}
         self.metaserver_dispatch_tasks = {}
         self.metaserver_lock = asyncio.Lock()
+        self.request_observer = None
+        self.decode_batch_settings = None
+        self.decode_batch_registry = None
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -355,14 +360,24 @@ def parse_args():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch import CONFIG_FILE_NAME, Registry, load_settings
+
     global proxy_state
     proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
-    print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
-    yield
-    for p in proxy_state.prefillers:
-        await p.client.aclose()
-    for d in proxy_state.decoders:
-        await d.client.aclose()
+    try:
+        decode = load_settings(Path(__file__).resolve().parents[2] / "scripts" / CONFIG_FILE_NAME)
+        if decode.enabled:
+            proxy_state.decode_batch_settings = decode
+            proxy_state.decode_batch_registry = Registry(decode)
+        print(
+            f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients."
+        )
+        yield
+    finally:
+        if proxy_state.decode_batch_registry is not None:
+            await proxy_state.decode_batch_registry.close()
+        for server in (*proxy_state.prefillers, *proxy_state.decoders):
+            await server.client.aclose()
 
 
 async def listen_for_disconnect(request: Request) -> None:
@@ -392,6 +407,55 @@ def with_cancellation(handler_func):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.get("/v1/kvaf-decode-batch")
+async def decode_batch_info():
+    settings = proxy_state.decode_batch_settings
+    if settings is None or proxy_state.decode_batch_registry is None or proxy_state.decode_batch_registry.closed:
+        return {"enabled": False}
+    return dict(
+        enabled=True,
+        coordination="proxy",
+        dp_size=settings.dp_size,
+        max_batch_size=settings.max_batch_size,
+        timeout_seconds=settings.timeout_seconds,
+    )
+
+
+@app.post("/v1/kvaf-decode-batch/ready")
+async def decode_batch_ready(request: Request):
+    registry = proxy_state.decode_batch_registry
+    if registry is None:
+        raise HTTPException(status_code=409, detail="Proxy decode batch gate is disabled")
+    from vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch import MAX_MESSAGE_BYTES
+
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > MAX_MESSAGE_BYTES:
+            raise HTTPException(status_code=413, detail="decode batch message budget exceeded")
+        data.extend(chunk)
+    try:
+        message = json.loads(data)
+        if not isinstance(message, dict):
+            raise ValueError("decode batch message must be an object")
+
+        @with_cancellation
+        async def wait_ready(request: Request):
+            return await registry.arrive(message)
+
+        # Consume the complete control body before the existing disconnect
+        # listener starts, so it cannot steal streaming request-body chunks.
+        return await wait_ready(request=request)
+    except (ValueError, KeyError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def request_observer():
+    # Optional object extension; the ordinary Proxy creates no capture resources.
+    return getattr(proxy_state, "request_observer", None)
+
+
 async def send_request_to_service(
     client: httpx.AsyncClient,
     prefiller_id: int,
@@ -412,13 +476,19 @@ async def send_request_to_service(
         del req_data["stream_options"]
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     last_exc = None
+    observer = request_observer()
     for attempt in range(1, max_retries + 1):
+        token, observed_success = None, False
+        if observer is not None:
+            notify(observer, "point", name="PROXY_PREFILL_HTTP_DISPATCHED", parent=request_id)
+            token = notify(observer, "begin", name="Proxy.prefill_http", parent=request_id)
         try:
             response = await client.post(endpoint, json=req_data, headers=headers)
             response.raise_for_status()
             if request_id in proxy_state.req_id_future:
                 result_future = proxy_state.req_id_future[request_id]
                 result_future.set_result(response.json()["kv_transfer_params"])
+            observed_success = True
             return
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             logger.warning("Attempt %s failed for %s: %s", attempt, endpoint, e)
@@ -428,6 +498,9 @@ async def send_request_to_service(
             else:
                 logger.error("All %s attempts failed for %s.", max_retries, endpoint)
                 raise last_exc
+        finally:
+            if observer is not None:
+                notify(observer, "end", token=token, success=observed_success)
 
 
 async def stream_service_response_with_retry(
@@ -439,14 +512,25 @@ async def stream_service_response_with_retry(
     base_delay: float = 0.2,
 ):
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+    if proxy_state.decode_batch_settings is not None:
+        spec = proxy_state.decode_batch_settings.validate(req_data["kv_transfer_params"].get("kvaf_decode_batch"))
+        headers["X-data-parallel-rank"] = str(spec["rank"])
+    observer = request_observer()
     for attempt in range(1, max_retries + 1):
+        token, observed_success = None, False
+        if observer is not None:
+            notify(observer, "point", name="PROXY_DECODE_HTTP_DISPATCHED", parent=request_id)
+            token = notify(observer, "begin", name="Proxy.decoder_http_stream", parent=request_id)
         try:
             async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
                 response.raise_for_status()
                 first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
+                    if observer is not None and not first_chunk_sent:
+                        notify(observer, "point", name="PROXY_FIRST_BODY_CHUNK", parent=request_id)
                     first_chunk_sent = True
                     yield chunk
+                observed_success = True
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries:
@@ -467,6 +551,9 @@ async def stream_service_response_with_retry(
                 else:
                     logger.error("All %s attempts failed for streaming %s.", max_retries, endpoint)
                     raise e
+        finally:
+            if observer is not None:
+                notify(observer, "end", token=token, success=observed_success)
 
 
 def get_api_request_id(api, req_id, prompt_idx=0):
@@ -489,24 +576,48 @@ def get_api_request_ids(api, req_id, req_data):
 
 
 async def _handle_completions(api: str, request: Request):
+    decode_spec = None
+    if proxy_state.decode_batch_settings is not None:
+        try:
+            decode_spec = proxy_state.decode_batch_settings.parse_header(request.headers.get("X-KVAF-Decode-Batch"))
+        except (ValueError, TypeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    observer = request_observer()
+    entered = notify(observer, "clock") if observer is not None else None
+    request_id = None
     try:
         req_data = await request.json()
         req_body = await request.body()
         request_length = len(req_body)
         request_id = await proxy_state.next_req_id()
         request_ids_api = get_api_request_ids(api, request_id, req_data)
+        if decode_spec is not None and len(request_ids_api) != 1:
+            raise ValueError("decode batch mode requires one prompt per HTTP request")
         proxy_state.register_request_batch(request_id, request_ids_api, req_data, request_length, api)
+        if observer is not None:
+            notify(
+                observer,
+                "bind",
+                parent=request_id,
+                requests=request_ids_api,
+                entered_ns=entered,
+                request_phase=request.headers.get("X-KVAF-Request-Phase", "unknown"),
+            )
         req_data["kv_transfer_params"] = {
             "do_remote_decode": False,
             "do_remote_prefill": True,
             "metaserver": f"http://{global_args.host}:{global_args.port}/v1/metaserver",
         }
+        if decode_spec is not None:
+            req_data["kv_transfer_params"]["kvaf_decode_batch"] = decode_spec
         # Select decoder
         decoder_score = proxy_state.calculate_decode_scores(request_length)
         logger.debug("Decoder score: %f", decoder_score)
         # Use the prefiller's kv_transfer_params to select decoder
         decoder_idx = proxy_state.select_decoder(decoder_score)
         decoder = proxy_state.decoders[decoder_idx]
+        if observer is not None:
+            notify(observer, "point", name="PROXY_DECODER_SELECTED", parent=request_id)
         # logger.debug("Using %s %s", prefiller.url, decoder.url)
         # Stream response from decoder
         released_kv = False
@@ -579,6 +690,8 @@ async def _handle_completions(api: str, request: Request):
                             else (completion_tokens + usage.get("completion_tokens"))
                         )
                         if stop_reason == "recomputed":
+                            if observer is not None:
+                                notify(observer, "point", name="PROXY_RECOMPUTE", parent=request_id)
                             retry = True
                             retry_count += 1
                             if chat_flag:
@@ -611,12 +724,17 @@ async def _handle_completions(api: str, request: Request):
                 # After streaming done, release tokens
                 proxy_state.release_decoder(decoder_idx, decoder_score)
                 await proxy_state.cleanup_request_batch(request_id)
+                if observer is not None:
+                    notify(observer, "point", name="PROXY_STREAM_CLOSED", parent=request_id)
+                    notify(observer, "release", parent=request_id)
 
         if stream_flag:
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         else:
             return StreamingResponse(generate_stream(), media_type="application/json")
     except Exception as e:
+        if observer is not None:
+            notify(observer, "failed", name="PROXY_HANDLER_FAILED", parent=request_id)
         import traceback
 
         exc_info = sys.exc_info()
@@ -677,6 +795,9 @@ async def dispatch_prefill_batch(
     expected_request_ids,
     params_by_request_id,
 ):
+    observer = request_observer()
+    if observer is not None:
+        notify(observer, "point", name="PROXY_PREFILL_TASK_STARTED", parent=parent_request_id)
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     logger.debug("Request length: %s, Prefiller score: %s", request_length, prefiller_score)
     prefiller_idx = proxy_state.select_prefiller(prefiller_score)
@@ -718,6 +839,12 @@ async def metaserver(request: Request):
         raise HTTPException(status_code=404, detail=f"Unknown metaserver request_id: {request_id!r}")
 
     req_data, request_length, api, parent_request_id = request_record
+    observer = request_observer()
+    token = None
+    if observer is not None:
+        generation = kv_transfer_params.get("kvaf_generation")
+        notify(observer, "generation", parent=parent_request_id, request=request_id, generation=generation)
+        token = notify(observer, "begin", name="Proxy.metaserver_gather", parent=parent_request_id, request=request_id)
     async with proxy_state.metaserver_lock:
         params_by_request_id = proxy_state.metaserver_params[parent_request_id]
         params_by_request_id[request_id] = kv_transfer_params
@@ -741,6 +868,8 @@ async def metaserver(request: Request):
             )
             proxy_state.metaserver_dispatch_tasks[parent_request_id] = dispatch_task
             proxy_state.metaserver_ready_events[parent_request_id].set()
+            if observer is not None:
+                notify(observer, "point", name="PROXY_PREFILL_TASK_QUEUED", parent=parent_request_id)
         ready_event = proxy_state.metaserver_ready_events[parent_request_id]
 
     if dispatch_task is None:
@@ -748,6 +877,8 @@ async def metaserver(request: Request):
         async with proxy_state.metaserver_lock:
             dispatch_task = proxy_state.metaserver_dispatch_tasks[parent_request_id]
 
+    if observer is not None:
+        notify(observer, "end", token=token, success=True)
     try:
         await asyncio.shield(dispatch_task)
     except Exception as error:

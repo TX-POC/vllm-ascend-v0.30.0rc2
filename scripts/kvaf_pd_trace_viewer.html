@@ -1,0 +1,2188 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:"
+    />
+    <title>KVAF PD 请求阶段耗时</title>
+    <style>
+      :root {
+        font:
+          14px system-ui,
+          sans-serif;
+        color: #192b42;
+        background: #f3f6fa;
+        color-scheme: light;
+      }
+      body {
+        max-width: 1600px;
+        margin: auto;
+        padding: 24px;
+      }
+      h1 {
+        font-size: 25px;
+        margin: 0 0 8px;
+      }
+      h2 {
+        font-size: 17px;
+      }
+      p {
+        line-height: 1.7;
+      }
+      header,
+      section {
+        background: white;
+        border: 1px solid #dce4ef;
+        border-radius: 10px;
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+      .muted {
+        color: #53647a;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        margin: 12px 0;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+        border: 1px solid #bdcbdc;
+        border-radius: 5px;
+        padding: 7px;
+        background: white;
+        color: inherit;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover {
+        background: #eaf1fc;
+      }
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 2px solid #2457a8;
+      }
+      input[type="file"] {
+        max-width: 90%;
+      }
+      #status {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .warning {
+        color: #90460b;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-variant-numeric: tabular-nums;
+      }
+      td,
+      th {
+        padding: 8px;
+        border-bottom: 1px solid #e5ebf2;
+        text-align: right;
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      .svgBox {
+        overflow: auto;
+        max-height: 800px;
+      }
+      .svgBox svg {
+        display: block;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        max-height: 420px;
+        overflow: auto;
+        font:
+          12px ui-monospace,
+          monospace;
+      }
+      .legend {
+        display: flex;
+        gap: 18px;
+        flex-wrap: wrap;
+      }
+      .legend span::before {
+        content: "■";
+        margin-right: 6px;
+        color: var(--color);
+      }
+      .metricCards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+      }
+      .metricCard {
+        border: 1px solid #dce4ef;
+        border-radius: 8px;
+        padding: 14px;
+      }
+      .metricCard strong {
+        display: block;
+        font-size: 25px;
+        margin: 8px 0;
+      }
+      .scrollTable {
+        overflow: auto;
+      }
+      .scrollTable td {
+        white-space: nowrap;
+      }
+      .selectedPhase {
+        background: #edf4ff;
+      }
+      #homeLane [data-phase] {
+        cursor: pointer;
+      }
+      #advanced > summary {
+        cursor: pointer;
+        padding: 16px;
+        font-size: 17px;
+        background: white;
+        margin: 16px 0;
+      }
+      .selectedRequest {
+        background: #e8f1ff;
+      }
+      #requestView {
+        margin-top: 18px;
+      }
+      #loadInfo {
+        margin: 16px 0;
+      }
+      .metricCard {
+        overflow-wrap: anywhere;
+      }
+      #requestTimeline svg [data-event] {
+        cursor: pointer;
+      }
+      #requestTimeline {
+        touch-action: none;
+      }
+      select {
+        max-width: 420px;
+      }
+      #matrixBody button {
+        max-width: 340px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: middle;
+      }
+      #selectedRequest {
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <header id="drop">
+      <h1>PD 请求性能分析</h1>
+      <p class="muted">
+        选择一个 Trace
+        文件，在本机离线分析，不上传数据。首页展示整组统计；点击请求 ID
+        查看真实执行时间轴。
+      </p>
+      <input
+        id="file"
+        type="file"
+        accept=".json"
+        aria-label="选择 Trace 文件"
+      />
+      <p id="status" role="status">等待 Trace 文件。</p>
+      <p id="eventScope" class="muted"></p>
+    </header>
+    <section id="home">
+      <h2>请求性能概览</h2>
+      <p id="homeScope" class="muted"></p>
+      <div id="metricCards" class="metricCards"></div>
+      <div id="loadInfo" class="metricCards"></div>
+      <details>
+        <summary>指标口径与测试轮次</summary>
+        <p>
+          TTFT：发送请求到首个输出；TPOT：首末 token 到达间隔除以首批之后的实际
+          token 数。TPS：整组公共输出窗口的吞吐，单位
+          token/s；每个完整有效测试轮次为一个样本，单轮不展示
+          P90/P99。请求预热默认排除。
+        </p>
+        <div class="scrollTable">
+          <table>
+            <thead>
+              <tr>
+                <th>测试轮次</th>
+                <th>目标并发 / 已关联 / 观察峰值</th>
+                <th>公共窗口 TPS · token/s</th>
+                <th>公共窗口 TPOT · ms/token</th>
+                <th>状态 / 原因</th>
+              </tr>
+            </thead>
+            <tbody id="waves"></tbody>
+          </table>
+        </div>
+      </details>
+      <div class="controls">
+        <label
+          >各阶段统计
+          <select id="homeMetric">
+            <option value="mean_ms">平均耗时（Mean）</option>
+            <option value="p90_ms">P90 耗时</option>
+            <option value="p99_ms">P99 耗时</option>
+          </select></label
+        ><button id="homeSvg">导出概览 SVG</button
+        ><button id="homePng">导出概览 PNG</button>
+      </div>
+      <div id="homeLane" class="svgBox"></div>
+      <p class="muted">
+        四阶段按业务顺序展示统计值，不是真实执行时间轴。阶段可能重叠、有效样本数可能不同，总长不等于
+        E2E。短色块设置最小显示宽度，不完全按比例；缺失数据保留占位。
+      </p>
+      <details id="requestBreakdown">
+        <summary>逐请求明细与纵向汇总</summary>
+        <p id="phaseBasis" class="muted">
+          每行一条请求，各列为该请求的阶段观察区间并集；表尾统计整组请求。筛选和选择请求不改变纵向汇总。
+        </p>
+        <div class="controls">
+          <input
+            id="matrixFilter"
+            placeholder="筛选请求 ID"
+            aria-label="筛选请求 ID"
+          /><button id="matrixPrevious">上一页</button
+          ><button id="matrixNext">下一页</button><span id="matrixPage"></span>
+        </div>
+        <div class="scrollTable">
+          <table>
+            <thead id="matrixHead"></thead>
+            <tbody id="matrixBody"></tbody>
+            <tfoot id="matrixFoot"></tfoot>
+          </table>
+        </div>
+        <section id="requestView" hidden>
+          <h2>请求阶段耗时</h2>
+          <p id="selectedRequest"></p>
+          <div class="controls">
+            <label
+              >时间域
+              <select id="clock" aria-label="时间域"></select></label
+            ><label
+              >观察进程 / Rank
+              <select id="actor" aria-label="观察进程"></select></label
+            ><label
+              >模型层
+              <select
+                id="timelineLayer"
+                aria-label="时序模型层"
+              ></select></label
+            ><label
+              >传输路径
+              <select id="path">
+                <option value="all">所有路径</option>
+                <option value="npu">P→D KV 传输（D2D）</option>
+                <option value="cpu">P→K DDR KV 传输（D2H）</option>
+              </select></label
+            >
+          </div>
+          <div class="controls">
+            <button id="fit">适应范围</button><button id="zoomIn">放大</button
+            ><button id="zoomOut">缩小</button><button id="earlier">向前</button
+            ><button id="later">向后</button
+            ><button id="timelineSvg">导出时序 SVG</button
+            ><button id="timelinePng">导出时序 PNG</button>
+          </div>
+          <p id="clockNote" class="warning"></p>
+          <div class="legend">
+            <span style="--color: #8260ba">计算接口调用</span
+            ><span style="--color: #2775cf">P→D KV 传输</span
+            ><span style="--color: #108574">P→K DDR KV 传输</span
+            ><span style="--color: #c17a24">控制 / 排队 / 等待</span
+            ><span style="--color: #c44747">失败 / 未完成</span>
+          </div>
+          <div id="requestTimeline" class="svgBox"></div>
+          <p id="timelineNote" class="muted"></p>
+          <div id="overlap" class="metricCards"></div>
+          <div id="eventDetails">
+            <p>点击色块查看阶段作用、接口、实际耗时及关联的计算/传输。</p>
+          </div>
+          <details>
+            <summary>该请求各观察点的汇总明细</summary>
+            <div class="controls">
+              <button id="microPrevious">上一页</button
+              ><button id="microNext">下一页</button
+              ><span id="microPage"></span>
+            </div>
+            <div class="scrollTable">
+              <table>
+                <thead>
+                  <tr>
+                    <th>作用 / 接口</th>
+                    <th>本请求并集 ms</th>
+                    <th>整组 Mean ms</th>
+                    <th>P90 ms</th>
+                    <th>P99 ms</th>
+                    <th>有效样本数</th>
+                  </tr>
+                </thead>
+                <tbody id="microBody"></tbody>
+              </table>
+            </div>
+          </details>
+        </section>
+      </details>
+    </section>
+    <details id="advanced">
+      <summary>传输核验与采集质量</summary>
+      <section>
+        <h2>导出集合传输统计</h2>
+        <p id="basis" class="muted"></p>
+        <div class="controls">
+          <label
+            >层类型
+            <select id="layerRole">
+              <option value="all">所有类型</option>
+              <option value="target">Target 主模型</option>
+              <option value="mtp">MTP 推测模型</option>
+              <option value="unknown">未知类型</option>
+            </select></label
+          ><label
+            >模型层
+            <select id="modelLayer">
+              <option value="all">所有层</option>
+            </select></label
+          >
+        </div>
+        <p id="layerScope" class="muted"></p>
+        <div class="scrollTable">
+          <table>
+            <thead>
+              <tr>
+                <th>传输路径 / 统计粒度</th>
+                <th>平均耗时（Mean）ms</th>
+                <th>P90 ms</th>
+                <th>P99 ms</th>
+                <th>有效样本数（N）</th>
+              </tr>
+            </thead>
+            <tbody id="summary"></tbody>
+          </table>
+        </div>
+        <details>
+          <summary>计时边界与完整性说明</summary>
+          <p>
+            P→D：Indexer KV＋尾部主 KV，从 P 显存到 D 显存。P→K DDR：主 KV，从 P
+            显存到 K
+            内存。请求-层样本合并同一请求同一层的分段及并行贡献者；每请求累计是所选层耗时之和，不是端到端时间。只统计完成校验的有效样本，缺失不补零。
+          </p>
+          <pre id="quality"></pre>
+        </details>
+      </section>
+    </details>
+    <script>
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      const MAX_BYTES = 256 * 1024 * 1024,
+        MAX_EVENTS = 200000,
+        MAX_RECORDS = 1000000,
+        MAX_MATRIX_CELLS = 200000,
+        MAX_VISIBLE = 2000,
+        PAGE_SIZE = 32,
+        WIDTH = 1240,
+        LEFT = 115;
+      let loadNumber = 0;
+      let trace = null,
+        byRequest = new Map(),
+        rawUnavailable = "",
+        selectedKey = "",
+        homePhase = "",
+        matrixPage = 0,
+        microPage = 0,
+        selectedEvent = null,
+        timelineEvents = [],
+        windowStart = 0,
+        windowSpan = 1;
+      const number = (value) =>
+        typeof value === "number" && Number.isFinite(value);
+      const format = (value) =>
+        number(value)
+          ? value.toLocaleString("zh-CN", {
+              minimumFractionDigits: 3,
+              maximumFractionDigits: value > 0 && value < 0.001 ? 6 : 3,
+            })
+          : "不可用";
+      const keyOf = (request, generation) =>
+        JSON.stringify([request, generation]);
+      const unique = (items) => [
+        ...new Set(
+          items.filter(
+            (item) => item !== null && item !== undefined && item !== "",
+          ),
+        ),
+      ];
+      function el(tag, content, className) {
+        const node = document.createElement(tag);
+        if (content !== undefined) node.textContent = content;
+        if (className) node.className = className;
+        return node;
+      }
+      function cell(row, text, tag = "td") {
+        const node = el(tag, text);
+        row.append(node);
+        return node;
+      }
+      function status(message, warning = false) {
+        $("status").textContent = message;
+        $("status").className = warning ? "warning" : "";
+      }
+      function svgEl(tag, attrs = {}, text) {
+        const node = document.createElementNS(
+          "http://www.w3.org/2000/svg",
+          tag,
+        );
+        for (const [key, value] of Object.entries(attrs))
+          node.setAttribute(key, String(value));
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+      function newSvg(height, title, metadata) {
+        const node = svgEl("svg", {
+          xmlns: "http://www.w3.org/2000/svg",
+          width: WIDTH,
+          height,
+          viewBox: `0 0 ${WIDTH} ${height}`,
+          role: "img",
+          "aria-label": title,
+          "font-family": "system-ui, sans-serif",
+          "font-size": 12,
+        });
+        node.append(
+          svgEl("title", {}, title),
+          svgEl("metadata", {}, JSON.stringify(metadata)),
+          svgEl("rect", { width: WIDTH, height, fill: "white" }),
+        );
+        return node;
+      }
+      function save(blob, name) {
+        const url = URL.createObjectURL(blob),
+          a = el("a");
+        a.href = url;
+        a.download = name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      function exportSvg(id, name) {
+        const svg = $(id).querySelector("svg");
+        if (svg)
+          save(
+            new Blob([new XMLSerializer().serializeToString(svg)], {
+              type: "image/svg+xml",
+            }),
+            name + ".svg",
+          );
+      }
+      function exportPng(id, name) {
+        const svg = $(id).querySelector("svg");
+        if (!svg) return;
+        const url = URL.createObjectURL(
+            new Blob([new XMLSerializer().serializeToString(svg)], {
+              type: "image/svg+xml",
+            }),
+          ),
+          img = new Image();
+        img.onload = () => {
+          const canvas = el("canvas");
+          canvas.width = svg.width.baseVal.value;
+          canvas.height = svg.height.baseVal.value;
+          canvas.getContext("2d").drawImage(img, 0, 0);
+          URL.revokeObjectURL(url);
+          canvas.toBlob((blob) => {
+            if (blob) save(blob, name + ".png");
+          });
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          status("图片导出失败", true);
+        };
+        img.src = url;
+      }
+      function reason(value) {
+        return (
+          {
+            "not observed": "未采集到对应观察点",
+            "multiple unaligned clock domains":
+              "涉及多个未对齐时间域，不能合并",
+            "observed intervals only": "仅已观察到的区间",
+            confirmed: "完成证据已核验",
+            unverified: "传输完成证据不完整",
+            cancelled: "请求已取消",
+            "missing or invalid token events": "缺少完整 token 到达记录",
+            "no tokens after first burst": "首批之后没有 token，无法计算 TPOT",
+            "unsuccessful stream or incomplete token IDs":
+              "请求失败或 token ID 不完整",
+            "No positive all-request overlap window; increase output length":
+              "没有所有请求共同输出的有效窗口，可增加输出长度再测试",
+            "Expected exactly batch * DP requests":
+              "已关联请求数量不足以覆盖完整测试轮次",
+            "missing recorded benchmark wave contract":
+              "缺少本轮 batch / DP / 路由配置，无法核验公共窗口",
+            "mixed unaligned client clocks":
+              "客户端时间域未对齐，不能计算公共窗口",
+          }[value] ||
+          value ||
+          "未知"
+        );
+      }
+      const EVENT_DESCRIPTIONS = Object.freeze({
+        "P.layer_host_forward": [
+          "本层计算",
+          "forward",
+          "执行本层 Host 前向调用；包含提交和 Host 等待，不等于 NPU kernel 执行时间。",
+        ],
+        "P.target_host_forward": [
+          "主模型计算",
+          "_model_forward",
+          "整个主模型 Host 前向区间；没有逐层数据时只作局部参考，不用于逐层覆盖率。",
+        ],
+        "P.mtp_host_propose": [
+          "MTP 推测计算",
+          "propose_draft_token_ids",
+          "产生草稿 token 的 Host 调用，不等于设备实际执行时间。",
+        ],
+        "D.target_host_forward": [
+          "D 解码计算",
+          "_model_forward",
+          "接收门控就绪后的 D 主模型 Host 前向调用。",
+        ],
+        "D.mtp_host_propose": [
+          "D 推测计算",
+          "propose_draft_token_ids",
+          "D 草稿 token 的 Host 调用。",
+        ],
+        "P.production_wait": [
+          "等待 KV 就绪",
+          "synchronize",
+          "等待原生产事件完成；沿用业务已有同步，不新增设备同步。",
+        ],
+        "P.send_queue_wait": [
+          "等待发送",
+          "_send_layer",
+          "从进入发送队列到发送线程开始执行的等待。",
+        ],
+        "connector.plan": [
+          "准备传输",
+          "plan",
+          "交换地址、块映射和传输任务控制信息；是 Host RPC 区间。",
+        ],
+        "connector.pull.npu": [
+          "P→D KV 传输",
+          "pull(npu)",
+          "Indexer KV 与尾部主 KV 的 Pull RPC，包含控制、排队与完成等待，不是纯 DMA。",
+        ],
+        "connector.pull.cpu": [
+          "P→K DDR KV 传输",
+          "pull(cpu)",
+          "主 KV 从 P 显存进入 K 内存的 Pull RPC，包含控制与等待，不是纯 DMA。",
+        ],
+        "connector.complete": [
+          "确认传输完成",
+          "complete",
+          "向接收端核对整项传输的完成状态。",
+        ],
+        "connector.status": [
+          "查询完成状态",
+          "status",
+          "查询传输状态及原有完成恢复结果。",
+        ],
+        "D.cpu_prepare": [
+          "准备 DDR 写入",
+          "prepare_put",
+          "为本次 CPU Pull 准备目标块和事务。",
+        ],
+        "D.cpu_submit": [
+          "提交 P→K 传输",
+          "submit_cpu_pull",
+          "提交 CPU Pull；返回不等于数据已传输完成。",
+        ],
+        "D.cpu_wait": [
+          "等待 P→K 完成",
+          "wait_cpu_pull",
+          "等待原 CPU Pull 完成状态，不新增同步。",
+        ],
+        "D.cpu_commit": [
+          "提交 DDR 事务",
+          "commit_put",
+          "确认本次写入事务提交。",
+        ],
+        "D.cpu_publish": [
+          "发布 DDR 地址",
+          "_publish_addresses",
+          "发布已确认提交的 KV 地址，供后续请求计算使用。",
+        ],
+        "D.npu_read": [
+          "执行 P→D 读取",
+          "batch_get_raw_addr",
+          "调用原 NPU READ 接口；显示调用方观察区间，不是 DMA kernel 时长。",
+        ],
+        "D.runtime_lock_wait": [
+          "等待 Runtime 锁",
+          "__enter__",
+          "进入原 Runtime 业务锁前的实际 Host 等待区间。",
+        ],
+        "D.compute_dependency_wait": [
+          "等待计算依赖",
+          "wait_compute",
+          "等待原计算完成依赖，避免接收写入与计算复用冲突。",
+        ],
+        HBM_PULL_DONE: [
+          "D 显存接收确认",
+          "notify",
+          "原读取完成后的 Host 确认里程碑，只有时间点，没有持续耗时。",
+        ],
+        CPU_PULL_DONE: [
+          "K 内存接收确认",
+          "notify",
+          "原 CPU Pull 完成状态确认里程碑，只有时间点。",
+        ],
+        DDR_COMMITTED: [
+          "DDR 事务已提交",
+          "notify",
+          "原 Commit 成功后的确认里程碑，不是单独计时区间。",
+        ],
+        DDR_PUBLISHED: [
+          "DDR 地址已发布",
+          "notify",
+          "原地址发布完成的里程碑，不补造持续时间。",
+        ],
+        "D.block_bind_and_advertise": [
+          "绑定接收资源",
+          "update_state_after_alloc",
+          "绑定并通告本请求接收资源的回调，物理 block 分配发生在回调之前。",
+        ],
+        "D.metaserver_transport": [
+          "交换请求信息",
+          "_access_metaserver",
+          "请求元数据交互；外层等待可能包含 P 计算和 KV 传输，不能重复相加。",
+        ],
+        "D.remote_kv_wait": [
+          "等待远端 KV",
+          "get_finished",
+          "请求 block 就绪至原接收门控完成的同域里程碑跨度。",
+        ],
+        "D.gate_to_decode_host": [
+          "等待开始解码",
+          "_model_forward",
+          "KV 接收门控就绪到首轮 Host Decode 开始的等待。",
+        ],
+        "D.decode_batch_wait": [
+          "等待整组放行",
+          "Gate.poll",
+          "本请求 KV 已就绪，等待整组各 rank 的 KV 都就绪；属于主动组批等待。",
+        ],
+      });
+      function description(name) {
+        if (Object.hasOwn(EVENT_DESCRIPTIONS, name))
+          return EVENT_DESCRIPTIONS[name];
+        if (name.startsWith("PullRPC."))
+          return [
+            name.includes(".cpu.") ? "P→K DDR KV 传输" : "P→D KV 传输",
+            "pull",
+            "旧采集的分段 Pull RPC 包络，可能包含多次调用及间隙。",
+          ];
+        if (name.startsWith("D.control."))
+          return [
+            "D 传输控制",
+            name.slice(10),
+            "D 侧观察的控制调用，时间域独立于 P，不跨主机直接相减。",
+          ];
+        return [
+          "请求阶段",
+          name,
+          "该观察点的详细边界以原始事件定义为准；不将未知内部动作解释成设备执行。",
+        ];
+      }
+      function eventName(event) {
+        const [label, api] = description(event.name),
+          layer = event.context?.layer,
+          match = layer?.match(/layers\.(\d+)/);
+        return `${match ? "第 " + match[1] + " 层 · " : ""}${label} · ${api}`;
+      }
+      function metricCard(label, mean, p90, p99, samples, note = "") {
+        const card = el("div", undefined, "metricCard");
+        card.append(
+          el("div", label),
+          el("strong", format(mean)),
+          el(
+            "div",
+            `Mean · P90 ${format(p90)} · P99 ${format(p99)} · 有效样本数 ${samples ?? 0}`,
+            "muted",
+          ),
+        );
+        if (note) card.append(el("p", note, "muted"));
+        return card;
+      }
+      function infoCard(label, value, note = "") {
+        const card = el("div", undefined, "metricCard");
+        card.append(el("div", label), el("b", value || "未知"));
+        if (note) card.append(el("div", note, "muted"));
+        return card;
+      }
+      function validateStats(row, keys = ["mean_ms", "p90_ms", "p99_ms"]) {
+        if (
+          !row ||
+          !Number.isSafeInteger(row.samples) ||
+          row.samples < 0 ||
+          keys.some(
+            (key) => row[key] !== null && (!number(row[key]) || row[key] < 0),
+          )
+        )
+          throw Error("无效的统计数值");
+      }
+      function renderLoad() {
+        const report = trace.kvaf_pd.summary,
+          waves = report.client?.overlap_groups || [],
+          sources = report.sources || [];
+        $("loadInfo").replaceChildren();
+        for (const role of ["P", "D"]) {
+          const values = unique(
+            sources
+              .filter((s) =>
+                role === "P" ? s.role === "P" : s.role?.startsWith("D"),
+              )
+              .map(
+                (s) =>
+                  s.deployment &&
+                  `DP=${s.deployment.dp_size ?? "未知"} · TP=${s.deployment.tp_size ?? "未知"} · EP=${s.deployment.ep_size ?? "未知"}`,
+              ),
+          );
+          $("loadInfo").append(
+            infoCard(
+              role + " 实例部署",
+              values.join("；"),
+              "以采集配置为准；旧记录缺失字段不推断",
+            ),
+          );
+        }
+        const models = unique([
+          ...sources.map((s) => s.deployment?.model),
+          ...waves.map((w) => w.workload?.model),
+        ]);
+        $("loadInfo").append(
+          infoCard(
+            "模型 / 输入 / 输出",
+            models.join("；"),
+            `输入 ${report.input_tokens ?? "未知"} token；目标输出 ${unique(waves.map((w) => w.workload?.output_tokens)).join(" / ") || "未知"} token；实际输出 ${unique(report.client?.request_metrics?.map((r) => r.output_tokens) || []).join(" / ") || "未知"} token`,
+          ),
+        );
+        $("loadInfo").append(
+          infoCard(
+            "请求负载",
+            `目标并发 ${unique(waves.map((w) => w.workload?.concurrency)).join(" / ") || "未知"}`,
+            `已观察 ${report.outcomes?.observed_requests ?? "未知"} 条请求/代次；客户端峰值 ${unique(waves.map((w) => w.observed_client_peak)).join(" / ") || "未知"}（仅已关联请求）`,
+          ),
+        );
+        const actual = Object.values(report.d_scheduled_batches || {}).map(
+          (item) => {
+            const sizes = Object.keys(item.histogram || {})
+              .map(Number)
+              .sort((a, b) => a - b);
+            return sizes.length
+              ? `Rank ${item.dp_rank ?? "?"}: ${sizes[0]}–${sizes.at(-1)}`
+              : null;
+          },
+        );
+        $("loadInfo").append(
+          infoCard(
+            "D 单卡 Batch Size",
+            `目标 ${unique(waves.map((w) => w.workload?.batch)).join(" / ") || "未知"}`,
+            actual.filter(Boolean).join("；") ||
+              "实际调度 batch 未采集，不能以并发 ÷ DP 代替",
+          ),
+        );
+        const batches = Object.values(report.d_scheduled_batches || {}).filter(
+          (item) => Object.keys(item.histogram || {}).length,
+        );
+        if (batches.length) {
+          const details = el("details");
+          details.append(
+            el("summary", "实际调度 Batch 分布（含所选请求的完整批次）"),
+          );
+          for (const item of batches)
+            details.append(
+              el(
+                "p",
+                `Rank ${item.dp_rank ?? "未知"}：` +
+                  Object.entries(item.histogram)
+                    .sort((a, b) => +a[0] - b[0])
+                    .map(([size, count]) => `Batch ${size} × ${count} 次`)
+                    .join("；"),
+              ),
+            );
+          $("loadInfo").lastElementChild.append(details);
+        }
+        $("loadInfo").append(
+          infoCard(
+            "调度 / 请求用途",
+            sources.some((s) => s.decode_batch_mode?.enabled)
+              ? "满 Batch 同步 Decode"
+              : waves.some((w) => w.workload?.sync === true)
+                ? "同步 Decode（客户端配置）"
+                : waves.some((w) => w.workload?.sync === false)
+                  ? "普通调度"
+                  : "旧记录未声明调度模式",
+            `统计用途：${report.selection?.request_phase === "measure" ? "仅正式请求" : report.selection?.request_phase || "未知"}；同步模式的 TTFT/E2E 包含主动等待`,
+          ),
+        );
+      }
+      function renderHome() {
+        if (!trace) return;
+        const report = trace.kvaf_pd.summary,
+          client = report.client || {},
+          data = report.stage_breakdown;
+        renderLoad();
+        $("homeScope").textContent =
+          `整组观察 ${report.outcomes?.observed_requests ?? "未知"} 个请求/代次。` +
+          (report.status === "INCOMPLETE"
+            ? "数据不完整：局部阶段仍可观察，缺失不补零，不能当作完整传输性能。"
+            : "仅对已观察到的有效样本统计。") +
+          ((report.selection?.request_phase || "unknown") !== "measure"
+            ? " 注意：当前并非仅正式请求。"
+            : "");
+        $("homeScope").className =
+          report.status === "INCOMPLETE" ? "warning" : "muted";
+        $("metricCards").replaceChildren();
+        for (const [label, key] of [
+          ["首 Token 时延 TTFT · ms", "ttft"],
+          ["每请求 TPOT · ms/token", "request_tpot"],
+          ["端到端 E2E · ms", "e2e"],
+        ]) {
+          const stats = client[key] || {};
+          $("metricCards").append(
+            metricCard(
+              label,
+              stats.mean_ms,
+              stats.p90_ms,
+              stats.p99_ms,
+              stats.samples,
+            ),
+          );
+        }
+        const tps = client.group_tps || {};
+        $("metricCards").append(
+          metricCard(
+            "整组公共窗口 TPS · token/s",
+            tps.mean,
+            tps.p90,
+            tps.p99,
+            tps.samples,
+            tps.samples === 1
+              ? "只有一个有效窗口，P90/P99 不适用"
+              : tps.reason
+                ? "包含不同测试负载，不合并 TPS；请查看各轮次。"
+                : "同一负载的完整有效轮次为样本，各轮等权",
+          ),
+        );
+        $("waves").replaceChildren();
+        for (const wave of client.overlap_groups || []) {
+          const row = el("tr");
+          cell(row, wave.group);
+          cell(
+            row,
+            `${wave.workload?.concurrency ?? "未知"} / ${wave.observed_requests ?? "未知"} / ${wave.observed_client_peak ?? "未知"}`,
+          );
+          cell(row, format(wave.tps));
+          cell(row, format(wave.tpot_ms));
+          cell(
+            row,
+            wave.status === "ready"
+              ? "有效窗口"
+              : reason(wave.reason) || "窗口不可用",
+          );
+          $("waves").append(row);
+        }
+        $("homeLane").replaceChildren();
+        if (!data) {
+          $("homeLane").append(
+            el(
+              "p",
+              "旧 Trace 缺少逐请求阶段数据，请用新版分析脚本从原采集重新导出。",
+            ),
+          );
+          renderMatrix();
+          return;
+        }
+        const metric = $("homeMetric").value,
+          rows = data.phases.map((p) => ({
+            phase: p,
+            stats: data.summary.find((r) => r.id === p.id),
+          })),
+          total = rows.reduce((sum, r) => sum + (r.stats?.[metric] ?? 0), 0),
+          base = 180,
+          extra = WIDTH - 40 - base * rows.length;
+        const svg = newSvg(182, "整组请求四阶段统计示意，不是实际时间轴", {
+          kind: "statistical_overview",
+          statistic: metric,
+          scope: "entire selected cohort",
+          min_width: base,
+          not_e2e: true,
+        });
+        svg.append(
+          svgEl(
+            "text",
+            { x: 20, y: 22, fill: "#53647a" },
+            `${metric === "mean_ms" ? "平均耗时（Mean）" : metric === "p90_ms" ? "P90" : "P99"} · 短色块有最小宽度，缺失不补零`,
+          ),
+        );
+        let x = 20;
+        for (const [index, { phase, stats }] of rows.entries()) {
+          const value = stats?.[metric],
+            width =
+              base + (number(value) && total ? (extra * value) / total : 0),
+            colour = ["#2775cf", "#8260ba", "#108574", "#c17a24"][index % 4],
+            group = svgEl("g", {
+              "data-phase": phase.id,
+              role: "button",
+              tabindex: 0,
+              "aria-label": phase.label,
+            });
+          group.append(
+            svgEl(
+              "title",
+              {},
+              `${phase.label}：${format(value)} ms；有效样本数 ${stats?.samples ?? 0}。${phase.basis}`,
+            ),
+            svgEl("rect", {
+              x,
+              y: 40,
+              width: Math.max(1, width - 2),
+              height: 38,
+              rx: 4,
+              fill: number(value) ? colour : "#edf0f5",
+              stroke: colour,
+              "stroke-dasharray": number(value) ? "" : "4 3",
+            }),
+          );
+          const label =
+            [
+              "请求准备 / 交互",
+              "P 计算 / 发送准备",
+              "Connector / KV 传输",
+              "D 接收 / 开始解码",
+            ][index] || phase.label;
+          group.append(
+            svgEl(
+              "text",
+              { x: x + 10, y: 64, fill: number(value) ? "white" : "#53647a" },
+              `${index + 1}. ${label}`,
+            ),
+            svgEl(
+              "text",
+              { x: x + 8, y: 105, fill: "#192b42" },
+              `${format(value)} ms`,
+            ),
+            svgEl(
+              "text",
+              { x: x + 8, y: 128, fill: "#53647a" },
+              `有效样本数 ${stats?.samples ?? 0}`,
+            ),
+          );
+          if (!number(value))
+            group.append(
+              svgEl(
+                "text",
+                { x: x + 8, y: 150, fill: "#90460b" },
+                "缺少可合并观察区间",
+              ),
+            );
+          const open = () => {
+            homePhase = phase.id;
+            $("requestBreakdown").open = true;
+            $("phaseBasis").textContent = phase.label + "：" + phase.basis;
+            renderMatrix();
+          };
+          group.onclick = open;
+          group.onkeydown = (event) => {
+            if (["Enter", " "].includes(event.key)) {
+              event.preventDefault();
+              open();
+            }
+          };
+          svg.append(group);
+          x += width;
+        }
+        $("homeLane").append(svg);
+        renderMatrix();
+      }
+      function renderMatrix() {
+        for (const id of ["matrixHead", "matrixBody", "matrixFoot"])
+          $(id).replaceChildren();
+        const report = trace?.kvaf_pd.summary,
+          data = report?.stage_breakdown;
+        if (!data) {
+          $("matrixPage").textContent = "旧 Trace 没有逐请求矩阵，请重新导出。";
+          return;
+        }
+        if (!data.matrix_available) {
+          $("matrixPage").textContent =
+            "逐请求矩阵超过预算；整组统计保留。请明确筛选请求后重新导出。";
+          return;
+        }
+        const head = el("tr");
+        for (const label of [
+          "请求 ID / 代次",
+          "TTFT ms",
+          "TPOT ms/token",
+          ...data.phases.map((p) => p.label + " ms"),
+        ])
+          cell(head, label, "th");
+        $("matrixHead").append(head);
+        const rows = data.requests.filter(
+          (r) =>
+            !$("matrixFilter").value ||
+            r.request.includes($("matrixFilter").value),
+        );
+        matrixPage = Math.max(
+          0,
+          Math.min(matrixPage, Math.ceil(rows.length / PAGE_SIZE) - 1),
+        );
+        $("matrixPage").textContent =
+          `${rows.length ? matrixPage * PAGE_SIZE + 1 : 0}–${Math.min((matrixPage + 1) * PAGE_SIZE, rows.length)} / ${rows.length}；表尾仍为整组统计`;
+        for (const item of rows.slice(
+          matrixPage * PAGE_SIZE,
+          (matrixPage + 1) * PAGE_SIZE,
+        )) {
+          const row = el("tr"),
+            key = keyOf(item.request, item.generation),
+            button = el("button", `${item.request} / ${item.generation}`);
+          row.className = key === selectedKey ? "selectedRequest" : "";
+          button.title =
+            `${item.request} / ${item.generation}；` +
+            reason(item.kv_status) +
+            (item.quality?.length ? "；有不完整或失败证据" : "");
+          button.onclick = () => {
+            selectedKey = key;
+            selectedEvent = null;
+            microPage = 0;
+            $("requestBreakdown").open = true;
+            $("requestView").hidden = false;
+            renderMatrix();
+            selectRequest();
+          };
+          const id = el("td");
+          id.append(button);
+          row.append(id);
+          cell(row, format(item.client?.ttft_ms));
+          cell(row, format(item.client?.tpot_ms)).title =
+            item.client?.tpot_unavailable || "真实 token 到达指标";
+          for (const phase of data.phases) {
+            const value = item.phases[phase.id],
+              node = cell(row, format(value.observed_ms));
+            node.title = reason(value.reason);
+            if (homePhase === phase.id) node.className = "selectedPhase";
+          }
+          $("matrixBody").append(row);
+        }
+        for (const [key, label] of [
+          ["mean_ms", "整组平均耗时（Mean）"],
+          ["p90_ms", "整组 P90"],
+          ["p99_ms", "整组 P99"],
+          ["samples", "有效样本数（N）"],
+        ]) {
+          const row = el("tr");
+          cell(row, label);
+          for (const stats of [
+            report.client?.ttft,
+            report.client?.request_tpot,
+            ...data.phases.map((p) => data.summary.find((r) => r.id === p.id)),
+          ])
+            cell(
+              row,
+              key === "samples" ? (stats?.samples ?? 0) : format(stats?.[key]),
+            );
+          $("matrixFoot").append(row);
+        }
+      }
+      function renderTransfer() {
+        if (!trace) return;
+        const report = trace.kvaf_pd.summary,
+          layer = $("modelLayer").value,
+          role = $("layerRole").value;
+        const selected = (report.layer_statistics || []).find(
+          (r) => r.layer === layer,
+        );
+        let stats = report.summary || [];
+        if (layer !== "all")
+          stats =
+            selected && (role === "all" || selected.role === role)
+              ? selected.summary
+              : [];
+        else if (role !== "all")
+          stats =
+            (report.layer_role_summary || []).find((r) => r.role === role)
+              ?.summary || [];
+        $("basis").textContent =
+          report.summary_basis === "transfer_eligible_to_ack"
+            ? "计时：允许发起传输至完成回执确认，包含控制、排队与等待。"
+            : "计时：兼容旧 Pull RPC 区间，不包含更早的允许发起等待。";
+        $("layerScope").textContent =
+          (layer === "all" ? "所有层" : layer) +
+          "；只重新计算本区域的传输统计，不改变首页或请求纵向汇总。" +
+          (layer !== "all" && !selected
+            ? "旧 Trace 未携带逐层统计，请重新导出。"
+            : "");
+        $("summary").replaceChildren();
+        for (const metric of ["t1", "t2"])
+          for (const scope of ["request_layer", "request"]) {
+            const statsRow = stats.find(
+                (r) => r.metric === metric && r.scope === scope,
+              ),
+              row = el("tr");
+            cell(
+              row,
+              `${metric === "t1" ? "P→D KV 传输（D2D）" : "P→K DDR KV 传输（D2H）"} / ${scope === "request_layer" ? "请求-层样本" : layer === "all" && role === "all" ? "每请求累计" : "每请求所选层累计"}`,
+            );
+            for (const key of ["mean_ms", "p90_ms", "p99_ms"])
+              cell(row, format(statsRow?.[key]));
+            cell(row, statsRow?.samples ?? 0);
+            $("summary").append(row);
+          }
+      }
+      function selectedRow() {
+        return trace?.kvaf_pd.summary.stage_breakdown?.requests.find(
+          (r) => keyOf(r.request, r.generation) === selectedKey,
+        );
+      }
+      function renderMicro() {
+        const row = selectedRow();
+        $("microBody").replaceChildren();
+        if (!row) return;
+        const stages = row.stages || [];
+        microPage = Math.max(
+          0,
+          Math.min(microPage, Math.ceil(stages.length / PAGE_SIZE) - 1),
+        );
+        $("microPage").textContent =
+          `${stages.length ? microPage * PAGE_SIZE + 1 : 0}–${Math.min((microPage + 1) * PAGE_SIZE, stages.length)} / ${stages.length}`;
+        for (const stage of stages.slice(
+          microPage * PAGE_SIZE,
+          (microPage + 1) * PAGE_SIZE,
+        )) {
+          const tr = el("tr"),
+            [label, api] = description(stage.name),
+            stats = (trace.kvaf_pd.summary.stages || []).find(
+              (s) =>
+                s.name === stage.name && s.clock_domain === stage.clock_domain,
+            );
+          cell(tr, `${label} · ${api}`).title = stage.clock_domain;
+          cell(tr, format(stage.observed_ms));
+          for (const key of ["mean_ms", "p90_ms", "p99_ms"])
+            cell(tr, format(stats?.[key]));
+          cell(tr, stats?.samples ?? 0);
+          $("microBody").append(tr);
+        }
+      }
+      function eventContext(event, row) {
+        const member = event.args?.members?.find(
+          (m) => m.request === row.request && m.generation === row.generation,
+        );
+        return { ...event.args, ...member };
+      }
+      function isCompute(e) {
+        return /^(P|D)\.(layer_host_forward|target_host_forward|mtp_host_propose)$/.test(
+          e.name,
+        );
+      }
+      function isTransfer(e) {
+        return (
+          e.name.startsWith("connector.") ||
+          e.name.startsWith("PullRPC.") ||
+          e.name.startsWith("P.send_") ||
+          e.name === "P.production_wait" ||
+          e.name.startsWith("D.control.") ||
+          e.name.startsWith("D.cpu_") ||
+          e.name.startsWith("D.npu_") ||
+          e.name === "D.runtime_lock_wait" ||
+          e.name === "D.compute_dependency_wait" ||
+          [
+            "HBM_PULL_DONE",
+            "CPU_PULL_DONE",
+            "DDR_COMMITTED",
+            "DDR_PUBLISHED",
+          ].includes(e.name)
+        );
+      }
+      function isPull(e) {
+        return /^(connector\.pull\.(cpu|npu)|PullRPC\.(cpu|npu)\.chunk_envelope)$/.test(
+          e.name,
+        );
+      }
+      function layerNumber(e) {
+        const match = e.context.layer?.match(/layers\.(\d+)/);
+        return match ? Number(match[1]) : null;
+      }
+      function sameChunk(left, right) {
+        return (
+          left.context.actor === right.context.actor &&
+          left.context.domain === right.context.domain &&
+          Number.isSafeInteger(left.context.first) &&
+          Number.isSafeInteger(left.context.tokens) &&
+          left.context.first === right.context.first &&
+          left.context.tokens === right.context.tokens
+        );
+      }
+      function intersects(left, right) {
+        return (
+          Math.min(left.ts + left.dur, right.ts + right.dur) >
+          Math.max(left.ts, right.ts)
+        );
+      }
+      function options(id, values, label, all = false) {
+        const previous = $(id).value;
+        $(id).replaceChildren();
+        if (all) $(id).append(new Option("所有层", "all"));
+        for (const value of values)
+          $(id).append(new Option(label(value), value));
+        if (values.includes(previous) || (all && previous === "all"))
+          $(id).value = previous;
+      }
+      function requestEvents() {
+        const row = selectedRow();
+        return row
+          ? (byRequest.get(selectedKey) || [])
+              .map((e) => ({
+                ...e,
+                context: eventContext(e, row),
+                dur: e.dur || 0,
+              }))
+              .filter((e) => isCompute(e) || isTransfer(e))
+          : [];
+      }
+      function selectRequest() {
+        const row = selectedRow();
+        if (!row) return;
+        $("requestView").hidden = false;
+        $("selectedRequest").textContent =
+          `请求 ${row.request} / 代次 ${row.generation} · ${reason(row.kv_status)}${row.quality?.length ? " · 有不完整证据，仅展示已观察区间" : ""}`;
+        const events = requestEvents();
+        const domains = unique(events.map((e) => e.context.domain));
+        domains.sort(
+          (a, b) =>
+            Number(
+              !events.some(
+                (e) => e.context.domain === a && e.context.role === "P",
+              ),
+            ) -
+            Number(
+              !events.some(
+                (e) => e.context.domain === b && e.context.role === "P",
+              ),
+            ),
+        );
+        options("clock", domains, (d) => {
+          try {
+            return JSON.parse(d).slice(0, 2).join(" / ");
+          } catch {
+            return d;
+          }
+        });
+        updateActors();
+        renderMicro();
+        $("requestView").scrollIntoView({ block: "start" });
+      }
+      function updateActors() {
+        const events = requestEvents().filter(
+            (e) => e.context.domain === $("clock").value,
+          ),
+          actors = unique(events.map((e) => e.context.actor));
+        const score = (actor) =>
+          events.filter((e) => e.context.actor === actor && isPull(e)).length;
+        actors.sort((a, b) => score(b) - score(a));
+        $("actor").replaceChildren(
+          ...actors.map((actor) => new Option(actor, actor)),
+        );
+        const layers = unique(events.map((e) => e.context.layer)).sort((a, b) =>
+          a.localeCompare(b, undefined, { numeric: true }),
+        );
+        options("timelineLayer", layers, (l) => l, true);
+        $("timelineLayer").value = "all";
+        refreshTimeline();
+      }
+      function refreshTimeline() {
+        selectedEvent = null;
+        const all = requestEvents().filter(
+          (e) =>
+            e.context.domain === $("clock").value &&
+            e.context.actor === $("actor").value,
+        );
+        const layerCalls = all.some((e) => e.name === "P.layer_host_forward");
+        const rpcKeys = new Set(
+          all
+            .filter((e) => e.name.startsWith("connector.pull."))
+            .map((e) =>
+              JSON.stringify([
+                e.context.layer,
+                e.context.first,
+                e.context.path,
+              ]),
+            ),
+        );
+        timelineEvents = all
+          .filter((e) => {
+            if (layerCalls && e.name === "P.target_host_forward") return false;
+            if (
+              e.name.startsWith("PullRPC.") &&
+              rpcKeys.has(
+                JSON.stringify([
+                  e.context.layer,
+                  e.context.first,
+                  e.context.path,
+                ]),
+              )
+            )
+              return false;
+            if (
+              $("timelineLayer").value !== "all" &&
+              e.context.layer !== $("timelineLayer").value &&
+              !isCompute(e)
+            )
+              return false;
+            return (
+              $("path").value === "all" ||
+              !e.context.path ||
+              e.context.path === $("path").value
+            );
+          })
+          .sort((a, b) => a.ts - b.ts || a.dur - b.dur);
+        fitTimeline();
+        showEvent(null);
+      }
+      function fitTimeline() {
+        windowStart = timelineEvents.length
+          ? timelineEvents.reduce((v, e) => Math.min(v, e.ts), Infinity)
+          : 0;
+        const end = timelineEvents.reduce(
+          (v, e) => Math.max(v, e.ts + e.dur),
+          windowStart + 1,
+        );
+        windowSpan = Math.max(1, end - windowStart) * 1.03;
+        if (timelineEvents.length > MAX_VISIBLE)
+          windowSpan *= (MAX_VISIBLE / timelineEvents.length) * 0.8;
+        drawTimeline();
+      }
+      function pack(events) {
+        const ends = [];
+        return events.map((event) => {
+          let track = ends.findIndex((end) => end <= event.ts);
+          if (track < 0) track = ends.length;
+          ends[track] = event.ts + Math.max(event.dur, 1);
+          return { event, track };
+        });
+      }
+      function colour(e) {
+        if (e.context.success === false || e.context.unfinished)
+          return "#c44747";
+        if (isCompute(e)) return "#8260ba";
+        if (e.context.path === "cpu" || e.name.includes(".cpu"))
+          return "#108574";
+        if (e.context.path === "npu" || e.name.includes(".npu"))
+          return "#2775cf";
+        return "#c17a24";
+      }
+      function related(e) {
+        if (!selectedEvent) return false;
+        if (e === selectedEvent) return true;
+        if (!sameChunk(e, selectedEvent)) return false;
+        const a = layerNumber(e),
+          b = layerNumber(selectedEvent);
+        return (
+          e.context.layer === selectedEvent.context.layer ||
+          (a !== null &&
+            b !== null &&
+            isCompute(e) !== isCompute(selectedEvent) &&
+            intersects(e, selectedEvent))
+        );
+      }
+      function drawTimeline() {
+        $("requestTimeline").replaceChildren();
+        if (!timelineEvents.length) {
+          $("clockNote").textContent =
+            rawUnavailable ||
+            "所选请求/时间域没有可绘制的计算或传输原始事件。请导出 full Trace；旧数据缺逐层计算时需重新采集。";
+          $("timelineNote").textContent = "统计汇总不能还原逐层真实时序。";
+          return;
+        }
+        $("clockNote").textContent =
+          "仅比较所选同域、同进程的 Host 接口时间；不等于设备 kernel/DMA 时序，不跨主机相减。";
+        const visible = timelineEvents.filter(
+          (e) =>
+            e.ts <= windowStart + windowSpan && e.ts + e.dur >= windowStart,
+        );
+        if (visible.length > MAX_VISIBLE) {
+          $("requestTimeline").append(
+            el(
+              "p",
+              `当前窗口 ${visible.length} 个事件超过绘图预算，请放大或聚焦模型层；原数据未截断。`,
+              "warning",
+            ),
+          );
+          return;
+        }
+        const compute = pack(visible.filter(isCompute)),
+          transfer = pack(visible.filter((e) => !isCompute(e))),
+          tracks = (rows) => Math.max(1, ...rows.map((r) => r.track + 1)),
+          firstHeight = tracks(compute) * 30 + 26,
+          secondHeight = tracks(transfer) * 30 + 26,
+          height = 110 + firstHeight + secondHeight;
+        if (height > 30000) {
+          $("requestTimeline").append(
+            el("p", "并行轨道过多，请缩小时间范围或筛选层。", "warning"),
+          );
+          return;
+        }
+        const svg = newSvg(height, "请求阶段耗时：计算与传输双行真实时序", {
+          request: selectedRow().request,
+          generation: selectedRow().generation,
+          clock: $("clock").value,
+          actor: $("actor").value,
+          observation: "host_call_only",
+          window_start_us: windowStart,
+          window_end_us: windowStart + windowSpan,
+          unit: "ms",
+          device_overlap: "unavailable",
+        });
+        const x = (stamp) =>
+          LEFT + ((stamp - windowStart) / windowSpan) * (WIDTH - LEFT - 20);
+        for (let index = 0; index <= 5; index++) {
+          const stamp = windowStart + (windowSpan * index) / 5,
+            px = x(stamp);
+          svg.append(
+            svgEl("line", {
+              x1: px,
+              y1: 40,
+              x2: px,
+              y2: height - 20,
+              stroke: "#e5ebf2",
+            }),
+            svgEl(
+              "text",
+              {
+                x: px,
+                y: 25,
+                fill: "#53647a",
+                "text-anchor": index === 5 ? "end" : "start",
+              },
+              `${format(stamp / 1000)} ms`,
+            ),
+          );
+        }
+        for (const [label, rows, y, size] of [
+          ["计算", compute, 45, firstHeight],
+          ["传输", transfer, 45 + firstHeight, secondHeight],
+        ]) {
+          svg.append(
+            svgEl("rect", {
+              x: 0,
+              y,
+              width: LEFT - 10,
+              height: size,
+              fill: "#f3f6fa",
+            }),
+            svgEl(
+              "text",
+              { x: 18, y: y + 25, fill: "#192b42", "font-size": 16 },
+              label,
+            ),
+          );
+          for (const { event: e, track } of rows) {
+            const begin = Math.max(LEFT, x(e.ts)),
+              end = Math.min(WIDTH - 20, x(e.ts + e.dur)),
+              width = Math.max(2, end - begin),
+              py = y + 8 + track * 30,
+              group = svgEl("g", {
+                role: "button",
+                tabindex: 0,
+                "data-event": e.args.event_id,
+                "aria-label": eventName(e),
+              });
+            group.append(
+              svgEl(
+                "title",
+                {},
+                `${eventName(e)}\n${description(e.name)[2]}\n${e.ph === "i" ? "里程碑时刻 " + format(e.ts / 1000) : "实际耗时 " + format(e.dur / 1000)} ms；层 ${e.context.layer || "未知"}；chunk 起始块 ${e.context.first ?? "未知"}`,
+              ),
+            );
+            if (e.ph === "i")
+              group.append(
+                svgEl("line", {
+                  x1: begin,
+                  y1: py,
+                  x2: begin,
+                  y2: py + 23,
+                  stroke: colour(e),
+                  "stroke-width": 3,
+                }),
+              );
+            else
+              group.append(
+                svgEl("rect", {
+                  x: begin,
+                  y: py,
+                  width,
+                  height: 23,
+                  rx: 3,
+                  fill: colour(e),
+                  opacity: selectedEvent && !related(e) ? 0.38 : 1,
+                  stroke: related(e) ? "#142f50" : colour(e),
+                  "stroke-width": related(e) ? 2 : 1,
+                }),
+              );
+            if (width > 35) {
+              const limit = Math.floor(width / 7),
+                api = description(e.name)[1],
+                full = eventName(e),
+                layerIndex = layerNumber(e),
+                short = `${layerIndex === null ? "" : "L" + layerIndex + " · "}${api}`,
+                text =
+                  full.length <= limit
+                    ? full
+                    : short.length <= limit
+                      ? short
+                      : api;
+              group.append(
+                svgEl(
+                  "text",
+                  {
+                    x: begin + 4,
+                    y: py + 16,
+                    fill: "white",
+                    "pointer-events": "none",
+                  },
+                  text.length > limit
+                    ? text.slice(0, Math.max(1, limit - 1)) + "…"
+                    : text,
+                ),
+              );
+            }
+            const choose = () => {
+              selectedEvent = e;
+              drawTimeline();
+              showEvent(e);
+            };
+            group.onclick = choose;
+            group.onkeydown = (ev) => {
+              if (["Enter", " "].includes(ev.key)) {
+                ev.preventDefault();
+                choose();
+              }
+            };
+            svg.append(group);
+          }
+        }
+        $("requestTimeline").append(svg);
+        $("timelineNote").textContent =
+          `当前窗口 ${visible.length} / ${timelineEvents.length} 个观察事件。计算与传输各归为一行，行内并行事件错层显示；短色块保留最小可点击宽度，实际耗时见提示。选择模型层只聚焦传输，计算行保留后续层便于对比。${timelineEvents.some((e) => e.name === "P.layer_host_forward") ? "" : " 未采集到逐层计算：整段 forward 不用于推导逐层覆盖率。"}`;
+        svg.addEventListener(
+          "wheel",
+          (event) => {
+            event.preventDefault();
+            const ratio =
+                (event.clientX - svg.getBoundingClientRect().left - LEFT) /
+                (WIDTH - LEFT - 20),
+              newSpan = Math.max(
+                1,
+                windowSpan * (event.deltaY > 0 ? 1.25 : 0.8),
+              );
+            windowStart +=
+              Math.max(0, Math.min(1, ratio)) * (windowSpan - newSpan);
+            windowSpan = newSpan;
+            drawTimeline();
+          },
+          { passive: false },
+        );
+      }
+      function union(spans) {
+        const result = [];
+        for (const [begin, end] of spans.sort((a, b) => a[0] - b[0])) {
+          const last = result.at(-1);
+          if (last && begin <= last[1]) last[1] = Math.max(last[1], end);
+          else result.push([begin, end]);
+        }
+        return result;
+      }
+      function overlapUs(event, calls) {
+        return union(
+          calls
+            .map((c) => [
+              Math.max(event.ts, c.ts),
+              Math.min(event.ts + event.dur, c.ts + c.dur),
+            ])
+            .filter(([a, b]) => b > a),
+        ).reduce((sum, [a, b]) => sum + b - a, 0);
+      }
+      function showEvent(event) {
+        $("overlap").replaceChildren();
+        $("eventDetails").replaceChildren();
+        if (!event) {
+          $("eventDetails").append(
+            el(
+              "p",
+              "点击色块查看阶段作用、接口和关联重叠；显示的都是该请求真实区间。",
+            ),
+          );
+          return;
+        }
+        const [label, api, explain] = description(event.name),
+          box = el("div");
+        box.append(
+          el("h3", eventName(event)),
+          el("p", explain),
+          el(
+            "p",
+            `${event.ph === "i" ? "里程碑，只有时间点、无持续耗时" : "实际耗时 " + format(event.dur / 1000) + " ms"}；接口 ${api}；${event.context.success === false || event.context.unfinished ? "失败或未完成，不能作为有效耗时" : "已观察 Host 边界"}`,
+          ),
+        );
+        if (event.args.shared_batch)
+          box.append(
+            el(
+              "p",
+              `此区间属于共享 Batch（实际 ${event.args.batch_size ?? "未知"} 条请求），当前请求只是其中一个成员；耗时未平摊，不表示独占执行。`,
+              "muted",
+            ),
+          );
+        if (isPull(event)) {
+          let unavailable = "";
+          const layer = layerNumber(event),
+            next = timelineEvents.filter(
+              (e) =>
+                e.name === "P.layer_host_forward" &&
+                e.context.success === true &&
+                !e.context.unfinished &&
+                sameChunk(e, event) &&
+                e.context.layer_role === "target" &&
+                event.context.layer_role === "target" &&
+                layerNumber(e) === layer + 1,
+            ),
+            later = timelineEvents.filter(
+              (e) =>
+                e.name === "P.layer_host_forward" &&
+                e.context.success === true &&
+                !e.context.unfinished &&
+                sameChunk(e, event) &&
+                e.context.layer_role === "target" &&
+                event.context.layer_role === "target" &&
+                layerNumber(e) > layer,
+            );
+          if (
+            event.context.success !== true ||
+            event.context.unfinished ||
+            !event.dur
+          )
+            unavailable = "传输调用未成功闭合，不能计算重叠。";
+          else if (selectedRow().kv_status !== "confirmed")
+            unavailable = "该请求的完整 KV 传输尚未核验，不输出覆盖比例。";
+          else if (selectedRow().quality?.length)
+            unavailable =
+              "采集存在不完整证据，不能把局部记录解释为完整覆盖率。";
+          else if (event.context.layer_role !== "target")
+            unavailable =
+              "该传输不属于已识别的 Target 主模型层，未提供可配对的逐层计算。";
+          else if (
+            layer === null ||
+            !Number.isSafeInteger(event.context.first) ||
+            !Number.isSafeInteger(event.context.tokens)
+          )
+            unavailable = "缺少可靠层号或 chunk 边界，不能精确配对。";
+          else if (!next.length)
+            unavailable =
+              "未采集到同 Rank、同 chunk 的下一层计算（可能是末层或证据缺失）。";
+          if (!unavailable) {
+            const expected = (
+              trace.kvaf_pd.summary.layer_statistics || []
+            ).filter(
+              (row) =>
+                row.role === "target" &&
+                Number(row.layer.match(/layers\.(\d+)/)?.[1]) > layer,
+            );
+            const observed = new Set(later.map((e) => e.context.layer));
+            const counts = new Map();
+            for (const call of timelineEvents.filter(
+              (e) => e.name === "P.layer_host_forward" && sameChunk(e, event),
+            ))
+              counts.set(
+                call.context.layer,
+                (counts.get(call.context.layer) || 0) + 1,
+              );
+            if ([...counts.values()].some((count) => count > 1))
+              unavailable =
+                "同层同 chunk 有重复计算，缺少唯一执行关联，不输出覆盖比例。";
+            if (!trace.kvaf_pd.summary.layer_statistics?.length)
+              unavailable = "缺少模型层清单，不能确认后续计算覆盖完整。";
+            else if (expected.some((row) => !observed.has(row.layer)))
+              unavailable = "同 chunk 后续层计算证据不完整，不输出覆盖比例。";
+          }
+          if (unavailable) box.append(el("p", unavailable, "warning"));
+          else {
+            const nextUs = overlapUs(event, next),
+              laterUs = overlapUs(event, later);
+            for (const [title, value, unit] of [
+              ["与下一层 Host 调用重叠", nextUs / 1000, "ms"],
+              ["与后续层 Host 调用重叠", laterUs / 1000, "ms"],
+              ["Host 观察重叠比例", (laterUs / event.dur) * 100, "%"],
+              ["未被 Host 调用覆盖", (event.dur - laterUs) / 1000, "ms"],
+            ])
+              $("overlap").append(infoCard(title, format(value) + " " + unit));
+            box.append(
+              el(
+                "p",
+                "重叠只在同一请求/代次、Rank、时间域及 chunk 中计算，重叠区间取并集；这些是 Host 调用观察值，不代表设备计算覆盖率，未覆盖时长不等于推理阻塞。",
+                "warning",
+              ),
+            );
+          }
+          box.append(
+            el(
+              "p",
+              "设备传输覆盖率：不可用。本采集没有 NPU kernel 与 DMA 执行区间，不能用 Host forward 或 RPC 时长替代。",
+              "muted",
+            ),
+          );
+        }
+        const relatedEvents = timelineEvents.filter(
+          (e) => related(e) && e !== event,
+        );
+        box.append(
+          el(
+            "p",
+            `关联计算/传输事件 ${relatedEvents.length} 个，已在图中高亮。等待导致的实际阻塞仅在原有依赖等待观察点有证据时展示。`,
+          ),
+        );
+        const details = el("details");
+        details.append(
+          el("summary", "技术信息：事件、层 / chunk / Rank 与计时边界"),
+          el(
+            "pre",
+            JSON.stringify(
+              {
+                event_name: event.name,
+                request: selectedRow().request,
+                generation: selectedRow().generation,
+                layer: event.context.layer,
+                first_block: event.context.first,
+                end_tokens: event.context.tokens,
+                domain: event.context.domain,
+                actor: event.context.actor,
+                raw_start_ns: event.args.raw_start_ns,
+                raw_end_ns: event.args.raw_end_ns,
+                shared_batch: !!event.args.shared_batch,
+                actual_batch: event.args.batch_size,
+                members: event.args.members,
+                observation:
+                  event.context.observation ||
+                  "Host 调用区间；RPC 包含控制与等待",
+              },
+              null,
+              2,
+            ),
+          ),
+        );
+        box.append(details);
+        $("eventDetails").append(box);
+      }
+      function validateReport(report) {
+        for (const row of report.summary || []) validateStats(row);
+        if (
+          (report.stages || []).length > 10000 ||
+          (report.layer_statistics || []).length > 10000
+        )
+          throw Error("阶段或模型层摘要超过预算");
+        for (const row of report.stages || []) validateStats(row);
+        const layerIds = new Set();
+        for (const layer of report.layer_statistics || []) {
+          if (
+            typeof layer.layer !== "string" ||
+            layerIds.has(layer.layer) ||
+            !Array.isArray(layer.summary) ||
+            layer.summary.length !== 4
+          )
+            throw Error("无效或重复的模型层摘要");
+          layerIds.add(layer.layer);
+          for (const row of layer.summary) validateStats(row);
+        }
+        for (const key of ["e2e", "ttft", "request_tpot"])
+          if (report.client?.[key]) validateStats(report.client[key]);
+        if (report.client?.group_tps)
+          validateStats(report.client.group_tps, ["mean", "p90", "p99"]);
+        validateBreakdown(report);
+      }
+      function resetView() {
+        trace = null;
+        byRequest.clear();
+        rawUnavailable = "";
+        selectedKey = "";
+        selectedEvent = null;
+        homePhase = "";
+        matrixPage = microPage = 0;
+        timelineEvents = [];
+        for (const id of [
+          "loadInfo",
+          "metricCards",
+          "waves",
+          "homeLane",
+          "matrixHead",
+          "matrixBody",
+          "matrixFoot",
+          "microBody",
+          "requestTimeline",
+          "overlap",
+          "eventDetails",
+          "summary",
+        ])
+          $(id).replaceChildren();
+        for (const id of [
+          "homeScope",
+          "matrixPage",
+          "microPage",
+          "selectedRequest",
+          "clockNote",
+          "timelineNote",
+          "basis",
+          "quality",
+          "eventScope",
+          "layerScope",
+        ])
+          $(id).textContent = "";
+        $("requestView").hidden = true;
+        $("requestBreakdown").open = false;
+        $("advanced").open = false;
+        $("matrixFilter").value = "";
+        $("phaseBasis").textContent =
+          "每行一条请求，各列为该请求的阶段观察区间并集；表尾统计整组请求。筛选和选择请求不改变纵向汇总。";
+        for (const id of ["clock", "actor", "timelineLayer", "modelLayer"])
+          $(id).replaceChildren();
+        $("modelLayer").append(new Option("所有层", "all"));
+        $("layerRole").value = "all";
+        $("path").value = "all";
+      }
+      async function load(file) {
+        if (!file) return;
+        const loadId = ++loadNumber;
+        resetView();
+        status("正在读取与校验 Trace…");
+        try {
+          if (file.size > MAX_BYTES)
+            throw Error(
+              "文件超过 256 MiB，请使用 --trace-detail stages，或只携带指定请求的时间轴。",
+            );
+          const content = await file.text();
+          if (loadId !== loadNumber) return;
+          const candidate = JSON.parse(content),
+            meta = candidate.kvaf_pd;
+          if (
+            !meta ||
+            ![1, 2].includes(meta.format_version) ||
+            !meta.summary ||
+            !Array.isArray(candidate.traceEvents) ||
+            !Array.isArray(meta.unaligned_domains) ||
+            !Array.isArray(meta.clocks)
+          )
+            throw Error("不支持的 Trace 格式");
+          validateReport(meta.summary);
+          const raw = [...candidate.traceEvents];
+          for (const domain of meta.unaligned_domains) {
+            if (!Array.isArray(domain.events)) throw Error("无效时间域事件");
+            for (const event of domain.events) raw.push(event);
+            if (raw.length > MAX_RECORDS)
+              throw Error(
+                "原始记录超过 100 万条，请轻量导出或只携带指定请求的时间轴。",
+              );
+          }
+          if (raw.length > MAX_RECORDS) throw Error("原始记录超过预算");
+          const events = raw.filter((e) => ["X", "i"].includes(e.ph));
+          let members = 0;
+          for (const event of events) {
+            if (
+              typeof event.name !== "string" ||
+              !event.args ||
+              typeof event.args.domain !== "string" ||
+              typeof event.args.actor !== "string" ||
+              !number(event.ts) ||
+              event.ts < 0 ||
+              (event.ph === "X" && (!number(event.dur) || event.dur < 0))
+            )
+              throw Error("无效的原始事件区间");
+            for (const context of [event.args, ...(event.args.members || [])]) {
+              for (const key of ["layer", "path"])
+                if (context[key] != null && typeof context[key] !== "string")
+                  throw Error("无效的层或路径身份");
+              for (const key of ["first", "tokens", "batch_size"])
+                if (
+                  context[key] != null &&
+                  (!Number.isSafeInteger(context[key]) || context[key] < 0)
+                )
+                  throw Error("无效的 chunk 或 batch 身份");
+            }
+            if (!number(event.ts + (event.dur || 0)))
+              throw Error("事件区间超出数值范围");
+            const identities = event.args.members || [event.args];
+            if (!Array.isArray(identities)) throw Error("无效请求关联");
+            members += identities.length;
+            if (members > MAX_RECORDS)
+              throw Error("请求关联超过预算，请只携带指定请求的时间轴");
+            for (const row of identities)
+              if (
+                typeof row.request !== "string" ||
+                typeof row.generation !== "string"
+              )
+                throw Error("事件缺少精确请求/代次");
+          }
+          if (events.length > MAX_EVENTS) {
+            if (
+              !Array.isArray(meta.summary.stages) ||
+              !meta.summary.stages.length
+            )
+              throw Error("原始事件超过预算且无统计摘要");
+            rawUnavailable =
+              "原始事件超过 20 万条，已切换为整组统计视图。请通过 --timeline-request-id 重新导出所需请求；统计集合保持不变。";
+          } else
+            for (const [index, event] of events.entries()) {
+              event.args.event_id ??= String(index);
+              for (const row of event.args.members || [event.args]) {
+                const key = keyOf(row.request, row.generation);
+                if (!byRequest.has(key)) byRequest.set(key, []);
+                byRequest.get(key).push(event);
+              }
+            }
+          trace = candidate;
+          if (events.length > MAX_EVENTS) {
+            trace.traceEvents = [];
+            for (const domain of meta.unaligned_domains) domain.events = [];
+            meta.links = [];
+          }
+          if (!events.length)
+            rawUnavailable =
+              "此文件仅含统计或没有原始事件。请使用 --trace-detail full --timeline-request-id 请求ID 导出该请求真实时序；整组统计不变。";
+          $("eventScope").textContent =
+            rawUnavailable ||
+            (meta.event_export?.timeline_request_ids?.length
+              ? "首页和纵向汇总对应整组请求；时序证据仅携带指定请求，未携带的请求不会反造时间轴。"
+              : "汇总对应整个导出集合；点击请求 ID 下钻真实事件。");
+          const layers = (meta.summary.layer_statistics || [])
+            .map((r) => r.layer)
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+          options("modelLayer", layers, (l) => l, true);
+          $("quality").textContent = JSON.stringify(
+            {
+              status: meta.summary.status,
+              scope: meta.summary.scope,
+              valid_requests: meta.summary.valid_requests,
+              outcomes: meta.summary.outcomes,
+              failed_events: meta.summary.failed_events,
+              unfinished_events: meta.summary.unfinished_events,
+              problems: meta.summary.problems,
+              notes: meta.summary.notes,
+              unavailable: meta.summary.unavailable,
+              sources: (meta.summary.sources || []).map((s) => ({
+                role: s.role,
+                host: s.host,
+                capture: s.capture_id,
+                checkpoint: s.checkpoint,
+                config: s.config,
+              })),
+            },
+            null,
+            2,
+          );
+          renderHome();
+          renderTransfer();
+          status(
+            `${file.name} | ${meta.summary.status === "INCOMPLETE" ? "采集不完整" : "Host 局部观察"} | 整组观察请求 ${meta.summary.outcomes?.observed_requests ?? "未知"}，完整 KV 传输请求 ${meta.summary.valid_requests ?? 0}`,
+            meta.summary.status === "INCOMPLETE",
+          );
+        } catch (error) {
+          if (loadId !== loadNumber) return;
+          resetView();
+          status("无法打开 Trace：" + error.message, true);
+        }
+      }
+      $("file").onchange = () => load($("file").files[0]);
+      $("drop").ondragover = (event) => event.preventDefault();
+      $("drop").ondrop = (event) => {
+        event.preventDefault();
+        load(event.dataTransfer.files[0]);
+      };
+      $("homeMetric").onchange = renderHome;
+      $("homeSvg").onclick = () => exportSvg("homeLane", "pd-overview");
+      $("homePng").onclick = () => exportPng("homeLane", "pd-overview");
+      $("matrixFilter").oninput = () => {
+        matrixPage = 0;
+        renderMatrix();
+      };
+      $("matrixPrevious").onclick = () => {
+        matrixPage--;
+        renderMatrix();
+      };
+      $("matrixNext").onclick = () => {
+        matrixPage++;
+        renderMatrix();
+      };
+      $("microPrevious").onclick = () => {
+        microPage--;
+        renderMicro();
+      };
+      $("microNext").onclick = () => {
+        microPage++;
+        renderMicro();
+      };
+      $("modelLayer").onchange = renderTransfer;
+      $("layerRole").onchange = () => {
+        const role = $("layerRole").value;
+        const layers = (trace?.kvaf_pd.summary.layer_statistics || [])
+          .filter((r) => role === "all" || r.role === role)
+          .map((r) => r.layer)
+          .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+        options("modelLayer", layers, (layer) => layer, true);
+        renderTransfer();
+      };
+      $("clock").onchange = updateActors;
+      $("actor").onchange = refreshTimeline;
+      $("timelineLayer").onchange = refreshTimeline;
+      $("path").onchange = refreshTimeline;
+      $("fit").onclick = fitTimeline;
+      $("zoomIn").onclick = () => {
+        windowSpan = Math.max(1, windowSpan / 2);
+        drawTimeline();
+      };
+      $("zoomOut").onclick = () => {
+        windowSpan *= 2;
+        drawTimeline();
+      };
+      $("earlier").onclick = () => {
+        windowStart -= windowSpan / 2;
+        drawTimeline();
+      };
+      $("later").onclick = () => {
+        windowStart += windowSpan / 2;
+        drawTimeline();
+      };
+      $("timelineSvg").onclick = () =>
+        exportSvg("requestTimeline", "pd-request-timeline");
+      $("timelinePng").onclick = () =>
+        exportPng("requestTimeline", "pd-request-timeline");
+      let dragState = null;
+      $("requestTimeline").onpointerdown = (event) => {
+        if (event.target.closest("[data-event]")) return;
+        dragState = { x: event.clientX, start: windowStart };
+        $("requestTimeline").setPointerCapture(event.pointerId);
+      };
+      $("requestTimeline").onpointermove = (event) => {
+        if (dragState) {
+          windowStart =
+            dragState.start -
+            ((event.clientX - dragState.x) / (WIDTH - LEFT - 20)) * windowSpan;
+          drawTimeline();
+        }
+      };
+      $("requestTimeline").onpointerup = $("requestTimeline").onpointercancel =
+        () => {
+          dragState = null;
+        };
+
+      function validateBreakdown(summary) {
+        const data = summary.stage_breakdown;
+        if (!data) return;
+        if (
+          data.schema !== 1 ||
+          typeof data.matrix_available !== "boolean" ||
+          !Number.isSafeInteger(data.observed_requests) ||
+          data.observed_requests < 0 ||
+          !Array.isArray(data.phases) ||
+          data.phases.length > 8 ||
+          !Array.isArray(data.summary) ||
+          !Array.isArray(data.requests) ||
+          data.requests.length > 10000
+        )
+          throw Error("无效或超预算的逐请求阶段矩阵。");
+        const ids = new Set(data.phases.map((phase) => phase.id));
+        if (
+          ids.size !== data.phases.length ||
+          data.summary.length !== ids.size ||
+          new Set(data.summary.map((row) => row.id)).size !== ids.size ||
+          data.phases.some(
+            (phase) =>
+              typeof phase.id !== "string" ||
+              typeof phase.label !== "string" ||
+              typeof phase.basis !== "string" ||
+              !Array.isArray(phase.detail_prefixes) ||
+              phase.detail_prefixes.some(
+                (prefix) => typeof prefix !== "string",
+              ),
+          )
+        )
+          throw Error("无效的业务阶段定义。");
+        for (const item of data.summary) {
+          if (
+            !ids.has(item.id) ||
+            !Number.isSafeInteger(item.samples) ||
+            item.samples < 0 ||
+            !["mean_ms", "p90_ms", "p99_ms"].every((key) =>
+              item.samples === 0
+                ? item[key] === null
+                : number(item[key]) && item[key] >= 0,
+            )
+          )
+            throw Error("无效的业务阶段统计。");
+        }
+        let cells = 0;
+        const requests = new Set();
+        for (const row of data.requests) {
+          const identity = JSON.stringify([row.request, row.generation]);
+          if (
+            typeof row.request !== "string" ||
+            typeof row.generation !== "string" ||
+            requests.has(identity) ||
+            !row.phases ||
+            !Array.isArray(row.stages)
+          )
+            throw Error("无效或重复的请求阶段行。");
+          requests.add(identity);
+          cells += row.stages.length + ids.size;
+          if (cells > MAX_MATRIX_CELLS)
+            throw Error("逐请求阶段单元超过浏览器预算。");
+          for (const id of ids) {
+            const item = row.phases[id],
+              value = item?.observed_ms;
+            if (
+              !item ||
+              !Array.isArray(item.clock_domains) ||
+              item.clock_domains.some((value) => typeof value !== "string") ||
+              typeof item.reason !== "string" ||
+              (value !== null && (!number(value) || value < 0))
+            )
+              throw Error("无效的请求阶段耗时。");
+          }
+          if (
+            row.stages.some(
+              (stage) =>
+                typeof stage.name !== "string" ||
+                typeof stage.clock_domain !== "string" ||
+                !number(stage.observed_ms) ||
+                stage.observed_ms < 0,
+            )
+          )
+            throw Error("无效的请求阶段调用明细。");
+        }
+      }
+    </script>
+  </body>
+</html>

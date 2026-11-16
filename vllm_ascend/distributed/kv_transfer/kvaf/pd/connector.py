@@ -16,6 +16,7 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.is_producer = vllm_config.kv_transfer_config.is_kv_producer
         self.requires_full_blocks_on_update_after_alloc = self.is_producer and role == KVConnectorRole.SCHEDULER
         self.scheduler = self.worker = None
+        self.request_observer = None
         self._caches = None
         self._layer_names = ()
         if role == KVConnectorRole.SCHEDULER:
