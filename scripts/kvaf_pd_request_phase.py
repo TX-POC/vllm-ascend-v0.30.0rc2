@@ -15,7 +15,7 @@ def request_phase(row):
     return phase
 
 
-def select_request_phase(captures, client_rows, desired="measure", request_ids=()):
+def select_request_phase(captures, client_rows, desired="measure", request_ids=(), *, client_scope=False):
     if desired not in (*PHASES, "all"):
         raise ValueError("invalid request phase selection")
     labels, known, keys = defaultdict(set), defaultdict(set), set()
@@ -29,21 +29,26 @@ def select_request_phase(captures, client_rows, desired="measure", request_ids=(
                     labels[key].add(phase)
                 if row.get("association") != "unresolved":
                     known[key[0]].add(key[1])
-    unmatched = 0
+    unmatched, client_keys = 0, set()
     for row in client_rows:
         phase = request_phase(row)
         identity = request_identity(row, known, request_ids)
         if identity is None:
             unmatched += 1
-        elif phase != "unknown":
-            labels[identity].add(phase)
+        else:
+            client_keys.add(identity)
+            if phase != "unknown":
+                labels[identity].add(phase)
+    cohort = {key for key in keys if not request_ids or key[0] in request_ids}
+    outside_client = len(cohort - client_keys) if client_scope else 0
+    if client_scope:
+        cohort &= client_keys
     resolved = {}
-    for key in keys:
+    for key in cohort:
         choices = labels[key]
         if len(choices) > 1:
             raise ValueError(f"conflicting request_phase labels for request {key[0]!r}, generation {key[1]!r}")
         resolved[key] = next(iter(choices)) if choices else "unknown"
-    cohort = {key for key in keys if not request_ids or key[0] in request_ids}
     selected = {key for key in cohort if desired == "all" or resolved[key] == desired}
     result = []
     for header, checkpoint, rows, source in captures:
@@ -75,6 +80,8 @@ def select_request_phase(captures, client_rows, desired="measure", request_ids=(
         excluded_requests=len(cohort - selected),
         observed_by_phase={phase: counts[phase] for phase in PHASES},
         unmatched_client_records=unmatched,
+        client_scope=client_scope,
+        outside_client_requests=outside_client,
         classification="explicit request_phase and exact request/generation identity; never order, length or latency",
         count_scope="captured request generations before input-length filtering",
     )

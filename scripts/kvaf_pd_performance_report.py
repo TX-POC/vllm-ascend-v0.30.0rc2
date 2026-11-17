@@ -523,7 +523,14 @@ def analyze(captures, notes, args, api, *, client_rows=()):
 
     captures = _resolve_proxy_generations(captures, notes)
     desired_phase = getattr(args, "request_phase", "measure")
-    captures, phase_quality = select_request_phase(captures, client_rows, desired_phase, args.request_id)
+    client_scope = bool(client_rows) or getattr(args, "client_records", None) is not None
+    captures, phase_quality = select_request_phase(
+        captures, client_rows, desired_phase, args.request_id, client_scope=client_scope
+    )
+    if client_scope:
+        omitted = sum(not rows for _, _, rows, _ in captures)
+        captures = [capture for capture in captures if capture[2]]
+        notes = [*notes, f"Client cohort: excluded {omitted} capture sources without matching selected requests"]
     canonical, full_canonical, events, problems, batch = [], [], [], [], {}
     if not phase_quality["selected_requests"] and desired_phase == "measure":
         problems.append(
@@ -935,10 +942,10 @@ def trace_document(report, events, *, detail="full", timeline_request_ids=()):
     )
 
 
-def export_trace(path, document, max_bytes):
+def export_trace(path, document, max_bytes, *, overwrite=False):
     path = Path(path)
-    if path.exists():
-        raise ValueError("Trace output already exists; choose a new filename")
+    if path.exists() and not overwrite:
+        raise ValueError("Trace output already exists; use --overwrite or choose a new filename")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
@@ -952,7 +959,10 @@ def export_trace(path, document, max_bytes):
                 if size > max_bytes:
                     raise ValueError("Trace size budget exceeded; reduce the selected data or raise --max-trace-bytes")
                 stream.write(data)
-        os.link(temporary, path)  # Atomic publication, refusing even a racing overwrite.
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)  # Atomic publication, refusing even a racing overwrite.
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -972,11 +982,14 @@ def main(argv, api):
         "--request-phase",
         choices=("measure", "warmup", "profile", "unknown", "all"),
         default="measure",
-        help="default: explicitly labelled measurements only; all is an unfiltered diagnostic view",
+        help="default: explicitly labelled measurements only; all includes every purpose in the selected cohort",
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--overwrite", action="store_true", help="atomically replace an existing exported Trace")
     parser.add_argument(
-        "--client-records", type=Path, help="existing JSON/JSONL request-tool output; IDs must correlate exactly"
+        "--client-records",
+        type=Path,
+        help="restrict analysis to requests in this JSON/JSONL result; IDs/generations must correlate exactly",
     )
     parser.add_argument("--max-input-bytes", type=int, default=268435456)
     parser.add_argument("--max-records", type=int, default=100000)
@@ -1003,6 +1016,17 @@ def main(argv, api):
             raise ValueError("export-trace requires --output")
         if args.command == "summary" and args.output is not None:
             raise ValueError("summary writes only to the terminal; use export-trace for a file")
+        if args.command != "export-trace" and args.overwrite:
+            raise ValueError("--overwrite applies only to export-trace")
+        if args.output is not None:
+            destination = args.output.resolve()
+            if args.client_records is not None and destination == args.client_records.resolve():
+                raise ValueError("Trace output must not overwrite client records")
+            for source in args.captures:
+                if destination == source.resolve() or (
+                    source.is_dir() and destination.is_relative_to(source.resolve()) and destination.suffix == ".jsonl"
+                ):
+                    raise ValueError("Trace output must not overwrite raw capture files")
         if args.command != "export-trace" and (args.trace_detail != "full" or args.timeline_request_id):
             raise ValueError("timeline selection and trace detail apply only to export-trace")
         if args.trace_detail == "stages" and args.timeline_request_id:
@@ -1067,7 +1091,7 @@ def main(argv, api):
             document = trace_document(
                 report, events, detail=args.trace_detail, timeline_request_ids=args.timeline_request_id
             )
-            export_trace(args.output, document, args.max_trace_bytes)
+            export_trace(args.output, document, args.max_trace_bytes, overwrite=args.overwrite)
             print("Trace event selection: " + json.dumps(document["kvaf_pd"]["event_export"], sort_keys=True))
             print(f"Trace: {args.output}")
         return 2 if report["status"] == "INCOMPLETE" else 0

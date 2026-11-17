@@ -15,6 +15,7 @@ import concurrent.futures as futures
 import dataclasses
 import json
 import math
+import os
 import statistics
 import sys
 import threading
@@ -378,12 +379,31 @@ def scheduler_metrics(http: Http):
 
 class Reporter:
     def __init__(self, config: Config):
-        stamp = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
-        self.directory = Path(config.result_dir) / stamp
-        self.directory.mkdir(parents=True)
+        self._lock = None
+        self.directory = Path(config.result_dir)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._lock = (self.directory / ".benchmark.lock").open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if self._lock.seek(0, os.SEEK_END) == 0:
+                    self._lock.write(b"\0")
+                    self._lock.flush()
+                self._lock.seek(0)
+                msvcrt.locking(self._lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            self.close()
+            raise BenchmarkError("result-dir is already in use; wait for the active benchmark to finish") from error
         public_config = dataclasses.asdict(config)
         public_config["api_key"] = "***" if config.api_key else ""
         self.report = {
+            "run_id": uuid.uuid4().hex,
+            "started_at_ns": time.time_ns(),
             "config": public_config,
             "levels": [],
             "profiles": [],
@@ -391,12 +411,29 @@ class Reporter:
             "request_phase_version": 1,
         }
         self.last_lines = 0
+        # Replace both entry points before any request: a reader must never
+        # mistake the previous final result for this round's live state.
+        self.save()
+        self.save(final=True)
+
+    def close(self):
+        if self._lock is not None:
+            self._lock.close()
+            self._lock = None
+
+    def __del__(self):
+        self.close()
 
     def save(self, *, final=False):
+        if self._lock is None:
+            raise BenchmarkError("reporter is closed; cannot overwrite a later benchmark")
         destination = self.directory / ("result.json" if final else "live.json")
-        temporary = destination.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self.report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-        temporary.replace(destination)
+        temporary = destination.with_name(f".{destination.name}.{self.report['run_id']}.tmp")
+        try:
+            temporary.write_text(json.dumps(self.report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def display(self, progress=None):
         proxy = self.report["config"].get("pd_proxy", False)
@@ -823,6 +860,10 @@ def parse_args(argv=None):
             options["help"] = "P/D backend origin used only for model validation and tokenization in PD Proxy mode"
         if field.name == "ignore_env_proxy":
             options["help"] = "bypass environment HTTP(S) proxies for both inference and metadata requests"
+        if field.name == "result_dir":
+            options["help"] = (
+                "overwrite live.json/result.json in this directory for each run; use another path to archive"
+            )
         parser.add_argument("--" + field.name.replace("_", "-"), **options)
     profile_group = parser.add_mutually_exclusive_group()
     profile_group.add_argument("--profile-prefill", action="store_true")
@@ -939,8 +980,11 @@ def main(argv=None):
         return 1
     finally:
         if reporter:
-            reporter.save(final=True)
-            print(f"Results: {reporter.directory / 'result.json'}")
+            try:
+                reporter.save(final=True)
+                print(f"Results: {reporter.directory / 'result.json'}")
+            finally:
+                reporter.close()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,12 @@ python3 scripts/benchmark.py \
   --data-parallel-size 1 --tensor-parallel-size 8
 ```
 
+同一个 `--result-dir` 固定写入 `live.json` 和 `result.json`，新一轮直接覆盖上一轮结果，不再自动创建时间戳子目录。
+开始时两份文件写入新的 `run_id`、`started_at_ns` 和 running 状态；预检或请求失败时保存本轮错误，不沿用旧结果。
+文件原子替换，写盘失败不留下半截 JSON；目录内其他文件及旧版时间戳归档保留。
+同一目录的并发 benchmark 会被 `.benchmark.lock` 拒绝，进程退出后锁释放，锁文件保留正常；不同实验并行使用不同目录。
+要归档历史，请运行前复制结果文件或使用新的 `--result-dir`。CLI 末尾打印实际结果路径。
+
 默认连接本机 8080，TP=8、DP=1；输入 130560、输出 512，总计 131072 tokens。
 压测前会用 `/v1/models` 返回的 `max_model_len` 校验实际请求总长；接口未提供该字段时跳过此检查。
 本机 `localhost`、`127.0.0.1`、`::1` 请求显式绕过环境代理，远端默认保留环境代理；
@@ -110,8 +116,9 @@ python3 scripts/benchmark.py \
 `levels` 与终端正式性能表只含 `measure`，profiling 仍单独保存在 `profiles`。
 
 性能工具 `summary` / `export-trace` 默认只分析明确标记的 `measure`。
-仅有 P/D 采集文件时，同时传入该次 `result.json`，按服务端响应 ID 和原生代次关联标签；
-采样 Proxy 可直接保存 HTTP 标签，供 P/D 事件离线关联。不会按请求先后、名称前缀或耗时猜测预热。
+仅有 P/D 采集文件时，同时传入该次 `result.json`，按服务端响应 ID 和原生代次关联标签，并将统计限定到该结果文件的请求集合；
+采样 Proxy 可直接保存 HTTP 标签，供 P/D 事件离线关联。P/D 原始采集可保留在固定路径，提供本轮客户端结果后排除旧请求及无关实例；允许同部署的多个 P DP engine，不修改采集头或按文件时间猜测归属。
+客户端覆盖结果不清理服务原始日志，也不重置每进程采集预算；配额耗尽仍需重新启动采集。空结果或关联失败不回退旧请求。不会按请求先后、名称前缀或耗时猜测预热。
 旧文件没有标签时视为 `unknown`，默认排除；诊断全部原始请求须显式选择分析端 `--request-phase all`。
 
 ### 其他能力

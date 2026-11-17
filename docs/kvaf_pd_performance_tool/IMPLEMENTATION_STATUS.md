@@ -1,6 +1,6 @@
 # KVAF PD 性能工具：本地实现与使用记录
 
-日期：2026-11-16。依据：[v1.9 设计](DESIGN.md)，沿用请求用途筛选，增加请求 ID 联动双行时序、按层传输核验、负载与 TPS，并精简重复视图。本文记录实现、使用方法及验证边界。
+更新日期：2026-11-17。依据：[v1.9 设计](DESIGN.md)，沿用请求用途筛选，增加请求 ID 联动双行时序、按层传输核验、负载与 TPS，并精简重复视图。新增同部署 P 多 DP 分析、固定结果覆盖和本轮客户端集合隔离。本文记录实现、使用方法及验证边界。
 
 ## 1. 当前交付边界（第四批）
 
@@ -78,7 +78,7 @@ export PYTHONPATH="$PWD/scripts${PYTHONPATH:+:$PYTHONPATH}"
 
 在原 `--kv-transfer-config` 中仅将 module path 选择为 `kvaf_pd_transfer_stats_connector`，Connector 名仍是 `PDKVoffloadConnector`。
 Worker、图模式、MTP、`source_tp0_only`、并行与原启动参数不变；`diagnostics_requests=0`、`verify_kv=false`。
-恢复原 module path 即退出工具接入；插件的 `enabled=false` 或 `sample_rate=0` 也关闭队列、线程与文件。
+恢复原 module path 前须先关闭 D 同步组批策略；否则带组批标签的请求不受支持。恢复原 module path 即退出工具接入；插件的 `enabled=false` 或 `sample_rate=0` 也关闭队列、线程与文件。
 配置缺失时关闭采集；配置无效时报告停用原因，保留原推理路径。调整配置需要新的采集轮次，不提供运行中热更新。
 
 ## 3. 配置与预算
@@ -86,7 +86,7 @@ Worker、图模式、MTP、`source_tp0_only`、并行与原启动参数不变；
 配置路径为 `kvaf_pd_performance.py` 顶部 `CONFIG_PATH`，默认与该模块同目录。
 不读取业务 additional_config，不新增环境变量或原生 CLI。完整字段、默认值与约束见 [设计 3.3 节](DESIGN.md#33-可配置采集契约)。
 
-短窗口全请求采集示例，其余字段沿用设计默认值：
+128K 长输入的短窗口采集起始配置如下。保存到 **P 的 `scripts/kvaf_pd_performance.json`**；D 使用同一配置，但将 `layer_compute` 改成 `false`。这是实验建议值，不更改随仓默认配置，也不保证任意负载无丢样。
 
 ```json
 {
@@ -94,11 +94,39 @@ Worker、图模式、MTP、`source_tp0_only`、并行与原启动参数不变；
   "sample_rate": 1.0,
   "sample_seed": 0,
   "detail_level": "layer",
+  "layer_compute": true,
+  "buffer": {
+    "max_events": 4096,
+    "max_bytes": 67108864,
+    "overflow_policy": "drop_new"
+  },
   "writer": {
-    "output_dir": "/home/c00612283/pd-perf"
+    "enabled": true,
+    "output_dir": "/home/c00612283/pd-perf/run02",
+    "batch_events": 256,
+    "flush_interval_ms": 1000,
+    "file_buffer_bytes": 1048576,
+    "max_file_bytes": 67108864,
+    "max_total_bytes": 524288000
   }
 }
 ```
+
+| 参数                             | 本例含义                                                                 |
+| -------------------------------- | ------------------------------------------------------------------------ |
+| `enabled`                        | 采集总开关，与同步 Decode 开关独立                                       |
+| `sample_rate`                    | 1.0 为全采样，0.1 为约 10%；P/D 保持一致                                 |
+| `sample_seed`                    | 确定性采样种子，不是预热次数；两侧保持一致                               |
+| `detail_level`                   | `layer` 包含逐层传输和请求阶段                                           |
+| `layer_compute`                  | P eager 下观察逐层 Host forward；D 保持 false；不是设备计时              |
+| `buffer.max_events/max_bytes`    | 每进程事件数上限 4096、缓冲预算 64 MiB，实际同时受身份预算约束           |
+| `overflow_policy`                | `drop_new` 丢弃新样本，不在这里填写路径                                  |
+| `writer.output_dir`              | 使用绝对路径；可固定复用，两侧分别写本机文件；分析必须关联本轮客户端结果 |
+| `batch_events/flush_interval_ms` | 后台批量写盘 256 条、刷新间隔 1000 ms                                    |
+| `file_buffer_bytes`              | 文件缓冲 1 MiB                                                           |
+| `max_file_bytes/max_total_bytes` | 单文件 64 MiB、每进程日志总上限 500 MiB；8 个写盘进程约 3.91 GiB         |
+
+修改配置后重启对应服务；没有热更新。服务不重启时，后续 benchmark 可复用同一采集目录，分析按本轮客户端结果隔离请求，不删除或截断服务正在写入的文件。采集预算仍按进程累计，不会因客户端新一轮开始而重置；日志预算耗尽后需结束实验并重新启动采集，不能假定新请求已被记录。先小批采集，检查有效 N、丢样和预算耗尽，再扩大负载。采集关闭不等于同步组批关闭。
 
 P/D/Proxy 使用一致的采样比例、seed 和档位。采样键只使用原外部请求 ID，不能用 TP 本地 alias 或独立随机 generation。
 长期观测调低 sample_rate；默认 10% 是配置建议，未经实机 A/B，不保证足够尾延迟样本或可接受开销。
@@ -119,41 +147,174 @@ P 在途身份预算再由原 RPC job 和请求阶段状态分配，因此较小
 采集预算是每进程预算，整机还要乘实际进程数。全采样 `detail` 不适合作为未经测量的长期默认值。
 `writer.enabled=false` 仅保留有界内存和退出计数，不隐式落盘，独立分析脚本无文件可读。
 
-## 4. 服务环境内分析与导出
+### 3.1 同步 Decode 的容量与启动参数
 
-在服务容器/服务器另开终端运行独立短期进程，不导入 NPU/SDK，不给推理添加分析回调或分析 API：
+本例 P/Proxy=`141.62.38.12`、D=`141.62.38.24`，D 为 DP8/TP1/EP8。P 拓扑以实际启动参数为准，不由 benchmark 的 D 元数据推断。
+P/D 保留 `PDKVWorker`、原生传输角色和其余已验证参数；按第 2 节设置 `PYTHONPATH` 与 `kvaf_pd_transfer_stats_connector`。
+P 的 `kvaf_config.enabled=false`、`kv_role=kv_producer`；D 的 `kvaf_config.enabled=true`、`kv_role=kv_consumer`。
+P 为获得逐层计算证据保留已验证 eager 配置，D 可沿用已验证的 `FULL_DECODE_ONLY`；不要为查看器改变业务图模式。
 
-```bash
-# 只校验配置，不创建采集资源。
-PYTHONPATH=scripts python3 -c 'from kvaf_pd_performance import load_config; print(load_config())'
+在 **D 和 Proxy 节点**分别编辑现有 `scripts/kvaf_pd_decode_batch.json`：
 
-# 本地 P 文件即可先看 P/传输统计；缺少的 D/客户端阶段保留未知。
-python3 scripts/kvaf_pd_transfer_stats.py summary /home/c00612283/pd-perf \
-  --client-records /home/c00612283/capture-run/result.json
-
-# 多源文件已集中到分析侧时，直接终端汇总，并导入已有压测结果。
-python3 scripts/kvaf_pd_transfer_stats.py summary \
-  /home/c00612283/capture-run/p \
-  /home/c00612283/capture-run/d \
-  --client-records /home/c00612283/capture-run/result.json
-
-# 同一分析集合汇总成一个 Trace，之后 Windows 不需要这些原始目录。
-python3 scripts/kvaf_pd_transfer_stats.py export-trace \
-  /home/c00612283/capture-run/p \
-  /home/c00612283/capture-run/d \
-  /home/c00612283/capture-run/proxy \
-  --client-records /home/c00612283/capture-run/result.json \
-  --output /home/c00612283/capture-run/kvaf-pd.trace.json
+```json
+{
+  "enabled": true,
+  "proxy_url": "http://141.62.38.12:8000",
+  "dp_size": 8,
+  "max_batch_size": 4,
+  "timeout_seconds": 3600
+}
 ```
 
-输入不能混合不同实验的 P engine。读 schema 1 旧文件、schema 2 和本批 schema 3；原无子命令分析与 compare 仍保持旧用法。
+D 启动脚本对应参数：
+
+```bash
+--max-model-len 131072 \
+--max-num-seqs 4 \
+--max-num-batched-tokens 4096 \
+--gpu-memory-utilization 0.90 \
+```
+
+| 参数                            | 作用                                                                         |
+| ------------------------------- | ---------------------------------------------------------------------------- |
+| `max_batch_size=4`              | 同步组批每个 D rank 的目标 batch 上限，不是全机总数                          |
+| `--max-num-seqs 4`              | 每个 D DP 实例的调度请求数上限；不会自动增加 KV 容量                         |
+| `--max-num-batched-tokens 4096` | 每个 DP 实例单轮所有请求合计的 token 预算，不是单请求长度；影响试运行/工作区 |
+| `--gpu-memory-utilization 0.90` | 引擎 HBM 使用预算比例，不是 KV 占比，也不是内存释放开关                      |
+| `--levels 4`                    | 本轮每个 D rank 目标 4 请求，DP8 总计 32；TP1 时等价于每卡 4                 |
+
+D 的 token 预算至少覆盖 `max_batch_size × (num_speculative_tokens + 1)`；本例 MTP 3、batch 4 的该项需求为 16，但不能据此断言所有必要运行路径只需 16 token。
+必须检查启动日志的 `logical_blocks`、`Maximum concurrency` 及运行时实际 batch；准入容量不足时，全组等待可能形成循环等待。
+K DDR 承载 Target 主 KV，HBM 中仍有 Hot/尾块、Indexer/MTP 和运行工作区；不能用 DDR 大小代替本地准入容量。
+P 不需要开启组批开关，也不必跟随 D 把 `max-num-seqs` 改成 4。P 的每个 DP rank 实际分配由 P 路由/调度决定。
+完整协议与限制见 [同步 Decode 组批说明](DECODE_BATCH.md)。
+
+### 3.2 启动 Proxy、发送请求与核验
+
+K 服务及原初始化协调器就绪后启动 D、P，再启动一个 Proxy。D/Proxy 配置均按进程启动读取。
+在 P/Proxy 容器执行，日志写文件，避免后续无法取得终端历史：
+
+```bash
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
+mkdir -p pd-logs/proxy
+
+KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3 \
+bash scripts/kvaf_pd_proxy.sh \
+  --host 141.62.38.12 --port 8000 \
+  --prefiller-hosts 141.62.38.12 --prefiller-ports 8100 \
+  --decoder-hosts 141.62.38.24 --decoder-ports 8200 \
+  2>&1 | tee "pd-logs/proxy/$(date +%Y%m%d_%H%M%S).log"
+```
+
+P/D 采集不要求额外采集 Proxy。若需要 Proxy 阶段事件，使用同一解释器启动 `scripts/kvaf_pd_performance_proxy.py` 替代上述 shell 入口，参数相同；不要额外启动第二个 Proxy。
+
+另开终端确认 P/D 健康及 Proxy **实际运行**的配置：
+
+```bash
+curl --fail --noproxy '*' --max-time 5 http://141.62.38.12:8100/health
+curl --fail --noproxy '*' --max-time 5 http://141.62.38.24:8200/health
+curl --fail --noproxy '*' --max-time 5 http://141.62.38.12:8000/v1/kvaf-decode-batch
+```
+
+最后一项应包含 `enabled=true`、`dp_size=8`、`max_batch_size=4`。磁盘 JSON 正确不代表旧进程已重新加载。
+benchmark 是标准库 HTTP 客户端，建议在 P 容器新终端执行，也可在能访问两个地址且具备同版本脚本的客户端执行，不需要 NPU。
+首次将下面的 `--levels 4` 改为 `--levels 1`，8 请求全部完成后，再测试每卡目标 4、共 32 请求：
+
+```bash
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
+
+python3 scripts/benchmark.py \
+  --pd-proxy --sync-decode-batch \
+  --levels 4 \
+  --base-url http://141.62.38.12:8000 \
+  --metadata-base-url http://141.62.38.24:8200 \
+  --model glm --ignore-env-proxy \
+  --input-tokens 130947 --output-tokens 125 \
+  --data-parallel-size 8 --tensor-parallel-size 1 \
+  --warmup-rounds 0 \
+  --request-timeout 7200 \
+  --result-dir /home/c00612283/pd-benchmark/sync-run04
+```
+
+| 压测参数                                      | 含义                                                                   |
+| --------------------------------------------- | ---------------------------------------------------------------------- |
+| `--pd-proxy`                                  | 全部生成请求经 Proxy，metadata 后端只提供模型/分词信息                 |
+| `--sync-decode-batch`                         | 启用本轮组身份、定向 D rank 及全组 KV 就绪后放行                       |
+| `--data-parallel-size/--tensor-parallel-size` | 描述 D 拓扑，不能当作 P 拓扑                                           |
+| `--input-tokens/--output-tokens`              | 本例输入加目标输出为 131072，不可超过服务上下文上限                    |
+| `--warmup-rounds 0`                           | 不额外预热，适合先定位和比较同条件基线                                 |
+| `--warmup-rounds 2 --warmup-batch-size 1`     | 可替换上项，先发两轮各 8 请求，分析默认排除预热                        |
+| `--request-timeout 7200`                      | 大于本例组批超时 3600 秒，并为后续计算留时间                           |
+| `--result-dir`                                | 固定写在客户端执行位置；同目录下 `live.json` 和 `result.json` 每轮覆盖 |
+
+同一个 `--result-dir` 不再自动建立时间戳子目录，直接覆盖 `live.json` 和 `result.json`。启动新一轮时两者先写入本轮 `run_id`、`started_at_ns` 和 running 状态，结束后写最终状态；预检失败也不会展示旧轮成功结果。结果原子替换，写盘失败保留上一次完整文件，不产生半截 JSON。目录内其他文件和旧版时间戳归档不自动删除；要保留某轮结果，请提前复制结果文件或换一个结果目录。
+同一结果目录使用 `.benchmark.lock` 防止两个 benchmark 并发覆盖；进程退出后锁释放，锁文件保留是正常现象，不要手工删除活动锁。若要并行实验，分别指定结果目录。
+
+不需要修改 benchmark 源文件。`--levels 4`、无预热时产生 32 个 P Prefill 和 32 个 D Decode 请求；两轮各 8 请求预热则累计 48 个请求走完整 PD 流程，正式统计仍是 32 个。
+同步模式会延迟 D 的放行，TTFT/E2E 包含该等待；TPOT/TPS 仍来自真实 token ID/到达时间。
+公共窗口 TPS 为整组 token/s，不是每卡吞吐或全程吞吐；单轮 TPS 样本不提供 P90/P99。
+
+`Measuring`/`Warmup` 的 `0` 和 `live.json` 空结果是实时状态，不能直接称为失败。128K Prefill 可能耗时数分钟；比较客户端 token/完成数、P 队列、D 的 capacity/deferred 和 Proxy 记录，不能只看 HTTP 200 或 NPU 100%。
+`KVAF_DECODE_BATCH_RELEASE` 表示 rank 获得放行，不是设备同时开始的证明；`request released` 可能是完成、取消或失败清理，不是成功判据。
+实验反馈中，128K 总长、每卡目标 1 的 8 请求已报告 8/8 成功；这不代表每卡 4/16 的容量、精度或采集开销也已验收。
+
+活动轮次中关闭 Proxy 会丢失组状态，重启不能接续旧组。应结束旧 benchmark、清理受影响的 D 状态并确认 P 旧请求结束，再开始新轮次；不要重复叠加发送。
+关闭同步策略时，将 D/Proxy 的组批 `enabled=false` 后重启，并去掉客户端 `--sync-decode-batch`；关闭被动采集则在两侧性能 JSON 设置 `enabled=false` 后重启。
+
+## 4. 服务环境内分析与导出
+
+在服务容器/服务器另开终端运行独立短期分析进程，不导入 NPU/SDK，不给推理添加分析回调或分析 API。
+完成本轮请求后，在 P 容器集中 P/D 文件。采集路径可沿用上轮，无需为每个 benchmark 改服务配置：传入本轮 `--client-records` 后，按精确请求 ID/代次限定分析集合，自动排除没有本轮选中请求的旧实例；当前部署的 `_dp0` 等 P 分片可共同统计。相同请求身份跨实例或代次有歧义时仍报错，不按文件时间猜测。
+下例采集路径 `run02` 必须替换成两侧配置中实际的 `writer.output_dir`，不能因为 benchmark 结果目录名称变了就假定服务端路径也改变。复制过程应在本轮请求结束并等待后台刷新后进行；原始历史仍计入输入扫描预算。
+
+```bash
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
+mkdir -p /home/c00612283/capture-run02/{p,d}
+
+cp -a /home/c00612283/pd-perf/run02/. /home/c00612283/capture-run02/p/
+scp -r root@141.62.38.24:/home/c00612283/pd-perf/run02/. \
+  /home/c00612283/capture-run02/d/
+
+# 替换为本轮 benchmark 末尾打印的真实结果路径。
+CLIENT_RESULT=/home/c00612283/pd-benchmark/sync-run04/result.json
+test -f "$CLIENT_RESULT"
+
+python3 scripts/kvaf_pd_transfer_stats.py summary \
+  /home/c00612283/capture-run02/p /home/c00612283/capture-run02/d \
+  --client-records "$CLIENT_RESULT" \
+  --max-records 10000000 --max-input-bytes 4294967296
+
+# 整组轻量概览：保留请求矩阵及统计，不携带原始时序。
+python3 scripts/kvaf_pd_transfer_stats.py export-trace \
+  /home/c00612283/capture-run02/p /home/c00612283/capture-run02/d \
+  --client-records "$CLIENT_RESULT" \
+  --max-records 10000000 --max-input-bytes 4294967296 \
+  --trace-detail stages --overwrite \
+  --output /home/c00612283/capture-run02/overview.trace.json
+
+# 从概览请求表复制完整 ID；保留整组统计，仅携带该请求时序。
+python3 scripts/kvaf_pd_transfer_stats.py export-trace \
+  /home/c00612283/capture-run02/p /home/c00612283/capture-run02/d \
+  --client-records "$CLIENT_RESULT" \
+  --max-records 10000000 --max-input-bytes 4294967296 \
+  --trace-detail full --timeline-request-id '替换为完整请求ID' --overwrite \
+  --output /home/c00612283/capture-run02/request.trace.json
+```
+
+仅开启 Proxy 阶段采集时，额外集中其文件并作为第三个输入目录；原 Proxy 的访问日志不能替代事件文件。
+`scp` 首次主机指纹应从目标主机核验，不关闭主机身份校验。P 单侧文件也能分析局部阶段，但缺少的 D/客户端证据保留未知。
+将新 Trace 与同版本 `scripts/kvaf_pd_trace_viewer.html` 复制到 Windows，在 Chrome/Edge 打开 HTML 后选择 Trace，无需网络或服务端绘图。
+首页查看 TTFT/TPOT/TPS、负载与阶段统计，请求表点击 ID 联动计算/传输双行时序；轻量文件缺少原始时序时使用上面的定向 full 文件。详细操作及历史 run01 重导示例见第 5 节。
+
+输入不能混合不同实验的 P engine。允许同 host/boot、同部署标识下的 `_dp0`、`_dp1` 等兄弟 engine：后缀必须与 `dp_rank` 一致，DP/TP 拓扑和层集合一致，同一请求/代次只能属于一个 P engine。不能为了通过校验删除后缀或伪造采集头；筛选来源应以共同部署标识分组，不把正常 DP 分片当成多次重启。读 schema 1 旧文件、schema 2 和本批 schema 3；原无子命令分析与 compare 仍保持旧用法。
+提供 `--client-records` 时，分析仅包含该文件关联的请求（再应用正式/预热、输入长度与请求 ID 筛选），不把其他已标记 measure 的旧请求计入。显式空结果或没有匹配时不会回退统计历史请求；缺少有效证据仍显示 INCOMPLETE。缺少客户端文件时没有自动选择最新实验的依据，混合旧部署仍拒绝。
 正式性能分析使用 `summary` / `export-trace`；旧版无子命令流程仅兼容历史原始统计，不提供请求用途筛选。
 多个输入长度需 `--input-tokens`，可重复 `--request-id` 精确选原生外部请求 ID。终端显示四组、阶段分布、客户端可得 E2E/TTFT 和完整性。
 未导入客户端证据就显示 E2E 未知；不以第一个服务事件为请求发送，也不把传输累计当作 E2E。
 
 默认输入字节上限 256 MiB、记录及展开事件上限各 100000、Trace 上限 256 MiB，可用
 `--max-input-bytes`、`--max-records`、`--max-trace-bytes` 显式调整；不是分析进程 RSS 限额。
-客户端文件也计入输入预算。超预算明确拒绝，不静默截断或拆成多个 Trace；已存在的输出不覆盖。
+客户端文件也计入输入预算。超预算明确拒绝，不静默截断或拆成多个 Trace。Trace 默认不覆盖已有输出；传入 `--overwrite` 后，成功导出才原子替换，失败保留旧 Trace，且拒绝覆盖客户端记录或原始采集文件。
 快照只读最后完整 checkpoint，不强制业务线程 flush；相同副本去重，缺失分片、冲突副本或损坏完整记录明确报错。
 
 原 begin 已提交而 end 未提交的事件显示为“未结束”的起点，持续时间未知，不用当前时间补造结束。
@@ -320,7 +481,7 @@ python3 scripts/kvaf_pd_transfer_stats.py export-trace \
 }
 ```
 
-这段只说明需要修改的字段，不是完整配置替换。写盘使用已确认的绝对路径，例如 `/home/c00612283/pd-perf/run01`；分轮保存，勿混入旧文件。
+这段只说明需要修改的字段，不是完整配置替换。写盘使用已确认的绝对路径，例如 `/home/c00612283/pd-perf/run01`；可固定复用；提供本轮客户端结果来隔离分析。
 D 可保持 `layer_compute=false`，但仍需开启原请求/接收观察。逐层 hook 按当前 GLM 的 `.self_attn.` 所属 Target block 匹配，未匹配时 `hooked_layers=0`，不假定任意模型都具备逐层证据。
 P 保留已经验证的 eager 启动配置，不为了观察强制改变原图模式；非 eager P 不安装逐层 hook，checkpoint 明确报告 `hooked_layers=0`。
 重启 P 后，在正常真实请求中记录各 Target block 的 Host `forward`；初始化/dummy、未绑定请求、未采样请求不产生逐层计算样本。原模型只调用一次，hook 不改参数、输出、异常，不同步设备、不读取 Tensor，不持有 KV/SDK 所有权。
@@ -350,7 +511,16 @@ Host 重叠只匹配同请求/代次、同进程/时间域、同 Target 层类�
 
 ## 6. 验证和未完成项
 
-v1.9 本轮验证（CPU/本地 TCP/Chromium，非 NPU 实测）：
+2026-11-17 多 DP 与重复运行修复验证（CPU/本地 HTTP/TCP，非 NPU 实测）：
+
+- 91 项原有 PD、传输统计及 benchmark 测试通过，15 个关闭/零采样率检查通过；没有更改推理、调度、KV 传输或采集热路径。
+- 合成 P DP4/TP2 的请求/层统计、同部署多 DP 来源校验通过；拒绝跨主机/boot/重启、拓扑变化、rank 后缀不一致，以及同请求代次跨 DP 合并。
+- 原始文件含旧实例、旧 measure 请求、错误来源时，显式客户端集合的样本数、阶段值、状态与干净输入一致；空客户端结果不回退历史数据。
+- 真实本地 HTTP 连续两轮覆盖相同目录，预检失败清除旧成功结果；线程外进程竞争也被拒绝。覆盖写盘错误及 Trace 超预算均保留旧完整文件，原始/客户端文件覆盖被拒绝。
+- 请求用途、warmup-only、预热失败终止、同步组批 rank/slot 与原 token 载荷回归通过；复用临时检查并适配新的固定结果路径，未新增仓库测试文件。
+- `format.sh ci` 本轮仍在 Markdownlint 钩子的 npm Git 安装策略处失败（EALLOWGIT），相关文件另行执行 Ruff、Markdownlint、Prettier 等检查；不宣称全量 CI 或 NPU 性能/精度已验收。
+
+以下为 v1.9 前一批验证（CPU/本地 TCP/Chromium，非 NPU 实测）：
 
 - 91 项原有 PD flow/recovery/integration、传输统计及 benchmark 用例通过。关闭/零采样率另复用 15 个原生用例，禁止调用采集工厂、计时器、回调及元数据复制，原字节、同步次数、恢复和返回/异常保持。
 - 可选逐层 hook 用真实 CPU Torch 模块验证一次调用、输出及原异常对象身份不变、dummy 排除、精确层/chunk、采集故障隔离；图模式和新开关关闭均不安装 hook。真实设备开销与精度仍待原环境 A/B。

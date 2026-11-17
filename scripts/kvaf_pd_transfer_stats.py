@@ -358,9 +358,41 @@ def merge_layer(records, input_tokens):
     )
 
 
+def _validate_producer_sources(headers):
+    """Allow sibling DP engines, while retaining one host/boot and deployment."""
+    sources = {(header["host"], header["boot_id"], header["engine"]) for header in headers}
+    if len(sources) == 1:
+        return
+    families = set()
+    ranks = {}
+    for header in headers:
+        family, separator, suffix = header["engine"].rpartition("_dp")
+        rank, size, tp_size = header.get("dp_rank"), header.get("dp_size"), header.get("tp_size")
+        if (
+            not separator
+            or not family
+            or not suffix.isascii()
+            or not suffix.isdecimal()
+            or type(rank) is not int
+            or type(size) is not int
+            or type(tp_size) is not int
+            or tp_size <= 0
+            or not 0 <= rank < size
+            or int(suffix) != rank
+        ):
+            raise ValueError("P sources require one engine or verified sibling DP engine identities")
+        families.add((header["host"], header["boot_id"], family, size, tp_size))
+        previous = ranks.setdefault(rank, header["engine"])
+        if previous != header["engine"]:
+            raise ValueError("P DP rank has conflicting engine identities")
+    if len(families) != 1:
+        raise ValueError("P samples must come from one host/boot/deployment; do not mix restarts or clocks")
+
+
 def collect_samples(captures, input_tokens, request_ids=None, skip_first=0):
     problems, headers, raw = [], [], defaultdict(lambda: defaultdict(list))
     cancelled, observed_batches = set(), {}
+    request_engines = defaultdict(set)
     for header, checkpoint, rows, path in captures:
         if checkpoint["dropped"] or checkpoint["errors"]:
             problems.append(f"{path}: capture dropped records or had observer/writer errors")
@@ -372,6 +404,7 @@ def collect_samples(captures, input_tokens, request_ids=None, skip_first=0):
                 problems.append(f"{path}: unfinished layer/job measurements")
             for row in rows:
                 key = row["request"], row["generation"]
+                request_engines[key].add(header["engine"])
                 if row["kind"] == "cancel":
                     cancelled.add(key)
                 elif row["kind"] == "layer":
@@ -383,8 +416,7 @@ def collect_samples(captures, input_tokens, request_ids=None, skip_first=0):
             observed_batches[rank] = dict(header=header, histogram=checkpoint.get("batch_histogram", {}))
     if not headers:
         raise ValueError("no P worker captures")
-    if len({(header["host"], header["boot_id"], header["engine"]) for header in headers}) != 1:
-        raise ValueError("P samples must come from one host/boot/engine; cross-host clocks cannot be merged")
+    _validate_producer_sources(headers)
     layer_names = set(headers[0]["layers"])
     if any(set(header["layers"]) != layer_names for header in headers):
         raise ValueError("P workers disagree on the layer set")
@@ -400,6 +432,8 @@ def collect_samples(captures, input_tokens, request_ids=None, skip_first=0):
     layer_samples, request_samples, rejected = [], [], []
     for _, key, layers in sorted(candidates)[skip_first:]:
         try:
+            if len(request_engines[key]) != 1:
+                raise ValueError("request generation belongs to multiple P DP engines")
             if key in cancelled or set(layers) != layer_names:
                 raise ValueError("cancelled request or missing layer")
             merged = [merge_layer(rows, input_tokens) for rows in layers.values()]
