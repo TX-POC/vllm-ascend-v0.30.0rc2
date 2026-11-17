@@ -282,6 +282,12 @@
               >观察进程 / Rank
               <select id="actor" aria-label="观察进程"></select></label
             ><label
+              >Prefill 分段
+              <select
+                id="timelineChunk"
+                aria-label="Prefill 分段"
+              ></select></label
+            ><label
               >模型层
               <select
                 id="timelineLayer"
@@ -1296,6 +1302,8 @@
             return d;
           }
         });
+        $("timelineChunk").replaceChildren();
+        $("timelineLayer").replaceChildren();
         updateActors();
         renderMicro();
         $("requestView").scrollIntoView({ block: "start" });
@@ -1311,21 +1319,62 @@
         $("actor").replaceChildren(
           ...actors.map((actor) => new Option(actor, actor)),
         );
-        const layers = unique(events.map((e) => e.context.layer)).sort((a, b) =>
-          a.localeCompare(b, undefined, { numeric: true }),
-        );
-        options("timelineLayer", layers, (l) => l, true);
-        $("timelineLayer").value = "all";
-        refreshTimeline();
+        updateChunks();
       }
-      function refreshTimeline() {
-        selectedEvent = null;
-        const all = requestEvents().filter(
+      function chunkKey(e) {
+        const { first, tokens } = e.context;
+        return Number.isSafeInteger(first) &&
+          first >= 0 &&
+          Number.isSafeInteger(tokens) &&
+          tokens > 0
+          ? JSON.stringify([first, tokens])
+          : "unknown";
+      }
+      function actorEvents() {
+        return requestEvents().filter(
           (e) =>
             e.context.domain === $("clock").value &&
             e.context.actor === $("actor").value,
         );
-        const layerCalls = all.some((e) => e.name === "P.layer_host_forward");
+      }
+      function updateChunks() {
+        const chunks = unique(actorEvents().map(chunkKey)).sort((a, b) => {
+          if (a === b) return 0;
+          if (a === "unknown") return 1;
+          if (b === "unknown") return -1;
+          const left = JSON.parse(a),
+            right = JSON.parse(b);
+          return left[0] - right[0] || left[1] - right[1];
+        });
+        options("timelineChunk", chunks, (key) => {
+          if (key === "unknown") return "分段未知（不参与掩盖配对）";
+          const [first, tokens] = JSON.parse(key);
+          return `起始块 ${first} · ${tokens} token`;
+        });
+        updateTimelineLayers();
+      }
+      function updateTimelineLayers() {
+        const layers = unique(
+          actorEvents()
+            .filter((e) => chunkKey(e) === $("timelineChunk").value)
+            .map((e) => e.context.layer),
+        ).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+        options("timelineLayer", layers, (l) => l, true);
+        refreshTimeline();
+      }
+      function refreshTimeline() {
+        selectedEvent = null;
+        const all = actorEvents().filter(
+          (e) => chunkKey(e) === $("timelineChunk").value,
+        );
+        const selectedLayer = $("timelineLayer").value;
+        const selectedNumber = selectedLayer.match(/layers\.(\d+)/);
+        const layer = selectedNumber ? Number(selectedNumber[1]) : null;
+        const targetLayer = all.some(
+          (e) =>
+            e.context.layer === selectedLayer &&
+            e.context.layer_role === "target",
+        );
         const rpcKeys = new Set(
           all
             .filter((e) => e.name.startsWith("connector.pull."))
@@ -1339,7 +1388,20 @@
         );
         timelineEvents = all
           .filter((e) => {
-            if (layerCalls && e.name === "P.target_host_forward") return false;
+            if (isCompute(e)) {
+              if (
+                e.name !== "P.layer_host_forward" ||
+                e.context.layer_role !== "target"
+              )
+                return false;
+              const number = layerNumber(e);
+              return (
+                selectedLayer === "all" ||
+                (targetLayer &&
+                  layer !== null &&
+                  (number === layer || number === layer + 1))
+              );
+            }
             if (
               e.name.startsWith("PullRPC.") &&
               rpcKeys.has(
@@ -1351,16 +1413,10 @@
               )
             )
               return false;
-            if (
-              $("timelineLayer").value !== "all" &&
-              e.context.layer !== $("timelineLayer").value &&
-              !isCompute(e)
-            )
+            if (selectedLayer !== "all" && e.context.layer !== selectedLayer)
               return false;
             return (
-              $("path").value === "all" ||
-              !e.context.path ||
-              e.context.path === $("path").value
+              $("path").value === "all" || e.context.path === $("path").value
             );
           })
           .sort((a, b) => a.ts - b.ts || a.dur - b.dur);
@@ -1424,6 +1480,19 @@
         }
         $("clockNote").textContent =
           "仅比较所选同域、同进程的 Host 接口时间；不等于设备 kernel/DMA 时序，不跨主机相减。";
+        const selectedLayer = $("timelineLayer").value;
+        if (selectedLayer !== "all") {
+          const match = selectedLayer.match(/layers\.(\d+)/);
+          const next = match ? Number(match[1]) + 1 : null;
+          if (
+            next === null ||
+            !timelineEvents.some((e) => isCompute(e) && layerNumber(e) === next)
+          )
+            $("clockNote").textContent +=
+              " 未采集到同分段的下一层计算（末层或证据缺失），不借用其他分段。";
+        }
+        if ($("timelineChunk").value === "unknown")
+          $("clockNote").textContent += " 分段身份未知，不能判断逐层掩盖。";
         const visible = timelineEvents.filter(
           (e) =>
             e.ts <= windowStart + windowSpan && e.ts + e.dur >= windowStart,
@@ -1455,6 +1524,9 @@
           generation: selectedRow().generation,
           clock: $("clock").value,
           actor: $("actor").value,
+          prefill_chunk: $("timelineChunk").value,
+          layer: $("timelineLayer").value,
+          path: $("path").value,
           observation: "host_call_only",
           window_start_us: windowStart,
           window_end_us: windowStart + windowSpan,
@@ -1591,7 +1663,7 @@
         }
         $("requestTimeline").append(svg);
         $("timelineNote").textContent =
-          `当前窗口 ${visible.length} / ${timelineEvents.length} 个观察事件。计算与传输各归为一行，行内并行事件错层显示；短色块保留最小可点击宽度，实际耗时见提示。选择模型层只聚焦传输，计算行保留后续层便于对比。${timelineEvents.some((e) => e.name === "P.layer_host_forward") ? "" : " 未采集到逐层计算：整段 forward 不用于推导逐层覆盖率。"}`;
+          `当前窗口 ${visible.length} / ${timelineEvents.length} 个观察事件。计算与传输各归为一行，行内并行事件错层显示；短色块保留最小可点击宽度，实际耗时见提示。仅展示所选请求、Rank 和一个 Prefill 分段；所有层展示逐层计算与通信，单层展示本层及下一层计算和本层通信。未识别分段不与已知分段混合。${timelineEvents.some((e) => e.name === "P.layer_host_forward") ? "" : " 未采集到逐层计算：整段 forward 不用于推导逐层覆盖率。"}`;
         svg.addEventListener(
           "wheel",
           (event) => {
@@ -1662,8 +1734,9 @@
           );
         if (isPull(event)) {
           let unavailable = "";
+          const evidence = actorEvents().filter((e) => sameChunk(e, event));
           const layer = layerNumber(event),
-            next = timelineEvents.filter(
+            next = evidence.filter(
               (e) =>
                 e.name === "P.layer_host_forward" &&
                 e.context.success === true &&
@@ -1673,7 +1746,7 @@
                 event.context.layer_role === "target" &&
                 layerNumber(e) === layer + 1,
             ),
-            later = timelineEvents.filter(
+            later = evidence.filter(
               (e) =>
                 e.name === "P.layer_host_forward" &&
                 e.context.success === true &&
@@ -1716,7 +1789,7 @@
             );
             const observed = new Set(later.map((e) => e.context.layer));
             const counts = new Map();
-            for (const call of timelineEvents.filter(
+            for (const call of evidence.filter(
               (e) => e.name === "P.layer_host_forward" && sameChunk(e, event),
             ))
               counts.set(
@@ -1868,7 +1941,13 @@
         $("matrixFilter").value = "";
         $("phaseBasis").textContent =
           "每行一条请求，各列为该请求的阶段观察区间并集；表尾统计整组请求。筛选和选择请求不改变纵向汇总。";
-        for (const id of ["clock", "actor", "timelineLayer", "modelLayer"])
+        for (const id of [
+          "clock",
+          "actor",
+          "timelineChunk",
+          "timelineLayer",
+          "modelLayer",
+        ])
           $(id).replaceChildren();
         $("modelLayer").append(new Option("所有层", "all"));
         $("layerRole").value = "all";
@@ -2055,7 +2134,8 @@
         renderTransfer();
       };
       $("clock").onchange = updateActors;
-      $("actor").onchange = refreshTimeline;
+      $("actor").onchange = updateChunks;
+      $("timelineChunk").onchange = updateTimelineLayers;
       $("timelineLayer").onchange = refreshTimeline;
       $("path").onchange = refreshTimeline;
       $("fit").onclick = fitTimeline;
