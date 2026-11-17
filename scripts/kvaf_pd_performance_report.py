@@ -794,6 +794,26 @@ def analyze(captures, notes, args, api, *, client_rows=()):
     report["stage_breakdown"] = build_breakdown(
         intervals, observed_requests, api.distribution, _union_ms, quality, valid_keys, cancelled
     )
+    # Preserve actual D rank evidence in compact exports as well as full traces.
+    d_sources = {
+        f"{header.get('host', '?')}/TP{header.get('tp_rank', '?')}/{header['capture_id']}": (
+            header.get("host"),
+            header.get("engine"),
+            header["dp_rank"],
+        )
+        for header, _, _, _ in captures
+        if header["role"].startswith("D") and type(header.get("dp_rank")) is int and header["dp_rank"] >= 0
+    }
+    request_ranks = defaultdict(set)
+    for event in events:
+        if event["actor"] in d_sources:
+            for identity in event_members(event):
+                request_ranks[identity].add(d_sources[event["actor"]])
+    for row in report["stage_breakdown"]["requests"]:
+        row["d_ranks"] = [
+            dict(host=host, engine=engine, dp_rank=rank)
+            for host, engine, rank in sorted(request_ranks[row["request"], row["generation"]], key=str)
+        ]
     return report, events
 
 

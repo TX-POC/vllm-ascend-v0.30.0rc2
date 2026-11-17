@@ -29,6 +29,8 @@ PHASES = (
             "connector.plan",
             "connector.pull.cpu",
             "connector.pull.npu",
+            "connector.pull_pair.cpu",
+            "connector.pull_pair.npu",
             "connector.complete",
             "connector.status",
             "PullRPC.cpu.chunk_envelope",

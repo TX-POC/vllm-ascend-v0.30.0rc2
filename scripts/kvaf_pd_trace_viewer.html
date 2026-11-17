@@ -220,14 +220,15 @@
           token/s；每个完整有效测试轮次为一个样本，单轮不展示
           P90/P99。请求预热默认排除。
         </p>
+        <div id="metricDefinitions"></div>
         <div class="scrollTable">
           <table>
             <thead>
               <tr>
                 <th>测试轮次</th>
                 <th>目标并发 / 已关联 / 观察峰值</th>
-                <th>公共窗口 TPS · token/s</th>
-                <th>公共窗口 TPOT · ms/token</th>
+                <th>系统公共窗口 TPS · token/s</th>
+                <th>系统公共窗口等效 TPOT · ms/token</th>
                 <th>状态 / 原因</th>
               </tr>
             </thead>
@@ -417,6 +418,7 @@
         microPage = 0,
         selectedEvent = null,
         timelineEvents = [],
+        timelineOriginUs = 0,
         windowStart = 0,
         windowSpan = 1;
       const number = (value) =>
@@ -734,7 +736,15 @@
           match = layer?.match(/layers\.(\d+)/);
         return `${match ? "第 " + match[1] + " 层 · " : ""}${label} · ${api}`;
       }
-      function metricCard(label, mean, p90, p99, samples, note = "") {
+      function metricCard(
+        label,
+        mean,
+        p90,
+        p99,
+        samples,
+        note = "",
+        formulaLabel = "",
+      ) {
         const card = el("div", undefined, "metricCard");
         card.append(
           el("div", label),
@@ -746,6 +756,22 @@
           ),
         );
         if (note) card.append(el("p", note, "muted"));
+        if (formulaLabel) {
+          const button = el("button", "统计公式与计时边界");
+          button.onclick = () => {
+            const definition = [...$("metricDefinitions").children].find(
+              (item) =>
+                item
+                  .querySelector("summary")
+                  .textContent.startsWith(formulaLabel),
+            );
+            if (!definition) return;
+            $("metricDefinitions").parentElement.open = true;
+            definition.open = true;
+            definition.scrollIntoView({ block: "center" });
+          };
+          card.append(button);
+        }
         return card;
       }
       function infoCard(label, value, note = "") {
@@ -801,13 +827,12 @@
             `输入 ${report.input_tokens ?? "未知"} token；目标输出 ${unique(waves.map((w) => w.workload?.output_tokens)).join(" / ") || "未知"} token；实际输出 ${unique(report.client?.request_metrics?.map((r) => r.output_tokens) || []).join(" / ") || "未知"} token`,
           ),
         );
-        $("loadInfo").append(
-          infoCard(
-            "请求负载",
-            `目标并发 ${unique(waves.map((w) => w.workload?.concurrency)).join(" / ") || "未知"}`,
-            `已观察 ${report.outcomes?.observed_requests ?? "未知"} 条请求/代次；客户端峰值 ${unique(waves.map((w) => w.observed_client_peak)).join(" / ") || "未知"}（仅已关联请求）`,
-          ),
+        const workloadCard = infoCard(
+          "请求负载",
+          `Target Concurrency = ${unique(waves.map((w) => w.workload?.concurrency)).join(" / ") || "未知"}`,
+          `已观察 ${report.outcomes?.observed_requests ?? "未知"} 条请求/代次；客户端峰值 ${unique(waves.map((w) => w.observed_client_peak)).join(" / ") || "未知"}（仅已关联请求）`,
         );
+        $("loadInfo").append(workloadCard);
         const actual = Object.values(report.d_scheduled_batches || {}).map(
           (item) => {
             const sizes = Object.keys(item.histogram || {})
@@ -818,14 +843,13 @@
               : null;
           },
         );
-        $("loadInfo").append(
-          infoCard(
-            "D 单卡 Batch Size",
-            `目标 ${unique(waves.map((w) => w.workload?.batch)).join(" / ") || "未知"}`,
-            actual.filter(Boolean).join("；") ||
-              "实际调度 batch 未采集，不能以并发 ÷ DP 代替",
-          ),
+        const batchCard = infoCard(
+          "D 单卡 Batch Size",
+          `Batch Size=${unique(waves.map((w) => w.workload?.batch)).join(" / ") || "未知"}`,
+          actual.filter(Boolean).join("；") ||
+            "实际调度 batch 未采集，不能以并发 ÷ DP 代替",
         );
+        $("loadInfo").append(batchCard);
         const batches = Object.values(report.d_scheduled_batches || {}).filter(
           (item) => Object.keys(item.histogram || {}).length,
         );
@@ -860,6 +884,110 @@
             `统计用途：${report.selection?.request_phase === "measure" ? "仅正式请求" : report.selection?.request_phase || "未知"}；同步模式的 TTFT/E2E 包含主动等待`,
           ),
         );
+        $("loadInfo").prepend(batchCard, workloadCard);
+      }
+      function metricDefinition(label, text) {
+        const details = el("details");
+        details.append(el("summary", label), el("p", text));
+        return details;
+      }
+      function renderDefinitions() {
+        const root = $("metricDefinitions");
+        root.replaceChildren();
+        const population =
+          "Mean=有效样本之和/N；P90/P99 对有效样本排序后线性插值：h=(N−1)×p，Q=x[floor(h)]+(h−floor(h))×(x[ceil(h)]−x[floor(h)])。缺失不补零；不同阶段可能重叠，分位数不可相加。";
+        for (const [label, text] of [
+          ["Mean / P90 / P99 / 有效 N", population],
+          [
+            "TTFT · 单请求 / 系统入口",
+            "范围：系统入口观察单请求，可覆盖不同 D Rank 的请求集合，不是单卡吞吐或每卡均值。起点：客户端发送请求；终点：收到首个输出。TTFT=(首输出时间−发送时间)/10⁶，单位 ms；每条成功且边界有效的请求为一个样本。不是 P 计算时间；同步组批等待计入。",
+          ],
+          [
+            "E2E · 单请求 / 系统入口",
+            "范围：系统入口观察单请求，可覆盖不同 D Rank 的请求集合。起点：客户端发送请求；终点：客户端记录请求完成。E2E=(完成时间−发送时间)/10⁶，单位 ms；每条成功且边界有效的请求为一个样本，不只统计 Decode。",
+          ],
+          [
+            "TPOT · 单请求 / 系统入口",
+            "范围：系统入口观察单请求，不是单卡 kernel 耗时。起点：首批真实输出 token 到达；终点：末批真实输出 token 到达。TPOT=(末到达时间−首到达时间)/10⁶/(总输出 token 数−首批 token 数)，单位 ms/token。每条 token 证据完整、分母大于 0 的成功请求为一个样本；MTP 首批多个 token 不按 1 个计算。",
+          ],
+          [
+            "公共窗口 TPS / TPOT · 系统请求集合 / 整组轮次",
+            "范围：本轮完整请求集合，可分布于多个 D Rank，实际参与 Rank 以采集为准。TPS 是系统总吞吐，不除以 DP/TP。公共窗口 TPOT 是系统吞吐折算的每请求等效值，不是单卡算子时延。窗口起点=max(本轮各请求首批 token 到达时间)，终点=min(各请求末批 token 到达时间)。T=窗口秒数，K=严格位于两端点之间的真实 token 总数，R=本轮并发请求数。TPS=K/T，TPOT=1000×R×T/K。必须满足完整成功请求组及有效公共窗口；各个相同负载有效轮次等权统计，N 为轮次数，单轮不展示 P90/P99。不是逐请求 TPOT 的均值。",
+          ],
+          [
+            "四阶段耗时 · 关联 Rank 的请求区间 / 跨请求汇总",
+            "范围：关联 P/D 进程或 Rank 的 Host 请求区间；整组分布跨请求/Rank 汇总，不是单卡平均计算时长，也不是系统端到端。对一条请求、一个阶段、同一时间域中的主观察区间，耗时=各区间并集的总长度/10⁶ ms。重叠部分不重复计数，未观察间隙不补齐，共享 Batch 不除以 batch size；跨时间域不相减。每条有有效证据的请求/代次为一个样本。不是从首段开始到末段结束的连续墙钟跨度。",
+          ],
+          [
+            "P→D / P→K 传输 · 请求路径 / 含 TP 贡献汇总",
+            "范围：同一请求的传输路径，按实际 TP 贡献者汇总；不是每张卡独立带宽。请求×层样本：对同请求、同层、同分段的并行 TP 贡献分支取最早开始至最晚结束；再累加各分段。请求累计样本：再累加该请求各层结果。前者 N 是请求层组合数，后者 N 是请求数。允许传输→ACK 口径包含控制、排队和等待；兼容 Pull RPC 不含更早等待。联合 Pull 的 P 侧两路共用 RPC 包络，不是独立 DMA 时间。",
+          ],
+          [
+            "D DP Rank / Batch Size / Target Concurrency",
+            "D DP Rank 来自该请求/代次的 D 采集来源及实际成员关联；缺失显示未知，不按并发或 P Rank 推算。Batch Size 为每个 D DP 的目标请求数，只有 D TP=1 时对应单卡；实际 batch 以调度证据为准。Target Concurrency 为客户端本轮目标总并发，不是实际同时 Decode 的数量。",
+          ],
+          [
+            "请求时间轴 · HH:MM:SS.mmm",
+            "零点为所选请求/代次、时间域、Rank 中首个计算或通信观察事件；显示时间=(本事件时间−零点)，缩放和分段/层筛选不改变零点。记录是 Host 调用边界，不是设备 kernel/DMA 时间；不对齐 P/D 时钟。",
+          ],
+        ])
+          root.append(metricDefinition(label, text));
+        for (const phase of trace.kvaf_pd.summary.stage_breakdown?.phases || [])
+          root.append(
+            metricDefinition(
+              phase.label + " · 主观察边界",
+              phase.basis +
+                " 范围：该请求的关联进程/Rank；各请求主区间并集跨请求统计，不是单卡或系统端到端。主区间：" +
+                (phase.primary_stages || []).join("、") +
+                "。每请求按同域区间并集统计；点击请求 ID 查看实际记录。",
+            ),
+          );
+      }
+      function requestRanks(row) {
+        if (Array.isArray(row.d_ranks))
+          return row.d_ranks.filter(
+            (rank) =>
+              rank && Number.isSafeInteger(rank.dp_rank) && rank.dp_rank >= 0,
+          );
+        const ranks = new Map();
+        for (const event of byRequest.get(keyOf(row.request, row.generation)) ||
+          []) {
+          const source = (trace.kvaf_pd.summary.sources || []).find(
+            (source) =>
+              source.role?.startsWith("D") &&
+              event.args?.actor ===
+                `${source.host ?? "?"}/TP${source.deployment?.tp_rank ?? "?"}/${source.capture_id}`,
+          );
+          if (
+            source &&
+            Number.isSafeInteger(source.deployment?.dp_rank) &&
+            source.deployment.dp_rank >= 0
+          ) {
+            const value = {
+              host: source.host,
+              engine: source.engine,
+              dp_rank: source.deployment.dp_rank,
+            };
+            ranks.set(JSON.stringify(value), value);
+          }
+        }
+        return [...ranks.values()];
+      }
+      function elapsedTime(us) {
+        const sign = us < 0 ? "−" : "";
+        const ms = Math.floor(Math.abs(us) / 1000);
+        return (
+          sign +
+          [
+            Math.floor(ms / 3600000),
+            Math.floor(ms / 60000) % 60,
+            Math.floor(ms / 1000) % 60,
+          ]
+            .map((n) => String(n).padStart(2, "0"))
+            .join(":") +
+          "." +
+          String(ms % 1000).padStart(3, "0")
+        );
       }
       function renderHome() {
         if (!trace) return;
@@ -867,6 +995,7 @@
           client = report.client || {},
           data = report.stage_breakdown;
         renderLoad();
+        renderDefinitions();
         $("homeScope").textContent =
           `整组观察 ${report.outcomes?.observed_requests ?? "未知"} 个请求/代次。` +
           (report.status === "INCOMPLETE"
@@ -879,9 +1008,9 @@
           report.status === "INCOMPLETE" ? "warning" : "muted";
         $("metricCards").replaceChildren();
         for (const [label, key] of [
-          ["首 Token 时延 TTFT · ms", "ttft"],
-          ["每请求 TPOT · ms/token", "request_tpot"],
-          ["端到端 E2E · ms", "e2e"],
+          ["系统请求 · TTFT · ms", "ttft"],
+          ["系统请求 · TPOT · ms/token", "request_tpot"],
+          ["系统请求 · E2E · ms", "e2e"],
         ]) {
           const stats = client[key] || {};
           $("metricCards").append(
@@ -891,22 +1020,26 @@
               stats.p90_ms,
               stats.p99_ms,
               stats.samples,
+              "系统入口按请求统计，覆盖本轮请求集合；不是逐卡均值。",
+              key === "request_tpot" ? "TPOT" : key.toUpperCase(),
             ),
           );
         }
         const tps = client.group_tps || {};
         $("metricCards").append(
           metricCard(
-            "整组公共窗口 TPS · token/s",
+            "系统总吞吐 · TPS · token/s",
             tps.mean,
             tps.p90,
             tps.p99,
             tps.samples,
-            tps.samples === 1
-              ? "只有一个有效窗口，P90/P99 不适用"
-              : tps.reason
-                ? "包含不同测试负载，不合并 TPS；请查看各轮次。"
-                : "同一负载的完整有效轮次为样本，各轮等权",
+            "覆盖本轮完整请求集合，不按卡拆分；实际参与 Rank 以采集为准。" +
+              (tps.samples === 1
+                ? "只有一个有效窗口，P90/P99 不适用"
+                : tps.reason
+                  ? "包含不同测试负载，不合并 TPS；请查看各轮次。"
+                  : "同一负载的完整有效轮次为样本，各轮等权"),
+            "公共窗口 TPS / TPOT",
           ),
         );
         $("waves").replaceChildren();
@@ -1057,6 +1190,7 @@
         const head = el("tr");
         for (const label of [
           "请求 ID / 代次",
+          "D DP Rank",
           "TTFT ms",
           "TPOT ms/token",
           ...data.phases.map((p) => p.label + " ms"),
@@ -1098,6 +1232,20 @@
           const id = el("td");
           id.append(button);
           row.append(id);
+          const ranks = requestRanks(item);
+          const rankCell = cell(
+            row,
+            unique(ranks.map((r) => `DP Rank=${r.dp_rank}`)).join(" / ") ||
+              "未知",
+          );
+          rankCell.title = ranks.length
+            ? ranks
+                .map(
+                  (r) =>
+                    `${r.host ?? "未知主机"} / ${r.engine ?? "未知引擎"} / DP Rank=${r.dp_rank}`,
+                )
+                .join("；")
+            : "缺少该请求的 D Rank 关联证据；旧轻量 Trace 需重新导出";
           cell(row, format(item.client?.ttft_ms));
           cell(row, format(item.client?.tpot_ms)).title =
             item.client?.tpot_unavailable || "真实 token 到达指标";
@@ -1117,6 +1265,7 @@
         ]) {
           const row = el("tr");
           cell(row, label);
+          cell(row, "—");
           for (const stats of [
             report.client?.ttft,
             report.client?.request_tpot,
@@ -1374,7 +1523,11 @@
       }
       function refreshTimeline() {
         selectedEvent = null;
-        const all = actorEvents().filter(
+        const actor = actorEvents();
+        timelineOriginUs = actor.length
+          ? actor.reduce((start, e) => Math.min(start, e.ts), Infinity)
+          : 0;
+        const all = actor.filter(
           (e) => chunkKey(e) === $("timelineChunk").value,
         );
         const selectedLayer = $("timelineLayer").value;
@@ -1492,7 +1645,7 @@
           return;
         }
         $("clockNote").textContent =
-          "仅比较所选同域、同进程的 Host 接口时间；不等于设备 kernel/DMA 时序，不跨主机相减。";
+          "横轴为相对计时 HH:MM:SS.mmm，零点为该请求/时间域/Rank 首个观察事件。仅比较所选同域、同进程的 Host 接口时间；不等于设备 kernel/DMA 时序，不跨主机相减。";
         const selectedLayer = $("timelineLayer").value;
         if (selectedLayer !== "all") {
           const match = selectedLayer.match(/layers\.(\d+)/);
@@ -1541,6 +1694,8 @@
           layer: $("timelineLayer").value,
           path: $("path").value,
           observation: "host_call_only",
+          axis_format: "HH:MM:SS.mmm",
+          relative_origin_us: timelineOriginUs,
           window_start_us: windowStart,
           window_end_us: windowStart + windowSpan,
           unit: "ms",
@@ -1567,7 +1722,7 @@
                 fill: "#53647a",
                 "text-anchor": index === 5 ? "end" : "start",
               },
-              `${format(stamp / 1000)} ms`,
+              elapsedTime(stamp - timelineOriginUs),
             ),
           );
         }
@@ -1604,7 +1759,7 @@
               svgEl(
                 "title",
                 {},
-                `${eventName(e)}\n${description(e.name)[2]}\n${e.ph === "i" ? "里程碑时刻 " + format(e.ts / 1000) : "实际耗时 " + format(e.dur / 1000)} ms；层 ${e.context.layer || "未知"}；chunk 起始块 ${e.context.first ?? "未知"}`,
+                `${eventName(e)}\n${description(e.name)[2]}\n${e.ph === "i" ? "相对里程碑时刻 " + elapsedTime(e.ts - timelineOriginUs) : "实际耗时 " + format(e.dur / 1000) + " ms"}；层 ${e.context.layer || "未知"}；chunk 起始块 ${e.context.first ?? "未知"}`,
               ),
             );
             if (e.ph === "i")
