@@ -76,6 +76,7 @@ class TestTP0Flow(unittest.TestCase):
                     source_tp0_only=True,
                     source_cleanup_v1=True,
                     pull_api_version=2,
+                    parallel_pull_v1=True,
                     ticket=dict(version=2, region_id=1, epoch=1),
                     receiver=dict(version=1, control_address=endpoint, receiver_id=1, receiver_epoch=1),
                 )
@@ -342,6 +343,8 @@ class TestTP0Recovery(unittest.TestCase):
         def call(endpoint, message, **kwargs):
             nonlocal lost
             calls.append(message["op"])
+            if "paired_cpu" in message:
+                calls.append("paired")
             result = f.receiver.dispatch(message)
             if message["op"] == "pull" and not lost:
                 lost = True
@@ -358,7 +361,10 @@ class TestTP0Recovery(unittest.TestCase):
                 f.chunk(300)
                 f.assert_payload(300)
                 self.assertEqual(calls.count("status"), 1)
-                self.assertEqual(calls.count("pull"), sum(len(job.completed) for job in f.receiver.jobs.values()))
+                self.assertEqual(
+                    calls.count("pull") + calls.count("paired"),
+                    sum(len(job.completed) for job in f.receiver.jobs.values()),
+                )
                 self.assertTrue(all(source.active is None for source in f.sdk.sources.values()))
                 for sender in f.senders:
                     self.assertEqual(sender.get_finished({"r"}), {"r"})

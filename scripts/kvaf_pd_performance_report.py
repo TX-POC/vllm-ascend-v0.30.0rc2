@@ -349,6 +349,7 @@ def _events(header, rows, limit):
                                 member=row["member"],
                                 peer=row["peer"],
                                 first=chunk["first"],
+                                paired_rpc=row.get("paired_rpc", False),
                                 name=f"PullRPC.{path}.chunk_envelope",
                                 request_phase=row.get("request_phase", "unknown"),
                                 path=path,
@@ -378,6 +379,7 @@ def _events(header, rows, limit):
                             "job",
                             "span_id",
                             "batch_size",
+                            "paired_rpc",
                             "batch",
                             "instant",
                             "unfinished",
@@ -531,6 +533,12 @@ def analyze(captures, notes, args, api, *, client_rows=()):
         omitted = sum(not rows for _, _, rows, _ in captures)
         captures = [capture for capture in captures if capture[2]]
         notes = [*notes, f"Client cohort: excluded {omitted} capture sources without matching selected requests"]
+    if any(row.get("paired_rpc") for _, _, rows, _ in captures for row in rows):
+        notes = [
+            *notes,
+            "Paired Pull: P paths share one combined RPC envelope; "
+            "use D path observations for separate Host intervals, not DMA timings",
+        ]
     canonical, full_canonical, events, problems, batch = [], [], [], [], {}
     if not phase_quality["selected_requests"] and desired_phase == "measure":
         problems.append(

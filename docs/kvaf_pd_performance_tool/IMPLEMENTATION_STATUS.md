@@ -658,3 +658,20 @@ K 端没有独立内部打点，当前显示的是 D/P 调用方观察；不声�
 
 `detail_level=layer` 适合 t1/t2 与主要请求阶段；锁等待、SDK 调用、Commit/Publish 等细分使用 `detail` 短时采集。
 `stage` 缺少逐层传输证据时，对应指标显示不可用；不以外层跨度替代缺失指标。
+
+## PD 双路径并行传输
+
+当前显式启用 `PDKVoffloadConnector` 的 P/D 使用双路径联合调度，无需新增配置开关。保留 Chunked Prefill 和逐层传输，不等待整个请求计算结束。
+
+- 同一请求、代次、层、描述符批次有两路数据时，P 先取得两路独立 Ready，再发一次联合 Pull 控制 RPC。
+- D 先 Prepare/Submit CPU Pull，使 K 服务后台执行 P→K DDR READ；随后执行独立 HBM reader 的 P→D raw READ；最后等待原 CPU Pull、Commit 并发布目录。两路数据面可重叠，不依赖两个 Python 线程并发调用 SDK。
+- D Runtime 锁继续保护不同任务和 Decode Get，遵守一个未决 Put 的 SDK 约束；锁不会暂停已提交的 K 后台 READ。两路不是严格同时启动，较短传输可能在另一条启动前结束，真实性能收益需实测。
+- 每路分别记录原 Ready sequence 和批次完成。两路闭合后才回报联合 RPC；P 释放对应 Ready 后才进行原完成握手，源 storage 仍受逐层 future 和原生物理复用门控保护。
+- 某一路失败仍处理另一条已提交路径；不能逆转既有 Commit，也不重发原 READ。DMA/Commit 状态不确定时保留源、目的、Put/Ready 和错误状态，不放行 Decode。丢失 ACK 只查询原任务。
+- 无完整块、无 HBM 接收段或批次数不同的情况，不创建空传输；剩余批次沿用单路径调用。注册前握手检查 D 的 `parallel_pull_v1` 能力，双路 plan 再核对一次，旧 D 不静默回退，必须先更新并重启 P/D。
+
+部署只需更新 P/D 的 vLLM-Ascend 代码并重启相关实例；本次不修改 KVAF SDK 或 K 二进制。依据为 `KVAF-Devlop/codex/cpu-pull-hbm-reference` 的 `7912517`：K 的 Submit 创建后台 READ worker，NPU raw READ 使用独立 HBM reader。继续使用该匹配 SDK 与现有 K 服务。
+
+采集开启时，D 的 `D.control.pull.cpu` 包含 Prepare/Submit 到 Wait/Commit/发布的 Host 区间，`D.control.pull.npu` 记录独立 raw READ 控制区间；两者可以重叠。P 的 `connector.pull_pair.npu/cpu` 共用一次 RPC 包络，明确标记 `paired_rpc`，不能当成两个独立传输耗时，也不能据此推导设备 DMA 掩盖率。请求/层的允许传输到完成确认口径保留；旧 Pull RPC 兼容统计在联合调用上表示共同 RPC 包络，报告会提示此边界。原采集关闭路径不创建新观察资源。
+
+验证：复用 CPU 字节级 TCP、分段、TP/MTP、取消与完成恢复用例；使用独立后台 CPU 传输替身验证其在 raw READ 期间推进，并验证原 Runtime 锁仍被持有。此验证证明调度与生命周期，不替代真实 Ascend/K 设备的精度、重叠和性能 A/B 测试。

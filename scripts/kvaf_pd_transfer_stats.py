@@ -186,6 +186,13 @@ class PullObserver:
             self.capture.note_error()
 
     def _observe(self, endpoint, message, result, begin, end):
+        if "paired_cpu" in message:
+            self.jobs[message["job"]]["paired_rpc"] = True
+            for item in (message, message["paired_cpu"]):
+                single = {key: value for key, value in item.items() if key != "paired_cpu"}
+                path_result = result.get("paths", {}).get(item["path"]) if isinstance(result, dict) else None
+                self._observe(endpoint, single, path_result, begin, end)
+            return
         operation = message.get("op")
         if operation == "plan":
             context = {
@@ -237,6 +244,8 @@ class PullObserver:
                 errors=[],
             )
         layer = self.layers[key]
+        if job.get("paired_rpc"):
+            layer["paired_rpc"] = True
         if any(layer[name] != job[name] for name in ("peer", "member", "ratio")):
             layer["errors"].append("changed_layer_contributor_or_destination")
         layer["chunks"].append(dict(first=job["first"], tokens=job["tokens"], final=job["final"], spans=job["spans"]))

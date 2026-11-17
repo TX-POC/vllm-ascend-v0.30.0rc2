@@ -124,12 +124,13 @@ class Runtime(PullRuntime, DecodeRuntime):
     def submit_cpu_pull(self, ready, *args):
         self.source = self.sdk.sources[ready.source.source_id].tensors[ready.mr_id - 1].view(torch.uint8)
         put, sources, destinations, lengths = args
+        put.ready = ready
         return super().submit_cpu_pull(ready, put, sources, destinations, lengths)
 
     def commit_put(self, put):
         result = super().commit_put(put)
         if result == CpuState.COMMITTED:
-            self.sdk.acknowledged.add((self.last_ready.source.source_id, self.last_ready.sequence))
+            self.sdk.acknowledged.add((put.ready.source.source_id, put.ready.sequence))
         return result
 
     def wait_cpu_pull(self, put, timeout):
@@ -140,7 +141,7 @@ class Runtime(PullRuntime, DecodeRuntime):
 
     def abort_put(self, put):
         result = super().abort_put(put)
-        self.sdk.acknowledged.add((self.last_ready.source.source_id, self.last_ready.sequence))
+        self.sdk.acknowledged.add((put.ready.source.source_id, put.ready.sequence))
         for entry in put.entries:
             self.pages.pop(entry.key, None)
         return result
@@ -665,6 +666,7 @@ class TestProductionMesh(unittest.TestCase):
                         peer=peer,
                         ticket=dict(version=2, region_id=worker_id + 1, epoch=1, address=f"K-{worker_id % 8}"),
                         pull_api_version=2,
+                        parallel_pull_v1=True,
                         receiver=dict(version=1, receiver_id=worker_id + 1),
                         source_tp0_only=source_tp0_only,
                     )

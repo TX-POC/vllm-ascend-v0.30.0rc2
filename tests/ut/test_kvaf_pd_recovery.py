@@ -313,6 +313,7 @@ class TestPDCompleteRecovery(unittest.TestCase):
 
         def call(endpoint, message, **kwargs):
             self.calls[message["op"]] += 1
+            self.calls["paired"] += int("paired_cpu" in message)
             self.before(message)
             result = self.fixture.receiver.dispatch(message)
             self.dispatched[message["op"]] += 1
@@ -407,7 +408,10 @@ class TestPDCompleteRecovery(unittest.TestCase):
         self.assert_finished()
         self.assertEqual(self.calls["status"], 1)
         self.assertEqual(self.calls["complete"], len(self.fixture.receiver.jobs))
-        self.assertEqual(self.calls["pull"], sum(len(job.completed) for job in self.fixture.receiver.jobs.values()))
+        self.assertEqual(
+            self.calls["pull"] + self.calls["paired"],
+            sum(len(job.completed) for job in self.fixture.receiver.jobs.values()),
+        )
         self.assertEqual(self.fixture.receiver.get_finished(), {"r"})
 
     def test_complete_delivery_loss_retries_only_idempotent_completion(self):
@@ -424,7 +428,10 @@ class TestPDCompleteRecovery(unittest.TestCase):
         self.assert_finished()
         self.assertEqual(self.calls["status"], 1)
         self.assertEqual(self.calls["complete"], self.dispatched["complete"] + 1)
-        self.assertEqual(self.calls["pull"], sum(len(job.completed) for job in self.fixture.receiver.jobs.values()))
+        self.assertEqual(
+            self.calls["pull"] + self.calls["paired"],
+            sum(len(job.completed) for job in self.fixture.receiver.jobs.values()),
+        )
 
     def test_native_release_before_lost_reply_recovery_uses_terminal_record(self):
         released = False

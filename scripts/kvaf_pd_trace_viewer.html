@@ -700,6 +700,16 @@
       function description(name) {
         if (Object.hasOwn(EVENT_DESCRIPTIONS, name))
           return EVENT_DESCRIPTIONS[name];
+        if (name.startsWith("connector.pull_pair"))
+          return [
+            "双路径联合完成确认",
+            "pull_pair",
+            "P 侧两路共享的 RPC 区间；独立路径 Host 时序请查看 D 侧，不作为单路 DMA 耗时。",
+          ];
+        if (name === "D.control.pull.npu")
+          return EVENT_DESCRIPTIONS["connector.pull.npu"];
+        if (name === "D.control.pull.cpu")
+          return EVENT_DESCRIPTIONS["connector.pull.cpu"];
         if (name.startsWith("PullRPC."))
           return [
             name.includes(".cpu.") ? "P→K DDR KV 传输" : "P→D KV 传输",
@@ -1377,7 +1387,10 @@
         );
         const rpcKeys = new Set(
           all
-            .filter((e) => e.name.startsWith("connector.pull."))
+            .filter(
+              (e) =>
+                e.name.startsWith("connector.pull.") || e.context.paired_rpc,
+            )
             .map((e) =>
               JSON.stringify([
                 e.context.layer,
@@ -1714,7 +1727,13 @@
           );
           return;
         }
-        const [label, api, explain] = description(event.name),
+        const [label, api, explain] = event.context.paired_rpc
+            ? [
+                "双路径联合完成确认",
+                "pull_pair",
+                "P 侧两条路径共享一次 RPC 起止区间，不能将该区间解释为单独 D2D 或 D2H 传输耗时；独立路径 Host 区间请查看 D 侧记录。",
+              ]
+            : description(event.name),
           box = el("div");
         box.append(
           el("h3", eventName(event)),

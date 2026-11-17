@@ -373,6 +373,21 @@ class SenderObserver:
 
     def _observe(self, endpoint, message, context, result, begin, end, span_id):
         try:
+            if "paired_cpu" in message:
+                for item in (message, message["paired_cpu"]):
+                    single = {key: value for key, value in item.items() if key != "paired_cpu"}
+                    single["paired_rpc"] = True
+                    path_result = result.get("paths", {}).get(item["path"]) if isinstance(result, dict) else None
+                    self._observe(
+                        endpoint,
+                        single,
+                        context,
+                        path_result,
+                        begin,
+                        end,
+                        span_id if item["path"] == "npu" else span_id + ":cpu",
+                    )
+                return
             operation = message["op"]
             success = result is True
             job_id = message.get("job")
@@ -418,6 +433,8 @@ class SenderObserver:
                 record["count"] = {path: result["count"][path] for path in ("npu", "cpu")}
             elif operation == "pull":
                 record.update(path=message["path"], batch=message["batch"])
+                if message.get("paired_rpc"):
+                    record.update(paired_rpc=True, name="connector.pull_pair")
             elif operation == "status":
                 record["done"] = isinstance(result, dict) and result.get("done") is True
                 record["success"] = isinstance(result, dict) and not result.get("error")

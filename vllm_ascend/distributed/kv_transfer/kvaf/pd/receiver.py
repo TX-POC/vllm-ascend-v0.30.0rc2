@@ -36,6 +36,7 @@ class PullJob:
     acknowledged: bool = False
     diagnostic: bool = False
     replicas_checked: bool = False
+    path_errors: dict = field(default_factory=dict)
 
 
 class Receiver:
@@ -189,6 +190,7 @@ class Receiver:
                 "source_tp0_only": self.source_tp0_only,
                 "source_cleanup_v1": True,
                 "pull_api_version": PULL_API_VERSION,
+                "parallel_pull_v1": True,
                 "receiver": self.hbm_receiver,
             }
         if message.get("peer") != self.identity:
@@ -254,11 +256,13 @@ class Receiver:
             if self.request_observer is not None:
                 return observed_call(
                     self.request_observer,
-                    f"D.control.{operation}",
+                    "D.control.pull_pair" if message.get("paired_cpu") else f"D.control.{operation}",
                     self._job_operation,
                     operation,
                     message,
-                    context=message,
+                    context={key: value for key, value in message.items() if key != "path"}
+                    if "paired_cpu" in message
+                    else message,
                 )
             return self._job_operation(operation, message)
         if operation == "cancel":
@@ -305,6 +309,8 @@ class Receiver:
             if identity != (job.producer, job.generation):
                 raise ValueError("stale source/job identity")
             if operation == "pull":
+                if "paired_cpu" in message:
+                    return self._pull_pair(job, message)
                 return self._pull(job, message)
             if operation == "complete":
                 if job.diagnostic and self.diagnostics.verify and not job.replicas_checked and job.error is None:
@@ -319,6 +325,7 @@ class Receiver:
                 "done": job.finished,
                 "error": str(job.error) if job.error else None,
                 "completed": dict(job.completed),
+                "path_errors": {key: str(error) for key, error in job.path_errors.items()},
             }
 
     def _forget_request_jobs(self, request_id):
@@ -440,7 +447,7 @@ class Receiver:
                 # new DMA for a receive that will enter native error handling.
                 count.update(cpu=0, npu=0)
                 self.jobs[job_id].error = RuntimeError("an earlier request contribution failed")
-            result = {"job": job_id, "count": count}
+            result = {"job": job_id, "count": count, "parallel_pull_v1": True}
             if self.diagnostics and self.diagnostics.active(request["id"]):
                 self.jobs[job_id].diagnostic = True
                 result["trace"] = True
@@ -486,7 +493,7 @@ class Receiver:
                     }
             return result
 
-    def _pull(self, job, message):
+    def _validate_pull(self, job, message):
         path, batch = message["path"], message["batch"]
         ready = message["ready"]
         with self.runtime.lock:
@@ -503,19 +510,80 @@ class Receiver:
             if key in job.completed:
                 if job.completed[key] != ready.sequence:
                     raise ValueError("another Ready reused a completed batch")
-                return True
+                return
             if batch and (path, batch - 1) not in job.completed:
                 raise ValueError("Pull batches must remain ordered")
+
+    def _pull_pair(self, job, message):
+        """Submit CPU DMA before blocking raw READ; drain both before ACK.
+
+        The Runtime lock still excludes other Put/Get jobs. It does not block
+        the already-submitted K CPU READ, whose engine is independent of the
+        HBM reader. No concurrent SDK calls or extra Runtime/DDR pool is needed.
+        """
+        cpu = message["paired_cpu"]
+        if (
+            message["path"] != "npu"
+            or cpu.get("path") != "cpu"
+            or any(cpu.get(key) != message.get(key) for key in ("job", "generation", "batch"))
+        ):
+            raise ValueError("paired Pull requires the same job/generation/batch and distinct paths")
+        self._validate_pull(job, message)
+        self._validate_pull(job, cpu)
+        # Do not resume/reissue part of an uncertain pair through a new Pull.
+        if any((path, message["batch"]) in job.completed for path in ("cpu", "npu")):
+            raise RuntimeError("paired Pull already attempted; query original completion instead")
+        submitted = None
+        paths, failure = {}, None
+        cpu_token = None
+        if self.request_observer is not None:
+            cpu_token = notify(self.request_observer, "begin", name="D.control.pull", context=cpu)
+        try:
+            submitted = self._pull(job, cpu, submit_only=True)
+        except Exception as exc:
+            failure = exc
+        try:
+            if self.request_observer is None:
+                paths["npu"] = self._pull(job, message)
+            else:
+                paths["npu"] = observed_call(
+                    self.request_observer, "D.control.pull", self._pull, job, message, context=message
+                )
+        except Exception as exc:
+            failure = failure or exc
+        if isinstance(submitted, CpuPullTransfer):
+            try:
+                paths["cpu"] = self._pull(job, cpu, transfer=submitted)
+            except Exception as exc:
+                failure = failure or exc
+        elif submitted is not None:
+            paths["cpu"] = submitted
+        if self.request_observer is not None:
+            notify(
+                self.request_observer, "end", token=cpu_token, success=paths.get("cpu") is True, result=paths.get("cpu")
+            )
+        if failure is not None:
+            raise failure
+        return {"paths": paths}
+
+    def _pull(self, job, message, *, submit_only=False, transfer=None):
+        path, batch, ready = message["path"], message["batch"], message["ready"]
+        with self.runtime.lock:
+            self._validate_pull(job, message)
+            key = path, batch
+            if key in job.completed:
+                return True
             transfers_before = len(job.transfers)
             try:
-                if job.error is not None:
+                if job.error is not None and transfer is None:
                     if path == "npu":
                         self._cancel_npu_ready(ready)
                     job.completed[key] = ready.sequence
+                    job.path_errors[key] = job.error
                     return {"error": str(job.error)}
-                if self.request_observer is None:
+                if transfer is None and self.request_observer is None:
                     self.runtime.wait_compute()
-                else:
+                elif transfer is None:
                     observed_call(
                         self.request_observer,
                         "D.compute_dependency_wait",
@@ -529,7 +597,7 @@ class Receiver:
                         job.plan.hbm.batches()[batch],
                         self.memories[job.layer].tensor,
                         self.stream_factory(),
-                        source_bytes=metadata.layout.nbytes,
+                        source_bytes=self.sources[job.producer, job.layer].layout.nbytes,
                     )
                     job.transfers.append(transfer)
                     if self.request_observer is not None:
@@ -541,8 +609,12 @@ class Receiver:
                         if not self.runtime.pending_raw_addr:
                             raise
                         transfer.recover()
+                elif transfer is None:
+                    transfer = self._cpu_pull(job, batch, ready, submit_only=submit_only)
+                    if submit_only:
+                        return transfer
                 else:
-                    transfer = self._cpu_pull(job, batch, ready)
+                    self._finish_cpu_pull(job, transfer)
                 if job.diagnostic:
                     self._diagnose_pull(job, path, batch, ready, transfer, message.get("digests"))
                 job.completed[key] = ready.sequence
@@ -564,7 +636,9 @@ class Receiver:
                     self.runtime.failure = exc
                     raise
                 job.error = exc
-                transfer = job.transfers[-1] if len(job.transfers) > transfers_before else None
+                job.path_errors[key] = exc
+                if transfer is None and len(job.transfers) > transfers_before:
+                    transfer = job.transfers[-1]
                 if self._resolve_failure(transfer, job, ready, path):
                     job.completed[key] = ready.sequence
                     # P must prove release/cancellation with the SDK before
@@ -606,7 +680,7 @@ class Receiver:
             if self.runtime.pending_raw_addr:
                 raise RuntimeError("NPU Ready cancellation remains unresolved")
 
-    def _cpu_pull(self, job, batch, ready):
+    def _cpu_pull(self, job, batch, ready, *, submit_only=False):
         group_index = self.pool.indices[job.layer]
         group = self.writer.groups[group_index]
         state = self.writer.requests[job.request_id][group_index]
@@ -641,14 +715,21 @@ class Receiver:
         except Exception:
             if not put.submitted:
                 raise
+        if not submit_only:
+            self._finish_cpu_pull(job, transfer)
+        return transfer
+
+    def _finish_cpu_pull(self, job, transfer):
         try:
             transfer.finish(int(self.timeout * 1000))
         except Exception:
             # Resolve the original Wait/Commit only. A sticky Commit decision
             # is never replaced with an Abort or a newly prepared transaction.
             transfer.finish(int(self.timeout * 1000))
-        transfer.publish(self.writer, group, state)
-        return transfer
+        group_index = self.pool.indices[job.layer]
+        transfer.publish(
+            self.writer, self.writer.groups[group_index], self.writer.requests[job.request_id][group_index]
+        )
 
     def _diagnose_pull(self, job, path, batch, ready, transfer, expected):
         diag = self.diagnostics

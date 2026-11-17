@@ -176,6 +176,8 @@ class Sender:
             self._cleanup_barriers.add(endpoint)
         if hello.get("pull_api_version") != PULL_API_VERSION:
             raise ValueError("P/D require KVAF multi-MR Pull API v2; update both framework and SDK")
+        if hello.get("parallel_pull_v1") is not True:
+            raise ValueError("P/D parallel Pull protocol mismatch; update and restart both P and D")
         group = PeerRegistration(
             self.sdk,
             hello["peer"],
@@ -412,9 +414,13 @@ class Sender:
                         count=planned["count"],
                         endpoint=endpoint,
                     )
-                failed = False
-                for path in ("npu", "cpu"):
-                    for batch in range(planned["count"][path]):
+                if all(planned["count"].values()) and planned.get("parallel_pull_v1") is not True:
+                    raise RuntimeError("P/D parallel Pull protocol mismatch; update and restart both P and D")
+                for batch in range(max(planned["count"].values())):
+                    operations = {}
+                    for path in ("npu", "cpu"):
+                        if batch >= planned["count"][path]:
+                            continue
                         digests = None
                         if "verify" in planned:
                             sources, lengths = planned["verify"][path][batch]
@@ -438,37 +444,57 @@ class Sender:
                                 source_bytes=memory.tensor.numel() * memory.tensor.element_size(),
                                 mr_id=ready.mr_id,
                             )
-                        try:
-                            result = self._call(endpoint, operation)
-                        except (ConnectionError, OSError, TimeoutError):
-                            # Query only: never replay READ after a lost reply.
-                            status = self._call(endpoint, dict(op="status", job=planned["job"], generation=generation))
-                            if status["completed"].get((path, batch)) != ready.sequence:
-                                raise RuntimeError(
-                                    "Pull ACK lost with unresolved original Ready; retain source"
-                                ) from None
-                            result = {"error": status["error"]} if status["error"] else True
-                        failed = isinstance(result, dict) and "error" in result
-                        if failed:
-                            try:
-                                registration.release(path, ready)
-                            except Exception:
-                                registration.cancel(path, ready)
-                                registration.release(path, ready)
-                            break
-                        registration.release(path, ready)
-                        if self.diagnostics and planned.get("trace"):
-                            self.diagnostics.emit(
-                                "SOURCE_RELEASED",
-                                (planned["job"], path, batch),
-                                request=message["request"],
-                                layer=layer,
-                                path=path,
-                                sequence=ready.sequence,
-                            )
-                    if failed:
+                        operations[path] = operation
+                    if self._pull_batches(
+                        endpoint, planned["job"], generation, registration, operations, message, planned
+                    ):
                         break
                 self._complete_job(endpoint, planned["job"], generation, replicas=replicas)
+
+    def _pull_batches(self, endpoint, job, generation, registration, operations, context, planned):
+        """One RPC pairs independent sources; a lost ACK never replays READ."""
+        operation = next(iter(operations.values()))
+        if len(operations) == 2:
+            operation = dict(operation, paired_cpu=operations["cpu"])
+        try:
+            result = self._call(endpoint, operation)
+            results = result["paths"] if len(operations) == 2 else {operation["path"]: result}
+        except (ConnectionError, OSError, TimeoutError):
+            status = self._call(endpoint, dict(op="status", job=job, generation=generation))
+            if any(
+                status["completed"].get((path, item["batch"])) != item["ready"].sequence
+                for path, item in operations.items()
+            ):
+                raise RuntimeError("Pull ACK lost with unresolved original Ready; retain both sources") from None
+            results = {}
+            for path, item in operations.items():
+                error = status["path_errors"].get((path, item["batch"])) if "path_errors" in status else status["error"]
+                results[path] = {"error": error} if error else True
+        failed = False
+        for path, item in operations.items():
+            ready = item["ready"]
+            error = isinstance(results[path], dict) and "error" in results[path]
+            failed |= error
+            if error:
+                try:
+                    registration.release(path, ready)
+                except Exception:
+                    registration.cancel(path, ready)
+                    registration.release(path, ready)
+            else:
+                if results[path] is not True:
+                    raise RuntimeError("Pull reply did not confirm the original source")
+                registration.release(path, ready)
+            if self.diagnostics and planned.get("trace"):
+                self.diagnostics.emit(
+                    "SOURCE_RELEASED",
+                    (job, path, item["batch"]),
+                    request=context["request"],
+                    layer=context["layer"],
+                    path=path,
+                    sequence=ready.sequence,
+                )
+        return failed
 
     def _contributors(self, request):
         if self.config.source_tp0_only:
