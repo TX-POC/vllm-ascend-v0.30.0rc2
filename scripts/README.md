@@ -14,18 +14,19 @@ bash scripts/install_kvip.sh
 source third_party/KVIP/scripts/env.sh
 ```
 
-KVIP 使用 `main` 分支，固定到 `46c03fcf889a3ab56e62c1dbf5acb60580120142`，下载到被 Git 忽略的
+一次运行安装脚本即可构建 URMA 和 UBmem。脚本先构建支持两种传输的 KVAF、LIDU 和 UBmem LIFetch，再用同一份 KVAF 构建 URMA LIFetch。
+
+KVIP 使用 `main` 分支，固定到 `b30e8733dc08dd601075fa1c4a0dc6f8ba4c8467`，下载到被 Git 忽略的
 `third_party/KVIP`。源码、算子测试及 KVAF 补丁均由
 [KVIP 仓库](https://gitcode.com/CacheOS/KVIP/tree/main)维护，不提交到本仓。
 安装脚本调用 KVIP 的构建入口，准备同一份 `third_party/KVAF`、编译并安装 LIDU、
-LIFetch/Index update 与 Python 包。已有 KVIP 工作区有改动时停止，不覆盖实验代码。
-已有 `third_party/KVIP` 会自动删除并重新下载（包含其中的本地改动和构建产物）。
+LIFetch/Index update 与 Python 包。
+已有 `third_party/KVIP` 会移入同级备份目录，保留本地改动和构建产物。
 `--source-only` 只下载固定版本；`--skip-kvaf-build` 仅适用于已按当前补丁构建的 KVAF。
-旧 `install_kvaf.sh` 入口转发到同一个安装流程。服务安装额外应用 Put 释放 GIL 和 ABC 可变容量补丁；
-不改 Put/LIDU/LIFetch 的传输或替换算法。升级本改动后需完整运行 `bash scripts/install_kvip.sh`，
+旧 `install_kvaf.sh` 入口转发到同一个安装流程。固定版本已包含 ABC 可变容量和批量页更新，由 KVIP 构建入口准备 KVAF 补丁。升级本改动后需完整运行 `bash scripts/install_kvip.sh`，
 不能使用 `--skip-kvaf-build` 跳过首次重编译。
 
-KVAF 固定基线仍为 `c4375e13d7a9519d907ab6a5d11227795f207286`。
+KVIP 要求 KVAF 基线为 `1c1310387ebfb6776a07316874e924265b209ada`。安装脚本会在切换基线前备份旧版 `third_party/KVAF`。
 CPU 服务启动方式不变；已有 UMDK 环境可指定 `KVAF_UMDK_ROOT`、`KVAF_URMA_LIBRARY`。
 KVAF 关闭时无需安装 KVIP，基础 vLLM 安装脚本不自动编译可选算子。
 

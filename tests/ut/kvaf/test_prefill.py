@@ -21,6 +21,19 @@ Manager = importlib.import_module(f"{package}.cache_policy").CacheFeedbackManage
 Archive = helpers.load_prefix_module().RequestSnapshotStore
 
 
+class TestLiduCapacity(unittest.TestCase):
+    def test_1024k_history_and_resident_limit(self):
+        layout = helpers.layout_module
+        pool = NS(names=["layer"], max_requests=1, device="cpu", max_tokens=(1 << 20) + 20 * layout.BLOCK_SIZE)
+        adapter = helpers.adapter_module.NativeCacheAdapter(pool, native=object())
+        self.assertEqual(adapter.inputs["blocks"].shape[-1], pool.max_tokens // layout.BLOCK_SIZE)
+        with self.assertRaisesRegex(ValueError, "resident slot budget"):
+            Window(pool, 128, 1 << 20, native=object(), hot_tokens=layout.NATIVE_SLOT_CAPACITY, tail_tokens=1)
+        pool.max_tokens += 1
+        with self.assertRaisesRegex(ValueError, "map entries"):
+            helpers.adapter_module.NativeCacheAdapter(pool, native=object())
+
+
 class Runtime:
     def __init__(self):
         self.pages = {}
