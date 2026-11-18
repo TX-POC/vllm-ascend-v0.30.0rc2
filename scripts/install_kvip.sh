@@ -4,22 +4,28 @@
 set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kvip_dir="$repo_dir/third_party/KVIP"
-revision=81b1472809b7a5f3469e26467feee0ca1c61d71a
+revision=b30e8733dc08dd601075fa1c4a0dc6f8ba4c8467
 branch=main
 kvaf_revision=1c1310387ebfb6776a07316874e924265b209ada
 source_only=false
 skip_kvaf=false
 build_args=()
-for argument in "$@"; do
-    case "$argument" in
+while (( $# )); do
+    case "$1" in
         --source-only) source_only=true ;;
+        --transport)
+            case "${2:-}" in
+                urma|ubmem) shift ;;
+                *) echo "--transport requires urma or ubmem" >&2; exit 2 ;;
+            esac ;;
         --transport=urma|--transport=ubmem) ;; # Accepted for compatibility; always build both.
-        --skip-kvaf-build) skip_kvaf=true; build_args+=("$argument") ;;
+        --skip-kvaf-build) skip_kvaf=true; build_args+=("$1") ;;
         --help|-h)
             echo "Usage: bash scripts/install_kvip.sh [--source-only] [--skip-kvaf-build]"
             exit 0 ;;
-        *) echo "Unknown argument: $argument" >&2; exit 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
+    shift
 done
 # Do not reuse a URMA-only or unknown KVAF binary for a dual-transport install.
 if [[ "$skip_kvaf" == true ]]; then
@@ -69,7 +75,7 @@ fi
 # The UBmem KVAF build includes URMA. Build UBmem first, then warm the
 # original URMA LIFetch cache against exactly the same KVAF checkout.
 bash "$kvip_dir/scripts/build.sh" --kvaf-root "$kvaf_dir" --transport ubmem ${build_args[@]+"${build_args[@]}"}
-PYTHONPATH="$kvip_dir/python${PYTHONPATH:+:$PYTHONPATH}" python3 - "$kvaf_dir/build-npu" <<'PYBUILD'
+PYTHONPATH="$kvip_dir/python${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON:-python3}" - "$kvaf_dir/build-npu" <<'PYBUILD'
 import sys
 from pathlib import Path
 from kvip.runtime.build import build_libraries, kvaf_build_paths

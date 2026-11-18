@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import KVAFConfig
-from .layout import BLOCK_SIZE, MAX_QUERIES, NATIVE_SLOT_CAPACITY, TOPK, KVCacheLayout, grouped_layouts, runtime_weights
+from .layout import BLOCK_SIZE, MAX_QUERIES, NATIVE_SOURCE_CAPACITY, TOPK, KVCacheLayout, grouped_layouts, runtime_weights
 from .native_log import NativeLog
 from .transfer import KVTransfer, verify_put_block
 
@@ -247,8 +247,8 @@ class NativeCacheAdapter:
     def __init__(self, pool, *, native=None):
         import torch
 
-        if pool.max_tokens > NATIVE_SLOT_CAPACITY or pool.max_tokens < 2 * TOPK:
-            raise ValueError(f"LIDU requires {2 * TOPK}..{NATIVE_SLOT_CAPACITY} map entries including spare slots")
+        if pool.max_tokens > NATIVE_SOURCE_CAPACITY or pool.max_tokens < 2 * TOPK:
+            raise ValueError(f"LIDU requires {2 * TOPK}..{NATIVE_SOURCE_CAPACITY} map entries including spare slots")
         if native is None:
             from kvip import lidu
 

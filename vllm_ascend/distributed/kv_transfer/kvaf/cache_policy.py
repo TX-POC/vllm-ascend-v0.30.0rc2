@@ -11,7 +11,17 @@ import numpy as np
 import torch
 
 from .adapter import NativeCacheAdapter
-from .layout import BLOCK_SIZE, HISTORY, MAX_QUERIES, NATIVE_BITMAP_WORDS, SLOTS, TAIL, TOKEN_BYTES, TOPK
+from .layout import (
+    BLOCK_SIZE,
+    HISTORY,
+    MAX_QUERIES,
+    NATIVE_BITMAP_WORDS,
+    NATIVE_SLOT_CAPACITY,
+    SLOTS,
+    TAIL,
+    TOKEN_BYTES,
+    TOPK,
+)
 from .metrics import HotMissStats
 from .transfer import get_tokens
 
@@ -33,6 +43,8 @@ class DecodeHotCache(NativeCacheAdapter):
         self.tail_tokens = tail_tokens
         self.tail_start = hot_tokens
         self.slot_capacity = self.tail_start + self.tail_tokens
+        if self.slot_capacity > NATIVE_SLOT_CAPACITY:
+            raise ValueError(f"LIDU resident slot budget exceeds {NATIVE_SLOT_CAPACITY}")
         if self.slot_capacity > pool.max_tokens:
             raise ValueError("KVAF hot slots exceed the token/slot map capacity")
         super().__init__(pool, native=native)
