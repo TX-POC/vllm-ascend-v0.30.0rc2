@@ -4,7 +4,7 @@
 set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kvip_dir="$repo_dir/third_party/KVIP"
-revision=b30e8733dc08dd601075fa1c4a0dc6f8ba4c8467
+revision=d78f6da311b6316f0fd0aa1076d67cbc3124d2b8
 branch=main
 kvaf_revision=1c1310387ebfb6776a07316874e924265b209ada
 source_only=false

@@ -71,7 +71,7 @@ class ExternalKvipInstallTest(unittest.TestCase):
     def test_build_uses_external_checkout_and_explicit_kvaf_root(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("81b1472809b7a5f3469e26467feee0ca1c61d71a", result.stdout)
+        self.assertIn("d78f6da311b6316f0fd0aa1076d67cbc3124d2b8", result.stdout)
         self.assertIn("BUILD --kvaf-root", result.stdout)
         self.assertIn("/third_party/KVAF", result.stdout)
         self.assertIn("Previous UBmem KVAF build not verified; rebuilding KVAF.", result.stdout)

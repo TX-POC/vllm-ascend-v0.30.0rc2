@@ -20,8 +20,8 @@ class KVAFConfig:
     jettys_per_core: int = 2
     transport: str = "urma"  # KVAF transport, fixed for the worker lifetime.
     decode_backend: str = "batch_get"  # batch_get or li_fetch; fixed for the worker lifetime.
-    intermediate_fetches: int = 8  # LIFetch windows, including the initial hot window; 1..32.
-    prefetch_tokens: int = 512  # Per request/round; divided equally across LIFetch windows.
+    intermediate_fetches: int = 4  # LIFetch windows, including the initial hot window; 1..32.
+    prefetch_tokens: int = 1024  # Per request/round; divided equally across LIFetch windows.
     verify_put: bool = False  # Read back one prefill and one decode block per worker for byte comparison.
 
     def __post_init__(self) -> None:

@@ -1223,22 +1223,32 @@ class CacheFeedbackManager:
         if device_errors is not None and np.any(device_errors):
             failures = np.argwhere(device_errors != 0)
             details = []
-            for group, request in failures[:8]:
+            # Prioritize real requests when a shared Fetch lane also reports
+            # its failure on padding rows. Keep the total across all rows.
+            active_failures = [(g, r) for g, r in failures if r < len(frames[g][0])]
+            padding_failures = [(g, r) for g, r in failures if r >= len(frames[g][0])]
+            for group, request in (active_failures + padding_failures)[:8]:
                 status = int(device_errors[group, request])
                 item = {"group": int(group), "row": int(request), "status": status}
-                item["active"] = request < len(frames[group][0])
+                item["active"] = bool(request < len(frames[group][0]))
                 if traffic and miss_counts is not None:
                     row = miss_counts[group, request]
+                    errors = [(int(row[249]) >> shift) & 0xFF for shift in (0, 8, 16, 24)]
                     item.update(
                         prefetch_error=int(row[11]),
                         prefetch_reads=int(row[9]),
                         prefetch_pending=int(row[211]),
                         final_reads=int(row[247]),
                         final_pending=int(row[248]),
+                        final_q_errors=[code & 0x3F for code in errors],
+                        final_q_sources=[
+                            ("pipeline", "safe_get", "conflict_get", "unknown")[code >> 6] if code else None
+                            for code in errors
+                        ],
                     )
                 details.append(item)
             raise RuntimeError(
-                f"LIFetch Index update failed: failed_rows={len(failures)} details={details}; "
+                f"LIFetch Index update failed: failed_rows={len(failures)} active_failed_rows={len(active_failures)} details={details}; "
                 "status bits: 1=invalid Index change records, 2=prefetch state, "
                 "4=resolver/transport failure. Counts are from the same feedback copy."
             )
