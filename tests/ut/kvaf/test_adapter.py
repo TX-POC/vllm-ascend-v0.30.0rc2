@@ -157,6 +157,11 @@ class TestKVAFAdapter(unittest.TestCase):
         self.assertEqual(self.sdk.NpuRuntime.call_args.kwargs["npu_core_count"], 40)
         self.assertEqual(config.npu_core_count, 2)
 
+    def test_lifetch_default_budget(self):
+        config = KVAFConfig(decode_backend="li_fetch")
+        self.assertEqual(config.intermediate_fetches, 4)
+        self.assertEqual(config.prefetch_tokens, 1024)
+
     def test_reject_invalid_configuration(self):
         for values in (
             {"enabled": "true"},

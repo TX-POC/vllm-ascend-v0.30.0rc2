@@ -91,7 +91,7 @@ class TestFeedback(unittest.TestCase):
         row = self.prepare().rows[0]
         frames = ((((row.lru, self.hot.slot_capacity),), np.array([0, 4], np.int32)),)
         rows = np.zeros((1, 2, 256), np.int32)
-        rows[0, 0, [9, 11, 211, 247, 248]] = [64, 7, 1, 123, 1]
+        rows[0, 0, [9, 11, 211, 247, 248, 249]] = [64, 7, 1, 123, 1, 0x00870042]
         before = row.lru.version
         with self.assertRaises(RuntimeError) as caught:
             self.manager._commit(
@@ -105,7 +105,10 @@ class TestFeedback(unittest.TestCase):
         message = str(caught.exception)
         for expected in (
             "failed_rows=2",
+            "active_failed_rows=1",
+            "'final_q_errors': [2, 0, 7, 0]",
             "'status': 4",
+            "'final_q_sources': ['safe_get', None, 'conflict_get', None]",
             "'prefetch_error': 7",
             "'final_reads': 123",
             "'active': False",
