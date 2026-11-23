@@ -4379,12 +4379,6 @@ class NPUModelRunner(GPUModelRunner):
     def profile_run(self) -> None:
         self.eplb_warmup()
         self._initialize_kvaf_cache_state()
-        if self.sparse_kv_offload_enabled:
-            allocate_kv_offload_topk_profile_buffers(
-                getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec(),
-                self.vllm_config,
-                self.sparse_kv_offload_config,
-            )
 
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
@@ -4394,6 +4388,66 @@ class NPUModelRunner(GPUModelRunner):
             with disable_compilation(self.get_model()):
                 self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         super().profile_run()
+
+    def _build_kvaf_cache_layout_report(self, config, tensors):
+        from vllm_ascend.distributed.kv_transfer.kvaf.layout import BLOCK_SIZE, TOKEN_BYTES
+
+        state = self.kvaf_cache_state
+        policy = state.policy
+        seqs = state.max_requests - 1  # The last row is reserved for graph padding.
+        target_slots = state.max_requests * policy.slot_capacity * sum(policy.group_sizes)
+        # The hot tensor also backs prefill staging, which starts after these slots.
+        target_bytes = target_slots * TOKEN_BYTES
+        self.kvaf_target_slot_bytes = target_bytes
+        drafts = set(getattr(self.drafter, "attn_layer_names", ()))
+        specs = self._get_layer_kv_cache_specs(config)
+        rows = [[target_bytes, target_slots // BLOCK_SIZE, target_slots]]
+        rows.extend([[0, 0, 0] for _ in range(3)])
+        seen = set()
+        for name, spec in specs.items():
+            if name in self.kvaf_target_layer_names or name not in tensors:
+                continue
+            index = isinstance(spec, AscendSFAIndexerCacheSpec)
+            draft = name in drafts or name.removesuffix(".indexer.k_cache") + ".attn" in drafts
+            row = rows[3 if index and draft else 1 if index else 2]
+            backing = tensors[name]
+            for tensor in backing if isinstance(backing, tuple) else (backing,):
+                storage = tensor.untyped_storage()
+                if storage.data_ptr() not in seen:
+                    row[0] += storage.nbytes()
+                    seen.add(storage.data_ptr())
+            row[1] += config.num_blocks
+            row[2] += config.num_blocks * spec.block_size
+
+        length = self.model_config.max_model_len
+        blocks_per_request = sum(
+            (length + self.num_spec_tokens + group.kv_cache_spec.block_size - 1)
+            // group.kv_cache_spec.block_size
+            for group in config.kv_cache_groups
+        )
+        pool_limit = max(0, config.num_blocks - 1) // max(1, blocks_per_request)
+        current_cache_bytes = sum(row[0] for row in rows)
+        logger.info(
+            "Current KV cache memory: %.2f GiB allocated (%.2f GiB preallocated Target KV + "
+            "%.2f GiB Index/MTP)",
+            current_cache_bytes / (1 << 30),
+            target_bytes / (1 << 30),
+            (current_cache_bytes - target_bytes) / (1 << 30),
+        )
+        lines = [
+            "KVAF cache layout",
+            f"  Capacity basis: max sequence={length} tokens, MTP lookahead={self.num_spec_tokens}, "
+            "no cross-request prefix sharing",
+            "  Cache                HBM GiB      Blocks   Token slots   BS limit",
+        ]
+        for name, (size, blocks, slots), limit in zip(
+            ("Target KV slots", "Target Index cache", "MTP KV cache", "MTP Index cache"),
+            rows,
+            (seqs, pool_limit, pool_limit, pool_limit),
+        ):
+            limit_text = str(limit) if slots else "—"
+            lines.append(f"  {name:20} {size / (1 << 30):8.2f} {blocks:11d} {slots:13d} {limit_text:>10}")
+        return lines, min(seqs, pool_limit, self.max_num_reqs)
 
     def _initialize_kvaf_cache_state(self):
         if not self.ascend_config.kvaf_config.enabled or self.kvaf_cache_state is not None:
@@ -4877,7 +4931,20 @@ class NPUModelRunner(GPUModelRunner):
                 writer.runtimes[geometry], writer.slots[geometry], layouts, kv_caches,
                 token_bytes=geometry[0], tokens_per_block=geometry[1],
             )
-            get_kv_transfer_group().bind_archive(RequestSnapshotStore(writer, auxiliary), self.tp_rank)
+            archive = RequestSnapshotStore(writer, auxiliary)
+            get_kv_transfer_group().bind_archive(archive, self.tp_rank)
+            lines, hbm_limit = self._kvaf_cache_layout_report
+            capacity = archive.capacity
+            # Match the scheduler's admission horizon, including its two guard blocks.
+            horizon = self.model_config.max_model_len + self.num_spec_tokens + 2 * capacity.block_size
+            ddr_limit = min(
+                capacity.capacities[geometry] // slots
+                for geometry, slots in capacity.cost(horizon).items()
+                if slots
+            )
+            lines.append(f"  DDR BS limit: {ddr_limit} (reservation horizon={horizon} tokens)")
+            lines.append(f"  Effective BS limit: {min(hbm_limit, ddr_limit)} (HBM and DDR capacity)")
+            logger.info("%s", "\n".join(lines))
 
     def shutdown(self) -> None:
         if self.kvaf_adapter is not None:
@@ -4946,6 +5013,10 @@ class NPUModelRunner(GPUModelRunner):
         allocation_context = kv_cache_allocation_context or nullcontext()
         with allocation_context:
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        if self.kvaf_cache_state is not None:
+            self._kvaf_cache_layout_report = self._build_kvaf_cache_layout_report(
+                kv_cache_config, kv_cache_raw_tensors
+            )
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(
             kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
