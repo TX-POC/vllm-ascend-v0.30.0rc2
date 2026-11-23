@@ -647,9 +647,12 @@ class NPUWorker(WorkerBase):
                 )
 
         logger.debug(profile_result)
-        logger.info_once(
-            "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
+        budget_label = (
+            "Logical KV scheduler budget"
+            if getattr(self.model_runner, "kvaf_target_layer_names", None)
+            else "Available KV cache memory"
         )
+        logger.info_once("%s: %.2f GiB", budget_label, GiB(self.available_kv_cache_memory_bytes), scope="local")
         self.available_kv_cache_memory_bytes = self._apply_kv_offload_decode_memory_constraints(
             self.available_kv_cache_memory_bytes
         )
@@ -744,8 +747,13 @@ class NPUWorker(WorkerBase):
             )
             blocks = min(workload, max(0, available_memory - reserve) // sum_pages)
             logger.info(
+                "Available KV cache memory: %.2f GiB physical (for Index and MTP pools)",
+                max(0, available_memory - reserve) / GiB_bytes,
+            )
+            logger.info(
                 "KVAF HBM budget: logical_blocks=%s auxiliary_bytes_per_block=%s; "
-                "Target workspaces already profiled", blocks, sum_pages,
+                "Indexer/draft HBM budget=%.2f GiB; Target workspaces already profiled",
+                blocks, sum_pages, (blocks * sum_pages) / GiB_bytes,
             )
             return blocks * bytes_per_block
         if bytes_per_block > 0 and sum_pages > bytes_per_block:
@@ -928,6 +936,18 @@ class NPUWorker(WorkerBase):
             self.npugraph_memory_bytes = npugraph_memory_bytes
             suggested_to_requested = int(self.requested_memory) - non_kv_memory - redundancy_buffer
             suggested_to_gpu_limit = int(self.init_snapshot.free_memory) - non_kv_memory - redundancy_buffer
+            activation_usage = f"{format_gib(self.peak_activation_memory)} GiB for peak activation"
+            kvaf_bytes = getattr(self.model_runner, "kvaf_target_slot_bytes", 0)
+            if isinstance(kvaf_bytes, int) and 0 < kvaf_bytes <= self.peak_activation_memory:
+                activation_usage = (
+                    f"{format_gib(self.peak_activation_memory - kvaf_bytes)} GiB for peak activation "
+                    "including KVAF prefill buffers"
+                )
+            kv_budget_label = (
+                "Current logical KV scheduler budget"
+                if getattr(self.model_runner, "kvaf_target_layer_names", None)
+                else "Current KV cache memory"
+            )
             msg = (
                 f"Free memory on device "
                 f"({format_gib(self.init_snapshot.free_memory)}/"
@@ -936,15 +956,15 @@ class NPUWorker(WorkerBase):
                 f"({self.cache_config.gpu_memory_utilization}, "
                 f"{format_gib(self.requested_memory)} GiB). "
                 f"Actual usage: {format_gib(self.model_runner.model_memory_usage)} GiB "
-                f"for weights, {format_gib(self.peak_activation_memory)} GiB for peak "
-                f"activation, {format_gib(self.non_torch_memory)} GiB for non-torch "
+                f"for weights, {activation_usage}, "
+                f"{format_gib(self.non_torch_memory)} GiB for non-torch "
                 f"memory, {format_gib(npugraph_memory_bytes)} GiB for NPU graph memory. "
                 f"Replace gpu_memory_utilization with "
                 f"`--kv-cache-memory={suggested_to_requested}` "
                 f"({format_gib(suggested_to_requested)} GiB) to fit into requested "
                 f"memory, or `--kv-cache-memory={suggested_to_gpu_limit}` "
                 f"({format_gib(suggested_to_gpu_limit)} GiB) to fully utilize NPU "
-                f"free memory. Current KV cache memory: "
+                f"free memory. {kv_budget_label}: "
                 f"{format_gib(self.available_kv_cache_memory_bytes)} GiB. "
                 f"After warmup: torch reserved memory {format_gib(torch.npu.memory_reserved())} GiB, "
                 f"torch allocated memory {format_gib(torch.npu.memory_allocated())} GiB."
