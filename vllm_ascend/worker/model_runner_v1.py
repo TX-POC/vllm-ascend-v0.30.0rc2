@@ -2576,6 +2576,9 @@ class NPUModelRunner(GPUModelRunner):
                 # A prefix-cache replay can leave one prompt token and look
                 # like decode. It must not replay the hot-only decode graph.
                 cudagraph_mode = CUDAGraphMode.NONE
+            if self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+                graph_batch = (batch_desc.num_reqs or num_reqs) if cudagraph_mode == CUDAGraphMode.FULL else num_reqs
+                self.kvaf_cache_state.policy.select_fused_batch(self.ascend_config.kvaf_config, graph_batch)
             with record_function_or_nullcontext("kvaf: cache_input_upload"):
                 self.kvaf_adapter.writer.feedback.prepare(
                     self.input_batch.req_ids[:num_reqs],
@@ -4063,6 +4066,14 @@ class NPUModelRunner(GPUModelRunner):
             )
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        if (
+            self.kvaf_adapter is not None
+            and self.ascend_config.kvaf_config.decode_backend == "li_fetch"
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            self.kvaf_cache_state.policy.select_fused_batch(
+                self.ascend_config.kvaf_config, num_reqs_padded, dummy=True
+            )
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             if _cudagraph_mode == CUDAGraphMode.NONE:
@@ -4901,15 +4912,6 @@ class NPUModelRunner(GPUModelRunner):
                 log_dir=self.ascend_config.ascend_log_path,
                 tp_rank=self.tp_rank,
                 dp_rank=self.dp_rank,
-                # Memory profiling has already initialized HCCL for TP/EP.
-                # Repeating device RaInit can reset its live HDC mutex.
-                reuse_device_ra=(
-                    self.parallel_config.tensor_parallel_size > 1
-                    or (
-                        self.parallel_config.enable_expert_parallel
-                        and self.parallel_config.data_parallel_size > 1
-                    )
-                ),
             )
             self.kvaf_adapter.connect()
             self.kvaf_adapter.bind_caches(kv_caches)
@@ -4919,7 +4921,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.ascend_config.kvaf_config.decode_backend == "li_fetch":
                 from kvip.adapters.vllm.binding import bind_selectors
 
-                bind_selectors(torch, self.kvaf_cache_state.policy, self.ascend_config.kvaf_config)
+                policy = self.kvaf_cache_state.policy
+                bind_selectors(torch, policy, self.ascend_config.kvaf_config)
+                policy.fused_selectors_by_batch[policy.fused_setup.batch] = policy.indexer_selectors
             from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import (
                 AuxiliarySnapshotStore,
                 RequestSnapshotStore,
@@ -4948,6 +4952,13 @@ class NPUModelRunner(GPUModelRunner):
 
     def shutdown(self) -> None:
         if self.kvaf_adapter is not None:
+            if self.kvaf_adapter.graph_resources or (
+                self.kvaf_adapter.config.decode_backend == "li_fetch"
+                and isinstance(self.model, ACLGraphWrapper)
+            ):
+                torch.npu.synchronize(self.device)
+                self.model.concrete_aclgraph_entries.clear()
+                self.kvaf_adapter.close_graph_resources()
             self.kvaf_adapter.close()
         parent_shutdown = getattr(super(), "shutdown", None)
         if callable(parent_shutdown):
@@ -6699,9 +6710,62 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
+    def _warmup_and_capture(
+        self,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+        **capture_kwargs,
+    ):
+        adapter = self.kvaf_adapter
+        if (
+            adapter is None
+            or adapter.config.decode_backend == "li_fetch"
+            or cudagraph_runtime_mode != CUDAGraphMode.FULL
+        ):
+            return super()._warmup_and_capture(
+                desc, cudagraph_runtime_mode, profile_seq_lens, allow_microbatching, num_warmups, **capture_kwargs
+            )
+        if num_warmups is None:
+            num_warmups = self.compilation_config.cudagraph_num_of_warmups
+        if not isinstance(self.model, ACLGraphWrapper):
+            raise RuntimeError("Unified KVAF FULL capture requires ACLGraphWrapper")
+        stream = torch.npu.current_stream(self.device)
+        warmup_kwargs = dict(
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            force_attention=True,
+            uniform_decode=desc.uniform,
+            allow_microbatching=allow_microbatching,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=desc.num_active_loras,
+            profile_seq_lens=profile_seq_lens,
+        )
+        for _ in range(max(0, num_warmups - 1)):
+            self._dummy_run(desc.num_tokens, **warmup_kwargs)
+        with adapter.capture_get_resources(stream, lambda: self._dummy_run(desc.num_tokens, **warmup_kwargs)):
+            self.model.capture_stream = stream
+            try:
+                return super()._warmup_and_capture(
+                    desc, cudagraph_runtime_mode, profile_seq_lens, allow_microbatching, num_warmups=0, **capture_kwargs
+                )
+            finally:
+                self.model.capture_stream = None
+
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
+        if self.kvaf_adapter is not None and self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+            policy = self.kvaf_cache_state.policy
+            previous = policy.indexer_selectors
+            for mode, descriptors in self.cudagraph_dispatcher.get_capture_descs():
+                if mode == CUDAGraphMode.FULL:
+                    for desc in descriptors:
+                        batch = desc.num_reqs or min(desc.num_tokens, self.scheduler_config.max_num_seqs)
+                        policy.select_fused_batch(self.ascend_config.kvaf_config, batch)
+            policy.indexer_selectors = previous
         self._engram_capture_active = True
         try:
             with (

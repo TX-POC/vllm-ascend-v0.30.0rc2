@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run inside the container after install_vllm_in_container.sh.
-# Usage: bash scripts/start_vllm_server.sh
+# Usage: bash scripts/start_vllm_server.sh [--kvip-root KVIP_CHECKOUT]
 
 # ---- Editable configuration (GLM-5.3 TP1 / DP8 with KVAF) ----
 model_path="/home/models/GLM-5.3-w4a4c8-mxfp4"
@@ -34,12 +34,13 @@ kvaf_cpu_addresses='{
   "6":"127.0.0.1:28886",
   "7":"127.0.0.1:28887"
 }' # JSON: physical NPU ID -> host:port; unlisted cards use kvaf_cpu_address.
-kvaf_build_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party/KVAF/build-npu"
+kvip_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party/KVIP"
+kvaf_build_dir=""
 kvaf_ddr_size_gb=128 # Per NPU worker; TP8 allocates up to 8 times this amount.
 kvaf_transport=urma # urma or ubmem.
 kvaf_decode_backend=batch_get # batch_get (native LI/LIDU/Get) or li_fetch.
-kvaf_prefetch_tokens=512 # Total prefetch tokens/request/round; final repair is not capped.
-kvaf_intermediate_fetches=8 # Includes the initial hot window; li_fetch only.
+kvaf_prefetch_tokens=1024 # Total prefetch tokens/request/round; final repair is not capped.
+kvaf_intermediate_fetches=4 # Includes the initial hot window; li_fetch only.
 kvaf_hot_tokens=16384 # History tokens per request/layer; excludes ABC.
 kvaf_put_interval_steps=32 # One shared decode Put window across requests.
 kvaf_put_overlap_steps=8 # Extra ABC space for forward/Put overlap; wait only before reuse.
@@ -50,8 +51,16 @@ profiler_dir="$PWD/profiling/$(date +%Y%m%d_%H%M%S)"
 
 # Use the container shell's CANN/ATB environment, as in the verified launch.
 set -euo pipefail
+if (( $# )); then
+    if [[ $# != 2 || "$1" != "--kvip-root" || ! -f "$2/scripts/env.sh" ]]; then
+        echo "Usage: bash scripts/start_vllm_server.sh [--kvip-root KVIP_CHECKOUT]" >&2
+        exit 2
+    fi
+    kvip_root="$(cd "$2" && pwd)"
+fi
 if [[ "$kvaf_enabled" == true ]]; then
-    source "$(dirname "${BASH_SOURCE[0]}")/../third_party/KVIP/scripts/env.sh"
+    source "$kvip_root/scripts/env.sh"
+    kvaf_build_dir="$(dirname "$(dirname "$KVAF_BATCH_GET_KERNEL")")"
 fi
 
 # Only this service process drops proxies; container installs can still use them.

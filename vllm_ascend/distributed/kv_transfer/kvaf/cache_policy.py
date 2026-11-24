@@ -445,6 +445,7 @@ class KVCachePolicy(DecodeHotCache):
         self.decode_frames = ()
         self.only_decode = True
         self.indexer_selectors = {}
+        self.fused_selectors_by_batch = {}
         self.fused_query_inputs = ()
         self.fused_index_storage = ()
         self.fused_workspace = None
@@ -567,7 +568,8 @@ class KVCachePolicy(DecodeHotCache):
         if shape["logical_aic_tasks"] > aics:
             raise ValueError("LIFetch maximum request batch exceeds concurrently resident LI tasks")
         final_workers = geometry.final_aivs(batch, "auto", aics)
-        workers = (batch * (final_workers + 1) + 1) // 2
+        queues = max(batch * (final_workers + 1), 2 * batch + 16)
+        workers = (queues + 1) // 2
         self.fused_setup = SimpleNamespace(
             cann=cann,
             headers=headers,
@@ -594,6 +596,23 @@ class KVCachePolicy(DecodeHotCache):
             aics=aics,
             windows=config.intermediate_fetches,
         )
+
+    def select_fused_batch(self, config, batch, *, dummy=False):
+        if not self.indexer_selectors:
+            return
+        if not 1 <= batch <= self.fused_setup.batch:
+            raise ValueError(f"LIFetch graph batch {batch} exceeds service capacity {self.fused_setup.batch}")
+        if batch not in self.fused_selectors_by_batch:
+            from kvip.adapters.vllm.binding import bind_selectors
+
+            self.fused_selectors_by_batch[batch] = bind_selectors(torch, self, config, batch=batch)
+        self.indexer_selectors = self.fused_selectors_by_batch[batch]
+        if dummy:
+            for index, selector in enumerate(self.indexer_selectors.values()):
+                selector.prepare((), prepare_inputs=index == 0)
+            selector.inputs.query_ends.zero_()
+            # All groups share the packed query metadata.
+            self.fused_query_inputs = (selector.inputs,)
 
     def prepare_indexer_metadata(self, layer, local_layer, metadata):
         # Indexer metadata can be reused across layers/steps. Always overwrite
@@ -851,11 +870,12 @@ class KVCachePolicy(DecodeHotCache):
         try:
             if self.indexer_selectors:
                 queries = int(manager.groups[0].query_offsets[-1])
+                batch = next(iter(self.indexer_selectors.values())).inputs.batch
                 manager.submit_feedback(
                     self.destinations[: self.group_count, :queries],
                     generation=manager.generation,
-                    device_errors=self.fused_errors,
-                    fetch_rows=self.fused_fetch_rows,
+                    device_errors=self.fused_errors[:, :batch],
+                    fetch_rows=self.fused_fetch_rows[:, :batch],
                 )
             else:
                 super().finish(manager)
