@@ -28,14 +28,19 @@
 
 ## 2. 准备候选源码
 
-现有远端 `develop` 仍是旧基线。使用随部署包提供的 `kvaf-pd-2a2k.bundle` 导入候选提交。Bundle 包含框架合并与本说明的脚本，要求仓库已有基线提交 `f9bf84aab`。在各主机保留旧框架和旧 SDK，候选版本用独立目录。
-
-在框架仓库执行，先把 bundle 放到 `/home/c00612283/kvaf-pd-2a2k.bundle`：
+从 `TX-POC/vllm-ascend-v0.30.0rc2` 的 `v0.30.0rc2-develop` 分支获取候选源码。在各主机保留旧框架和旧 SDK，候选版本用独立目录。
 
 ```bash
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
-# 如果缺少 bundle 前置提交，先获取仍包含该基线的 develop。
-git cat-file -e 'f9bf84aab^{commit}' || git fetch origin refs/heads/v0.30.0rc2-develop
+git fetch origin refs/heads/v0.30.0rc2-develop
+git worktree add --detach /home/c00612283/pd-main-framework FETCH_HEAD
+git -C /home/c00612283/pd-main-framework log -2 --oneline
+```
+
+无法访问远端的主机可以通过部署包离线导入。将其中的 `kvaf-pd-2a2k.bundle` 放到 `/home/c00612283/kvaf-pd-2a2k.bundle`，使用已有基线提交 `f9bf84aab` 的框架仓库执行：
+
+```bash
+cd /home/c00612283/vllm-ascend-v0.30.0rc2
 git bundle verify /home/c00612283/kvaf-pd-2a2k.bundle
 git fetch /home/c00612283/kvaf-pd-2a2k.bundle HEAD
 git worktree add --detach /home/c00612283/pd-main-framework FETCH_HEAD
