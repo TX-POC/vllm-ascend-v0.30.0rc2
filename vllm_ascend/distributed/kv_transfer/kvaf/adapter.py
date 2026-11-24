@@ -7,7 +7,7 @@ import logging
 import os
 import time
 import traceback
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -34,7 +34,6 @@ class KVAFAdapter:
         log_dir: str | Path,
         tp_rank: int,
         dp_rank: int,
-        reuse_device_ra: bool = False,
         groups=None,
         fused_workers: int | None = None,
     ):
@@ -46,7 +45,6 @@ class KVAFAdapter:
                 raise ValueError("LIFetch requires two jettys per transport worker")
         self.transport_workers = config.npu_core_count if fused_workers is None else fused_workers
         self.device_id = device_id  # Logical NPU ID; KVAF resolves the physical device itself.
-        self.reuse_device_ra = reuse_device_ra
         self.cpu_address = config.cpu_address
         if config.cpu_addresses:
             # Resolve after device binding, and only when per-card routing is requested.
@@ -63,6 +61,8 @@ class KVAFAdapter:
         self.runtimes: dict[tuple[int, int], Any] = {}
         self.slot_counts: dict[tuple[int, int], int] = {}
         self.writer: KVTransfer | None = None
+        self.graph_resources = []
+        self.graph_capture_failed = False
         self.log_path = (
             Path(log_dir).expanduser().resolve()
             / "kvaf"
@@ -83,6 +83,33 @@ class KVAFAdapter:
             except BaseException:
                 traceback.print_exc(file=output)
                 raise
+
+    def _create_runtime(self, sdk, kernels, token_bytes, block_size):
+        transport = self.config.transport
+        layout = dict(
+            batch_get_token_bytes=token_bytes,
+            batch_get_tokens_per_block=block_size,
+            device_id=self.device_id,
+        )
+        if self.config.decode_backend == "li_fetch":
+            binding = "get_graph_mapped_base" if transport == "ubmem" else "get_graph_urma_resources"
+            if not callable(getattr(sdk.NpuRuntime, binding, None)):
+                raise RuntimeError(f"Unified KVAF LIFetch requires KVIP binding {binding}")
+        put = sdk.PutExecutionConfig(transport, "aiv")
+        get = sdk.GetExecutionConfig(transport, "aiv", "direct")
+        put_resources = dict(cores=self.config.npu_core_count, kernel_path=str(kernels["put"]))
+        get_resources = dict(cores=self.transport_workers, kernel_path=str(kernels["get"]))
+        if transport == "urma":
+            put_resources["jettys"] = min(self.config.jettys_per_core, 2)
+            get_resources["jettys"] = self.config.jettys_per_core
+        return sdk.NpuRuntime(
+            **layout,
+            transport_mode=transport,
+            default_put=put,
+            default_get=get,
+            put_resources=[(put, sdk.ExecutionResources(**put_resources))],
+            get_resources=[(get, sdk.ExecutionResources(**get_resources))],
+        )
 
     def connect(self) -> None:
         """Initialize one session per distinct (token bytes, tokens per block)."""
@@ -111,8 +138,8 @@ class KVAFAdapter:
         # Worker-isolated imports: the ordinary vLLM startup needs no KVAF SDK.
         importlib.import_module("torch_npu")
         sdk = importlib.import_module("kvaf")
-        if not hasattr(sdk, "NpuRuntime"):
-            raise RuntimeError("Installed kvaf has no NpuRuntime; install the NPU build with Get and Put enabled")
+        if not hasattr(sdk, "ExecutionResources") or not hasattr(sdk, "NpuRuntime"):
+            raise RuntimeError("KVAF unified NPU Runtime required; run scripts/install_kvip.sh")
         if not Path(sdk.__file__).resolve().is_relative_to(build_dir / "python" / "kvaf"):
             raise RuntimeError(f"Imported kvaf from {sdk.__file__}, outside {build_dir}; rerun scripts/install_kvaf.sh")
 
@@ -143,17 +170,7 @@ class KVAFAdapter:
                 with self._native_log(
                     f"initialize token_bytes={token_bytes} block_size={block_size} DDR_bytes={ddr_bytes}"
                 ):
-                    runtime = sdk.NpuRuntime(
-                        batch_get_kernel_object_path=str(kernels["get"]),
-                        batch_get_token_bytes=token_bytes,
-                        batch_get_tokens_per_block=block_size,
-                        device_id=self.device_id,
-                        npu_core_count=self.transport_workers,
-                        batch_put_kernel_object_path=str(kernels["put"]),
-                        jettys_per_core=self.config.jettys_per_core,
-                        reuse_device_ra=self.reuse_device_ra,
-                        **({"transport": "ubmem"} if self.config.transport == "ubmem" else {}),
-                    )
+                    runtime = self._create_runtime(sdk, kernels, token_bytes, block_size)
                     self.runtimes[token_bytes, block_size] = runtime
                     runtime.link_to(self.cpu_address)
                     runtime.initialize(ddr_bytes, slot_size)
@@ -203,6 +220,30 @@ class KVAFAdapter:
             self.config.verify_put,
         )
         logger.info("KVAF Target workspace and DDR prefix archive will bind before graph capture")
+
+    @contextmanager
+    def capture_get_resources(self, stream, warmup):
+        """Prepare one set of Get leases for the next FULL graph."""
+        resources = [runtime.graph_resources() for runtime in self.runtimes.values()]
+        self.graph_resources.extend(resources)
+        try:
+            with ExitStack() as scopes:
+                for owner in resources:
+                    scopes.enter_context(owner.prepare(stream))
+                warmup()
+            with ExitStack() as scopes:
+                for owner in resources:
+                    scopes.enter_context(owner.capture(stream))
+                yield
+        except BaseException:
+            self.graph_capture_failed = True
+            raise
+
+    def close_graph_resources(self):
+        """Release leases after the runner has retired its graph entries."""
+        while self.graph_resources:
+            self.graph_resources[-1].close(discard_result=self.graph_capture_failed)
+            self.graph_resources.pop()
 
     def close(self) -> None:
         """Release every session on normal shutdown, including partial startup."""

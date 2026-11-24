@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host-only checks of KVAF configuration and native-session ownership."""
 
+import ast
 import importlib
 import json
 import subprocess
@@ -8,9 +9,10 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 PACKAGE = ModuleType("kvaf_adapter_under_test")
@@ -91,11 +93,15 @@ class TestKVAFAdapter(unittest.TestCase):
         sdk.__file__ = str(self.build_dir / "python/kvaf/__init__.py")
         sdk.NpuRuntime = Mock(side_effect=make_runtime)
         self.sdk = sdk
+        self.sdk.ExecutionResources = Mock(side_effect=lambda **kwargs: kwargs)
+        self.sdk.PutExecutionConfig = Mock(return_value="put")
+        self.sdk.GetExecutionConfig = Mock(return_value="get")
+        sdk.NpuRuntime.get_graph_urma_resources = Mock()
         imports = patch.dict(sys.modules, {"kvaf": sdk, "torch_npu": ModuleType("torch_npu")})
         imports.start()
         self.addCleanup(imports.stop)
 
-    def adapter(self, widths, *, reuse_device_ra=False):
+    def adapter(self, widths):
         config = KVAFConfig(enabled=True, build_dir=str(self.build_dir), ddr_size_gb=0.001)
         result = adapter_module.KVAFAdapter(
             config,
@@ -104,42 +110,118 @@ class TestKVAFAdapter(unittest.TestCase):
             log_dir=str(self.build_dir),
             tp_rank=3,
             dp_rank=0,
-            reuse_device_ra=reuse_device_ra,
         )
         self.addCleanup(result.close)
         return result
+
+    def test_model_capture_forwards_upstream_profiler(self):
+        path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+        tree = ast.parse(path.read_text())
+        runner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+        hook = next(node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "_warmup_and_capture")
+        parent_capture = Mock()
+        full = object()
+        namespace = dict(
+            BatchDescriptor=SimpleNamespace,
+            CUDAGraphMode=type("GraphMode", (), {"FULL": full, "NONE": object()}),
+            ACLGraphWrapper=SimpleNamespace,
+            torch=SimpleNamespace(npu=SimpleNamespace(current_stream=Mock())),
+            super=lambda: SimpleNamespace(_warmup_and_capture=parent_capture),
+        )
+        exec(compile(ast.Module(body=[hook], type_ignores=[]), str(path), "exec"), namespace)
+        profiler = nullcontext()
+        desc = SimpleNamespace(num_tokens=4, uniform=True, num_active_loras=0)
+        for backend in ("li_fetch", "batch_get"):
+            with self.subTest(backend=backend):
+                adapter = SimpleNamespace(
+                    config=SimpleNamespace(decode_backend=backend),
+                    capture_get_resources=Mock(return_value=nullcontext()),
+                )
+                model = SimpleNamespace(kvaf_adapter=adapter, model=SimpleNamespace(), device=0, _dummy_run=Mock())
+                namespace[hook.name](model, desc, full, num_warmups=1, profiler=profiler)
+                self.assertIs(parent_capture.call_args.kwargs["profiler"], profiler)
+                self.assertEqual(adapter.capture_get_resources.call_count, int(backend == "batch_get"))
+
+    def test_graph_resources_prepare_before_capture_and_retain_failed_owner(self):
+        adapter = self.adapter((656,))
+        calls = []
+        stream = object()
+
+        @contextmanager
+        def scope(label, actual_stream):
+            self.assertIs(actual_stream, stream)
+            calls.append(f"enter {label}")
+            try:
+                yield
+            finally:
+                calls.append(f"exit {label}")
+
+        owner = Mock()
+        owner.prepare.side_effect = lambda value: scope("prepare", value)
+        owner.capture.side_effect = lambda value: scope("capture", value)
+        adapter.runtimes[(656, 128)] = Mock(graph_resources=Mock(return_value=owner))
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            with adapter.capture_get_resources(stream, lambda: calls.append("warmup")):
+                calls.append("capture")
+                raise RuntimeError("capture failed")
+        self.assertEqual(calls, ["enter prepare", "warmup", "exit prepare", "enter capture", "capture", "exit capture"])
+        self.assertEqual(adapter.graph_resources, [owner])
+        adapter.close_graph_resources()
+        owner.close.assert_called_once_with(discard_result=True)
+
+    def test_graph_cleanup_checks_successful_capture_and_retries_failed_release(self):
+        adapter = self.adapter((656,))
+        owner = Mock()
+        owner.close.side_effect = [RuntimeError("lease still busy"), None]
+        adapter.graph_resources.append(owner)
+        with self.assertRaisesRegex(RuntimeError, "lease still busy"):
+            adapter.close_graph_resources()
+        self.assertEqual(adapter.graph_resources, [owner])
+        owner.close.assert_called_once_with(discard_result=False)
+        adapter.graph_capture_failed = True
+        adapter.close_graph_resources()
+        owner.close.assert_called_with(discard_result=True)
+        self.assertFalse(adapter.graph_resources)
 
     def test_default_get_uses_mainline_even_with_isolated_artifact(self):
         (self.build_dir / "vllm-get-build").write_text("isolated\n")
         self.adapter((656,)).connect()
         self.assertEqual(
-            self.sdk.NpuRuntime.call_args.kwargs["batch_get_kernel_object_path"],
+            self.sdk.NpuRuntime.call_args.kwargs["get_resources"][0][1]["kernel_path"],
             str((self.build_dir / "bin/kvaf_execute_batch_get_kernels.o").resolve()),
         )
 
-    def test_runtime_borrows_existing_hccl_ra_only_when_requested(self):
-        for reuse in (False, True):
-            with self.subTest(reuse_device_ra=reuse):
-                adapter = self.adapter((656,), reuse_device_ra=reuse)
-                adapter.connect()
-                self.assertIs(self.sdk.NpuRuntime.call_args.kwargs["reuse_device_ra"], reuse)
-                adapter.close()
+    def test_unified_runtime_uses_separate_execution_budgets(self):
+        adapter = self.adapter((656,))
+        adapter.connect()
+        kwargs = self.sdk.NpuRuntime.call_args.kwargs
+        self.assertEqual(kwargs["transport_mode"], "urma")
+        self.assertEqual(kwargs["default_put"], "put")
+        self.assertEqual(kwargs["default_get"], "get")
+        for direction in ("put", "get"):
+            execution, resources = kwargs[f"{direction}_resources"][0]
+            self.assertEqual(execution, direction)
+            self.assertEqual(resources["cores"], adapter.transport_workers)
+            self.assertEqual(
+                resources["kernel_path"],
+                str((self.build_dir / "bin" / f"kvaf_execute_batch_{direction}_kernels.o").resolve()),
+            )
+        self.assertNotIn("reuse_device_ra", kwargs)
+        self.runtimes[0].link_to.assert_called_once_with(adapter.cpu_address)
+        self.runtimes[0].initialize.assert_called_once()
 
-    def test_transport_selects_runtime_without_changing_urma_default(self):
-        for transport in ("urma", "ubmem"):
-            with self.subTest(transport=transport):
-                config = KVAFConfig(enabled=True, build_dir=str(self.build_dir), ddr_size_gb=0.001, transport=transport)
-                adapter = adapter_module.KVAFAdapter(
-                    config, 3, (layout(656, "target"),), log_dir=self.build_dir, tp_rank=3, dp_rank=0
-                )
-                self.addCleanup(adapter.close)
-                adapter.connect()
-                kwargs = self.sdk.NpuRuntime.call_args.kwargs
-                if transport == "ubmem":
-                    self.assertEqual(kwargs["transport"], "ubmem")
-                else:
-                    self.assertNotIn("transport", kwargs)
-                adapter.close()
+    def test_unified_ubmem_uses_transport_resources_without_urma_jettys(self):
+        adapter = self.adapter((656,))
+        adapter.config = replace(adapter.config, transport="ubmem")
+        adapter.connect()
+
+        kwargs = self.sdk.NpuRuntime.call_args.kwargs
+        self.assertEqual(kwargs["transport_mode"], "ubmem")
+        self.sdk.PutExecutionConfig.assert_called_once_with("ubmem", "aiv")
+        self.sdk.GetExecutionConfig.assert_called_once_with("ubmem", "aiv", "direct")
+        for direction in ("put", "get"):
+            _, resources = kwargs[f"{direction}_resources"][0]
+            self.assertNotIn("jettys", resources)
 
     def test_fused_worker_budget_reaches_runtime_without_changing_config(self):
         config = KVAFConfig(enabled=True, build_dir=str(self.build_dir), ddr_size_gb=0.001, decode_backend="li_fetch")
@@ -154,7 +236,9 @@ class TestKVAFAdapter(unittest.TestCase):
         )
         self.addCleanup(adapter.close)
         adapter.connect()
-        self.assertEqual(self.sdk.NpuRuntime.call_args.kwargs["npu_core_count"], 40)
+        kwargs = self.sdk.NpuRuntime.call_args.kwargs
+        self.assertEqual(kwargs["get_resources"][0][1]["cores"], 40)
+        self.assertEqual(kwargs["put_resources"][0][1]["cores"], config.npu_core_count)
         self.assertEqual(config.npu_core_count, 2)
 
     def test_lifetch_default_budget(self):

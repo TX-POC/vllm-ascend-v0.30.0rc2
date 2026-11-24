@@ -4,76 +4,77 @@
 set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kvip_dir="$repo_dir/third_party/KVIP"
-revision=d78f6da311b6316f0fd0aa1076d67cbc3124d2b8
-branch=main
-kvaf_revision=1c1310387ebfb6776a07316874e924265b209ada
+kvip_branch=main
+kvip_revision=d6cfd392f722dd3f96ef6e05175f503aac511dbb
+kvaf_branch=main
+kvaf_revision=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 source_only=false
-skip_kvaf=false
 build_args=()
+main_kvip_dir=""
+main_kvaf_dir=""
 while (( $# )); do
     case "$1" in
         --source-only) source_only=true ;;
+        --main-kvaf)
+            if (( $# < 3 )) || [[ ! -d "$2" || ! -d "$3" ]]; then
+                echo "--main-kvaf requires existing KVIP and KVAF checkout directories" >&2
+                exit 2
+            fi
+            main_kvip_dir="$(cd "$2" && pwd)"
+            main_kvaf_dir="$(cd "$3" && pwd)"
+            shift 2 ;;
+
         --transport)
             case "${2:-}" in
                 urma|ubmem) shift ;;
                 *) echo "--transport requires urma or ubmem" >&2; exit 2 ;;
             esac ;;
         --transport=urma|--transport=ubmem) ;; # Accepted for compatibility; always build both.
-        --skip-kvaf-build) skip_kvaf=true; build_args+=("$1") ;;
+        --skip-kvaf-build) build_args+=("$1") ;;
         --help|-h)
             echo "Usage: bash scripts/install_kvip.sh [--source-only] [--skip-kvaf-build]"
+            echo "       bash scripts/install_kvip.sh --main-kvaf KVIP_CHECKOUT KVAF_CHECKOUT [--source-only] [--skip-kvaf-build]"
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
 done
-# Do not reuse a URMA-only or unknown KVAF binary for a dual-transport install.
-if [[ "$skip_kvaf" == true ]]; then
-    if [[ ! -f "$repo_dir/third_party/KVAF/access_operator/include/ubmem/fused_batch_get_device.h" ]] ||
-        ! python3 - "$kvip_dir/build/dependencies.json" "$repo_dir/third_party/KVAF/build-npu" <<'PYSTATE'
-import json
-import sys
-from pathlib import Path
-try:
-    state = json.loads(Path(sys.argv[1]).read_text())
-    valid = (state.get("transport") == "ubmem" and
-             Path(state["kvaf_build_dir"]).resolve() == Path(sys.argv[2]).resolve())
-except (OSError, ValueError, KeyError, TypeError):
-    valid = False
-raise SystemExit(0 if valid else 1)
-PYSTATE
-    then
-        echo "Previous UBmem KVAF build not verified; rebuilding KVAF."
-        build_args=()
-    fi
+if [[ -n "$main_kvaf_dir" ]]; then
+    kvip_dir="$main_kvip_dir"
+    kvaf_dir="$main_kvaf_dir"
+else
+    kvaf_dir="$repo_dir/third_party/KVAF"
+    for dependency in KVIP KVAF; do
+        if [[ "$dependency" == KVIP ]]; then
+            directory="$kvip_dir"
+            branch="$kvip_branch"
+            revision="$kvip_revision"
+        else
+            directory="$kvaf_dir"
+            branch="$kvaf_branch"
+            revision="$kvaf_revision"
+        fi
+        if [[ -d "$directory/.git" || -f "$directory/.git" ]] &&
+           [[ "$(git -C "$directory" rev-parse HEAD)" == "$revision" ]]; then
+            echo "$dependency source ready: $directory @ $revision"
+            continue
+        fi
+        if [[ -e "$directory" || -L "$directory" ]]; then
+            backup="$(mktemp -d "$repo_dir/third_party/$dependency-backup.XXXXXX")"
+            mv "$directory" "$backup/$dependency"
+            echo "Previous $dependency preserved: $backup/$dependency"
+        fi
+        git clone --no-checkout --branch "$branch" "https://gitcode.com/CacheOS/$dependency.git" "$directory"
+        git -C "$directory" checkout --detach "$revision"
+        echo "$dependency source ready: $directory @ $revision"
+        if [[ "$dependency" == KVAF ]]; then
+            build_args=()
+        fi
+    done
 fi
-# Preserve any existing checkout, including local edits and build outputs.
-mkdir -p "$repo_dir/third_party"
-if [[ -e "$kvip_dir" || -L "$kvip_dir" ]]; then
-    backup="$(mktemp -d "$repo_dir/third_party/KVIP-backup.XXXXXX")"
-    mv "$kvip_dir" "$backup/KVIP"
-    echo "Previous KVIP preserved: $backup/KVIP"
-fi
-git clone --branch "$branch" https://gitcode.com/CacheOS/KVIP.git "$kvip_dir"
-git -C "$kvip_dir" checkout --detach "$revision"
-echo "KVIP source ready: $kvip_dir @ $revision (git-ignored external dependency)"
 if [[ "$source_only" == true ]]; then
-    exit 0
+    exec bash "$kvip_dir/scripts/build.sh" --prepare-only --kvaf-root "$kvaf_dir" --transport ubmem
 fi
-# Preserve a different checkout (including local patches/builds) before switching versions.
-kvaf_dir="$repo_dir/third_party/KVAF"
-if [[ -e "$kvaf_dir" ]] && {
-    [[ "$(git -C "$kvaf_dir" rev-parse HEAD)" != "$kvaf_revision" ]] ||
-    grep -q 'kvaf_build_isolated_urma_get' "$kvaf_dir/access_operator/demo/aiv_batch_get/kernel/CMakeLists.txt" 2>/dev/null
-}; then
-    backup="$(mktemp -d "$repo_dir/third_party/KVAF-backup.XXXXXX")"
-    mv "$kvaf_dir" "$backup/KVAF"
-    echo "Previous KVAF preserved: $backup/KVAF"
-    # A changed SDK must be rebuilt even if --skip-kvaf-build was supplied.
-    build_args=()
-fi
-# The UBmem KVAF build includes URMA. Build UBmem first, then warm the
-# original URMA LIFetch cache against exactly the same KVAF checkout.
 bash "$kvip_dir/scripts/build.sh" --kvaf-root "$kvaf_dir" --transport ubmem ${build_args[@]+"${build_args[@]}"}
 PYTHONPATH="$kvip_dir/python${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON:-python3}" - "$kvaf_dir/build-npu" <<'PYBUILD'
 import sys

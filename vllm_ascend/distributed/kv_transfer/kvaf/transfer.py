@@ -195,8 +195,6 @@ class KVTransfer:
         if self.verify is not None:
             logger.info("KVAF Put verification enabled: decode Put remains synchronous for safe Get readback")
             return
-        if any(not getattr(runtime, "supports_background_put", False) for runtime in self.runtimes.values()):
-            raise RuntimeError("Rebuild KVAF with scripts/install_kvip.sh for GIL-free background Put")
         self.put_stream = torch.npu.Stream(device=device)
         self.put_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvaf-put")
 
