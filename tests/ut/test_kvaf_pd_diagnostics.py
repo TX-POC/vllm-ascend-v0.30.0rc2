@@ -112,8 +112,8 @@ class TestPDDiagnosticFlow(unittest.TestCase):
         f = self.fixture
         native = f.native.batch_get_raw_addr
 
-        def corrupt(ready, *args):
-            result = native(ready, *args)
+        def corrupt(ready, *args, **kwargs):
+            result = native(ready, *args, **kwargs)
             args[3].view(torch.uint8).reshape(-1)[int(args[1][0])] ^= 1
             return result
 

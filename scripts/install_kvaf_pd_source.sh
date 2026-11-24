@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Run in the existing matched torch/torch_npu/CANN container.
 set -euo pipefail
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-    echo "Usage: $0 VLLM_SOURCE_OR_- KVAF_SOURCE [KVAF_BUILD]" >&2
+if [[ $# != 3 ]]; then
+    echo "Usage: $0 VLLM_SOURCE_OR_- KVAF_CHECKOUT KVIP_CHECKOUT" >&2
     exit 2
 fi
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 vllm_source=$1
 kvaf_source=$(realpath "$2")
-kvaf_build=$(realpath -m "${3:-$kvaf_source/build-pd}")
+kvip_source=$(realpath "$3")
+kvaf_build="$kvaf_source/build-npu"
 python_bin=${KVAF_PD_PYTHON:-python3}
 if [[ $vllm_source != - ]]; then
     vllm_source=$(realpath "$vllm_source")
@@ -24,7 +25,6 @@ else
     "$python_bin" -c 'import vllm; print("Using installed vLLM", vllm.__version__)'
 fi
 "$python_bin" -m pip install --no-deps --no-build-isolation -e "$root"
-bash "$root/third_party/KVOP/build.sh" "${KVAF_PD_BUILD_JOBS:-8}" "$python_bin"
-KVAF_PD_PYTHON="$python_bin" bash "$root/scripts/install_kvaf_pd.sh" "$kvaf_source" "$kvaf_build"
+KVAF_PD_PYTHON="$python_bin" bash "$root/scripts/install_kvaf_pd.sh" "$kvaf_source" "$kvip_source"
 PYTHONPATH="$kvaf_build/python${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -c \
     'import vllm, vllm_ascend, kvaf; from vllm_ascend.distributed.kv_transfer.kvaf.pd.connector import PDKVoffloadConnector; print("PD_SOURCE_INSTALL_OK", vllm.__version__, kvaf.__file__)'

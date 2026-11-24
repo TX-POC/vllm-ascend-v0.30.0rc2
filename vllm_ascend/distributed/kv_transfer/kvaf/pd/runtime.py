@@ -2,15 +2,12 @@
 """Worker-only SDK setup and serialization shared with native Decode Get."""
 
 import importlib
-import os
-from dataclasses import replace
 from pathlib import Path
 from threading import RLock
 
 from ..adapter import BYTES_PER_GIB, SLOT_ALIGNMENT, KVAFAdapter
-from ..cache_policy import CacheFeedbackManager
 from ..layout import grouped_layouts
-from ..transfer import KVTransfer, verify_put_block
+from ..transfer import KVTransfer
 from .initialization import initialization_slot
 
 
@@ -20,6 +17,11 @@ class PDTransfer(KVTransfer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.receiving, self.deferred_release = set(), set()
+
+    def start_decode_put(self, device):
+        # The receive path shares a Runtime and its lock with ordinary Get/Put.
+        # A background Put cannot drain while the runner holds that lock.
+        pass
 
     @property
     def lock(self):
@@ -76,6 +78,7 @@ class SerializedRuntime:
                     "wait_cpu_pull",
                     "commit_put",
                     "abort_put",
+                    "cancel_cpu_pull",
                     "resolve_raw_addr",
                     "cancel_raw_addr",
                     "shutdown",
@@ -90,48 +93,70 @@ class SerializedRuntime:
 
 def load_sdk(build_dir):
     build_dir = Path(build_dir).expanduser().resolve()
-    # HCCL owns device RA after native worker initialization. The separately
-    # shipped SDK patch implements explicit borrowing before the first RaInit.
-    # This affects only the explicitly selected external Worker process.
-    os.environ["KVAF_REUSE_DEVICE_RA"] = "1"
     sdk = importlib.import_module("kvaf")
-    if not getattr(getattr(sdk, "_native", None), "reuse_device_ra_supported", False):
-        raise RuntimeError("build PD SDK with scripts/install_kvaf_pd.sh to borrow HCCL device RA explicitly")
     if not Path(sdk.__file__).resolve().is_relative_to(build_dir / "python" / "kvaf"):
         raise RuntimeError(f"KVAF imported outside configured build directory {build_dir}")
-    for name in ("NpuRuntime", "CpuPullHbmSource", "NpuPullHbmSource"):
+    for name in (
+        "NpuRuntime",
+        "CpuPullHbmSource",
+        "NpuPullHbmSource",
+        "CpuPullOptions",
+        "NpuPullOptions",
+        "ExecutionResources",
+        "PutExecutionConfig",
+        "GetExecutionConfig",
+    ):
         if not hasattr(sdk, name):
-            raise RuntimeError(f"build the cpu-pull-hbm-reference SDK with {name}")
-    for name in ("listen_hbm", "cancel_raw_addr", "submit_cpu_pull", "batch_get_raw_addr"):
+            raise RuntimeError(f"PD requires unified KVAF main binding {name}")
+    for name in (
+        "listen_hbm",
+        "cancel_raw_addr",
+        "cancel_cpu_pull",
+        "submit_cpu_pull",
+        "batch_get_raw_addr",
+        "graph_resources",
+    ):
         if not hasattr(sdk.NpuRuntime, name):
-            raise RuntimeError(f"KVAF multi-MR Pull API v2 requires NpuRuntime.{name}; rebuild SDK and K together")
+            raise RuntimeError(f"KVAF main multi-MR Pull requires NpuRuntime.{name}; rebuild SDK and K together")
+    if not hasattr(sdk.NpuPullOptions, "verify_completion"):
+        raise RuntimeError("rebuild PD KVAF with scripts/install_kvaf_pd.sh for checked synchronous raw READ")
     for kind, field in (("ReadyToken", "mr_id"), ("CpuPullSourceDesc", "mr_length")):
         if not hasattr(sdk, kind) or not hasattr(getattr(sdk, kind), field):
-            raise RuntimeError(f"KVAF multi-MR Pull API v2 requires {kind}.{field}; rebuild SDK and K together")
+            raise RuntimeError(f"KVAF main multi-MR Pull requires {kind}.{field}; rebuild SDK and K together")
     return sdk
 
 
 class PDAdapter(KVAFAdapter):
-    def __init__(self, *args, cpu_eid="", initialization_coordinator="", initialization_timeout=120.0, **kwargs):
+    def __init__(
+        self, *args, cpu_eid="", initialization_coordinator="", initialization_timeout=120.0, receive_layers, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.cpu_eid = cpu_eid
+        self.receive_layers = receive_layers
         self.initialization_coordinator = initialization_coordinator
         self.initialization_timeout = initialization_timeout
 
     def bind_caches(self, kv_caches):
-        self.writer = PDTransfer(
-            self.runtimes,
-            self.slot_counts,
-            self.layouts,
-            kv_caches,
-            verify=verify_put_block if self.config.verify_put else None,
+        self._bind_caches(kv_caches, PDTransfer)
+
+    def _create_runtime(self, sdk, kernels, token_bytes, block_size, **options):
+        return super()._create_runtime(
+            sdk,
+            kernels,
+            token_bytes,
+            block_size,
+            cpu_pull_options=sdk.CpuPullOptions(timeout_ms=int(self.initialization_timeout * 1000)),
+            npu_pull_options=sdk.NpuPullOptions(
+                kernel_path=str(kernels["get_raw_addr"]),
+                cores=self.config.npu_core_count,
+                jettys=self.config.jettys_per_core,
+                # Each connection can write into one stable arena per model layer.
+                max_output_bindings=self.receive_layers,
+                verify_completion=True,
+            ),
+            npu_eids=[self.cpu_eid] if self.cpu_eid else [],
+            **options,
         )
-        sources = {name: group for group in self.writer.groups for name in group.layout.layer_names}
-        self.writer.groups = [
-            replace(sources[layout.layer_names[0]], layout=layout, geometry=(656, 128))
-            for layout in self.target_layouts
-        ]
-        self.writer.feedback = CacheFeedbackManager(self.writer, log_context=self._log_context)
 
     def connect(self):
         if self.runtimes:
@@ -155,18 +180,7 @@ class PDAdapter(KVAFAdapter):
         slots = int(self.config.ddr_size_gb * BYTES_PER_GIB) // slot_size
         if slots < len(self.target_layouts):
             raise ValueError("DDR budget cannot hold one page per Target layer")
-        native = sdk.NpuRuntime(
-            batch_get_kernel_object_path=str(kernels["get"]),
-            batch_put_kernel_object_path=str(kernels["put"]),
-            batch_get_raw_addr_kernel_object_path=str(kernels["get_raw_addr"]),
-            batch_get_token_bytes=656,
-            batch_get_tokens_per_block=128,
-            device_id=self.device_id,
-            npu_core_count=self.config.npu_core_count,
-            jettys_per_core=self.config.jettys_per_core,
-            enable_cpu_offload=True,
-            npu_eids=[self.cpu_eid] if self.cpu_eid else [],
-        )
+        native = self._create_runtime(sdk, kernels, 656, 128)
         runtime = SerializedRuntime(native)
         self.runtimes[656, 128] = runtime
         self.slot_counts[656, 128] = slots
@@ -180,6 +194,8 @@ class PDAdapter(KVAFAdapter):
                 runtime.link_to(self.cpu_address)
                 runtime.initialize()
                 runtime.initialize_ddr(slots * slot_size, slot_size)
+                # Main allocates CPU Pull resources lazily at ticket export.
+                runtime.offload_region()
         except BaseException:
             self.close()
             raise

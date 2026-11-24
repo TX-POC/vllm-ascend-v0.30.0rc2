@@ -79,7 +79,7 @@ if [[ $dry_run == true ]]; then
     exit 0
 fi
 test -d "$build_dir/python/kvaf"
-source "$root/third_party/KVOP/env.sh"
+source "${KVAF_PD_KVIP_ROOT:-$root/third_party/KVIP}/scripts/env.sh"
 export PYTHONPATH="$build_dir/python${PYTHONPATH:+:$PYTHONPATH}"
 unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY all_proxy ALL_PROXY
 export VLLM_HOST_IP="$local_ip"

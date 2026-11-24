@@ -26,9 +26,10 @@ P/D 均使用物理 NPU `0,1,2,3,4,5,6,7`，网卡为 `enp34s0f1`，PP=1。
 | 项目 | 固定路径 / 版本 |
 | --- | --- |
 | 框架源码 | `/home/c00612283/vllm-ascend-v0.30.0rc2`，`v0.30.0rc2-develop` 分支 |
-| KVAF SDK 源码 | `/home/c00612283/KVAF-Devlop`，`codex/cpu-pull-hbm-reference` 分支 |
-| SDK 适配基准 | `74c3fc491a257bae73356da54eafb08e1e9e4e45` |
-| P/D SDK 构建目录 | `/home/c00612283/KVAF-Devlop/build-pd-py312` |
+| KVAF SDK 源码 | `/home/c00612283/KVAF-Devlop`，`main` 分支 |
+| SDK 适配基准 | `813f1750a50b7e6c92d5f5397f2fbc05befef6da` |
+| KVIP 源码 | `TX-POC/KVAF-KVIP/main`，固定 `d6cfd392f722dd3f96ef6e05175f503aac511dbb` |
+| P/D SDK 构建目录 | `/home/c00612283/KVAF-Devlop/build-npu` |
 | K CPU 构建目录 | `/home/c00612283/KVAF-Devlop/build-hostcpu-k` |
 | 模型 | `/home/models/GLM-5.3-w4a4c8-mxfp4` |
 | 容器 Python | `/usr/local/python3.12.13/bin/python3` |
@@ -78,12 +79,16 @@ cd /home/c00612283
 git clone --branch v0.30.0rc2-develop \
   https://github.com/TX-POC/vllm-ascend-v0.30.0rc2.git \
   vllm-ascend-v0.30.0rc2
-git clone --branch codex/cpu-pull-hbm-reference \
+git clone --branch main \
   https://github.com/TX-POC/KVAF-Devlop.git KVAF-Devlop
+git -C KVAF-Devlop switch --detach 813f1750a50b7e6c92d5f5397f2fbc05befef6da
+# 以下两条仅在 P/D 侧执行。
+git clone --branch main https://github.com/TX-POC/KVAF-KVIP.git vllm-ascend-v0.30.0rc2/third_party/KVIP
+git -C vllm-ascend-v0.30.0rc2/third_party/KVIP switch --detach d6cfd392f722dd3f96ef6e05175f503aac511dbb
 ```
 
 分支头可能前进，克隆后核对版本再编译；同一轮部署保存并统一实际使用的提交。
-K 运行协调器仅需框架脚本文件，无需在宿主机 pip 安装或编译 vLLM、vLLM-Ascend、KVOP。
+K 运行协调器仅需框架脚本文件，无需在宿主机 pip 安装或编译 vLLM、vLLM-Ascend、KVIP。
 K 仍需单独编译下一节所述的 KVAF CPU 服务。
 
 P/D/Proxy 使用容器中可达的业务 IP。P 到全部 D 控制端口和 SDK ticket 中的动态 HBM 端口、
@@ -92,9 +97,15 @@ P/D 到 K `28997`、D 到协调器 `28998`、Proxy 到 P `8100` 与 D `8200` 必
 
 ## 2. 编译安装：P/D 容器各执行一次
 
-以下是用户提供的实际编译脚本，去除重复粘贴并补齐子 shell。
-`-` 表示保留现有 vLLM，仍会构建安装 vLLM-Ascend、KVOP 和 KVAF；不要替换已配套的 vLLM、torch 或 torch_npu。
-K 宿主机不要执行本节的 NPU 编译。
+P/D 采用统一 SDK 和外部 KVIP 的配套构建。已有旧产物应保存在独立目录，以便整套回滚。
+`-` 表示保留现有 vLLM，仍会构建安装 vLLM-Ascend、KVIP 和 KVAF；不要替换已配套的 vLLM、torch 或 torch_npu。
+K 宿主机不要执行本节的 NPU 编译。P/D 使用同一套补丁后的 SDK，所有 K 使用对应版本的 CPU 服务。
+本版首次部署沿用 URMA 与 `batch_get`，共享 K 端口沿用初始化协调器。
+保留既有 P/D/K 构建目录。切换前排空当前请求，回滚时整套恢复。
+
+PD 逐层 raw READ 使用传输 stream 的同步完成和设备状态检查。常规 Decode Get 与 release 编译图复用
+对应的 Runtime 资源。首轮继续使用同步的 Decode 池内 Put，以免后台作业与 PD 接收持有同一 Runtime 锁。
+启用 LIFetch 的 release 配置适用于混布路径。
 
 ```bash
 (
@@ -103,11 +114,12 @@ set -euo pipefail
 export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
 export ASCEND_REPO=/home/c00612283/vllm-ascend-v0.30.0rc2
 export KVAF_PD_SRC=/home/c00612283/KVAF-Devlop
-export KVAF_PD_BUILD=/home/c00612283/KVAF-Devlop/build-pd-py312
+export KVIP_SRC="$ASCEND_REPO/third_party/KVIP"
 export MODEL=/home/models/GLM-5.3-w4a4c8-mxfp4
 export SOC_VERSION=ascend950dt_9582
 
 CANN_ROOT=/usr/local/Ascend/cann-9.2.0
+export ASCEND_CANN_PACKAGE_PATH="$CANN_ROOT"
 
 # 加载本次日志中使用的 CANN 环境。
 set +u
@@ -135,10 +147,10 @@ command -v g++
 
 # “-”表示保留现有 vLLM，仍编译安装 vLLM-Ascend。
 if bash scripts/install_kvaf_pd_source.sh - \
-    "$KVAF_PD_SRC" "$KVAF_PD_BUILD" \
+    "$KVAF_PD_SRC" "$KVIP_SRC" \
     2>&1 | tee /home/c00612283/full-model-pd-build.log
 then
-    echo "ASCEND_KVOP_KVAF_BUILD_OK"
+    echo "ASCEND_KVIP_KVAF_BUILD_OK"
 else
     echo "构建失败，提取具体错误："
     grep -n -B 15 -A 40 -m 1 \
@@ -164,21 +176,21 @@ else
 fi
 ```
 
-加载失败时先修正环境，再执行启动脚本。脚本会各自加载 KVOP，并优先导入指定 SDK binding。
+加载失败时先修正环境，再执行启动脚本。脚本会各自加载 KVIP，并优先导入指定 SDK binding。
 可在两个容器各做一次最终导入检查：
 
 ```bash
 (
 set -euo pipefail
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
-source third_party/KVOP/env.sh
-export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+source third_party/KVIP/scripts/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 /usr/local/python3.12.13/bin/python3 - <<'CHECK'
 import torch
 import torch_npu
 import vllm_ascend.vllm_ascend_C as extension
 from vllm_ascend.distributed.kv_transfer.kvaf.pd.runtime import load_sdk
-sdk = load_sdk('/home/c00612283/KVAF-Devlop/build-pd-py312')
+sdk = load_sdk('/home/c00612283/KVAF-Devlop/build-npu')
 print('ASCEND_EXTENSION_OK', extension.__file__)
 print('PD_SDK_IMPORT_OK', sdk.__file__)
 CHECK
@@ -186,7 +198,7 @@ CHECK
 ```
 
 `connector_pull_api_design.md` 缺失表示 SDK 路径或分支需核对，不要创建空文件绕过检查。
-安装入口会检查/应用已有 device RA 借用补丁；补丁不匹配时先核对源码版本。
+安装入口复用统一 SDK 的 RA 生命周期，并应用 checked raw READ 补丁。D 仅在同步 raw READ 的设备状态验证通过后上报 HBM 完成。
 
 ## 3. K CPU 服务：24 号宿主机
 
@@ -325,8 +337,8 @@ set -euo pipefail
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
 unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY
 unset http_proxy HTTP_PROXY all_proxy ALL_PROXY
-source third_party/KVOP/env.sh
-export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+source third_party/KVIP/scripts/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 
 local_ip=141.62.38.24
 nic_name=enp34s0f1
@@ -422,7 +434,7 @@ exec /usr/local/python3.12.13/bin/python3 \
       "npu_core_count": 1,
       "jettys_per_core": 1,
       "enabled": true,
-      "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312",
+      "build_dir": "/home/c00612283/KVAF-Devlop/build-npu",
       "cpu_address": "141.62.38.24:28997",
       "ddr_size_gb": 16
     }
@@ -465,8 +477,8 @@ cd /home/c00612283/vllm-ascend-v0.30.0rc2
 unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY
 unset http_proxy HTTP_PROXY all_proxy ALL_PROXY
 
-source third_party/KVOP/env.sh
-export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+source third_party/KVIP/scripts/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 
 local_ip=141.62.38.12
 nic_name=enp34s0f1
@@ -562,7 +574,7 @@ exec /usr/local/python3.12.13/bin/python3 \
     "c8_enable_reshape_optim": false,
     "kvaf_config": {
       "enabled": false,
-      "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312"
+      "build_dir": "/home/c00612283/KVAF-Devlop/build-npu"
     }
   }'
 P_SCRIPT

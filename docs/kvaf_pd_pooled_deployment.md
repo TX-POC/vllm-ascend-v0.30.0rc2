@@ -29,7 +29,7 @@
 共 14 份完整脚本，每份直接声明本机环境、路径、启动命令和配置。
 P/D 使用原生 CLI 和内联 JSON；K、协调器、Proxy 包含各自后台启动与就绪检查。
 可将单份脚本复制到对应服务器后独立执行，不需要同目录的其他模板文件。
-运行仍需要本机已安装的框架、KVOP、SDK 和模型。
+运行仍需要本机已安装的框架、KVIP、SDK 和模型。
 
 本版本移除了旧的 config.sh、start_npu.sh、k_start.sh；不再通过共享配置或编号参数转发。
 已有用户先备份本地脚本，再将配置填写到对应新脚本。所有入口均不接收参数，也不支持 --dry-run。
@@ -73,10 +73,10 @@ numactl 绑定不等同于固定 SDK 的 URMA/EID 候选，仍需验证实际内
 ## 3. 安装与启动前修改
 
 四个智算容器保持相同模型、tokenizer、CANN/torch_npu、框架提交及 SDK 构建版本。
-八个 K 宿主机使用同一 SDK 提交。基准 SDK 为 codex/cpu-pull-hbm-reference 的
-`74c3fc491a257bae73356da54eafb08e1e9e4e45`，不可混用旧 Pull 协议。
+八个 K 宿主机使用同一 SDK 提交。基准 SDK 为 main 的
+`813f1750a50b7e6c92d5f5397f2fbc05befef6da`，不可混用旧 Pull 协议。
 
-四个 NPU 容器分别执行用户在 2026-11-11 验证过的完整编译命令。
+四个 NPU 容器分别执行配套构建。
 该块自行加载 CANN，保留现有 vLLM，并保存完整构建日志：
 
 ```bash
@@ -86,11 +86,12 @@ set -euo pipefail
 export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
 export ASCEND_REPO=/home/c00612283/vllm-ascend-v0.30.0rc2
 export KVAF_PD_SRC=/home/c00612283/KVAF-Devlop
-export KVAF_PD_BUILD=/home/c00612283/KVAF-Devlop/build-pd-py312
+export KVIP_SRC="$ASCEND_REPO/third_party/KVIP"
 export MODEL=/home/models/GLM-5.3-w4a4c8-mxfp4
 export SOC_VERSION=ascend950dt_9582
 
 CANN_ROOT=/usr/local/Ascend/cann-9.2.0
+export ASCEND_CANN_PACKAGE_PATH="$CANN_ROOT"
 set +u
 if [ -f "$CANN_ROOT/set_env.sh" ]; then
     source "$CANN_ROOT/set_env.sh"
@@ -114,10 +115,10 @@ command -v ninja
 command -v g++
 
 if bash scripts/install_kvaf_pd_source.sh - \
-    "$KVAF_PD_SRC" "$KVAF_PD_BUILD" \
+    "$KVAF_PD_SRC" "$KVIP_SRC" \
     2>&1 | tee /home/c00612283/full-model-pd-build.log
 then
-    echo "ASCEND_KVOP_KVAF_BUILD_OK"
+    echo "ASCEND_KVIP_KVAF_BUILD_OK"
 else
     echo "构建失败，提取具体错误："
     grep -n -B 15 -A 40 -m 1 \
@@ -129,7 +130,7 @@ fi
 )
 ```
 
-同版本 Ascend 原生扩展和 KVOP 已成功构建时，可用基础指南的 SDK-only 构建步骤。
+同版本 Ascend 原生扩展和 KVIP 已成功构建时，可用基础指南的 SDK-only 构建步骤。
 检查实际导入路径及 listen_hbm、cancel_raw_addr、ReadyToken.mr_id 等接口。
 安装入口保留现有 HCCL device RA 借用补丁，本次模板调整不修改 SDK。
 
@@ -182,7 +183,7 @@ K0 的协调器及后台就绪检查只依赖 Python 标准库，使用宿主机
 
 | 脚本 | 需核对的配置 |
 | --- | --- |
-| p0/p1 | 本机 IP/网卡；P0 DP 主地址；16 个 decode_endpoints；Python、模型、KVOP、SDK 路径 |
+| p0/p1 | 本机 IP/网卡；P0 DP 主地址；16 个 decode_endpoints；Python、模型、KVIP、SDK 路径 |
 | d0/d1 | 本机 IP/网卡；D0 DP 主地址；协调器地址；本机完整 cpu_addresses；相同模型和 SDK 路径 |
 | k0～k7 | 本机 local_ip、numa_nodes、两个端口、K_BIN、日志路径 |
 | coordinator | K0 local_ip、port、COORDINATOR 路径；使用宿主机 command -v python3 |

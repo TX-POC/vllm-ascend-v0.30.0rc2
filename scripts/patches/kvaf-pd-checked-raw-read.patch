@@ -1,0 +1,276 @@
+diff --git a/bindings/src/npu_python_runtime.cc b/bindings/src/npu_python_runtime.cc
+index 5c86827..71102ea 100644
+--- a/bindings/src/npu_python_runtime.cc
++++ b/bindings/src/npu_python_runtime.cc
+@@ -1551,20 +1551,22 @@ void BindNpuPythonRuntime(py::module_& module) {
+       .def_readonly("timeout_ms", &CpuPullOptions::timeout_ms);
+   py::class_<NpuPullOptions>(module, "NpuPullOptions")
+       .def(py::init([](std::string kernel_path, std::uint32_t cores, std::uint32_t jettys,
+-                       std::uint32_t inflight, std::uint32_t output_bindings, bool diagnostics) {
++                       std::uint32_t inflight, std::uint32_t output_bindings, bool diagnostics,
++                       bool verify_completion) {
+         NpuPullOptions value; value.kernel_path = std::move(kernel_path);
+         value.cores = cores; value.jettys = jettys; value.max_inflight_total = inflight;
+         value.max_output_bindings = output_bindings;
+-        value.diagnostics = diagnostics; return value;
++        value.diagnostics = diagnostics; value.verify_completion = verify_completion; return value;
+       }), py::kw_only(), py::arg("kernel_path") = "", py::arg("cores") = 2,
+           py::arg("jettys") = 2, py::arg("max_inflight_total") = 0,
+           py::arg("max_output_bindings") = 64,
+-          py::arg("diagnostics") = false)
++          py::arg("diagnostics") = false, py::arg("verify_completion") = false)
+       .def_readonly("kernel_path", &NpuPullOptions::kernel_path)
+       .def_readonly("cores", &NpuPullOptions::cores).def_readonly("jettys", &NpuPullOptions::jettys)
+       .def_readonly("max_inflight_total", &NpuPullOptions::max_inflight_total)
+       .def_readonly("max_output_bindings", &NpuPullOptions::max_output_bindings)
+-      .def_readonly("diagnostics", &NpuPullOptions::diagnostics);
++      .def_readonly("diagnostics", &NpuPullOptions::diagnostics)
++      .def_readonly("verify_completion", &NpuPullOptions::verify_completion);
+ 
+   auto runtime = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
+   python_binding::BindNpuRuntimeConstructor(runtime);
+@@ -1583,7 +1585,7 @@ void BindNpuPythonRuntime(py::module_& module) {
+            "Caller keeps metadata/storage and stream alive through completion and graph destruction, "
+            "and owns stream ordering, graph lifetime and producer reuse. "
+            "synchronize=True waits for completion. profile=True adds Host timings; device event timing "
+-           "is available only with synchronize=True. Device status is not read back. "
++           "is available only with synchronize=True. NpuPullOptions.verify_completion checks the device result. "
+            "Output storage is retained until successful Runtime shutdown; do not resize storage while registered. "
+            "One WQE per request, without splitting. Callers guarantee valid, disjoint ranges and lengths in "
+            "1..UINT32_MAX within device READ limits. validate_ranges=True enables length/bounds diagnostics.")
+diff --git a/runtime/include/npu_runtime.h b/runtime/include/npu_runtime.h
+index ef9fbee..af076c9 100644
+--- a/runtime/include/npu_runtime.h
++++ b/runtime/include/npu_runtime.h
+@@ -24,6 +24,7 @@ struct NpuPullOptions {
+   // Per-source cache capacity for distinct output address/size registrations.
+   std::uint32_t max_output_bindings{64};
+   bool diagnostics{false};
++  bool verify_completion{false};  // Validate device completion for synchronous raw READ.
+ };
+ struct NpuRuntimeOptions : ExecutionPolicy {
+   // Providers are discovered from the build and prepared on first use.
+diff --git a/runtime/src/hbm_read_client.cc b/runtime/src/hbm_read_client.cc
+index 1d409e5..28cdd45 100644
+--- a/runtime/src/hbm_read_client.cc
++++ b/runtime/src/hbm_read_client.cc
+@@ -91,8 +91,9 @@ struct Engine {
+   std::uint32_t cores,jettys,budget;
+   std::uint64_t mr_id{1};
+   bool statuses_initialized{};
++  std::vector<KvafRawReadCoreStatus> completion_status;
+   bool uncertain{},kernel_finished{},cache_output{};
+-  bool diagnostics{};
++  bool diagnostics{}, verify_completion{};
+   aclrtStream probe_stream{};
+   aclrtEvent profile_start{},profile_end{};
+   Engine(std::uint32_t c,std::uint32_t j,std::uint32_t b):cores(c),jettys(j),budget(b){
+@@ -174,7 +175,7 @@ struct Engine {
+       auto allocated=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!allocated.ok())return allocated;
+     }
+     // Device diagnostics are initialized once, like ordinary BatchGet. The
+-    // Host does not copy or interpret them on the synchronous READ path.
++    // Checked READ clears the status on its own stream before each launch.
+     if(!statuses_initialized) {
+       if(aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
+         return Status::Internal("initialize raw READ status");
+@@ -205,10 +206,18 @@ struct Engine {
+     args.output=reinterpret_cast<std::uint64_t>(output.data);
+     args.core_status=reinterpret_cast<std::uint64_t>(statuses.data);args.queue_state=reinterpret_cast<std::uint64_t>(queues.data);
+     args.channel_entity=entity;args.block_count=cores;args.jettys_per_core=jettys;args.batch_get_max_inflight_total=budget;
+-    if(diagnostics && aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
+-      return Status::Internal("clear raw READ diagnostic status");
++    // PD uses the synchronous offsets path as its receive-completion proof.
++    // Probe and asynchronous/captured reads keep their existing contracts.
++    const bool check_completion = diagnostics ||
++        (verify_completion && synchronize && args.input_mode == KVAF_RAW_NPU_OFFSETS);
++    if (check_completion) completion_status.resize(cores);
+     kernel_finished=false;
+-    uncertain=true; // Includes launch errors: never assume the device saw no work.
++    uncertain=true;
++    if (check_completion) {
++      if (aclrtMemsetAsync(statuses.data, statuses.bytes, 0, statuses.bytes,
++                         static_cast<aclrtStream>(stream)) != ACL_SUCCESS)
++        return Status::CompletionUnknown("clear raw READ completion status uncertain");
++    }
+     if(profile && synchronize)profile->event_error=Timed(&profile->event_record_us,[&]{
+       return aclrtRecordEvent(profile_start,static_cast<aclrtStream>(stream));});
+     if(Timed(profile?&profile->launch_us:nullptr,[&]{
+@@ -224,17 +233,24 @@ struct Engine {
+         return Status::CompletionUnknown("raw READ launch/stream completion uncertain");
+       kernel_finished=true;
+     }
++    if (check_completion) {
++      if (Timed(profile ? &profile->status_us : nullptr, [&] {
++            return aclrtMemcpy(completion_status.data(), statuses.bytes, statuses.data,
++                               statuses.bytes, ACL_MEMCPY_DEVICE_TO_HOST);
++          }) != ACL_SUCCESS)
++        return Status::CompletionUnknown("raw READ completion status unavailable; retain source and output");
++      if (!raw_read_debug::AllRequestsCompleted(args, completion_status.data()) && !diagnostics)
++        return Status::CompletionUnknown("raw READ did not complete all requests; retain source and output");
++    }
+     if(diagnostics) {
+-      std::vector<KvafRawReadCoreStatus> status(cores);
+       std::vector<KvafBatchGetQueueState> queue(cores*jettys);
+       std::vector<KvafBatchGetDirectUrmaEntity> entities(cores*jettys);
+-      if(aclrtMemcpy(status.data(),statuses.bytes,statuses.data,statuses.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS ||
+-          aclrtMemcpy(queue.data(),queues.bytes,queues.data,queues.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS ||
++      if(aclrtMemcpy(queue.data(),queues.bytes,queues.data,queues.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS ||
+           aclrtMemcpy(entities.data(),entities.size()*sizeof(entities.front()),reinterpret_cast<void*>(entity),
+               entities.size()*sizeof(entities.front()),ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
+         return Status::CompletionUnknown("raw READ diagnostic snapshot failed; retain source and output");
+-      std::fprintf(stderr,"%s",raw_read_debug::Format(args,status.data(),queue.data(),entities.data()).c_str());
+-      if(!raw_read_debug::AllRequestsCompleted(args,status.data()))
++      std::fprintf(stderr,"%s",raw_read_debug::Format(args,completion_status.data(),queue.data(),entities.data()).c_str());
++      if(!raw_read_debug::AllRequestsCompleted(args,completion_status.data()))
+         return Status::CompletionUnknown("raw READ kernel diagnostic failed; inspect HBM_READ_CORE_DIAGNOSTIC; retain source and output");
+     }
+     if(profile && synchronize && !profile->event_error) {
+@@ -262,7 +278,7 @@ struct Connection {
+ }
+ struct HbmReader::Impl {
+   std::uint32_t device,cores,jettys,budget,max_outputs;
+-  bool diagnostics{};
++  bool diagnostics{}, verify_completion{};
+   std::string kernel;
+   mutable std::recursive_mutex mutex;
+   HbmReceiverTicket receiver;
+@@ -287,10 +303,11 @@ struct HbmReader::Impl {
+   }
+ };
+ HbmReader::HbmReader(std::uint32_t d,std::uint32_t c,std::uint32_t j,std::uint32_t b,std::string k,
+-    std::uint32_t max_outputs,bool diagnostics):
++    std::uint32_t max_outputs,bool diagnostics,bool verify_completion):
+     impl_(new Impl{}) {
+   impl_->device=d;impl_->cores=c;impl_->jettys=j;impl_->budget=b;impl_->kernel=std::move(k);
+   impl_->max_outputs=max_outputs;impl_->diagnostics=diagnostics;
++  impl_->verify_completion=verify_completion;
+ }
+ HbmReader::~HbmReader(){if(!Shutdown().ok()){
+   impl_->stop=true;if(impl_->thread.joinable())impl_->thread.join();
+@@ -412,6 +429,7 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
+     auto owned=std::make_shared<Connection>(control,ticket,local_eid,impl_->cores,impl_->jettys,impl_->budget);
+     auto& c=*owned;
+     c.engine.diagnostics=c.engine.diagnostics || impl_->diagnostics;
++    c.engine.verify_completion=impl_->verify_completion;
+     {std::lock_guard<std::recursive_mutex> lock(impl_->mutex);impl_->connections.emplace(key,owned);}
+     std::unique_lock<std::mutex> connection_lock(c.mutex);
+     auto request=hr::Make(hr::Command::Open,ticket,c.link->client);request.candidate=b;
+@@ -546,6 +564,8 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
+     if(address>UINT64_MAX-bytes || (address<=base ? base-address<bytes : address-base<output.bytes))
+       return Status::InvalidArgument("NPU raw READ metadata must not overlap output");
+   }
++  if (c.engine.verify_completion && !synchronize)
++    return Status::InvalidArgument("checked raw READ requires synchronize=true");
+   const auto output_key=std::make_pair(reinterpret_cast<std::uintptr_t>(output.data),output.bytes);
+   if(!c.outputs.count(output_key)) {
+     if(c.outputs.size()>=impl_->max_outputs)return Status::Busy("raw output binding budget exhausted");
+diff --git a/runtime/src/hbm_read_client.h b/runtime/src/hbm_read_client.h
+index 4fa2532..4825e20 100644
+--- a/runtime/src/hbm_read_client.h
++++ b/runtime/src/hbm_read_client.h
+@@ -9,7 +9,8 @@ class HbmReader {
+  public:
+   HbmReader(std::uint32_t device, std::uint32_t cores, std::uint32_t jettys,
+             std::uint32_t budget, std::string kernel,
+-            std::uint32_t max_outputs = 64, bool diagnostics = false);
++            std::uint32_t max_outputs = 64, bool diagnostics = false,
++            bool verify_completion = false);
+   ~HbmReader();
+   Status Listen(const std::string& address, const std::string& advertise_address,
+                 const std::string& local_eid, HbmReceiverTicket*);
+diff --git a/runtime/src/npu_runtime.cc b/runtime/src/npu_runtime.cc
+index dc16080..4fc0970 100644
+--- a/runtime/src/npu_runtime.cc
++++ b/runtime/src/npu_runtime.cc
+@@ -940,7 +940,7 @@ Status NpuRuntime::ListenHbm(const std::string& address,const std::string& adver
+     if(kernel.empty())kernel=detail::kDefaultRawReadKernelPath;
+     if(kernel.empty())return Status::InvalidArgument("configure npu_pull_options.kernel_path");
+     impl_->hbm_reader=std::make_shared<HbmReader>(device_id(),o.cores,o.jettys,
+-        o.max_inflight_total,kernel,o.max_output_bindings,o.diagnostics);
++        o.max_inflight_total,kernel,o.max_output_bindings,o.diagnostics,o.verify_completion);
+   }
+   return impl_->hbm_reader->Listen(address,advertised,local_eid,receiver);
+ #else
+diff --git a/tests/diagnostics/run_pull_host_checks.sh b/tests/diagnostics/run_pull_host_checks.sh
+index c0ce203..e717de2 100755
+--- a/tests/diagnostics/run_pull_host_checks.sh
++++ b/tests/diagnostics/run_pull_host_checks.sh
+@@ -52,6 +52,7 @@ for check in get_recovery profile eid wire region recovery transaction raw_model
+ done
+ run "$KVAF_CHECK_BUILD/raw_runtime" launch-failure
+ run "$KVAF_CHECK_BUILD/raw_runtime" sync-failure
++run "$KVAF_CHECK_BUILD/raw_runtime" checked-status
+ if [[ -n "${KVAF_TEST_URMA_INCLUDE_DIR:-}" ]]; then
+   compile urma -I"$KVAF_TEST_URMA_INCLUDE_DIR" -Wl,-export_dynamic \
+     tests/cpu_pull_urma_test.cc runtime/src/cpu_pull_urma.cc
+diff --git a/tests/hbm_read_test.cc b/tests/hbm_read_test.cc
+index fdd62c4..48b5d58 100644
+--- a/tests/hbm_read_test.cc
++++ b/tests/hbm_read_test.cc
+@@ -64,6 +64,12 @@ extern "C" aclError aclrtMemcpyAsync(void* dst,std::size_t capacity,const void*
+   // A status copy would be counted and fail the no-readback assertions below.
+   fake_stream_tasks[stream].push_back([=]{std::memcpy(dst,src,bytes);});return 0;
+ }
++extern "C" aclError aclrtMemsetAsync(void* dst,std::size_t capacity,int value,
++                                     std::size_t bytes,aclrtStream stream) {
++  Require(bytes<=capacity,"reset fits status buffer");
++  EnqueueRawTask(stream,[=]{std::memset(dst,value,bytes);});
++  return 0;
++}
+ extern "C" aclError aclrtSynchronizeStream(aclrtStream stream) {
+   Require(capturing_stream!=stream,"raw READ must not synchronize during graph capture");
+   ++raw_syncs;
+@@ -532,9 +538,40 @@ void SubmissionFailure(const std::string& mode) {
+   std::_Exit(0);
+ }
+ 
++void CheckedReadRejectsStaleStatus() {
++  raw_mode=true;fake_device=0;
++  std::vector<uint8_t> source(4096,0x67),output(128);
++  kvaf::HbmReader reader(0,2,2,2048,"fake.o",64,false,true);
++  kvaf::HbmReceiverTicket receiver;
++  Check(reader.Listen("127.0.0.1:0","",reader_eid,&receiver));
++  Proxy proxy(receiver);
++  kvaf::NpuPullHbmSource producer(0,producer_eid);
++  auto stream=reinterpret_cast<void*>(1);
++  Check(producer.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},proxy.receiver,stream));
++  kvaf::ReadyToken token;
++  int64_t src=7,dst=11,bytes=64;
++  auto read=[&](bool synchronize) {
++    return reader.Read(token,{&src,1},{&dst,1},{&bytes,1},
++                       {output.data(),output.size(),kvaf::DeviceKind::kNpu},
++                       stream,nullptr,false,synchronize);
++  };
++  Check(producer.Ready(&token));
++  Require(!read(false).ok(),"checked READ must wait for device completion");
++  Check(read(true));
++  Check(producer.ReleaseBatch(token));
++  Check(producer.Ready(&token));
++  skip_status_core=1;
++  const auto status=read(true);
++  Require(status.code()==kvaf::StatusCode::kCompletionUnknown && reader.pending() && producer.frozen(),
++          "missing device status cannot reuse a previous successful batch or release the source");
++  Require(!reader.Resolve(token).ok(),"unresolved READ cannot be promoted to completion");
++  std::_Exit(0);  // The unresolved device operation deliberately retains its resources.
++}
++
+ int main(int argc,char** argv){try{
+   if(argc==2) {
+     const std::string mode=argv[1];
++    if(mode=="checked-status") CheckedReadRejectsStaleStatus();
+     Require(mode=="launch-failure"||mode=="sync-failure","known ACL fault mode");
+     SubmissionFailure(mode);
+   }
+diff --git a/tests/offload_fake_acl/acl/acl.h b/tests/offload_fake_acl/acl/acl.h
+index 9e5c0b7..bca3f86 100644
+--- a/tests/offload_fake_acl/acl/acl.h
++++ b/tests/offload_fake_acl/acl/acl.h
+@@ -20,6 +20,7 @@ aclError aclrtFree(void*);
+ aclError aclrtMallocHost(void**, std::size_t);
+ aclError aclrtFreeHost(void*);
+ aclError aclrtMemset(void*, std::size_t, int, std::size_t);
++aclError aclrtMemsetAsync(void*, std::size_t, int, std::size_t, aclrtStream);
+ aclError aclrtCreateStream(aclrtStream*);
+ aclError aclrtDestroyStream(aclrtStream);
+ aclError aclrtSynchronizeStream(aclrtStream);

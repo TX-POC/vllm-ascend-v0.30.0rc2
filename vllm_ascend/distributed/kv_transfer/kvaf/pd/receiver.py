@@ -578,6 +578,8 @@ class Receiver:
                 if job.error is not None and transfer is None:
                     if path == "npu":
                         self._cancel_npu_ready(ready)
+                    else:
+                        self.runtime.cancel_cpu_pull(ready)
                     job.completed[key] = ready.sequence
                     job.path_errors[key] = job.error
                     return {"error": str(job.error)}
@@ -650,18 +652,35 @@ class Receiver:
                 raise
 
     def _resolve_failure(self, transfer, job, ready, path):
-        if isinstance(transfer, CpuPullTransfer):
-            if transfer.committed:
-                return True
+        if path == "cpu":
+            if isinstance(transfer, CpuPullTransfer) and transfer.committed:
+                return True  # DMA is complete even if catalog publication failed.
             try:
-                transfer.abort()
+                keys = ()
+                if isinstance(transfer, CpuPullTransfer):
+                    if transfer.decision == "commit":
+                        return False
+                    if not transfer.put.submitted:
+                        transfer.abort()
+                    keys = [entry.key for entry in transfer.put.entries]
+                elif isinstance(transfer, dict):
+                    put = transfer["put"]
+                    if put is None:
+                        # Prepare raised before returning a handle. The slots may still be reserved.
+                        return False
+                    self.runtime.abort_put(put)
+                    keys = transfer["keys"]
+                self.runtime.cancel_cpu_pull(ready)
+                if keys:
+                    group = self.writer.groups[self.pool.indices[job.layer]]
+                    pool = self.writer.slots[group.geometry]
+                    pool.recycle(pool.release(keys))
             except Exception:
                 return False
-            group = self.writer.groups[self.pool.indices[job.layer]]
-            pool = self.writer.slots[group.geometry]
-            pool.free.extend(pool.release([entry.key for entry in transfer.put.entries]))
             return True
         if path == "npu" and not self.runtime.pending_raw_addr:
+            if transfer is not None and transfer.completion_uncertain:
+                return False
             try:
                 self._cancel_npu_ready(ready)
                 return True
@@ -670,15 +689,7 @@ class Receiver:
         return False
 
     def _cancel_npu_ready(self, ready):
-        try:
-            self.runtime.cancel_raw_addr(ready)
-        except Exception:
-            if not self.runtime.pending_raw_addr:
-                raise
-            # Resolve only the already-pending cancellation; never issue READ.
-            self.runtime.resolve_raw_addr(ready)
-            if self.runtime.pending_raw_addr:
-                raise RuntimeError("NPU Ready cancellation remains unresolved")
+        self.runtime.cancel_raw_addr(ready)
 
     def _cpu_pull(self, job, batch, ready, *, submit_only=False):
         group_index = self.pool.indices[job.layer]
@@ -688,7 +699,9 @@ class Receiver:
         blocks = job.plan.full_blocks[begin : begin + MAX_SEGMENTS]
         if not blocks or blocks[0] != len(state.keys):
             raise ValueError("DDR main prefix has a gap or a duplicate")
-        keys = self.writer.slots[group.geometry].take(len(blocks))
+        self.writer.configure_slot_regions()
+        after = state.keys[-1] + 1 if state.keys else None
+        keys = self.writer.slots[group.geometry].take(len(blocks), region=group_index, after=after)
         # Retain reserved keys even if Prepare raises after a remote decision.
         reservation = {"keys": keys, "put": None}
         job.transfers.append(reservation)

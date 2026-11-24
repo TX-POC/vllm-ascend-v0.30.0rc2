@@ -115,6 +115,7 @@ class ACLGraphWrapper:
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
         self.graph_pool = current_platform.get_global_graph_pool()
+        self.capture_stream = None
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -207,7 +208,7 @@ class ACLGraphWrapper:
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
                 try:
-                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                    with torch.npu.graph(aclgraph, pool=self.graph_pool, stream=self.capture_stream):
                         # `output` is managed by pytorch's aclgraph pool
                         with super_kernel_scope("full_model", self.enable_super_kernel):
                             output = self.runnable(*args, **kwargs)

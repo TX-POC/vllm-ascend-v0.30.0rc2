@@ -6,10 +6,11 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace as NS
 
-import test_kvaf_adapter as helpers
 import torch
-from test_kvaf_grouped_get import Runtime
-from test_kvaf_prefill import Manager, Writer
+
+from tests.ut.kvaf import test_adapter as helpers
+from tests.ut.kvaf.test_grouped_get import Runtime
+from tests.ut.kvaf.test_prefill import Manager, Writer
 
 backend = importlib.import_module(f"{helpers.PACKAGE.__name__}.pd.backend")
 
@@ -58,7 +59,8 @@ class TestPDBackend(unittest.TestCase):
                     .view(torch.uint8)
                 )
             state.keys.extend(keys)
-            self.writer._publish_addresses(group, keys, [(state, len(keys))])
+            addresses = self.writer._read_addresses(group, keys)
+            self.writer._publish_result(addresses, [(state, len(keys))])
             if tokens % 128 and bind_tail:
                 tail = torch.full((128, 656), 120, dtype=torch.int8)
                 tail[: tokens % 128] = self.values(torch.arange(tokens // 128 * 128, tokens), i)[:, None]

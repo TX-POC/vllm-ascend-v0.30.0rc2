@@ -25,10 +25,10 @@ K1/K2 上相同的端口号属于不同主机，不冲突；协调器端口不�
 ### 1.1 源码与编译准备
 
 - P/D 框架使用同一 `v0.30.0rc2-develop` 提交，目录为 `/home/c00612283/vllm-ascend-v0.30.0rc2`。
-- P/D 和两个 K 的 SDK 使用同一 `codex/cpu-pull-hbm-reference` 提交；当前适配基准为 `74c3fc491a257bae73356da54eafb08e1e9e4e45`。
-- P/D 的 Python binding 为 `/home/c00612283/KVAF-Devlop/build-pd-py312`；K 的 CPU 二进制来自 `build-hostcpu-k`。
-- 模型为 `/home/models/GLM-5.3-w4a4c8-mxfp4`；容器使用 Python 3.12.13、配套 CANN/ATB 和 KVOP。
-- 两个 K 各安装匹配 UMDK/liburma、C++ 编译器、CMake、numactl 和宿主机 Python3；不需要编译完整 vLLM/Ascend/KVOP。
+- P/D 和两个 K 的 SDK 使用同一 `main` 提交；当前适配基准为 `813f1750a50b7e6c92d5f5397f2fbc05befef6da`。
+- P/D 的 Python binding 为 `/home/c00612283/KVAF-Devlop/build-npu`；K 的 CPU 二进制来自 `build-hostcpu-k`。
+- 模型为 `/home/models/GLM-5.3-w4a4c8-mxfp4`；容器使用 Python 3.12.13、配套 CANN/ATB 和 KVIP。
+- 两个 K 各安装匹配 UMDK/liburma、C++ 编译器、CMake、numactl 和宿主机 Python3；不需要编译完整 vLLM/Ascend/KVIP。
 
 完整 P/D 编译和 K CPU-only CMake 命令见 [双机部署指南](kvaf_pd_2nodes_deployment.md) 的编译章节。
 P/D 容器各编译一次，K1/K2 宿主机各编译一次；该指南原单 K 的 `.24:28997` 启动地址不用于本拓扑，
@@ -522,8 +522,8 @@ cd /home/c00612283/vllm-ascend-v0.30.0rc2
 unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY
 unset http_proxy HTTP_PROXY all_proxy ALL_PROXY
 
-source third_party/KVOP/env.sh
-export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+source third_party/KVIP/scripts/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 
 local_ip=141.62.38.12
 nic_name=enp34s0f1
@@ -619,7 +619,7 @@ exec /usr/local/python3.12.13/bin/python3 \
     "c8_enable_reshape_optim": false,
     "kvaf_config": {
       "enabled": false,
-      "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312"
+      "build_dir": "/home/c00612283/KVAF-Devlop/build-npu"
     }
   }'
 P_SCRIPT
@@ -645,8 +645,8 @@ set -euo pipefail
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
 unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY
 unset http_proxy HTTP_PROXY all_proxy ALL_PROXY
-source third_party/KVOP/env.sh
-export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+source third_party/KVIP/scripts/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 
 local_ip=141.62.38.24
 nic_name=enp34s0f1
@@ -744,7 +744,7 @@ exec /usr/local/python3.12.13/bin/python3 \
     "npu_core_count": 1,
     "jettys_per_core": 1,
     "enabled": true,
-    "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312",
+    "build_dir": "/home/c00612283/KVAF-Devlop/build-npu",
     "ddr_size_gb": 16,
     "cpu_addresses": {
       "0": "141.62.38.71:28997",

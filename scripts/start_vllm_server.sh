@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run inside the container after install_vllm_in_container.sh.
-# Usage: bash scripts/start_vllm_server.sh
+# Usage: bash scripts/start_vllm_server.sh [--kvip-root KVIP_CHECKOUT]
 
-# ---- Editable configuration (user-tested GLM-5.3 TP8 baseline) ----
+# ---- Editable configuration (GLM-5.3 TP1 / DP8 with KVAF) ----
 model_path="/home/models/GLM-5.3-w4a4c8-mxfp4"
 served_model_name="glm"
 host="0.0.0.0"
@@ -10,10 +10,10 @@ port=8080
 nic_name="enp34s0f1"
 local_ip="141.62.38.12"
 device_ids="0,1,2,3,4,5,6,7"
-tensor_parallel_size=8
+tensor_parallel_size=1
 routed_experts=0 # 0: full model; positive: retain the first N routed experts per MoE layer (GLM only).
-data_parallel_size=1
-data_parallel_size_local=1
+data_parallel_size=8
+data_parallel_size_local=8
 data_parallel_address="$local_ip"
 data_parallel_rpc_port=13389
 max_num_seqs=16
@@ -22,12 +22,28 @@ max_num_batched_tokens=4096
 gpu_memory_utilization=0.95
 hccl_buffsize=400
 enable_dsa_cp=false # true or false: DSA context parallelism.
-kvaf_enabled=false # Target hot decode + transient prefill + DDR prefix cache.
+kvaf_enabled=true # Target hot decode + transient prefill + DDR prefix cache.
 kvaf_cpu_address="127.0.0.1:28999"
-kvaf_cpu_addresses='{}' # JSON: physical NPU ID -> host:port; unlisted cards use kvaf_cpu_address.
-kvaf_build_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party/KVAF/build-npu"
-kvaf_ddr_size_gb=1 # Per NPU worker; TP8 allocates up to 8 times this amount.
-kvaf_hot_tokens=8192 # History tokens per request/layer; ABC remains 384 tokens.
+kvaf_cpu_addresses='{
+  "0":"127.0.0.1:28880",
+  "1":"127.0.0.1:28881",
+  "2":"127.0.0.1:28882",
+  "3":"127.0.0.1:28883",
+  "4":"127.0.0.1:28884",
+  "5":"127.0.0.1:28885",
+  "6":"127.0.0.1:28886",
+  "7":"127.0.0.1:28887"
+}' # JSON: physical NPU ID -> host:port; unlisted cards use kvaf_cpu_address.
+kvip_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party/KVIP"
+kvaf_build_dir=""
+kvaf_ddr_size_gb=128 # Per NPU worker; TP8 allocates up to 8 times this amount.
+kvaf_transport=urma # urma or ubmem.
+kvaf_decode_backend=batch_get # batch_get (native LI/LIDU/Get) or li_fetch.
+kvaf_prefetch_tokens=1024 # Total prefetch tokens/request/round; final repair is not capped.
+kvaf_intermediate_fetches=4 # Includes the initial hot window; li_fetch only.
+kvaf_hot_tokens=16384 # History tokens per request/layer; excludes ABC.
+kvaf_put_interval_steps=32 # One shared decode Put window across requests.
+kvaf_put_overlap_steps=8 # Extra ABC space for forward/Put overlap; wait only before reuse.
 kvaf_verify_put=false # Validation: read back the first prefill/decode block per worker and compare bytes.
 profiler_enabled=true # Configure on-demand /start_profile and /stop_profile; does not start capture.
 profiler_dir="$PWD/profiling/$(date +%Y%m%d_%H%M%S)"
@@ -35,8 +51,16 @@ profiler_dir="$PWD/profiling/$(date +%Y%m%d_%H%M%S)"
 
 # Use the container shell's CANN/ATB environment, as in the verified launch.
 set -euo pipefail
+if (( $# )); then
+    if [[ $# != 2 || "$1" != "--kvip-root" || ! -f "$2/scripts/env.sh" ]]; then
+        echo "Usage: bash scripts/start_vllm_server.sh [--kvip-root KVIP_CHECKOUT]" >&2
+        exit 2
+    fi
+    kvip_root="$(cd "$2" && pwd)"
+fi
 if [[ "$kvaf_enabled" == true ]]; then
-    source "$(dirname "${BASH_SOURCE[0]}")/../third_party/KVOP/env.sh"
+    source "$kvip_root/scripts/env.sh"
+    kvaf_build_dir="$(dirname "$(dirname "$KVAF_BATCH_GET_KERNEL")")"
 fi
 
 # Only this service process drops proxies; container installs can still use them.
@@ -77,11 +101,11 @@ export HCCL_ASYNC_ERROR_HANDLING=0
 printf 'Starting %s on %s:%s\nModel: %s\nAscend logs: %s\n' \
     "$served_model_name" "$host" "$port" "$model_path" "$ASCEND_PROCESS_LOG_PATH"
 
-additional_config="$(python3 - "$enable_dsa_cp" "$kvaf_enabled" "$kvaf_cpu_address" "$kvaf_build_dir" "$kvaf_ddr_size_gb" "$kvaf_cpu_addresses" "$kvaf_verify_put" "$kvaf_hot_tokens" <<'PY'
+additional_config="$(python3 - "$enable_dsa_cp" "$kvaf_enabled" "$kvaf_cpu_address" "$kvaf_build_dir" "$kvaf_ddr_size_gb" "$kvaf_cpu_addresses" "$kvaf_verify_put" "$kvaf_hot_tokens" "$kvaf_decode_backend" "$kvaf_intermediate_fetches" "$kvaf_put_interval_steps" "$kvaf_put_overlap_steps" "$kvaf_prefetch_tokens" "$kvaf_transport" <<'PY'
 import json
 import sys
 
-dsa_cp, enabled, address, build_dir, ddr_gb, addresses, verify, hot_tokens = sys.argv[1:]
+dsa_cp, enabled, address, build_dir, ddr_gb, addresses, verify, hot_tokens, backend, windows, put_interval, put_overlap, prefetch_tokens, transport = sys.argv[1:]
 if any(value not in ("true", "false") for value in (dsa_cp, enabled, verify)):
     raise SystemExit("enable_dsa_cp, kvaf_enabled and kvaf_verify_put must be true or false")
 config = {"enable_dsa_cp": dsa_cp == "true", "enable_cpu_binding": True,
@@ -90,7 +114,8 @@ if enabled == "true":
     config["kvaf_config"] = {
         "enabled": True, "cpu_address": address, "cpu_addresses": json.loads(addresses),
         "build_dir": build_dir, "ddr_size_gb": float(ddr_gb), "verify_put": verify == "true",
-        "hot_tokens": int(hot_tokens)
+        "hot_tokens": int(hot_tokens), "decode_backend": backend, "intermediate_fetches": int(windows),
+        "prefetch_tokens": int(prefetch_tokens), "transport": transport, "put_interval_steps": int(put_interval), "put_overlap_steps": int(put_overlap)
     }
 print(json.dumps(config))
 PY

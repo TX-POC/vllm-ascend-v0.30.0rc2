@@ -13,12 +13,31 @@ class KVAFConfig:
     cpu_addresses: dict[str, str] = field(default_factory=dict)  # Physical NPU ID -> host:port; overrides cpu_address.
     build_dir: str = ""
     ddr_size_gb: float = 1.0
-    hot_tokens: int = 8192  # Per request/layer; excludes the fixed 384-token ABC tail.
+    hot_tokens: int = 8192  # Per request/layer; excludes the computed ABC tail.
+    put_interval_steps: int = 32
+    put_overlap_steps: int = 8
     npu_core_count: int = 2
     jettys_per_core: int = 2
+    transport: str = "urma"  # KVAF transport, fixed for the worker lifetime.
+    decode_backend: str = "batch_get"  # batch_get or li_fetch; fixed for the worker lifetime.
+    intermediate_fetches: int = 4  # LIFetch windows, including the initial hot window; 1..32.
+    prefetch_tokens: int = 1024  # Per request/round; divided equally across LIFetch windows.
     verify_put: bool = False  # Read back one prefill and one decode block per worker for byte comparison.
 
     def __post_init__(self) -> None:
+        if self.transport not in ("urma", "ubmem"):
+            raise ValueError("kvaf_config.transport must be urma or ubmem")
+        if self.decode_backend not in ("batch_get", "li_fetch"):
+            raise ValueError("kvaf_config.decode_backend must be batch_get or li_fetch")
+        if type(self.intermediate_fetches) is not int or not 1 <= self.intermediate_fetches <= 32:
+            raise ValueError("kvaf_config.intermediate_fetches must be an integer in 1..32")
+        if type(self.prefetch_tokens) is not int or not 0 <= self.prefetch_tokens <= 2048:
+            raise ValueError("kvaf_config.prefetch_tokens must be an integer in 0..2048")
+        if self.decode_backend == "li_fetch" and (
+            self.prefetch_tokens % self.intermediate_fetches
+            or self.prefetch_tokens // self.intermediate_fetches > 480
+        ):
+            raise ValueError("prefetch_tokens must divide evenly into windows, with at most 480 tokens/window")
         if type(self.enabled) is not bool:
             raise ValueError("kvaf_config.enabled must be true or false")
         if type(self.verify_put) is not bool:
@@ -39,11 +58,22 @@ class KVAFConfig:
             raise ValueError("kvaf_config.ddr_size_gb must be finite and positive (per worker)")
         if type(self.hot_tokens) is not int or self.hot_tokens < 8192 or self.hot_tokens % 128:
             raise ValueError("kvaf_config.hot_tokens must be an integer >= 8192 and a multiple of 128")
+        if self.decode_backend == "li_fetch" and self.hot_tokens % 256:
+            raise ValueError("li_fetch requires hot_tokens aligned to the original kernel's 256-token tiles")
+        for name in ("put_interval_steps", "put_overlap_steps"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"kvaf_config.{name} must be a positive integer")
         # Limits of the pinned KVAF native runtime.
         for name, maximum in (("npu_core_count", 48), ("jettys_per_core", 64)):
             value = getattr(self, name)
             if type(value) is not int or not 0 < value <= maximum:
                 raise ValueError(f"kvaf_config.{name} must be an integer in 1..{maximum}")
+
+    def abc_tokens(self, max_queries):
+        from .layout import BLOCK_SIZE, TAIL
+
+        tokens = TAIL + max_queries * (self.put_interval_steps + self.put_overlap_steps)
+        return (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE * BLOCK_SIZE
 
     @classmethod
     def from_dict(cls, values: Any) -> "KVAFConfig":

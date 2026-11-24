@@ -7,8 +7,8 @@ set -euo pipefail
 # 如需加载环境，可在此手动启用：source /root/.bashrc
 unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY
 # shellcheck disable=SC1091
-source /home/c00612283/vllm-ascend-v0.30.0rc2/third_party/KVOP/env.sh
-export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+source /home/c00612283/vllm-ascend-v0.30.0rc2/third_party/KVIP/scripts/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 
 # 手动填写通信网卡与本机IP。
 nic_name=enp34s0f1
@@ -71,6 +71,6 @@ exec /usr/local/python3.12.13/bin/python3 -m vllm.entrypoints.cli.main serve /ho
     "c8_enable_reshape_optim": false,
     "kvaf_config": {
       "enabled": false,
-      "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312"
+      "build_dir": "/home/c00612283/KVAF-Devlop/build-npu"
     }
   }'

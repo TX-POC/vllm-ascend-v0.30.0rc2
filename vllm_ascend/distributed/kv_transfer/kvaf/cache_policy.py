@@ -11,7 +11,17 @@ import numpy as np
 import torch
 
 from .adapter import NativeCacheAdapter
-from .layout import BLOCK_SIZE, HISTORY, MAX_QUERIES, NATIVE_BITMAP_WORDS, SLOTS, TAIL, TOKEN_BYTES, TOPK
+from .layout import (
+    BLOCK_SIZE,
+    HISTORY,
+    MAX_QUERIES,
+    NATIVE_BITMAP_WORDS,
+    NATIVE_SLOT_CAPACITY,
+    SLOTS,
+    TAIL,
+    TOKEN_BYTES,
+    TOPK,
+)
 from .metrics import HotMissStats
 from .transfer import get_tokens
 
@@ -20,9 +30,21 @@ class DecodeHotCache(NativeCacheAdapter):
     slot_capacity = SLOTS
     history_capacity = HISTORY
 
-    def __init__(self, pool, native=None, staging_tokens=0, group_sizes=None, hot_tokens=HISTORY):
+    def __init__(
+        self,
+        pool,
+        native=None,
+        staging_tokens=0,
+        group_sizes=None,
+        hot_tokens=HISTORY,
+        tail_tokens=TAIL,
+    ):
         self.history_capacity = hot_tokens
-        self.slot_capacity = hot_tokens + TAIL
+        self.tail_tokens = tail_tokens
+        self.tail_start = hot_tokens
+        self.slot_capacity = self.tail_start + self.tail_tokens
+        if self.slot_capacity > NATIVE_SLOT_CAPACITY:
+            raise ValueError(f"LIDU resident slot budget exceeds {NATIVE_SLOT_CAPACITY}")
         if self.slot_capacity > pool.max_tokens:
             raise ValueError("KVAF hot slots exceed the token/slot map capacity")
         super().__init__(pool, native=native)
@@ -59,7 +81,10 @@ class DecodeHotCache(NativeCacheAdapter):
         self.owners = {}
         self.free = list(range(batch - 1, 0, -1))  # Row zero guards LI's -1 entries.
         self.snapshots = {}
+        self.published_pages = {}
+        self.page_clear_rows = set()
         self.writer = None
+        self.put_targets = {}
         self.bytes_outputs = []
         self.attention_caches = []
         self.abc_descriptors = torch.empty((layers, batch, 4), dtype=torch.int32, device=pool.device)
@@ -106,16 +131,20 @@ class DecodeHotCache(NativeCacheAdapter):
         logging.getLogger("vllm").info(
             "KVAF Get enabled: independent Target hot slots=%s+%s per request",
             self.history_capacity,
-            TAIL,
+            self.tail_tokens,
         )
 
     def release(self, req_id):
+        self.put_targets.pop(req_id, None)
         owner = self.owners.pop(req_id, None)
         if owner is not None:
             self.free.append(owner)
         for key in tuple(self.snapshots):
             if key[0] == req_id:
                 del self.snapshots[key]
+        for key in tuple(self.published_pages):
+            if key[0] == req_id:
+                del self.published_pages[key]
 
     def prepare(self, manager, *, decode, padded_requests):
         frame = manager.groups[0]
@@ -153,6 +182,14 @@ class DecodeHotCache(NativeCacheAdapter):
             descriptors_host = staging("abc_batch", self.abc_descriptors)
             candidate_values = candidates_host.numpy()
             candidate_values.fill(0)
+            reserved = getattr(self, "fused_reserved_hot", None)
+            if reserved is not None:
+                from kvip.adapters.vllm.inputs import committed_candidates
+
+                reserved_host = staging("reserved_hot_batch", reserved)
+                reserved_values = reserved_host.numpy()
+                reserved_values.fill(-1)
+                ordinals = np.arange(TOPK, dtype=np.int32)
             bitmap_values = bitmap_host.numpy()
             bitmap_values.fill(0)
             descriptors = descriptors_host.numpy()
@@ -172,7 +209,7 @@ class DecodeHotCache(NativeCacheAdapter):
                 if not 1 <= end - begin <= MAX_QUERIES:
                     raise ValueError("Hot Get supports 1..4 decode queries per request")
                 tokens = np.arange(progress.computed_tokens, progress.write_end)
-                writes[begin:end] = pool_row * self.slot_capacity + self.history_capacity + tokens % TAIL
+                writes[begin:end] = pool_row * self.slot_capacity + self.tail_start + tokens % self.tail_tokens
                 bases[begin:end] = pool_row * self.pool.max_tokens
                 table = np.arange(
                     pool_row * (self.slot_capacity // BLOCK_SIZE),
@@ -194,9 +231,9 @@ class DecodeHotCache(NativeCacheAdapter):
                     old = self.snapshots.get(key)
                     committed = len(source_state.addresses)
                     tail_begin = committed * BLOCK_SIZE
-                    if progress.write_end - tail_begin > TAIL:
+                    if progress.write_end - tail_begin > self.tail_tokens:
                         raise RuntimeError(
-                            "ABC tail exceeds three blocks; "
+                            "ABC tail exceeds configured capacity; "
                             f"request={req_id} layer={i} first_hot_round={old is None} "
                             f"computed={progress.computed_tokens} write_end={progress.write_end} "
                             f"scheduled={end - begin} committed_pages={committed} "
@@ -218,7 +255,7 @@ class DecodeHotCache(NativeCacheAdapter):
                         if progress.computed_tokens < TOPK:
                             # Short contexts bypass LIDU: keep committed pages
                             # densely mapped when they leave the ABC ring.
-                            self._seed(i, pool_row, source_state, old[0], tail_begin, False)
+                            self._promote_abc(i, pool_row, old[0], tail_begin)
                             dense_tokens = np.arange(old[0], tail_begin)
                             upload(
                                 ("dense_t", i, pool_row),
@@ -231,34 +268,35 @@ class DecodeHotCache(NativeCacheAdapter):
                                 dense_tokens,
                             )
                         else:
-                            maps.token_to_slot[pool_row, old[0] : tail_begin].fill_(-1)
+                            self.page_clear_rows.add(key)
                     descriptors[i, row_index] = (self.map_groups[i], pool_row, tail_begin, progress.write_end)
-                    if old is None or old[1] != committed:
-                        upload(
-                            ("addresses", i, pool_row), self.addresses[pool_row, i, :committed], source_state.addresses
-                        )
-                        upload(("valid", i, pool_row), self.valid[pool_row, i, :committed], 1)
                     candidates, bitmap = getattr(item.lru, "hot_snapshot", (None, None))
                     if candidates is None:
                         candidates = np.arange(TOPK, dtype=np.int32)
                         bitmap = np.zeros(NATIVE_BITMAP_WORDS, np.int32)
                         bitmap[: TOPK // 32] = -1
+                    if reserved is not None:
+                        candidates = committed_candidates(candidates, tail_begin, self.history_capacity)
                     candidate_values[i, row_index] = candidates
+                    if reserved is not None:
+                        reserved_values[i, row_index, candidates] = ordinals
                     bitmap_values[i, row_index, : len(bitmap)] = bitmap
                     self.snapshots[key] = (tail_begin, committed)
             # Whole [group, batch, ...] transfers, not one H2D per row.
             self.spare_slots.copy_(candidates_host, non_blocking=self.pool.on_npu)
+            if reserved is not None:
+                self.fused_reserved_hot.copy_(reserved_host, non_blocking=self.pool.on_npu)
             self.spare_bitmap.copy_(bitmap_host, non_blocking=self.pool.on_npu)
             self.abc_descriptors.copy_(descriptors_host, non_blocking=self.pool.on_npu)
-            from kvop.abc_update import update_abc
+            from kvip.cache.abc import update_abc
 
             update_abc(
                 self.pool.storage["token_to_slot"],
                 self.pool.storage["slot_to_token"],
                 self.abc_descriptors,
                 len(ids),
-                self.history_capacity,
-                TAIL,
+                self.tail_start,
+                self.tail_tokens,
             )
             table_owners = tuple(self.owners[req] for req in ids)
             if self.uploaded_table_owners != table_owners:
@@ -296,6 +334,14 @@ class DecodeHotCache(NativeCacheAdapter):
         if local_layer:
             # Preserve the SFA invalid-index sentinel after interleaving layers.
             return (self.mapped[layer] * width + local_layer).clamp_min(-1)
+        selector = self.indexer_selectors.get(layer)
+        if selector is not None:
+            # Selection already fetched these physical slots. Do not launch
+            # native LIDU/Get again or look up the pre-update logical mapping.
+            mapped = selector.slots(topk.shape[0]).view_as(topk)
+            self.mapped[layer] = mapped
+            self.destinations[layer, : topk.shape[0]].copy_(mapped.view(-1, 1, TOPK))
+            return mapped if width == 1 else (mapped * width).clamp_min(-1)
         super().run(layer, topk, metadata)
         batch = metadata.cum_query_lens.shape[0]
         runtime = self.writer.runtimes[self.writer.groups[layer].geometry]
@@ -327,9 +373,29 @@ logger = logging.getLogger("vllm")
 
 
 class KVCachePolicy(DecodeHotCache):
-    def __init__(self, pool, max_tokens, max_model_len, native=None, group_sizes=None, hot_tokens=HISTORY):
+    def __init__(
+        self,
+        pool,
+        max_tokens,
+        max_model_len,
+        native=None,
+        group_sizes=None,
+        hot_tokens=HISTORY,
+        fused_history=0,
+        tail_tokens=TAIL,
+        put_interval_steps=1,
+    ):
         staging = ((max_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + pool.max_requests) * BLOCK_SIZE
-        super().__init__(pool, native, staging_tokens=staging, group_sizes=group_sizes, hot_tokens=hot_tokens)
+        super().__init__(
+            pool,
+            native,
+            staging_tokens=staging,
+            group_sizes=group_sizes,
+            hot_tokens=hot_tokens,
+            tail_tokens=tail_tokens,
+        )
+        self.put_interval_steps = put_interval_steps
+        self.put_step = 0
         self.stage_start = pool.max_requests * self.slot_capacity
         self.decode_writes = self.write_slots
         self.all_writes = torch.full((max(max_tokens, self.max_queries),), -1, dtype=torch.int64, device=pool.device)
@@ -370,13 +436,92 @@ class KVCachePolicy(DecodeHotCache):
             self.local_offsets[width] = torch.arange(width, dtype=torch.int64, device=pool.device)[:, None]
         if max(self.group_sizes) > 1:
             width = max(self.group_sizes)
-            self.group_context = torch.empty(
-                (pool.max_requests - 1, length, width, TOKEN_BYTES), dtype=torch.int8, device=pool.device
-            )
+            # KVAF's scheduler admits one prompt computation per step. Keep
+            # its four-layer history until the group's last layer consumes it;
+            # subsequent steps reuse this address on the ordered compute stream.
+            self.group_context = torch.empty((1, length, width, TOKEN_BYTES), dtype=torch.int8, device=pool.device)
         self.context_offsets_by_width = {w: self.context_offsets * w for w in set(self.group_sizes)}
         self.plans = {}
         self.decode_frames = ()
         self.only_decode = True
+        self.indexer_selectors = {}
+        self.fused_selectors_by_batch = {}
+        self.fused_query_inputs = ()
+        self.fused_index_storage = ()
+        self.fused_workspace = None
+        self.fused_setup = None
+        self.fused_outputs = None
+        self.fused_fetch_rows = None
+        self.fused_errors = None
+        self.fused_reserved_hot = None
+        if fused_history:
+            from kvip.adapters.vllm.index_import import VllmIndexCacheStorage
+
+            self.fused_index_storage = tuple(
+                VllmIndexCacheStorage(torch, pool.max_requests, fused_history, hot_tokens, pool.device)
+                for _ in self.group_sizes
+            )
+            # Per-group storage: all groups are prepared before forward.
+            # Use the same compact decode-row order as spare_slots.
+            self.fused_reserved_hot = torch.full(
+                (len(self.group_sizes), pool.max_requests, hot_tokens),
+                -1,
+                dtype=torch.int32,
+                device=pool.device,
+            )
+            # Stable TND outputs survive subsequent shared-layer consumers and
+            # are budgeted before HBM profiling, not allocated during capture.
+            self.fused_outputs = torch.zeros(
+                (len(self.group_sizes), 2, (pool.max_requests - 1) * MAX_QUERIES, 1, TOPK),
+                dtype=torch.int32,
+                device=pool.device,
+            )
+            # Original v9 row ABI, retained per group for one asynchronous upload.
+            self.fused_fetch_rows = torch.zeros(
+                (len(self.group_sizes), pool.max_requests - 1, 256),
+                dtype=torch.int32,
+                device=pool.device,
+            )
+            self.fused_errors = torch.zeros(
+                (len(self.group_sizes), pool.max_requests - 1),
+                dtype=torch.int32,
+                device=pool.device,
+            )
+
+        from kvip.cache.page_updates import PageUpdates
+
+        self.page_updates = PageUpdates(
+            torch,
+            self.addresses,
+            self.valid,
+            self.pool.storage["token_to_slot"],
+            fused=tuple(storage.addresses for storage in self.fused_index_storage),
+            widths=self.group_sizes,
+            token_bytes=TOKEN_BYTES,
+            block_size=BLOCK_SIZE,
+        )
+
+    def _publish_page_updates(self, ring):
+        rows = []
+        counts = []
+        for plan in self.plans.values():
+            for group, state in enumerate(self.writer.requests[plan.request]):
+                key = (plan.request, group)
+                previous = self.published_pages.get(key, 0)
+                count = len(state.addresses)
+                base = (plan.owner * len(self.group_sizes) + group) * self.qcap
+                map_base = (self.map_groups[group] * self.pool.max_requests + plan.owner) * self.pool.max_tokens
+                for page in range(previous, count):
+                    clear = map_base + page * BLOCK_SIZE if key in self.page_clear_rows else -1
+                    rows.append((base + page, state.addresses[page], clear))
+                counts.append((key, count, plan.owner, group))
+        # Existing done[ring] protects this pinned buffer; compute-stream order
+        # publishes addresses and clears retired ABC mappings before forward.
+        self.page_updates.submit(rows, ring)
+        for key, count, owner, group in counts:
+            self.published_pages[key] = count
+            if self.fused_index_storage:
+                self.fused_index_storage[group].published[owner] = count
 
     @property
     def nbytes(self):
@@ -393,7 +538,87 @@ class KVCachePolicy(DecodeHotCache):
             )
             for t in d.values()
         ]
-        return super().nbytes + sum(t.numel() * t.element_size() for t in tensors)
+        return (
+            super().nbytes
+            + sum(t.numel() * t.element_size() for t in tensors)
+            + self.page_updates.nbytes
+            + sum(storage.nbytes for storage in self.fused_index_storage)
+            + (0 if self.fused_workspace is None else self.fused_workspace.nbytes)
+        )
+
+    def initialize_fused_workspace(self, config, device_id, soc, index_heads=64):
+        """Allocate shared LI work memory before the runner profiles HBM."""
+        if config.transport == "ubmem":
+            from kvip.adapters.vllm.binding import prepare_workspace
+
+            prepare_workspace(torch, self, config, device_id, soc, index_heads=index_heads)
+            return
+        from kvip.operators.lifetch import geometry
+        from kvip.operators.lifetch.workspace import LIFetchWorkspace
+        from kvip.runtime.build import kvaf_build_paths
+        from kvip.runtime.device import query_device_resources
+
+        if not self.fused_index_storage or self.fused_workspace is not None:
+            raise RuntimeError("Fused Index storage must be initialized exactly once")
+        cann, headers = kvaf_build_paths(config.build_dir)
+        resources = query_device_resources(cann, device_id)
+        aics = resources["effective_aic"]
+        batch = self.pool.max_requests - 1  # Owner zero is the padding guard.
+        shape = geometry.li_geometry(batch, "auto", config.intermediate_fetches, aics)
+        if shape["logical_aic_tasks"] > aics:
+            raise ValueError("LIFetch maximum request batch exceeds concurrently resident LI tasks")
+        final_workers = geometry.final_aivs(batch, "auto", aics)
+        queues = max(batch * (final_workers + 1), 2 * batch + 16)
+        workers = (queues + 1) // 2
+        self.fused_setup = SimpleNamespace(
+            cann=cann,
+            headers=headers,
+            soc=soc,
+            aics=aics,
+            batch=batch,
+            windows=config.intermediate_fetches,
+            workers=max(config.npu_core_count, workers),
+        )
+        self.fused_workspace = LIFetchWorkspace(
+            torch,
+            batch=batch,
+            history=self.fused_index_storage[0].history,
+            aics=aics,
+            windows=config.intermediate_fetches,
+            device=self.pool.device,
+            index_heads=index_heads,
+        )
+        self.fused_workspace.allocate_rotation(
+            torch,
+            batch=batch,
+            history=self.fused_index_storage[0].history,
+            resident=self.history_capacity,
+            aics=aics,
+            windows=config.intermediate_fetches,
+        )
+
+    def select_fused_batch(self, config, batch, *, dummy=False):
+        if not self.indexer_selectors:
+            return
+        if not 1 <= batch <= self.fused_setup.batch:
+            raise ValueError(f"LIFetch graph batch {batch} exceeds service capacity {self.fused_setup.batch}")
+        if batch not in self.fused_selectors_by_batch:
+            from kvip.adapters.vllm.binding import bind_selectors
+
+            self.fused_selectors_by_batch[batch] = bind_selectors(torch, self, config, batch=batch)
+        self.indexer_selectors = self.fused_selectors_by_batch[batch]
+        if dummy:
+            for index, selector in enumerate(self.indexer_selectors.values()):
+                selector.prepare((), prepare_inputs=index == 0)
+            selector.inputs.query_ends.zero_()
+            # All groups share the packed query metadata.
+            self.fused_query_inputs = (selector.inputs,)
+
+    def prepare_indexer_metadata(self, layer, local_layer, metadata):
+        # Indexer metadata can be reused across layers/steps. Always overwrite
+        # the selector, including native/prefill steps, rather than leaving a
+        # stale callback from a previous group attached to the shared object.
+        metadata.topk_selector = self.indexer_selectors.get(layer) if local_layer == 0 else None
 
     def write_slots_for(self, layer, local_layer):
         width = self.group_sizes[layer]
@@ -436,10 +661,16 @@ class KVCachePolicy(DecodeHotCache):
                     synchronize=True,
                 )
         logger.info(
-            "KVAF grouped Get: groups=%s widths=%s; one LIDU/Get per group; prefill history workspace=%.2f MiB",
+            "KVAF grouped Get: groups=%s widths=%s; one LIDU/Get per group; "
+            "max_prefill_requests=1; prefill history workspace=%.2f MiB",
             len(self.group_sizes),
             self.group_sizes,
             (self.context.numel() + (0 if self.group_context is None else self.group_context.numel())) / (1 << 20),
+        )
+        if self.pool.on_npu:
+            self.writer.start_decode_put(self.pool.device)
+        logger.info(
+            "KVAF decode Put schedule: interval_steps=%s ABC_tokens=%s", self.put_interval_steps, self.tail_tokens
         )
         logger.info(
             "KVAF Target HBM: original full-length pages removed; transient prefill tokens=%s; "
@@ -451,6 +682,8 @@ class KVCachePolicy(DecodeHotCache):
 
     def prepare(self, manager, *, decode, padded_requests):
         # Phase is request-local. Never stall/reject a normal mixed batch.
+        self.writer.poll_put()
+        self.page_clear_rows.clear()
         frame = manager.groups[0]
         self.plans = {}
         selected = []
@@ -478,8 +711,16 @@ class KVCachePolicy(DecodeHotCache):
             )
             self.plans[req_id] = plan
             if is_decode:
+                # The high-water end also covers asynchronous MTP correction:
+                # positions may move backwards, but never beyond this scheduled end.
                 committed = min(len(states.addresses) for states in self.writer.requests[req_id]) * BLOCK_SIZE
-                if progress.write_end - committed > TAIL and progress.computed_tokens - committed <= TAIL:
+                if progress.write_end - committed > self.tail_tokens:
+                    self.writer.poll_put(wait=True)
+                    committed = min(len(s.addresses) for s in self.writer.requests[req_id]) * BLOCK_SIZE
+                if (
+                    progress.write_end - committed > self.tail_tokens
+                    and progress.computed_tokens - committed <= self.tail_tokens
+                ):
                     logger.warning(
                         "KVAF ABC backpressure: request=%s committed=%s computed=%s; "
                         "publishing stable tail before the next forward",
@@ -487,7 +728,10 @@ class KVCachePolicy(DecodeHotCache):
                         committed,
                         progress.computed_tokens,
                     )
-                    self.publish(req_id, max(0, progress.computed_tokens // BLOCK_SIZE - 1) * BLOCK_SIZE)
+                    # Use only lengths confirmed after prior MTP corrections;
+                    # prepare-time computed_tokens may still be optimistic.
+                    targets = {req: tokens for req, tokens in self.put_targets.items() if req in frame.request_ids}
+                    self.writer.publish_batch(self, targets, "decode")
                 selected.append(index)
             else:
                 stage += (
@@ -497,7 +741,9 @@ class KVCachePolicy(DecodeHotCache):
                 prefix = progress.computed_tokens % BLOCK_SIZE
                 if prefix:
                     source = (
-                        owner * self.slot_capacity + self.history_capacity + (progress.computed_tokens - prefix) % TAIL
+                        owner * self.slot_capacity
+                        + self.tail_start
+                        + (progress.computed_tokens - prefix) % self.tail_tokens
                     )
                     self._copy_slots(source, plan.stage, prefix)
         ids = tuple(frame.request_ids[i] for i in selected)
@@ -526,18 +772,14 @@ class KVCachePolicy(DecodeHotCache):
         for plan in self.plans.values():
             if plan.decode:
                 values[plan.begin : plan.stop] = (
-                    plan.owner * self.slot_capacity + self.history_capacity + np.arange(plan.start, plan.end) % TAIL
+                    plan.owner * self.slot_capacity
+                    + self.tail_start
+                    + np.arange(plan.start, plan.end) % self.tail_tokens
                 )
             else:
                 values[plan.begin : plan.stop] = (
                     plan.stage + plan.start % BLOCK_SIZE + np.arange(plan.stop - plan.begin)
                 )
-                for i, state in enumerate(self.writer.requests[plan.request]):
-                    count = len(state.addresses)
-                    self.addresses[plan.owner, i, :count].copy_(
-                        torch.tensor(state.addresses, dtype=torch.int64, device=self.pool.device)
-                    )
-                    self.valid[plan.owner, i, :count].fill_(1)
         self.all_writes.copy_(host, non_blocking=self.pool.on_npu)
         self.write_slots = self.all_writes
         table_ids = tuple((req, self.owners[req]) for req in ids)
@@ -559,20 +801,44 @@ class KVCachePolicy(DecodeHotCache):
             if tables and self.table_ids != table_ids:
                 self.group_tables[width][: len(ids)].copy_(torch.tensor(np.stack(tables), device=self.pool.device))
         self.table_ids = table_ids
+        shared_inputs = {}
+        for layer, selector in self.indexer_selectors.items():
+            identity = id(selector.inputs)
+            selector.prepare(self.plans.values(), prepare_inputs=identity not in shared_inputs)
+            shared_inputs[identity] = selector.inputs
+        self._publish_page_updates(ring)
+        self.fused_query_inputs = tuple(shared_inputs.values())
         if self.pool.on_npu:
             self.done[ring].record(torch.npu.current_stream(self.pool.device))
 
     def align_decode_writes(self, positions):
         # Async MTP corrects positions on device before CPU bookkeeping catches
         # up. Use those positions for the ring writes without waiting on CPU.
+        for inputs in self.fused_query_inputs:
+            inputs.bind_positions(positions)
+        for selector in self.indexer_selectors.values():
+            selector.positions = positions
         for plan in self.plans.values():
             if plan.decode:
                 slots = self.all_writes[plan.begin : plan.stop]
-                torch.remainder(positions[plan.begin : plan.stop], TAIL, out=slots)
-                slots.add_(plan.owner * self.slot_capacity + self.history_capacity)
+                torch.remainder(positions[plan.begin : plan.stop], self.tail_tokens, out=slots)
+                slots.add_(plan.owner * self.slot_capacity + self.tail_start)
                 for width, writes in self.group_writes.items():
                     torch.mul(slots[None, :], self.write_factors[width], out=writes[:, plan.begin : plan.stop])
                     writes[:, plan.begin : plan.stop].add_(self.local_offsets[width])
+
+    def _promote_abc(self, layer, owner, start, end):
+        """Copy committed ABC bytes before this forward can reuse their ring slots."""
+        if not 0 <= end - start <= self.tail_tokens or end > self.history_capacity:
+            raise ValueError("Retired ABC range exceeds retained ring or hot capacity")
+        flat = self.bytes_outputs[layer]
+        base = owner * self.slot_capacity
+        while start < end:
+            offset = start % self.tail_tokens
+            count = min(end - start, self.tail_tokens - offset)
+            source = base + self.tail_start + offset
+            flat[base + start : base + start + count].copy_(flat[source : source + count])
+            start += count
 
     def _seed(self, layer, owner, state, start, end, tail):
         if tail or start == end:
@@ -602,7 +868,17 @@ class KVCachePolicy(DecodeHotCache):
         original = manager.groups
         manager.groups = self.decode_frames
         try:
-            super().finish(manager)
+            if self.indexer_selectors:
+                queries = int(manager.groups[0].query_offsets[-1])
+                batch = next(iter(self.indexer_selectors.values())).inputs.batch
+                manager.submit_feedback(
+                    self.destinations[: self.group_count, :queries],
+                    generation=manager.generation,
+                    device_errors=self.fused_errors[:, :batch],
+                    fetch_rows=self.fused_fetch_rows[:, :batch],
+                )
+            else:
+                super().finish(manager)
         finally:
             manager.groups = original
 
@@ -611,26 +887,31 @@ class KVCachePolicy(DecodeHotCache):
         if plan is not None and not plan.decode and page >= plan.start // BLOCK_SIZE:
             return (plan.stage + (page - plan.start // BLOCK_SIZE) * BLOCK_SIZE) * TOKEN_BYTES
         return (
-            self.owners[req_id] * self.slot_capacity + self.history_capacity + page * BLOCK_SIZE % TAIL
+            self.owners[req_id] * self.slot_capacity + self.tail_start + page * BLOCK_SIZE % self.tail_tokens
         ) * TOKEN_BYTES
 
     def publish(self, req_id, tokens):
         self.writer.publish(self, req_id, tokens)
 
     def after_forward(self, requests, scheduled):
+        self.put_step += 1
+        decode = {}
         for req_id, plan in self.plans.items():
             request = requests[req_id]
             if plan.decode:
                 safe = max(request.num_prompt_tokens // BLOCK_SIZE, request.num_computed_tokens // BLOCK_SIZE - 1)
+                decode[req_id] = max(0, safe) * BLOCK_SIZE
             else:
-                safe = plan.end // BLOCK_SIZE
-            self.publish(req_id, max(0, safe) * BLOCK_SIZE)
+                self.publish(req_id, plan.end // BLOCK_SIZE * BLOCK_SIZE)
             if not plan.decode and plan.end % BLOCK_SIZE:
                 prefix = plan.end % BLOCK_SIZE
                 page = plan.end // BLOCK_SIZE
                 source = self._source_offset(req_id, page) // TOKEN_BYTES
-                destination = plan.owner * self.slot_capacity + self.history_capacity + page * BLOCK_SIZE % TAIL
+                destination = plan.owner * self.slot_capacity + self.tail_start + page * BLOCK_SIZE % self.tail_tokens
                 self._copy_slots(source, destination, prefix)
+        self.put_targets.update(decode)
+        if decode and self.put_step % self.put_interval_steps == 0:
+            self.writer.submit_decode(self, decode)
 
     def attention(self, impl, layer, q, rope, topk, metadata, query_ends, *, full_graph=False):
         from vllm_ascend.device.device_op import DeviceOperator
@@ -699,7 +980,7 @@ class KVCachePolicy(DecodeHotCache):
                 decode_row += 1
             else:
                 history = p.start // BLOCK_SIZE * BLOCK_SIZE
-                context = self.context.view(-1, 1, TOKEN_BYTES) if width == 1 else self.group_context[p.owner - 1]
+                context = self.context.view(-1, 1, TOKEN_BYTES) if width == 1 else self.group_context[0]
                 if history and local == 0:
                     self.context_count.fill_(history)
                     runtime = self.writer.runtimes[self.writer.groups[layer].geometry]
@@ -770,8 +1051,8 @@ class GroupFeedback:
 
 class CacheFeedbackManager:
     def __init__(self, writer, *, log_context=""):
-        # KVAF-disabled startup must not import/compile Numba or require KVOP.
-        from kvop.lru import SlotLRU, warmup
+        # KVAF-disabled startup must not import/compile Numba or require KVIP.
+        from kvip.cache.lru import SlotLRU, warmup
 
         warmup()
         self.row_factory = SlotLRU
@@ -818,14 +1099,14 @@ class CacheFeedbackManager:
             accesses, misses = accesses
             if misses and not self.logged_get:
                 logging.getLogger("vllm").info(
-                    "KVAF BatchGet completed: miss_tokens=%s across Target cache groups; "
+                    "KVAF DDR Get completed: fetched_tokens=%s across Target cache groups; "
                     "SFA uses independent hot slots",
                     misses,
                 )
                 self.logged_get = True
         if accesses and not self.logged_feedback:
             logging.getLogger("vllm").info(
-                "KVAF LIDU feedback committed: accessed_slots=%s; original LRU updated",
+                "KVAF cache feedback committed: accessed_slots=%s; original LRU updated",
                 accesses,
             )
             self.logged_feedback = True
@@ -864,7 +1145,7 @@ class CacheFeedbackManager:
         """Enqueue access feedback from the completed serving forward."""
         self.policy.finish(self)
 
-    def submit_feedback(self, destinations, *, generation, miss_counts=None):
+    def submit_feedback(self, destinations, *, generation, miss_counts=None, device_errors=None, fetch_rows=None):
         """Accept real LIDU feedback [layers, queries, (1), topk].
 
         NPU feedback copies on a separate stream; the worker waits for its
@@ -896,12 +1177,17 @@ class CacheFeedbackManager:
         if len(self.inflight) == len(self.feedback_buffers):
             self._finish_oldest()
         buffer = self.feedback_buffers[self.feedback_turn % len(self.feedback_buffers)]
+        traffic = fetch_rows is not None
+        if traffic:
+            miss_counts = fetch_rows
         ready = None
+        errors = None
         if isinstance(destinations, np.ndarray):
             if destinations.dtype != np.int32:
                 raise TypeError("LIDU feedback must use int32")
             host = destinations.copy()
             counts = None if miss_counts is None else np.array(miss_counts, copy=True)
+            errors = None if device_errors is None else np.array(device_errors, copy=True)
         else:
             import torch
 
@@ -927,10 +1213,18 @@ class CacheFeedbackManager:
                 counts = count_staging.numpy()
             self.copy_stream.wait_event(produced)
             with torch.npu.stream(self.copy_stream):
+                if device_errors is not None:
+                    elements = device_errors.numel()
+                    if "errors" not in buffer or buffer["errors"].numel() < elements:
+                        buffer["errors"] = torch.empty(elements, dtype=torch.int32, device="cpu", pin_memory=True)
+                    error_staging = buffer["errors"][:elements].view(device_errors.shape)
+                    error_staging.copy_(device_errors, non_blocking=True)
+                    device_errors.record_stream(self.copy_stream)
+                    errors = error_staging.numpy()
                 for layer in range(destinations.shape[0]):
                     staging[layer].copy_(destinations[layer], non_blocking=True)
-                    if miss_counts is not None:
-                        count_staging[layer].copy_(miss_counts[layer], non_blocking=True)
+                if miss_counts is not None:
+                    count_staging.copy_(miss_counts, non_blocking=True)
                 destinations.record_stream(self.copy_stream)
                 if miss_counts is not None:
                     miss_counts.record_stream(self.copy_stream)
@@ -938,14 +1232,52 @@ class CacheFeedbackManager:
             self.feedback_read_done = ready
             host = staging.numpy()  # Keeps the pinned tensor alive through NumPy.base.
         self.submitted_generation = generation
-        future = self.executor.submit(self._commit, frames, host, ready, counts, self.miss_stats)
+        future = self.executor.submit(self._commit, frames, host, ready, counts, self.miss_stats, errors, traffic)
         self.inflight.append(future)
         self.feedback_turn += 1
 
     @staticmethod
-    def _commit(frames, host, ready, miss_counts=None, stats=None):
+    def _commit(frames, host, ready, miss_counts=None, stats=None, device_errors=None, traffic=False):
         if ready is not None:
             ready.synchronize()  # Background thread only, not the model launch thread.
+        if device_errors is not None and np.any(device_errors):
+            failures = np.argwhere(device_errors != 0)
+            details = []
+            # Prioritize real requests when a shared Fetch lane also reports
+            # its failure on padding rows. Keep the total across all rows.
+            active_failures = [(g, r) for g, r in failures if r < len(frames[g][0])]
+            padding_failures = [(g, r) for g, r in failures if r >= len(frames[g][0])]
+            for group, request in (active_failures + padding_failures)[:8]:
+                status = int(device_errors[group, request])
+                item = {"group": int(group), "row": int(request), "status": status}
+                item["active"] = bool(request < len(frames[group][0]))
+                if traffic and miss_counts is not None:
+                    row = miss_counts[group, request]
+                    errors = [(int(row[249]) >> shift) & 0xFF for shift in (0, 8, 16, 24)]
+                    item.update(
+                        prefetch_error=int(row[11]),
+                        prefetch_reads=int(row[9]),
+                        prefetch_pending=int(row[211]),
+                        final_reads=int(row[247]),
+                        final_pending=int(row[248]),
+                        final_q_errors=[code & 0x3F for code in errors],
+                        final_q_sources=[
+                            ("pipeline", "safe_get", "conflict_get", "unknown")[code >> 6] if code else None
+                            for code in errors
+                        ],
+                    )
+                details.append(item)
+            raise RuntimeError(
+                f"LIFetch Index update failed: failed_rows={len(failures)} active_failed_rows={len(active_failures)} details={details}; "
+                "status bits: 1=invalid Index change records, 2=prefetch state, "
+                "4=resolver/transport failure. Counts are from the same feedback copy."
+            )
+        if traffic:
+            # Original v9 ABI: word 9 counts prefetch requests, 247 final reads.
+            # Ignore graph padding; sum on CPU after the existing copy event.
+            requests = len(frames[0][0])
+            reads = miss_counts[:, :requests, 9].astype(np.int64) + miss_counts[:, :requests, 247]
+            miss_counts = np.concatenate((reads, reads.sum(axis=1, keepdims=True)), axis=1)
         if miss_counts is not None and np.any(miss_counts < 0):
             raise RuntimeError(
                 f"LIDU expected nonnegative counts; got {miss_counts.tolist()}. "
@@ -960,7 +1292,11 @@ class CacheFeedbackManager:
                     raise ValueError("LIDU feedback points outside request HBM slots")
                 jobs.append((lru, values[values >= 0], row[2:]))
         # Validate the complete frame before changing any LRU chain.
-        references = np.zeros((len(frames), len(frames[0][0])), dtype=np.int64) if stats else None
+        references = (
+            np.zeros((len(frames), len(frames[0][0])), dtype=np.int64)
+            if stats is not None and miss_counts is not None
+            else None
+        )
         for job_index, (lru, values, resize) in enumerate(jobs):
             if resize:
                 lru.resize(*resize)  # FIFO worker exclusively owns native-mode LRU.
@@ -971,9 +1307,14 @@ class CacheFeedbackManager:
                 references.flat[job_index] = lru.unique[0]
             lru.hot_snapshot = (lru.slots[0].copy(), lru.bitmap[0].copy())
         if references is not None:
-            stats.record(miss_counts[:, : references.shape[1]], references)
+            stats.record(
+                miss_counts[:, : references.shape[1]],
+                references,
+                get_counts=miss_counts[:, -1],
+                ddr_fetch=traffic,
+            )
         accesses = sum(values.size for _, values, _ in jobs)
-        return (accesses, int(miss_counts[:, -1].sum()))
+        return accesses if miss_counts is None else (accesses, int(miss_counts[:, -1].sum()))
 
     def release(self, req_id):
         self.wait_pending()

@@ -167,6 +167,7 @@ class PDKVModelRunner(NPUModelRunner):
                 dp_rank=self.dp_rank,
                 initialization_coordinator=self.pd_config.initialization_coordinator,
                 initialization_timeout=self.pd_config.timeout,
+                receive_layers=len(self.pd_memories),
                 cpu_eid=self.pd_config.eids(
                     current_platform.visible_device_id_to_physical_device_id(torch.npu.current_device())
                 )[0],

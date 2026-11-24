@@ -16,8 +16,9 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import test_kvaf_adapter as native
 import torch
+
+from tests.ut.kvaf import test_adapter as native
 
 PD_PATH = Path(__file__).resolve().parents[2] / "vllm_ascend/distributed/kv_transfer/kvaf/pd"
 SPEC = importlib.util.spec_from_file_location("kvaf_pd_under_test", PD_PATH / "__init__.py")
@@ -108,7 +109,8 @@ class Runtime:
         put.state = CpuState.ABORTED
         return put.state
 
-    def batch_get_raw_addr(self, ready, sources, destinations, lengths, output, stream):
+    def batch_get_raw_addr(self, ready, sources, destinations, lengths, output, stream, *, synchronize=False):
+        assert synchronize
         self.raw_calls += 1
         for src, dst, size in zip(sources.tolist(), destinations.tolist(), lengths.tolist()):
             output[dst : dst + size].copy_(self.source[src : src + size])
@@ -120,7 +122,7 @@ class Runtime:
     def resolve_raw_addr(self, ready):
         self.calls.append("resolve")
         self.last_ready = ready
-        self.pending_raw_addr = False
+        raise RuntimeError("raw READ completion unresolved")
 
 
 class TestPDLayout(unittest.TestCase):
@@ -373,17 +375,33 @@ class TestPDTransactions(unittest.TestCase):
             raw.run()
         self.assertTrue(raw.done)
 
-    def test_raw_ack_loss_resolves_without_re_read(self):
+    def test_raw_ack_loss_retains_buffers_without_re_read(self):
         raw, arrays = self.make_raw()
         self.runtime.raw_lost = True
         with patch.object(raw, "_make_arrays", return_value=arrays), self.assertRaises(TimeoutError):
             raw.run()
         self.assertIs(raw.arrays, arrays)
         self.assertFalse(raw.done)
-        raw.recover()
-        self.assertTrue(raw.done)
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            raw.recover()
+        self.assertFalse(raw.done)
+        self.assertTrue(self.runtime.pending_raw_addr)
         self.assertEqual(self.runtime.raw_calls, 1)
         self.assertIs(self.runtime.last_ready, self.ready)
+
+    def test_raw_submission_without_done_retains_buffers(self):
+        raw, arrays = self.make_raw()
+        with (
+            patch.object(raw, "_make_arrays", return_value=arrays),
+            patch.object(
+                self.runtime, "batch_get_raw_addr", return_value={"state": "submitted", "sequence": self.ready.sequence}
+            ),
+            self.assertRaisesRegex(RuntimeError, "retain"),
+        ):
+            raw.run()
+        self.assertFalse(raw.done)
+        self.assertTrue(raw.completion_uncertain)
+        self.assertIs(raw.arrays, arrays)
 
     def test_raw_failure_cannot_be_promoted_to_completion(self):
         raw, arrays = self.make_raw()

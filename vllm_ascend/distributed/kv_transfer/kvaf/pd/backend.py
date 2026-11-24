@@ -123,12 +123,12 @@ class PDCachePolicy(KVCachePolicy):
         try:
             table = runtime.access_table_view(handle, device="npu")
             destinations = self.context_destinations[start:end] - start
-            destinations = destinations + owner * self.slot_capacity + self.history_capacity + start % TAIL
+            destinations = destinations + owner * self.slot_capacity + self.tail_start + start % self.tail_tokens
             get_tokens(
                 runtime,
                 table,
                 self.context_indices[start:end],
-                self.context_offsets[start:end],
+                self.context_offsets_by_width[1][start:end],
                 torch.tensor([end - start], dtype=torch.int32, device=self.pool.device),
                 destinations,
                 self.bytes_outputs[layer],
@@ -170,7 +170,7 @@ class PDCachePolicy(KVCachePolicy):
         # Hot/ABC addressing is confined to this Backend, at computation time.
         # start is block aligned and TAIL is three blocks, so this partial page
         # cannot cross the ring end. Copy raw bytes without dtype conversion.
-        first = owner * self.slot_capacity + self.history_capacity + start % TAIL
+        first = owner * self.slot_capacity + self.tail_start + start % self.tail_tokens
         source = received[1].view(torch.int8).reshape(-1)[: (end - start) * TOKEN_BYTES]
         self.hot[layer].view(-1, TOKEN_BYTES)[first : first + end - start].copy_(source.view(-1, TOKEN_BYTES))
         if self.diagnostics and self.diagnostics.active(req_id):

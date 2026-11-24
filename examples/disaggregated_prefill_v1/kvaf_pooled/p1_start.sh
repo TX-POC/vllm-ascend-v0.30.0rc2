@@ -6,8 +6,8 @@ set -euo pipefail
 
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
 unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY
-source third_party/KVOP/env.sh
-export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"
+source third_party/KVIP/scripts/env.sh
+export PYTHONPATH="/home/c00612283/KVAF-Devlop/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 
 local_ip=141.62.38.13
 nic_name=enp34s0f1
@@ -96,6 +96,6 @@ exec /usr/local/python3.12.13/bin/python3 -m vllm.entrypoints.cli.main serve \
   "c8_enable_reshape_optim": false,
   "kvaf_config": {
     "enabled": false,
-    "build_dir": "/home/c00612283/KVAF-Devlop/build-pd-py312"
+    "build_dir": "/home/c00612283/KVAF-Devlop/build-npu"
   }
 }'

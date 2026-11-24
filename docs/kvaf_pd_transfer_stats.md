@@ -81,7 +81,7 @@ D 仅在原生 Scheduler build_connector_meta 后累计 `num_scheduled_tokens` �
 采样端使用现有服务 Python，先确认目录可写。每次实验使用全新目录，不混入历史启动文件。
 可以编辑统计脚本顶部 CAPTURE_DIR；默认路径为仓库 `scripts/result/kvaf_pd_transfer_stats`。
 
-在 P/D 启动脚本加载 KVOP 后，将 scripts 目录加入 PYTHONPATH，保留已有 SDK 路径：
+在 P/D 启动脚本加载 KVIP 后，将 scripts 目录加入 PYTHONPATH，保留已有 SDK 路径：
 
 ```bash
 export PYTHONPATH="/home/c00612283/vllm-ascend-v0.30.0rc2/scripts:/home/c00612283/KVAF-Devlop/build-pd-py312/python${PYTHONPATH:+:$PYTHONPATH}"

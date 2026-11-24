@@ -86,6 +86,10 @@ class PDConfig:
         backend = KVAFConfig.from_dict((config.additional_config or {}).get("kvaf_config", {}))
         if not backend.build_dir.strip() or backend.enabled == transfer.is_kv_producer:
             raise ValueError("configure kvaf_config.build_dir on P/D, enabled=false on P and enabled=true on D")
+        if backend.transport != "urma" or backend.decode_backend != "batch_get":
+            raise ValueError("PD KVAF requires URMA with the batch_get Decode backend")
+        if backend.npu_core_count * backend.jettys_per_core > 4:
+            raise ValueError("PD NPU raw Pull supports at most four Jettys per source connection")
         if any(
             getattr(pc, name) != 1
             for name in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")

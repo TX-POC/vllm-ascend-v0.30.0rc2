@@ -12,12 +12,13 @@ from threading import Barrier, Event, Lock, Thread
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import test_kvaf_adapter as helpers
 import torch
-from test_kvaf_grouped_get import Runtime as DecodeRuntime
 from test_kvaf_pd import CpuState
 from test_kvaf_pd import Runtime as PullRuntime
-from test_kvaf_prefill import Manager
+
+from tests.ut.kvaf import test_adapter as helpers
+from tests.ut.kvaf.test_grouped_get import Runtime as DecodeRuntime
+from tests.ut.kvaf.test_prefill import Manager
 
 PACKAGE = helpers.PACKAGE.__name__
 MEMORY = importlib.import_module(f"{PACKAGE}.pd.memory")
@@ -146,9 +147,17 @@ class Runtime(PullRuntime, DecodeRuntime):
             self.pages.pop(entry.key, None)
         return result
 
-    def batch_get_raw_addr(self, ready, *args):
+    def cancel_cpu_pull(self, ready):
+        put = getattr(self, "last_put", None)
+        if put is not None and put.submitted and put.state not in (CpuState.ABORTED, CpuState.COMMITTED):
+            if put.state not in (CpuState.DONE, CpuState.FAILED) or self.last_ready is not ready:
+                raise RuntimeError("CPU Pull unresolved")
+            self.abort_put(put)
+        self.sdk.acknowledged.add((ready.source.source_id, ready.sequence))
+
+    def batch_get_raw_addr(self, ready, *args, **kwargs):
         self.source = self.sdk.sources[ready.source.source_id].tensors[ready.mr_id - 1]
-        result = super().batch_get_raw_addr(ready, *args)
+        result = super().batch_get_raw_addr(ready, *args, **kwargs)
         self.sdk.acknowledged.add((ready.source.source_id, ready.sequence))
         return result
 
@@ -665,7 +674,7 @@ class TestProductionMesh(unittest.TestCase):
                     return dict(
                         peer=peer,
                         ticket=dict(version=2, region_id=worker_id + 1, epoch=1, address=f"K-{worker_id % 8}"),
-                        pull_api_version=2,
+                        pull_api_version=3,
                         parallel_pull_v1=True,
                         receiver=dict(version=1, receiver_id=worker_id + 1),
                         source_tp0_only=source_tp0_only,

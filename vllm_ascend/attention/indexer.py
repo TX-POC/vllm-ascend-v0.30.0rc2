@@ -528,6 +528,12 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         topk_selector = getattr(indexer_metadata, "topk_selector", None)
         if topk_selector is not None:
             return topk_selector(q_li, weights, self, indexer_metadata, q_li_scale)
+        return self.select_topk_native(q_li, weights, indexer_metadata, q_li_scale, q_li_shape_ori)
+
+    def select_topk_native(self, q_li, weights, indexer_metadata, q_li_scale, q_li_shape_ori=None):
+        """Existing LI selection, also used by prefill rows in a fused mixed batch."""
+        if q_li_shape_ori is None and self.enable_sparse_li_quant:
+            q_li_shape_ori = (weights.shape[0], self.n_head, self.head_dim)
         return DeviceOperator.indexer_select_post_process(
             q_li,
             q_li_scale,

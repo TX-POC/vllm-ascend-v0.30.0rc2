@@ -13,8 +13,9 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import test_kvaf_adapter as helpers
 import test_kvaf_pd_integration as integration
+
+from tests.ut.kvaf import test_adapter as helpers
 
 INIT = importlib.import_module(f"{helpers.PACKAGE.__name__}.pd.initialization")
 RUNTIME = importlib.import_module(f"{helpers.PACKAGE.__name__}.pd.runtime")
@@ -25,8 +26,14 @@ class TestMultiMRSDKContract(unittest.TestCase):
     def sdk(build):
         return NS(
             __file__=str(build / "python/kvaf/__init__.py"),
-            _native=NS(reuse_device_ra_supported=True),
+            ExecutionResources=NS,
+            PutExecutionConfig=lambda *args: args,
+            GetExecutionConfig=lambda *args: args,
+            CpuPullOptions=NS,
+            NpuPullOptions=NS(verify_completion=False),
             NpuRuntime=NS(
+                graph_resources=lambda: None,
+                cancel_cpu_pull=lambda: None,
                 listen_hbm=lambda: None,
                 cancel_raw_addr=lambda: None,
                 submit_cpu_pull=lambda: None,
@@ -53,6 +60,7 @@ class TestMultiMRSDKContract(unittest.TestCase):
             for kind, field in (
                 ("NpuRuntime", "listen_hbm"),
                 ("NpuRuntime", "cancel_raw_addr"),
+                ("NpuPullOptions", "verify_completion"),
                 ("ReadyToken", "mr_id"),
                 ("CpuPullSourceDesc", "mr_length"),
             ):
@@ -61,7 +69,9 @@ class TestMultiMRSDKContract(unittest.TestCase):
                 with (
                     self.subTest(field=field),
                     patch.object(RUNTIME.importlib, "import_module", return_value=sdk),
-                    self.assertRaisesRegex(RuntimeError, field),
+                    self.assertRaisesRegex(
+                        RuntimeError, "checked synchronous" if field == "verify_completion" else field
+                    ),
                 ):
                     RUNTIME.load_sdk(build)
 
@@ -172,6 +182,7 @@ class TestInitializationIntegration(unittest.TestCase):
                 0,
                 (helpers.layout(656, "m"),),
                 groups=(("m",),),
+                receive_layers=1,
                 log_dir=directory,
                 tp_rank=0,
                 dp_rank=0,
@@ -197,6 +208,7 @@ class TestInitializationIntegration(unittest.TestCase):
             native.link_to.side_effect = check
             native.initialize.side_effect = check
             native.initialize_ddr.side_effect = check
+            native.offload_region.side_effect = check
             with (
                 patch.object(RUNTIME, "load_sdk", return_value=Mock(NpuRuntime=Mock(return_value=native))),
                 patch.object(RUNTIME, "initialization_slot", return_value=Slot()) as slot,
@@ -205,6 +217,7 @@ class TestInitializationIntegration(unittest.TestCase):
                 adapter.connect()
             slot.assert_called_once_with("coord:28998", adapter.cpu_address, timeout=600)
             native.initialize_ddr.assert_called_once_with(17179803648, 86016)
+            native.offload_region.assert_called_once_with()
 
     def test_adapter_rejected_admission_calls_no_sdk_initialization(self):
         with TemporaryDirectory() as directory:
@@ -217,6 +230,7 @@ class TestInitializationIntegration(unittest.TestCase):
                 0,
                 (helpers.layout(656, "m"),),
                 groups=(("m",),),
+                receive_layers=1,
                 log_dir=directory,
                 tp_rank=0,
                 dp_rank=0,

@@ -75,7 +75,7 @@ class TestTP0Flow(unittest.TestCase):
                     peer=endpoint,
                     source_tp0_only=True,
                     source_cleanup_v1=True,
-                    pull_api_version=2,
+                    pull_api_version=3,
                     parallel_pull_v1=True,
                     ticket=dict(version=2, region_id=1, epoch=1),
                     receiver=dict(version=1, control_address=endpoint, receiver_id=1, receiver_epoch=1),
@@ -316,7 +316,7 @@ class TestTP0Runner(unittest.TestCase):
             before = {
                 name: (memory.tensor.data_ptr(), memory.tensor.clone()) for name, memory in runner.pd_memories.items()
             }
-            connector = Mock(diagnostics=None)
+            connector = Mock(diagnostics=None, request_observer=None)
             with (
                 patch.object(integration.NativeRunnerBoundary, "initialize_kv_cache", create=True),
                 patch.object(fixture.runner_module, "get_kv_transfer_group", return_value=connector),

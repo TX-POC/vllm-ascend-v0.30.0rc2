@@ -160,17 +160,17 @@ class CpuPullTransfer:
             if len(state.addresses) != start:
                 raise ValueError("request addresses changed during publication")
             if self.request_observer is None:
-                writer._publish_addresses(group, list(keys), [(state, len(keys))])
+                addresses = writer._read_addresses(group, list(keys))
             else:
-                observed_call(
+                addresses = observed_call(
                     self.request_observer,
                     "D.cpu_publish",
-                    writer._publish_addresses,
+                    writer._read_addresses,
                     group,
                     list(keys),
-                    [(state, len(keys))],
                     context=self.observer_context,
                 )
+            writer._publish_result(addresses, [(state, len(keys))])
             self.published = True
             if self.request_observer is not None:
                 notify(self.request_observer, "point", name="DDR_PUBLISHED", context=self.observer_context)
@@ -189,6 +189,7 @@ class NpuPullTransfer:
         self.arrays = None
         self.attempted = False
         self.done = False
+        self.completion_uncertain = False
 
     def _make_arrays(self):
         # Worker-only dependency; the layout, control and CPU paths import no
@@ -209,7 +210,9 @@ class NpuPullTransfer:
         self.arrays = self._make_arrays()
         self.attempted = True
         if self.request_observer is None:
-            result = self.runtime.batch_get_raw_addr(self.ready, *self.arrays, self.output, self.stream)
+            result = self.runtime.batch_get_raw_addr(
+                self.ready, *self.arrays, self.output, self.stream, synchronize=True
+            )
         else:
             result = observed_call(
                 self.request_observer,
@@ -219,10 +222,12 @@ class NpuPullTransfer:
                 *self.arrays,
                 self.output,
                 self.stream,
+                synchronize=True,
                 context=self.observer_context,
             )
         if result != {"state": "done", "sequence": self.ready.sequence}:
-            raise RuntimeError("unexpected raw READ completion")
+            self.completion_uncertain = True
+            raise RuntimeError("unexpected raw READ completion; retain the source and receive buffers")
         self.done = True
         if self.request_observer is not None:
             notify(self.request_observer, "point", name="HBM_PULL_DONE", context=self.observer_context)
@@ -232,8 +237,6 @@ class NpuPullTransfer:
             return
         if not self.attempted or not self.runtime.pending_raw_addr:
             raise RuntimeError("no recoverable raw READ; do not report output ready")
-        # This SDK returns None on successful resolve, and raises if recovery
-        # merely cancels/cleans up a failed operation. None is not a Tensor.
         if self.request_observer is None:
             self.runtime.resolve_raw_addr(self.ready)
         else:
@@ -244,8 +247,4 @@ class NpuPullTransfer:
                 self.ready,
                 context=self.observer_context,
             )
-        if self.runtime.pending_raw_addr:
-            raise RuntimeError("raw READ is still pending")
-        self.done = True
-        if self.request_observer is not None:
-            notify(self.request_observer, "point", name="HBM_PULL_DONE", context=self.observer_context)
+        raise RuntimeError("raw READ recovery did not prove payload completion")

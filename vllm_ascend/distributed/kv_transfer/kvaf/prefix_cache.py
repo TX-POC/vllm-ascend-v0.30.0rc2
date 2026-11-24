@@ -546,7 +546,7 @@ class RequestSnapshotStore:
         retired = self.writer.slots[geometry].release(keys)
         if retired:
             self.writer.runtimes[geometry].batch_free(retired)
-            self.writer.slots[geometry].free.extend(retired)
+            self.writer.slots[geometry].recycle(retired)
 
     def drop(self, job):
         request = getattr(job, "request_id", None)

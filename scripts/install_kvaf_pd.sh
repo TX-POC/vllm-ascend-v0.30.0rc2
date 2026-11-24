@@ -1,48 +1,33 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Build the user's existing cpu-pull-hbm-reference checkout; no repository download.
+# Build checked PD bindings with the release's pinned external KVIP and KVAF.
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-    echo "Usage: bash scripts/install_kvaf_pd.sh KVAF_SOURCE [BUILD_DIR]" >&2
+if [[ $# != 2 ]]; then
+    echo "Usage: $0 KVAF_CHECKOUT KVIP_CHECKOUT" >&2
     exit 2
 fi
 
-KVAF_PD_SOURCE=$(realpath "$1")
-KVAF_PD_BUILD=$(realpath -m "${2:-$KVAF_PD_SOURCE/build-pd}")
-KVAF_PD_PYTHON=${KVAF_PD_PYTHON:-python3}
-KVAF_PD_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-KVAF_PD_PATCH="$KVAF_PD_SCRIPT_DIR/patches/kvaf-pd-borrow-device-ra.patch"
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+kvaf_source=$(realpath "$1")
+kvip_source=$(realpath "$2")
+python_bin=${KVAF_PD_PYTHON:-python3}
+patch="$root/scripts/patches/kvaf-pd-checked-raw-read.patch"
+build_dir="$kvaf_source/build-npu"
 
-test -f "$KVAF_PD_SOURCE/CMakeLists.txt"
-test -f "$KVAF_PD_SOURCE/docs/connector_pull_api_design.md"
-if git -C "$KVAF_PD_SOURCE" apply --check "$KVAF_PD_PATCH" 2>/dev/null; then
-    git -C "$KVAF_PD_SOURCE" apply "$KVAF_PD_PATCH"
-elif git -C "$KVAF_PD_SOURCE" apply --reverse --check "$KVAF_PD_PATCH" 2>/dev/null; then
-    echo "PD device-RA borrowing patch already applied"
-else
-    echo "SDK source does not match the cpu-pull-hbm-reference PD patch; inspect before building" >&2
+# Prepare checks the matching KVAF revision and applies KVIP's existing patches.
+PYTHON="$python_bin" bash "$root/scripts/install_kvip.sh" --main-kvaf "$kvip_source" "$kvaf_source" --source-only
+if git -C "$kvaf_source" apply --check "$patch" 2>/dev/null; then
+    git -C "$kvaf_source" apply "$patch"
+elif ! git -C "$kvaf_source" apply --reverse --check "$patch" 2>/dev/null; then
+    echo "KVAF checkout does not match the checked raw READ patch" >&2
     exit 1
 fi
+PYTHON="$python_bin" bash "$root/scripts/install_kvip.sh" --main-kvaf "$kvip_source" "$kvaf_source"
 
-cmake -S "$KVAF_PD_SOURCE" -B "$KVAF_PD_BUILD" \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DKVAF_ENABLE_CPU_OFFLOAD=ON \
-    -DKVAF_ENABLE_AIV_BATCH_GET=ON \
-    -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
-    -DKVAF_BUILD_PYTHON=ON \
-    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF \
-    -DBUILD_TESTING=OFF \
-    -DPython_EXECUTABLE="$(command -v "$KVAF_PD_PYTHON")"
-cmake --build "$KVAF_PD_BUILD" -j "${KVAF_PD_BUILD_JOBS:-8}"
-PYTHONPATH="$KVAF_PD_BUILD/python${PYTHONPATH:+:$PYTHONPATH}" "$KVAF_PD_PYTHON" - <<'PY'
-import kvaf
-
-assert kvaf._native.reuse_device_ra_supported
-for name in ("listen_hbm", "cancel_raw_addr", "submit_cpu_pull", "batch_get_raw_addr"):
-    assert hasattr(kvaf.NpuRuntime, name), f"Missing multi-MR Pull API: NpuRuntime.{name}"
-assert hasattr(kvaf.ReadyToken, "mr_id")
-assert hasattr(kvaf.CpuPullSourceDesc, "mr_length")
-print("PD_SDK_IMPORT_OK", kvaf.__file__)
-PY
-echo "Set additional_config.kvaf_config.build_dir to $KVAF_PD_BUILD and prepend $KVAF_PD_BUILD/python to PYTHONPATH"
+test -f "$build_dir/bin/kvaf_execute_batch_get_raw_addr_kernels.o"
+PYTHONPATH="$build_dir/python${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" \
+    "$kvaf_source/bindings/verify_python_binding.py" --require-npu --require-offload --require-raw
+PYTHONPATH="$build_dir/python${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -c \
+    'import kvaf; assert kvaf.NpuPullOptions(verify_completion=True).verify_completion; print("PD_SDK_IMPORT_OK", kvaf.__file__)'
+echo "Use $build_dir as kvaf_config.build_dir and source $kvip_source/scripts/env.sh on P/D"

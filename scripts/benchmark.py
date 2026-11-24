@@ -41,8 +41,8 @@ class Config:
     input_tokens: int = 130560  # Leave 512 output tokens within a 131072-token context.
     output_tokens: int = 512
     levels: tuple[int, ...] = (1, 2, 4, 8, 16)
-    data_parallel_size: int = 1
-    tensor_parallel_size: int = 8
+    data_parallel_size: int = 8
+    tensor_parallel_size: int = 1
     prompt_jsonl: str = ""  # First nonempty record; reused by all requests.
     prompt_field: str = "question"
     dataset_length_policy: str = "truncate"  # or strict; short inputs fail.
@@ -587,22 +587,36 @@ def warm_prefixes(config, http, source, batch, warmed, reporter):
     reporter.report.setdefault("prefix_warmups", []).append(report)
     reporter.display(f"Warming BS/DP={batch}: {len(jobs)} new prefixes")
     reporter.save()
-    # Bound prefill concurrency independently of the measured simultaneous wave.
+    # Keep one in-flight request per DP; a completed DP advances independently.
+    queues = {
+        rank: iter([variant for owner, variant in jobs if owner == rank]) for rank in range(config.data_parallel_size)
+    }
     with futures.ThreadPoolExecutor(max_workers=config.data_parallel_size) as pool:
-        pending = [
-            pool.submit(
-                http.complete, source.build(variant), 1, f"warm-{uuid.uuid4().hex}", rank, request_phase="warmup"
-            )
-            for rank, variant in jobs
-        ]
-        for future in pending:
-            result = future.result()
-            results.append(result)
-            report["duration_ms"] = (time.perf_counter_ns() - started) / 1e6
-            reporter.display(f"Warming BS/DP={batch}: completed {len(results)}/{len(jobs)} prefixes")
-            reporter.save()
-            if result["status"] != "ok":
-                raise BenchmarkError("prefix warmup failed: " + str(result["error"]))
+        pending = {}
+
+        def submit_next(rank):
+            variant = next(queues[rank], None)
+            if variant is not None:
+                future = pool.submit(
+                    http.complete, source.build(variant), 1, f"warm-{uuid.uuid4().hex}", rank, request_phase="warmup"
+                )
+                pending[future] = rank
+
+        for rank in queues:
+            submit_next(rank)
+        while pending:
+            done, _ = futures.wait(pending, return_when=futures.FIRST_COMPLETED)
+            for future in done:
+                rank = pending.pop(future)
+                result = future.result()
+                results.append(result)
+                if result["status"] == "ok":
+                    submit_next(rank)
+                report["duration_ms"] = (time.perf_counter_ns() - started) / 1e6
+                reporter.display(f"Warming BS/DP={batch}: completed {len(results)}/{len(jobs)} prefixes")
+                reporter.save()
+                if result["status"] != "ok":
+                    raise BenchmarkError("prefix warmup failed: " + str(result["error"]))
     report["duration_ms"] = (time.perf_counter_ns() - started) / 1e6
     return report
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native Scheduler reuse, external Runner allocation and feature-off contracts."""
 
+import ast
 import importlib
 import importlib.util
 import logging
@@ -13,8 +14,9 @@ from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import test_kvaf_adapter as helpers
 import torch
+
+from tests.ut.kvaf import test_adapter as helpers
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = helpers.PACKAGE.__name__
@@ -128,6 +130,25 @@ SCHEDULER, NATIVE, CONNECTOR = load_scheduler()
 
 
 class TestPDConfig(unittest.TestCase):
+    def test_colocated_prefill_limit_preserves_native_pd_scheduling(self):
+        path = ROOT / "vllm_ascend/patch/platform/patch_balance_schedule.py"
+        tree = ast.parse(path.read_text())
+        helpers = ast.Module(
+            body=[
+                node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_limit_kvaf_prefill"
+            ],
+            type_ignores=[],
+        )
+        namespace = {}
+        exec(compile(helpers, str(path), "exec"), namespace)
+        uses_limit = namespace["_limit_kvaf_prefill"]
+        config = NS(additional_config={"kvaf_config": {"enabled": True}}, kv_transfer_config=None)
+        self.assertTrue(uses_limit(config))
+        config.kv_transfer_config = NS(kv_connector="PDKVoffloadConnector")
+        self.assertFalse(uses_limit(config))
+        config.additional_config = {}
+        self.assertFalse(uses_limit(config))
+
     def test_control_backlog_is_bounded_and_configured_on_consumers_only(self):
         value = config()
         self.assertEqual(CONFIG.PDConfig.from_vllm(value).control_backlog, 128)

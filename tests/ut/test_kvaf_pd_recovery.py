@@ -351,25 +351,15 @@ class TestPDCompleteRecovery(unittest.TestCase):
         self.assertFalse(f.receiver.requests["r"]["published"])
         self.assertEqual(f.receiver.get_errors(), {block for group in f.blocks for block in group})
 
-    def test_lost_raw_cancellation_ack_resolves_without_read_replay(self):
+    def test_uncertain_raw_read_retains_source_and_blocks_decode(self):
         f = self.fixture
-        cancel = f.native.cancel_raw_addr
-
-        def lose_ack(ready):
-            cancel(ready)
-            f.native.pending_raw_addr = True
-            raise TimeoutError("cancel acknowledgement lost")
-
-        with (
-            patch.object(flow.RawTransfer, "_make_arrays", side_effect=ValueError("metadata invalid")),
-            patch.object(f.native, "cancel_raw_addr", side_effect=lose_ack),
-            patch.object(f.native, "resolve_raw_addr", wraps=f.native.resolve_raw_addr) as resolve,
-        ):
+        f.native.raw_lost = True
+        with self.assertRaises(RuntimeError):
             f.chunk(300)
-        self.assertGreater(resolve.call_count, 0)
-        self.assertEqual(f.native.raw_calls, 0)
-        self.assertFalse(f.native.pending_raw_addr)
-        self.assertTrue(all(source.active is None for source in f.sdk.sources.values()))
+        self.assertEqual(f.native.raw_calls, 1)
+        self.assertTrue(f.native.pending_raw_addr)
+        self.assertTrue(any(source.active is not None for source in f.sdk.sources.values()))
+        self.assertFalse(f.receiver.requests["r"]["published"])
 
     def test_published_ready_for_failed_job_is_fenced_without_read(self):
         f = self.fixture

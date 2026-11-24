@@ -23,7 +23,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -2576,6 +2576,9 @@ class NPUModelRunner(GPUModelRunner):
                 # A prefix-cache replay can leave one prompt token and look
                 # like decode. It must not replay the hot-only decode graph.
                 cudagraph_mode = CUDAGraphMode.NONE
+            if self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+                graph_batch = (batch_desc.num_reqs or num_reqs) if cudagraph_mode == CUDAGraphMode.FULL else num_reqs
+                self.kvaf_cache_state.policy.select_fused_batch(self.ascend_config.kvaf_config, graph_batch)
             with record_function_or_nullcontext("kvaf: cache_input_upload"):
                 self.kvaf_adapter.writer.feedback.prepare(
                     self.input_batch.req_ids[:num_reqs],
@@ -4063,6 +4066,14 @@ class NPUModelRunner(GPUModelRunner):
             )
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        if (
+            self.kvaf_adapter is not None
+            and self.ascend_config.kvaf_config.decode_backend == "li_fetch"
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            self.kvaf_cache_state.policy.select_fused_batch(
+                self.ascend_config.kvaf_config, num_reqs_padded, dummy=True
+            )
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             if _cudagraph_mode == CUDAGraphMode.NONE:
@@ -4379,12 +4390,6 @@ class NPUModelRunner(GPUModelRunner):
     def profile_run(self) -> None:
         self.eplb_warmup()
         self._initialize_kvaf_cache_state()
-        if self.sparse_kv_offload_enabled:
-            allocate_kv_offload_topk_profile_buffers(
-                getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec(),
-                self.vllm_config,
-                self.sparse_kv_offload_config,
-            )
 
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
@@ -4395,13 +4400,76 @@ class NPUModelRunner(GPUModelRunner):
                 self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         super().profile_run()
 
+    def _build_kvaf_cache_layout_report(self, config, tensors):
+        from vllm_ascend.distributed.kv_transfer.kvaf.layout import BLOCK_SIZE, TOKEN_BYTES
+
+        state = self.kvaf_cache_state
+        policy = state.policy
+        seqs = state.max_requests - 1  # The last row is reserved for graph padding.
+        target_slots = state.max_requests * policy.slot_capacity * sum(policy.group_sizes)
+        # The hot tensor also backs prefill staging, which starts after these slots.
+        target_bytes = target_slots * TOKEN_BYTES
+        self.kvaf_target_slot_bytes = target_bytes
+        drafts = set(getattr(self.drafter, "attn_layer_names", ()))
+        specs = self._get_layer_kv_cache_specs(config)
+        rows = [[target_bytes, target_slots // BLOCK_SIZE, target_slots]]
+        rows.extend([[0, 0, 0] for _ in range(3)])
+        seen = set()
+        for name, spec in specs.items():
+            if name in self.kvaf_target_layer_names or name not in tensors:
+                continue
+            index = isinstance(spec, AscendSFAIndexerCacheSpec)
+            draft = name in drafts or name.removesuffix(".indexer.k_cache") + ".attn" in drafts
+            row = rows[3 if index and draft else 1 if index else 2]
+            backing = tensors[name]
+            for tensor in backing if isinstance(backing, tuple) else (backing,):
+                storage = tensor.untyped_storage()
+                if storage.data_ptr() not in seen:
+                    row[0] += storage.nbytes()
+                    seen.add(storage.data_ptr())
+            row[1] += config.num_blocks
+            row[2] += config.num_blocks * spec.block_size
+
+        length = self.model_config.max_model_len
+        blocks_per_request = sum(
+            (length + self.num_spec_tokens + group.kv_cache_spec.block_size - 1)
+            // group.kv_cache_spec.block_size
+            for group in config.kv_cache_groups
+        )
+        pool_limit = max(0, config.num_blocks - 1) // max(1, blocks_per_request)
+        current_cache_bytes = sum(row[0] for row in rows)
+        logger.info(
+            "Current KV cache memory: %.2f GiB allocated (%.2f GiB preallocated Target KV + "
+            "%.2f GiB Index/MTP)",
+            current_cache_bytes / (1 << 30),
+            target_bytes / (1 << 30),
+            (current_cache_bytes - target_bytes) / (1 << 30),
+        )
+        lines = [
+            "KVAF cache layout",
+            f"  Capacity basis: max sequence={length} tokens, MTP lookahead={self.num_spec_tokens}, "
+            "no cross-request prefix sharing",
+            "  Cache                HBM GiB      Blocks   Token slots   BS limit",
+        ]
+        for name, (size, blocks, slots), limit in zip(
+            ("Target KV slots", "Target Index cache", "MTP KV cache", "MTP Index cache"),
+            rows,
+            (seqs, pool_limit, pool_limit, pool_limit),
+        ):
+            limit_text = str(limit) if slots else "—"
+            lines.append(f"  {name:20} {size / (1 << 30):8.2f} {blocks:11d} {slots:13d} {limit_text:>10}")
+        return lines, min(seqs, pool_limit, self.max_num_reqs)
+
     def _initialize_kvaf_cache_state(self):
         if not self.ascend_config.kvaf_config.enabled or self.kvaf_cache_state is not None:
             return
+        from vllm_ascend.distributed.kv_transfer.kvaf.cache_policy import KVCachePolicy
+        from vllm_ascend.distributed.kv_transfer.kvaf.layout import (
+            FUSED_HISTORY_ALIGNMENT,
+            TOPK,
+            index_groups,
+        )
         from vllm_ascend.distributed.kv_transfer.kvaf.state import DeviceCacheState
-        from vllm_ascend.distributed.kv_transfer.kvaf.layout import index_groups
-        from vllm_ascend.distributed.kv_transfer.kvaf.layout import TOPK
-        from vllm_ascend.distributed.kv_transfer.kvaf.cache_policy import TAIL, KVCachePolicy
 
         specs = getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec()
         drafts = frozenset(getattr(self.drafter, "attn_layer_names", ()))
@@ -4416,7 +4484,22 @@ class NPUModelRunner(GPUModelRunner):
         tokens = (tokens + block_size - 1) // block_size * block_size
         tokens = max(TOPK, tokens) + TOPK  # Empty candidates cannot overlap resident KV.
         hot_tokens = self.ascend_config.kvaf_config.hot_tokens
-        tokens = max(tokens, hot_tokens + TAIL)
+        li_fetch = self.ascend_config.kvaf_config.decode_backend == "li_fetch"
+        fused_history = (
+            (self.model_config.max_model_len + self.num_spec_tokens + FUSED_HISTORY_ALIGNMENT - 1)
+            // FUSED_HISTORY_ALIGNMENT * FUSED_HISTORY_ALIGNMENT if li_fetch else 0
+        )
+        if li_fetch:
+            # Original hot-first tiling needs a cold tile range even when the
+            # configured model length is shorter than the resident capacity.
+            fused_history = max(
+                fused_history,
+                hot_tokens + FUSED_HISTORY_ALIGNMENT * (self.ascend_config.kvaf_config.intermediate_fetches + 1),
+            )
+        tail_tokens = self.ascend_config.kvaf_config.abc_tokens(
+            self._num_drafter_query_tokens() if self.speculative_config else 1
+        )
+        tokens = max(tokens, hot_tokens + tail_tokens)
         # FIA graph padding can append one dummy request beyond max_num_reqs.
         groups = index_groups(targets, self.compilation_config.static_forward_context)
         self.kvaf_cache_state = DeviceCacheState([g[0] for g in groups], self.max_num_reqs + 1, tokens, self.device)
@@ -4428,7 +4511,22 @@ class NPUModelRunner(GPUModelRunner):
             self.model_config.max_model_len,
             group_sizes=[len(g) for g in groups],
             hot_tokens=hot_tokens,
+            fused_history=fused_history,
+            tail_tokens=tail_tokens,
+            put_interval_steps=self.ascend_config.kvaf_config.put_interval_steps,
         )
+        if fused_history:
+            import acl
+
+            # Current wheels record a device family, not the exact compiler SoC.
+            # ACL is initialized on this worker's logical device at this point.
+            soc = acl.get_soc_name()
+            if not soc:
+                raise RuntimeError("KVAF LIFetch: ACL could not query the active SoC name")
+            self.kvaf_cache_state.policy.initialize_fused_workspace(
+                self.ascend_config.kvaf_config, torch.npu.current_device(), soc,
+                index_heads=self.model_config.hf_text_config.index_n_heads,
+            )
         self.kvaf_target_layer_names = set(targets)
         logger.info(
             "KVAF device inputs: layers=%s requests=%s tokens=%s bytes=%s; included in memory profiling",
@@ -4807,26 +4905,29 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.current_device(),
                 layouts,
                 groups=self.kvaf_cache_state.groups,
+                fused_workers=(
+                    self.kvaf_cache_state.policy.fused_setup.workers
+                    if self.kvaf_cache_state.policy.fused_setup is not None else None
+                ),
                 log_dir=self.ascend_config.ascend_log_path,
                 tp_rank=self.tp_rank,
                 dp_rank=self.dp_rank,
-                # Memory profiling has already initialized HCCL for TP/EP.
-                # Repeating device RaInit can reset its live HDC mutex.
-                reuse_device_ra=(
-                    self.parallel_config.tensor_parallel_size > 1
-                    or (
-                        self.parallel_config.enable_expert_parallel
-                        and self.parallel_config.data_parallel_size > 1
-                    )
-                ),
             )
             self.kvaf_adapter.connect()
             self.kvaf_adapter.bind_caches(kv_caches)
             self._initialize_kvaf_cache_state()
             self.kvaf_adapter.writer.feedback.bind_device_pool(self.kvaf_cache_state)
             self.kvaf_adapter.writer.feedback.bind(self.compilation_config.static_forward_context)
-            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import RequestSnapshotStore
-            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import AuxiliarySnapshotStore
+            if self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+                from kvip.adapters.vllm.binding import bind_selectors
+
+                policy = self.kvaf_cache_state.policy
+                bind_selectors(torch, policy, self.ascend_config.kvaf_config)
+                policy.fused_selectors_by_batch[policy.fused_setup.batch] = policy.indexer_selectors
+            from vllm_ascend.distributed.kv_transfer.kvaf.prefix_cache import (
+                AuxiliarySnapshotStore,
+                RequestSnapshotStore,
+            )
 
             writer = self.kvaf_adapter.writer
             geometry = writer.groups[0].geometry
@@ -4834,10 +4935,30 @@ class NPUModelRunner(GPUModelRunner):
                 writer.runtimes[geometry], writer.slots[geometry], layouts, kv_caches,
                 token_bytes=geometry[0], tokens_per_block=geometry[1],
             )
-            get_kv_transfer_group().bind_archive(RequestSnapshotStore(writer, auxiliary), self.tp_rank)
+            archive = RequestSnapshotStore(writer, auxiliary)
+            get_kv_transfer_group().bind_archive(archive, self.tp_rank)
+            lines, hbm_limit = self._kvaf_cache_layout_report
+            capacity = archive.capacity
+            # Match the scheduler's admission horizon, including its two guard blocks.
+            horizon = self.model_config.max_model_len + self.num_spec_tokens + 2 * capacity.block_size
+            ddr_limit = min(
+                capacity.capacities[geometry] // slots
+                for geometry, slots in capacity.cost(horizon).items()
+                if slots
+            )
+            lines.append(f"  DDR BS limit: {ddr_limit} (reservation horizon={horizon} tokens)")
+            lines.append(f"  Effective BS limit: {min(hbm_limit, ddr_limit)} (HBM and DDR capacity)")
+            logger.info("%s", "\n".join(lines))
 
     def shutdown(self) -> None:
         if self.kvaf_adapter is not None:
+            if self.kvaf_adapter.graph_resources or (
+                self.kvaf_adapter.config.decode_backend == "li_fetch"
+                and isinstance(self.model, ACLGraphWrapper)
+            ):
+                torch.npu.synchronize(self.device)
+                self.model.concrete_aclgraph_entries.clear()
+                self.kvaf_adapter.close_graph_resources()
             self.kvaf_adapter.close()
         parent_shutdown = getattr(super(), "shutdown", None)
         if callable(parent_shutdown):
@@ -4903,6 +5024,10 @@ class NPUModelRunner(GPUModelRunner):
         allocation_context = kv_cache_allocation_context or nullcontext()
         with allocation_context:
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        if self.kvaf_cache_state is not None:
+            self._kvaf_cache_layout_report = self._build_kvaf_cache_layout_report(
+                kv_cache_config, kv_cache_raw_tensors
+            )
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(
             kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
@@ -6585,12 +6710,72 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
+    def _warmup_and_capture(
+        self,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+        **capture_kwargs,
+    ):
+        adapter = self.kvaf_adapter
+        if (
+            adapter is None
+            or adapter.config.decode_backend == "li_fetch"
+            or cudagraph_runtime_mode != CUDAGraphMode.FULL
+        ):
+            return super()._warmup_and_capture(
+                desc, cudagraph_runtime_mode, profile_seq_lens, allow_microbatching, num_warmups, **capture_kwargs
+            )
+        if num_warmups is None:
+            num_warmups = self.compilation_config.cudagraph_num_of_warmups
+        if not isinstance(self.model, ACLGraphWrapper):
+            raise RuntimeError("Unified KVAF FULL capture requires ACLGraphWrapper")
+        stream = torch.npu.current_stream(self.device)
+        warmup_kwargs = dict(
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            force_attention=True,
+            uniform_decode=desc.uniform,
+            allow_microbatching=allow_microbatching,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=desc.num_active_loras,
+            profile_seq_lens=profile_seq_lens,
+        )
+        for _ in range(max(0, num_warmups - 1)):
+            self._dummy_run(desc.num_tokens, **warmup_kwargs)
+        with adapter.capture_get_resources(stream, lambda: self._dummy_run(desc.num_tokens, **warmup_kwargs)):
+            self.model.capture_stream = stream
+            try:
+                return super()._warmup_and_capture(
+                    desc, cudagraph_runtime_mode, profile_seq_lens, allow_microbatching, num_warmups=0, **capture_kwargs
+                )
+            finally:
+                self.model.capture_stream = None
+
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
+        if self.kvaf_adapter is not None and self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+            policy = self.kvaf_cache_state.policy
+            previous = policy.indexer_selectors
+            for mode, descriptors in self.cudagraph_dispatcher.get_capture_descs():
+                if mode == CUDAGraphMode.FULL:
+                    for desc in descriptors:
+                        batch = desc.num_reqs or min(desc.num_tokens, self.scheduler_config.max_num_seqs)
+                        policy.select_fused_batch(self.ascend_config.kvaf_config, batch)
+            policy.indexer_selectors = previous
         self._engram_capture_active = True
         try:
-            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+            with (
+                ExitStack() as capture_resources,
+                _torch_cuda_wrapper(),
+                _replace_gpu_model_runner_function_wrapper(parent_module_name),
+            ):
+                if self.kvaf_adapter is not None and self.ascend_config.kvaf_config.decode_backend == "li_fetch":
+                    for runtime in self.kvaf_adapter.runtimes.values():
+                        capture_resources.enter_context(runtime.lease.capture_scope())
                 cuda_graph_size = GPUModelRunner.capture_model(self)
         finally:
             self._engram_capture_active = False

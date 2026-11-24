@@ -371,13 +371,21 @@ def _schedule_body_ast(source: str) -> str:
         def visit_If(self, node: ast.If):  # noqa: N802
             test = ast.dump(node.test)
             # delta 1: disabled-path early return.
-            if "_balance_enabled" in test:
+            if any(name in test for name in ("_balance_enabled", "single_prefill", "prefill_request_id")):
                 return None
             # delta 2: the balance admission gate inside the WAITING loop.
             if "balance_queue" in test and "max_num_running_reqs" in test:
                 return None
             # delta 3 (ours): if request_queue is None: break.
             if "request_queue" in test and "None" in test and "Is" in test:
+                return None
+            return self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign):  # noqa: N802
+            if any(
+                isinstance(t, ast.Name) and t.id in {"single_prefill", "balance_enabled", "prefill_request_id"}
+                for t in node.targets
+            ):
                 return None
             return self.generic_visit(node)
 
@@ -466,8 +474,8 @@ def test_balance_deltas_present_in_schedule():
     src = inspect.getsource(BalanceScheduler.schedule)
 
     # delta 1: disabled-path early return delegates to super().schedule().
-    assert "if not self._balance_enabled:" in src
-    assert "super().schedule(throttle_prefills)" in src
+    assert "if not balance_enabled and not single_prefill:" in src
+    assert "_upstream_schedule(self, throttle_prefills)" in src
 
     # delta 2: the balance_flag admission gate (leader-at-cap => global freeze).
     assert "max(t.item() for t in self.balance_queue)" in src

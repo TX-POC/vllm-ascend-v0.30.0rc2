@@ -31,6 +31,7 @@ from benchmark import (  # noqa: E402
     run_level,
     summarize_http,
     verify_cached,
+    warm_prefixes,
 )
 
 
@@ -280,6 +281,56 @@ class BenchmarkPrefixTests(unittest.TestCase):
         config.input_tokens = 256
         with self.assertRaisesRegex(BenchmarkError, "longer than two cache blocks"):
             prefix_probe(config, http, source, 128, [])
+
+
+class PrefixWarmupSchedulingTests(unittest.TestCase):
+    def test_each_dp_advances_without_waiting_for_slow_dp(self):
+        config = Config(data_parallel_size=2)
+        slow_started, fast_finished = threading.Event(), threading.Event()
+        active, peak = [0, 0], [0, 0]
+        calls = [[], []]
+        lock = threading.Lock()
+
+        def complete(prompt, max_tokens, request_id, rank, *, request_phase):
+            self.assertEqual(request_phase, "warmup")
+            with lock:
+                active[rank] += 1
+                peak[rank] = max(peak[rank], active[rank])
+                calls[rank].append(prompt)
+            try:
+                if rank == 0 and prompt == (0, 0):
+                    slow_started.set()
+                    self.assertTrue(fast_finished.wait(3), "DP1 must finish while DP0 is blocked")
+                elif rank == 1:
+                    self.assertTrue(slow_started.wait(3))
+                    if prompt == (1, 3):
+                        fast_finished.set()
+                return {"status": "ok", "dp_rank": rank}
+            finally:
+                with lock:
+                    active[rank] -= 1
+
+        source = mock.Mock()
+        source.variant.side_effect = lambda rank, index: (rank, index)
+        source.build.side_effect = lambda variant: variant
+        reporter = mock.Mock(report={})
+        warmed = set()
+        report = warm_prefixes(config, mock.Mock(complete=complete), source, 4, warmed, reporter)
+        self.assertEqual(peak, [1, 1])
+        self.assertEqual(calls, [[(rank, i) for i in range(4)] for rank in range(2)])
+        self.assertEqual(len(report["requests"]), 8)
+        again = warm_prefixes(config, mock.Mock(complete=complete), source, 4, warmed, reporter)
+        self.assertEqual(again["requests"], [])
+
+    def test_failed_request_stops_its_dp_queue(self):
+        http = mock.Mock()
+        http.complete.return_value = {"status": "error", "error": "failed"}
+        source = mock.Mock()
+        source.variant.side_effect = lambda rank, index: index
+        source.build.side_effect = lambda variant: variant
+        with self.assertRaisesRegex(BenchmarkError, "prefix warmup failed"):
+            warm_prefixes(Config(data_parallel_size=1), http, source, 4, set(), mock.Mock(report={}))
+        self.assertEqual(http.complete.call_count, 1)
 
 
 if __name__ == "__main__":

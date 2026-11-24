@@ -9,7 +9,8 @@ from uuid import uuid4
 
 from .layout import LayerLayout
 
-PULL_API_VERSION = 2
+# v3 requires the unified SDK completion and cancellation contract.
+PULL_API_VERSION = 3
 MAX_SOURCE_MRS = 4096
 
 

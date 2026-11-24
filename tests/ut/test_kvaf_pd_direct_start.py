@@ -18,7 +18,7 @@ class TestDirectPDStart(unittest.TestCase):
         for role, node in (("p", 0), ("p", 1), ("d", 0), ("d", 1)):
             with self.subTest(role=role, node=node), tempfile.TemporaryDirectory() as tmp:
                 target = Path(tmp)
-                environment = target / "third_party/KVOP/env.sh"
+                environment = target / "third_party/KVIP/scripts/env.sh"
                 environment.parent.mkdir(parents=True)
                 environment.write_text("# CPU-only command capture\n")
                 interpreter = target / "python"
@@ -108,8 +108,8 @@ class TestDirectPDStart(unittest.TestCase):
                 model.mkdir()
                 sdk = target / "sdk"
                 (sdk / "python/kvaf").mkdir(parents=True)
-                (target / "third_party/KVOP").mkdir(parents=True)
-                (target / "third_party/KVOP/env.sh").write_text("# Device environment substituted in CPU UT\n")
+                (target / "third_party/KVIP/scripts").mkdir(parents=True)
+                (target / "third_party/KVIP/scripts/env.sh").write_text("# Device environment substituted in CPU UT\n")
                 mock_python = target / "python"
                 mock_python.write_text(
                     f"#!{sys.executable}\nimport json,sys,os\n"
@@ -123,8 +123,8 @@ class TestDirectPDStart(unittest.TestCase):
                     .read_text()
                     .replace("/usr/local/python3.12.13/bin/python3", shlex.quote(str(mock_python)))
                     .replace(
-                        "source /home/c00612283/vllm-ascend-v0.30.0rc2/third_party/KVOP/env.sh",
-                        "source " + shlex.quote(str(target / "third_party/KVOP/env.sh")),
+                        "source /home/c00612283/vllm-ascend-v0.30.0rc2/third_party/KVIP/scripts/env.sh",
+                        "source " + shlex.quote(str(target / "third_party/KVIP/scripts/env.sh")),
                     )
                 )
                 text = text.replace(
