@@ -113,6 +113,52 @@ ldd /home/c00612283/pd-main-deps/KVAF/build-hostcpu-k/runtime/kvaf_cpu_service
 - P、D、Proxy 前台运行。D／P 各自使用 `curl --fail --noproxy '*' --max-time 5 http://本机IP:端口/health` 确认就绪。Proxy 脚本复查两端再监听 `8000`。
 - A 侧路径可用 `KVAF_PD_PYTHON`、`KVAF_PD_SDK_ROOT`、`KVAF_PD_BUILD_DIR`、`KVAF_PD_KVIP_ROOT`、`KVAF_PD_MODEL` 覆盖。K 侧用 `KVAF_PD_K_BUILD_DIR`、`KVAF_PD_K_PYTHON`、`KVAF_PD_K_LOG_DIR`。
 
+### K 宿主机指定 UB 设备与 NUMA 绑定
+
+如果现场使用 `start_k.sh` 手动指定 UB 设备，K1 的实机脚本提供了以下端口和设备组合。K2 以本机实际设备和 EID 为准。
+
+| K1 端口 | `--ub-device` | `--eid-index` | Gather |
+| --- | --- | --- | --- |
+| `28997` | `udmac0d1e3` | `0` | `8` 线程预算，`active` |
+| `28999` | `udmac1d1e3` | `0` | `8` 线程预算，`active` |
+| `28995` | `udmac0d1e2` | `0` | `8` 线程预算，`active` |
+| `28996` | `udmac1d1e2` | `0` | `8` 线程预算，`active` |
+
+2A+2K 拓扑默认每台 K 启动两个端点 `28997`、`28999`。如选用 `28995`、`28996`，同步修改 `d_start.sh` 中相应主机的 `cpu_addresses`。每次只用一种启动方式管理同一组端口。
+
+在 K1 的 KVAF 源码目录执行以下命令。`cpu_service` 指向本说明固定 KVAF 版本的构建产物。示例沿用现场的 `build-cpu` 路径，使用第 3 节的构建产物时改为 `./build-hostcpu-k/runtime/kvaf_cpu_service`。
+
+```bash
+lscpu -e=CPU,SOCKET,NODE
+numactl --hardware
+
+cpu_service=./build-cpu/runtime/kvaf_cpu_service
+numa0=0  # 按第一块 UB 设备所在的 NUMA 节点修改
+numa1=1  # 按第二块 UB 设备所在的 NUMA 节点修改
+log_dir="/home/c00612283/pd-pool-logs/k1/$(date +%Y%m%d_%H%M%S)_$$"
+mkdir -p "$log_dir"
+
+start_k_service() {
+    local node=$1 port=$2 device=$3
+    nohup numactl --cpunodebind="$node" --membind="$node" \
+        "$cpu_service" --listen 0.0.0.0 --port "$port" \
+        --ub-device "$device" --eid-index 0 \
+        --gather-threads 8 --gather-mode active --memory-page-mode default \
+        > "$log_dir/kserver_${port}.log" 2>&1 < /dev/null &
+    printf '%s\n' "$!" > "$log_dir/kserver_${port}.pid"
+}
+
+start_k_service "$numa0" 28997 udmac0d1e3
+start_k_service "$numa1" 28999 udmac1d1e3
+# 改用另一组设备时，替换上面两行，并重新核对对应的 NUMA 节点。
+# start_k_service "$numa0" 28995 udmac0d1e2
+# start_k_service "$numa1" 28996 udmac1d1e2
+
+ss -lntp | grep -E ':(28995|28996|28997|28999)[[:space:]]'
+```
+
+`--ub-device` 和 `--eid-index` 选择 UB 端点。`numactl` 限制进程及其 Gather 线程的 CPU 调度范围，以及 DDR 分配的 NUMA 节点。`--gather-threads 8` 是线程预算，`active` 表示主动轮询。手工启动后确认每个端口的监听 PID 与对应的 `.pid` 一致，并检查各自日志中的 `LISTEN`。D 初始化后可用 `numastat -p <PID>` 核对 DDR 的实际分布。
+
 ## 5. 请求、验收和回滚
 
 1. 先用 `smoke.sh` 发短请求，再用 `smoke.sh /path/to/prompt.txt` 发确定性长请求。建议长输入跨越 128 token block 和 4096 token 调度分段，输入和输出总长控制在 `131072` 以内。
