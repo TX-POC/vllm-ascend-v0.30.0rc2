@@ -1,8 +1,8 @@
-# 四智算节点与八鲲鹏节点的 PD 部署指南
+# 四智算节点与八鲲鹏节点的 PD 扩容模板
 
 本方案使用两个跨机 DP/EP 集群和八台 K 通算服务器，不修改框架计算、KVAF SDK 或 KV 内存布局。
 这是扩容部署模板，尚未完成该规模的硬件联调；单 P/单 D 的成功不能替代本方案验收。
-基础安装排障见 [PD 部署指南](kvaf_pd_deployment.md)，字段含义见 [配置说明](kvaf_pd_2nodes_configuration.md)。
+基础安装排障见 [2A+2K 安装部署说明](kvaf_pd_2Anodes_2Knodes_configuration.md)，字段含义见 [配置说明](kvaf_pd_2nodes_configuration.md)。
 
 ## 1. 拓扑与独立脚本
 
@@ -70,114 +70,11 @@ numactl 绑定不等同于固定 SDK 的 URMA/EID 候选，仍需验证实际内
 按 79 层估算，全建链中每个 P rank 每路径 16 个源组、1264 个逐层 MR；不是 Jetty 实测数量。
 多 MR 通道复用依赖匹配 SDK，不能把逐层 MR 数当作实际队列数。
 
-## 3. 安装与启动前修改
+## 3. 扩容前配置
 
-四个智算容器保持相同模型、tokenizer、CANN/torch_npu、框架提交及 SDK 构建版本。
-八个 K 宿主机使用同一 SDK 提交。基准 SDK 为 main 的
-`813f1750a50b7e6c92d5f5397f2fbc05befef6da`，不可混用旧 Pull 协议。
-
-四个 NPU 容器分别执行配套构建。
-该块自行加载 CANN，保留现有 vLLM，并保存完整构建日志：
-
-```bash
-(
-set -euo pipefail
-
-export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
-export ASCEND_REPO=/home/c00612283/vllm-ascend-v0.30.0rc2
-export KVAF_PD_SRC=/home/c00612283/KVAF-Devlop
-export KVIP_SRC="$ASCEND_REPO/third_party/KVIP"
-export MODEL=/home/models/GLM-5.3-w4a4c8-mxfp4
-export SOC_VERSION=ascend950dt_9582
-
-CANN_ROOT=/usr/local/Ascend/cann-9.2.0
-export ASCEND_CANN_PACKAGE_PATH="$CANN_ROOT"
-set +u
-if [ -f "$CANN_ROOT/set_env.sh" ]; then
-    source "$CANN_ROOT/set_env.sh"
-elif [ -f "$CANN_ROOT/bin/setenv.bash" ]; then
-    source "$CANN_ROOT/bin/setenv.bash"
-else
-    echo "未找到 CANN 环境脚本：$CANN_ROOT"
-    exit 1
-fi
-set -u
-
-cd "$ASCEND_REPO"
-test -x "$KVAF_PD_PYTHON"
-test -f "$KVAF_PD_SRC/CMakeLists.txt"
-test -f "$KVAF_PD_SRC/docs/connector_pull_api_design.md"
-
-"$KVAF_PD_PYTHON" -c \
-'import sys, torch, torch_npu, vllm; print(sys.executable); print(torch.__version__, torch_npu.__version__); print(vllm.__version__, vllm.__file__)'
-command -v cmake
-command -v ninja
-command -v g++
-
-if bash scripts/install_kvaf_pd_source.sh - \
-    "$KVAF_PD_SRC" "$KVIP_SRC" \
-    2>&1 | tee /home/c00612283/full-model-pd-build.log
-then
-    echo "ASCEND_KVIP_KVAF_BUILD_OK"
-else
-    echo "构建失败，提取具体错误："
-    grep -n -B 15 -A 40 -m 1 \
-      -E 'CMake Error|fatal error:|Traceback|ModuleNotFoundError|No such file|not found' \
-      /home/c00612283/full-model-pd-build.log \
-      || tail -n 150 /home/c00612283/full-model-pd-build.log
-    exit 1
-fi
-)
-```
-
-同版本 Ascend 原生扩展和 KVIP 已成功构建时，可用基础指南的 SDK-only 构建步骤。
-检查实际导入路径及 listen_hbm、cancel_raw_addr、ReadyToken.mr_id 等接口。
-安装入口保留现有 HCCL device RA 借用补丁，本次模板调整不修改 SDK。
-
-八个 K 宿主机需有匹配 UMDK、liburma、CMake、C++ 编译器、numactl 和 Python3。
-分别放置对应的独立 K 启动脚本；K0 另保留协调器所需的框架脚本目录。
-K 编译直接使用 SDK CMake，不需要容器 Python 或完整 Ascend 构建环境。各执行：
-
-```bash
-(
-set -euo pipefail
-
-SRC=/home/c00612283/KVAF-Devlop
-BUILD="$SRC/build-hostcpu-k"
-
-if [ ! -f "$SRC/CMakeLists.txt" ] ||
-   [ ! -f "$SRC/docs/connector_pull_api_design.md" ]; then
-    echo "KVAF 源码不完整或分支不匹配，请检查 cpu-pull-hbm-reference 分支。"
-    exit 1
-fi
-
-test -f /usr/include/ub/umdk/urma/urma_api.h
-test -f /usr/lib64/liburma.so
-
-cmake -S "$SRC" -B "$BUILD" \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
-  -DKVAF_BUILD_PYTHON=OFF \
-  -DKVAF_ENABLE_CPU_OFFLOAD=OFF \
-  -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
-  -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
-  -DBUILD_TESTING=OFF \
-  -DKVAF_URMA_INCLUDE_DIR=/usr/include/ub/umdk/urma \
-  -DKVAF_URMA_LIBRARY=/usr/lib64/liburma.so \
-  '-DCMAKE_CXX_FLAGS=-DURMA_ACCESS_REMOTE_READ=URMA_ACCESS_READ -DURMA_ACCESS_REMOTE_WRITE=URMA_ACCESS_WRITE -DURMA_ACCESS_REMOTE_ATOMIC=URMA_ACCESS_ATOMIC' \
-  2>&1 | tee /home/c00612283/kvaf-k-configure.log
-
-cmake --build "$BUILD" --parallel 8 \
-  2>&1 | tee /home/c00612283/kvaf-k-build.log
-
-test -x "$BUILD/runtime/kvaf_cpu_service"
-ldd "$BUILD/runtime/kvaf_cpu_service"
-echo "K_SERVICE_BUILD_OK"
-)
-```
-
-K0 的协调器及后台就绪检查只依赖 Python 标准库，使用宿主机实际 python3。
-证书、离线依赖、原生扩展问题按基础指南处理；RunAicpuCommInit 缺符号属于 HCCL/AICPU 配套问题。
+源码版本与构建步骤以 [2A+2K 安装部署说明](kvaf_pd_2Anodes_2Knodes_configuration.md) 为准。
+四台 A 使用配套的框架、模型、tokenizer、CANN 和 SDK，八台 K 使用同一 SDK 提交的 CPU 服务。
+使用本模板时，按下表配置扩容后的地址、路径和拓扑。
 
 逐份编辑以下内容，不会从其他脚本自动继承：
 
@@ -196,7 +93,7 @@ P 使用 eager。两侧均关闭 enable_dsa_cp 和 c8_enable_reshape_optim，禁
 
 D 的 control_backlog=128 是每个框架控制监听器的 TCP 等待队列，允许整数 1～4096；P 不配置。
 它不代表并行度或 Jetty 数，内核 somaxconn 仍可能限制实际容量；修改后须重启 D listener。
-本次仅调整脚本无需重编译框架或 SDK；健康 K/协调器可保留。改变 K 映射或服务时必须排空旧会话。
+改变 K 映射或服务前排空旧会话。
 
 ## 4. 网络及进程检查
 

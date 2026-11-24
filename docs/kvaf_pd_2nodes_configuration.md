@@ -1,11 +1,10 @@
 # KVAF 1P1D 双机部署配置说明（P 八卡 / D 八卡）
 
-本文逐项解释 [双机部署指南](kvaf_pd_2nodes_deployment.md) 中用户实际验证过的 P/D 启动参数。
-完整编译、启动脚本和请求命令以该指南为准；本文补充作用、单位、默认值和修改时的关联关系，不改动启动基线。
-字段说明依据 `v0.30.0rc2-develop` 的 PD 实现，基准框架提交为 `3927ee424`，对应启动脚本见同分支的双机部署指南。
+本文以 `3927ee424` 时期的单 K 配置为例，解释 P/D 参数的用途、单位与依赖关系。
+当前安装、SDK 路径和 K 路由以 [2A+2K 安装部署说明](kvaf_pd_2Anodes_2Knodes_configuration.md) 为准。
 表中的“未显式配置”不等于关闭；只在源码可确认时列出默认值，实际执行能力还受模型、量化和硬件条件影响。
 
-## 1. 当前 P/D 配置总览
+## 1. 历史基线 P/D 配置总览
 
 | 项目 | P 节点 | D 节点 |
 | --- | --- | --- |
@@ -266,26 +265,7 @@ HCCL、torch_npu 和驱动相关变量的具体实现以部署的配套版本为
 不要用 `Ctrl+Z` 暂停服务或 tee；独立 metrics/log 目录也不表示旧模型进程和 HBM 已自动释放。
 若要定位 SDK 原生错误，除 P/D server.log 外，也检查本轮打印的 KVAF 原生日志和 K 服务日志。
 
-## 8. 编译参数与 K/协调器/Proxy 参数
-
-### 8.1 P/D 编译环境
-
-| 参数 | 本次值 | 作用 |
-| --- | --- | --- |
-| `KVAF_PD_PYTHON` | `/usr/local/python3.12.13/bin/python3` | 选择安装、KVOP 和 SDK binding 的解释器 |
-| `ASCEND_REPO` | `/home/c00612283/vllm-ascend-v0.30.0rc2` | 框架源码目录 |
-| `KVAF_PD_SRC` | `/home/c00612283/KVAF-Devlop` | 已准备好的匹配 SDK 源码，不是输出目录 |
-| `KVAF_PD_BUILD` | SDK `build-pd-py312` | SDK 输出目录，与 P/D build_dir、PYTHONPATH 一致 |
-| `MODEL` | GLM 模型目录 | 部署记录中的模型路径；serve 仍显式传入该路径，修改变量不会自动重写启动脚本 |
-| `SOC_VERSION` | `ascend950dt_9582` | 选择对应 SoC 的原生构建目标 |
-| `CANN_ROOT` | `/usr/local/Ascend/cann-9.2.0` | 供脚本加载 set_env.sh 或 bin/setenv.bash；变量本身不完成加载 |
-| `install_kvaf_pd_source.sh` 第一个参数 | `-` | 保留已安装的 vLLM，仍编译 vLLM-Ascend、KVOP 和 KVAF SDK |
-
-K 的 CPU-only CMake 使用 `KVAF_BUILD_REMOTE_CPU_SERVICE=ON`，并关闭 Python、AIV Get/Put 和 NPU offload 构建。
-`KVAF_ENABLE_CPU_OFFLOAD=OFF` 不等于关闭 K 数据服务。
-协调器只需 Python 标准库和保持相对目录的两个框架 Python 文件，不需在 K 安装/编译完整 vLLM、Ascend 或 KVOP。
-
-### 8.2 运行地址与端口对应关系
+## 8. 历史基线的 K、协调器与 Proxy 端口
 
 | 组件 / 参数 | 本次值 | 必须对应的位置 |
 | --- | --- | --- |
