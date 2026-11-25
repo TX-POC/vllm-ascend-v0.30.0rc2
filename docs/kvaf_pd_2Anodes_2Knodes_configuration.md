@@ -21,7 +21,7 @@
 
 | 依赖 | 正式来源 | 本轮固定提交 |
 | --- | --- | --- |
-| KVAF | `TX-POC/KVAF-Develop/main` | `813f1750a50b7e6c92d5f5397f2fbc05befef6da` |
+| KVAF | `TX-POC/KVAF-Develop/main` | `95a14f1cfaa6d7c76666f5d692df4c4f182360ec` |
 | KVIP | `TX-POC/KVAF-KVIP/main` | `d6cfd392f722dd3f96ef6e05175f503aac511dbb` |
 
 ## 2. 准备候选源码
@@ -52,7 +52,7 @@ mkdir -p /home/c00612283/pd-main-deps
 cd /home/c00612283/pd-main-deps
 
 git clone --branch main https://github.com/TX-POC/KVAF-Develop.git KVAF
-git -C KVAF switch --detach 813f1750a50b7e6c92d5f5397f2fbc05befef6da
+git -C KVAF switch --detach 95a14f1cfaa6d7c76666f5d692df4c4f182360ec
 
 # 仅在 P/D 需要 KVIP。
 git clone --branch main https://github.com/TX-POC/KVAF-KVIP.git KVIP
@@ -63,7 +63,7 @@ git -C KVIP switch --detach d6cfd392f722dd3f96ef6e05175f503aac511dbb
 
 ### P/D 容器
 
-两侧各执行一次。使用当前镜像的 Python、torch、torch_npu 和配套 CANN／ATB 环境。候选框架采用 editable 安装，使用独立的测试容器或独立 Python 环境保留旧实例的安装。
+两侧各执行一次。使用当前镜像的 Python、torch、torch_npu 和配套 CANN／ATB 环境。KVAF `95a14f1` 的 Pull 路由编译还需要容器中的 Boost 开发头文件，例如 openEuler 的 `boost-devel` 或 Debian/Ubuntu 的 `libboost-dev`。候选框架采用 editable 安装，使用独立的测试容器或独立 Python 环境保留旧实例的安装。
 
 ```bash
 cd /home/c00612283/pd-main-framework
@@ -80,6 +80,13 @@ bash examples/disaggregated_prefill_v1/kvaf_2a_2k/install_a.sh
 
 安装脚本复用镜像中的 vLLM，安装候选 vLLM-Ascend，并用锁定的 KVAF/KVIP 构建 PD SDK。成功标记为 `PD_SDK_IMPORT_OK` 和 `PD_SOURCE_INSTALL_OK`。P/D 的 `build_dir` 指向 `pd-main-deps/KVAF/build-npu`。SDK 安装会打上 checked raw READ 补丁，D 在 NPU Pull 设备完成状态确认后才报告 HBM 就绪。
 
+如果同一检出已完成 vLLM-Ascend editable 安装，可以只重编配套 SDK 和算子。KVAF 与 KVIP 使用独立的干净检出，安装器会在各自的锁定提交上应用所需补丁。
+
+```bash
+export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
+bash scripts/install_kvaf_pd.sh /home/c00612283/pd-main-deps/KVAF /home/c00612283/pd-main-deps/KVIP
+```
+
 如果原生算子构建卡在 catlass 下载，先按候选仓库的 `.gitmodules` 在测试容器准备固定版本的 `csrc/third_party/catlass`，确认头文件目录可读后再运行安装脚本。
 
 ### K1/K2 宿主机
@@ -94,7 +101,7 @@ bash examples/disaggregated_prefill_v1/kvaf_2a_2k/build_k.sh \
 ldd /home/c00612283/pd-main-deps/KVAF/build-hostcpu-k/runtime/kvaf_cpu_service
 ```
 
-`ldd` 确认库都能解析。K 侧只需要 CPU 服务产物以及运行初始化协调器所需的宿主机 Python。P/D 的新绑定和 K 二进制配套切换，涉及 K 服务重启时旧 DDR ticket 会失效。
+用 `ldd` 确认库都能解析。P/D 和 K1/K2 统一切换到 `95a14f1` 的配套产物。新版 P/D 使用 KVHR v9，K 侧需要支持扩展的 UB 候选查询。切换前先排空旧请求，停止旧 P/D，再重启 K 服务。K 重启后旧 DDR ticket 会失效。
 
 ## 4. 启动顺序
 
@@ -115,6 +122,7 @@ export KVAF_PD_KVIP_ROOT=/home/c00612283/pd-main-deps/KVIP
 
 - 两台 K 各确认四个服务均在监听后启动 D。D 的 `initialization_coordinator` 默认留空，直接向映射的 K 端点初始化。
 - D 就绪后，P 需要访问 D `31000`～`31007` 和 SDK ticket 返回的动态 HBM 端口。P/D 还需能访问对应 K 的业务端口及 UB 数据面。
+- 跨机 NPU Pull 默认从 HCCL rootinfo 选择 CLOS EID。启动时核对 P/D 容器里的 rootinfo 和宿主机 boot ID，以及 K 日志中的候选设备是否符合实际 CPU 绑定。
 - P、D、Proxy 前台运行。D／P 各自使用 `curl --fail --noproxy '*' --max-time 5 http://本机IP:端口/health` 确认就绪。Proxy 脚本复查两端再监听 `8000`。
 - A 侧路径可用 `KVAF_PD_PYTHON`、`KVAF_PD_SDK_ROOT`、`KVAF_PD_BUILD_DIR`、`KVAF_PD_KVIP_ROOT`、`KVAF_PD_MODEL` 覆盖。K 侧用 `KVAF_PD_K_BUILD_DIR`、`KVAF_PD_K_PYTHON`、`KVAF_PD_K_LOG_DIR`。
 

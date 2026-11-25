@@ -7,7 +7,7 @@ kvip_dir="$repo_dir/third_party/KVIP"
 kvip_branch=main
 kvip_revision=d6cfd392f722dd3f96ef6e05175f503aac511dbb
 kvaf_branch=main
-kvaf_revision=813f1750a50b7e6c92d5f5397f2fbc05befef6da
+kvaf_revision=95a14f1cfaa6d7c76666f5d692df4c4f182360ec
 source_only=false
 build_args=()
 main_kvip_dir=""
@@ -59,7 +59,7 @@ else
             directory="$kvaf_dir"
             branch="$kvaf_branch"
             revision="$kvaf_revision"
-            repository=https://github.com/TX-POC/KVAF-Devlop.git
+            repository=https://github.com/TX-POC/KVAF-Develop.git
         fi
         if [[ -d "$directory/.git" || -f "$directory/.git" ]] &&
            [[ "$(git -C "$directory" rev-parse HEAD)" == "$revision" ]]; then
@@ -78,6 +78,15 @@ else
             build_args=()
         fi
     done
+fi
+# Keep the pinned KVIP build recipe and its AIV Direct Get patch aligned with KVAF main.
+compat_patch="$repo_dir/scripts/patches/kvip-kvaf-95a14f1.patch"
+if git -C "$kvip_dir" apply --check "$compat_patch" 2>/dev/null; then
+    git -C "$kvip_dir" apply "$compat_patch"
+    build_args=()
+elif ! git -C "$kvip_dir" apply --reverse --check "$compat_patch" 2>/dev/null; then
+    echo "KVIP checkout does not match the KVAF 95a14f1 compatibility patch" >&2
+    exit 1
 fi
 if [[ "$source_only" == true ]]; then
     exec bash "$kvip_dir/scripts/build.sh" --prepare-only --kvaf-root "$kvaf_dir" --transport ubmem

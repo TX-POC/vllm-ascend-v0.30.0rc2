@@ -1,0 +1,39 @@
+diff --git a/scripts/build.py b/scripts/build.py
+index 4abb4d7..a888327 100755
+--- a/scripts/build.py
++++ b/scripts/build.py
+@@ -10,7 +10,7 @@ import sys
+ from pathlib import Path
+
+ ROOT = Path(__file__).resolve().parents[1]
+-REVISION = "813f1750a50b7e6c92d5f5397f2fbc05befef6da"
++REVISION = "95a14f1cfaa6d7c76666f5d692df4c4f182360ec"
+
+
+ def call(command, cwd=None, env=None):
+@@ -50,7 +50,7 @@ def prepare_dependency(root, transport):
+     if not root.exists():
+         root.parent.mkdir(parents=True, exist_ok=True)
+         call(["git", "clone", "--no-checkout", "--branch", "main",
+-              "https://gitcode.com/CacheOS/KVAF.git", root])
++              "https://github.com/TX-POC/KVAF-Develop.git", root])
+         call(["git", "checkout", "--detach", REVISION], cwd=root)
+     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+     if head != REVISION:
+diff --git a/scripts/patches/kvaf-aiv-direct-get-capacity.patch b/scripts/patches/kvaf-aiv-direct-get-capacity.patch
+index b9bfbb9..b71ab63 100644
+--- a/scripts/patches/kvaf-aiv-direct-get-capacity.patch
++++ b/scripts/patches/kvaf-aiv-direct-get-capacity.patch
+@@ -1,9 +1,9 @@
+ diff --git a/runtime/include/peer_execution_resources.h b/runtime/include/peer_execution_resources.h
+ --- a/runtime/include/peer_execution_resources.h
+ +++ b/runtime/include/peer_execution_resources.h
+-@@ -58,4 +58,10 @@
+-   }
+-   Status ValidateCapacity(std::uint32_t count) const {
++@@ -73,4 +73,10 @@ class PeerExecutionResources final : public ExecutionResourceOwner {
++     if (!config_.put && IsWindowedGet({config_.transport, config_.executor, config_.algorithm}))
++       return Status::OK();
+ +    // Direct AIV Get consumes the caller's descriptor tensors. Its queue
+ +    // depth and in-flight budget are independent of descriptor capacity.
+ +    if (!config_.put && config_.executor == Executor::Aiv &&

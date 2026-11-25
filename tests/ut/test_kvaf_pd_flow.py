@@ -96,7 +96,7 @@ class SDK:
         return Source(self, npu=True)
 
     @staticmethod
-    def NpuRuntime(**kwargs):
+    def NpuRuntime(*, device_id):
         return NS(initialize=lambda: None, shutdown=lambda: None)
 
 

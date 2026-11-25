@@ -105,7 +105,7 @@ class Sender:
             self.executor = ThreadPoolExecutor(
                 max_workers=min(len(self.memories), 8), thread_name_prefix="kvaf-pd-send"
             )
-            self.bootstrap = self.sdk.NpuRuntime(device_id=self.device_id, enable_cpu_offload=True)
+            self.bootstrap = self.sdk.NpuRuntime(device_id=self.device_id)
             self.bootstrap.initialize()
             for endpoint in self.config.decode_endpoints:
                 self._register_peer(endpoint)

@@ -16,14 +16,14 @@ source third_party/KVIP/scripts/env.sh
 
 一次运行安装脚本即可构建 URMA 和 UBmem。脚本先构建支持两种传输的 KVAF、LIDU 和 UBmem LIFetch，再用同一份 KVAF 构建 URMA LIFetch。
 
-两个安装入口从 `TX-POC/KVAF-KVIP` 和 `TX-POC/KVAF-Devlop` 获取同一组固定版本：
+两个安装入口从 `TX-POC/KVAF-KVIP` 和 `TX-POC/KVAF-Develop` 获取同一组固定版本：
 
 | 依赖 | 下载分支 | 固定提交 |
 | --- | --- | --- |
 | KVIP | `main` | `d6cfd392f722dd3f96ef6e05175f503aac511dbb` |
-| KVAF | `main` | `813f1750a50b7e6c92d5f5397f2fbc05befef6da` |
+| KVAF | `main` | `95a14f1cfaa6d7c76666f5d692df4c4f182360ec` |
 
-脚本将依赖下载到 `third_party/KVIP` 和 `third_party/KVAF`。已有相同提交的检出会复用，切换提交时会备份原目录。KVAF 补丁由 KVIP 构建入口应用。
+脚本将依赖下载到 `third_party/KVIP` 和 `third_party/KVAF`。已有相同提交的检出会复用，切换提交时会备份原目录。安装脚本先更新固定版本 KVIP 的构建配置及 AIV Direct Get 补丁，再由 KVIP 构建入口应用 KVAF 补丁。编译启用了 Pull 的 KVAF 时，容器需提供 Boost 开发头文件。
 `--source-only` 下载并准备两份源码。`--skip-kvaf-build` 仅适用于已按当前补丁构建的 KVAF。
 `install_kvaf.sh` 转发到同一个安装流程。
 
