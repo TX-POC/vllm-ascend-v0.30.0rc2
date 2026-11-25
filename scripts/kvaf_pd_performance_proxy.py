@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in launcher: original Proxy arguments, routes, retries and streaming."""
+"""Launch the PD proxy with optional request-phase capture."""
 
 import importlib.util
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from kvaf_pd_performance import load_config
 
-
-def load_proxy():
+def load_proxy(*, capture=True):
     path = (
         Path(__file__).resolve().parents[1]
         / "examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py"
@@ -18,6 +17,8 @@ def load_proxy():
     spec = importlib.util.spec_from_file_location("kvaf_observed_proxy", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if not capture:
+        return module
     native_lifespan = module.app.router.lifespan_context
 
     @asynccontextmanager
@@ -25,6 +26,8 @@ def load_proxy():
         async with native_lifespan(app):
             observer = None
             try:
+                from kvaf_pd_performance import load_config
+
                 config = load_config()
                 if config.active:
                     from kvaf_pd_proxy_observer import ProxyObserver
@@ -46,11 +49,12 @@ def load_proxy():
 def main():
     import uvicorn
 
-    # Preserve scripts/kvaf_pd_proxy.sh backend-connectivity semantics.
     for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
         os.environ.pop(name, None)
-    proxy = load_proxy()
-    proxy.global_args = proxy.parse_args()
+    argv = sys.argv[1:]
+    capture = argv[:1] != ["--no-capture"]  # Used by the plain serving launcher.
+    proxy = load_proxy(capture=capture)
+    proxy.global_args = proxy.parse_args(argv if capture else argv[1:])
     uvicorn.run(proxy.app, host=proxy.global_args.host, port=proxy.global_args.port)
 
 

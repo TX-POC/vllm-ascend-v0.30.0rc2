@@ -4,10 +4,8 @@
 set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kvip_dir="$repo_dir/third_party/KVIP"
-kvip_branch=main
-kvip_revision=d6cfd392f722dd3f96ef6e05175f503aac511dbb
-kvaf_branch=main
-kvaf_revision=95a14f1cfaa6d7c76666f5d692df4c4f182360ec
+# shellcheck source=scripts/kvaf_dependency_versions.sh
+source "$repo_dir/scripts/kvaf_dependency_versions.sh"
 source_only=false
 build_args=()
 main_kvip_dir=""
@@ -52,14 +50,12 @@ else
     for dependency in KVIP KVAF; do
         if [[ "$dependency" == KVIP ]]; then
             directory="$kvip_dir"
-            branch="$kvip_branch"
             revision="$kvip_revision"
-            repository=https://github.com/TX-POC/KVAF-KVIP.git
+            repository="$kvip_repository"
         else
             directory="$kvaf_dir"
-            branch="$kvaf_branch"
             revision="$kvaf_revision"
-            repository=https://github.com/TX-POC/KVAF-Develop.git
+            repository="$kvaf_repository"
         fi
         if [[ -d "$directory/.git" || -f "$directory/.git" ]] &&
            [[ "$(git -C "$directory" rev-parse HEAD)" == "$revision" ]]; then
@@ -71,7 +67,7 @@ else
             mv "$directory" "$backup/$dependency"
             echo "Previous $dependency preserved: $backup/$dependency"
         fi
-        git clone --no-checkout --branch "$branch" "$repository" "$directory"
+        git clone --no-checkout --branch main "$repository" "$directory"
         git -C "$directory" checkout --detach "$revision"
         echo "$dependency source ready: $directory @ $revision"
         if [[ "$dependency" == KVAF ]]; then

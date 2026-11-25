@@ -391,17 +391,17 @@ class TestPDFlow(unittest.TestCase):
         self.assert_payload(256)
         self.assertFalse(self.pool.policy._received_tails)
 
-    def test_temporary_transfer_observer_keeps_native_chunks_bytes_and_waits(self):
-        from test_kvaf_pd_scripts import TRANSFER_STATS
+    def test_transfer_observer_keeps_native_chunks_bytes_and_waits(self):
+        from test_kvaf_pd_scripts import PERFORMANCE, capture_config, captured_transfer_samples
 
         events = []
         with tempfile.TemporaryDirectory() as directory:
             observers = []
             for sender in self.senders:
-                observer = TRANSFER_STATS.PullObserver(
+                observer = PERFORMANCE.SenderObserver(
                     sender,
+                    capture_config(directory),
                     dict(role="P", host="p", boot_id="boot", engine="e"),
-                    directory=directory,
                 )
                 observers.append(observer)
                 sender._call = observer
@@ -422,8 +422,7 @@ class TestPDFlow(unittest.TestCase):
             finally:
                 for observer in observers:
                     observer.capture.close()
-            captures = TRANSFER_STATS.read_captures(Path(directory).glob("*.jsonl"))
-            layers, requests, rejected, _, problems = TRANSFER_STATS.collect_samples(captures, 129)
+            layers, requests, rejected, _, problems = captured_transfer_samples(directory, 129)
             self.assertFalse(rejected)
             self.assertFalse(problems)
             self.assertEqual(len(layers), len(self.memories))

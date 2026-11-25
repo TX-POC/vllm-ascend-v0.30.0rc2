@@ -11,7 +11,7 @@ esac
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$here/../../.." && pwd)
-kvaf_source=${KVAF_PD_SDK_ROOT:-/home/c00612283/pd-main-deps/KVAF}
+kvaf_source=${KVAF_PD_SDK_ROOT:-$(dirname "$root")/KVAF}
 build=${KVAF_PD_K_BUILD_DIR:-$kvaf_source/build-hostcpu-k}
 python_bin=${KVAF_PD_K_PYTHON:-python3}
 log_root=${KVAF_PD_K_LOG_DIR:-/home/c00612283/pd-pool-logs}

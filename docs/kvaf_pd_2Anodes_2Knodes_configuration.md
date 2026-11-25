@@ -24,104 +24,61 @@
 | KVAF | `TX-POC/KVAF-Develop/main` | `95a14f1cfaa6d7c76666f5d692df4c4f182360ec` |
 | KVIP | `TX-POC/KVAF-KVIP/main` | `d6cfd392f722dd3f96ef6e05175f503aac511dbb` |
 
-## 2. 准备候选源码
+## 2. 获取框架源码
 
-框架仓库和 KVAF 仓库分别核对版本。`v0.30.0rc2-develop` 的 `2548ccb85` 是候选版本的基线。接入 KVAF `95a14f1` 的框架适配从 `fba271d33` 开始，按本节使用候选 Git Bundle，独立于现有部署。
-
-**严格一致构建限制**。当前 `install_a.sh`、`scripts/install_kvaf_pd.sh` 和 `scripts/install_kvip.sh` 会在准备阶段修改 KVAF 或 KVIP 构建源码，`--source-only` 也会应用补丁。即使 `git rev-parse HEAD` 返回锁定提交，源码仍可能与远端不同。要求编译输入和各自远端 `main` 严格一致时，保留干净检出，等兼容改动进入上游并更新锁定版本后再执行 P/D 构建。以下 P/D 安装步骤仅供明确允许构建补丁的候选验证环境使用。
-
-将部署包中的 `kvaf-pd-2a2k.bundle` 放到 `/home/c00612283/kvaf-pd-2a2k.bundle`。从现有框架仓库执行，`git bundle verify` 会检查该仓库是否具有导入所需的基线：
+P、D 和两台 K 使用同一份框架分支。以下以 `/home/c00612283/kvaf_vllm_ascend` 为部署根目录，框架与外部依赖放在同一级。
 
 ```bash
-(
-set -euo pipefail
-cd /home/c00612283/kvaf_vllm_ascend/vllm-ascend-v0.30.0rc2
-git bundle verify /home/c00612283/kvaf-pd-2a2k.bundle
-git fetch /home/c00612283/kvaf-pd-2a2k.bundle HEAD
-git merge-base --is-ancestor fba271d33 FETCH_HEAD
-git worktree add --detach /home/c00612283/pd-main-framework FETCH_HEAD
-git -C /home/c00612283/pd-main-framework log -2 --oneline
-)
+mkdir -p /home/c00612283/kvaf_vllm_ascend
+cd /home/c00612283/kvaf_vllm_ascend
+git clone --branch v0.30.0rc2-develop https://github.com/TX-POC/vllm-ascend-v0.30.0rc2.git
+cd vllm-ascend-v0.30.0rc2
+git log -1 --oneline
 ```
 
-四台主机各准备 KVAF。仅 P/D 准备 KVIP。以下目录用于首次检出，如果已有同版本独立目录，可通过脚本的路径变量指定。
-
-```bash
-mkdir -p /home/c00612283/pd-main-deps
-cd /home/c00612283/pd-main-deps
-
-git clone --branch main https://github.com/TX-POC/KVAF-Develop.git KVAF
-git -C KVAF switch --detach 95a14f1cfaa6d7c76666f5d692df4c4f182360ec
-
-# 仅在 P/D 需要 KVIP。
-git clone --branch main https://github.com/TX-POC/KVAF-KVIP.git KVIP
-git -C KVIP switch --detach d6cfd392f722dd3f96ef6e05175f503aac511dbb
-```
+已有 checkout 时在框架根目录执行 `git pull --ff-only origin v0.30.0rc2-develop`，先确认 P、D 和 Proxy 都使用这个目录。容器内需要核对实际挂载路径和启动进程的脚本路径。
 
 ## 3. 编译安装
 
 ### P/D 容器
 
-两侧各执行一次。使用当前镜像的 Python、torch、torch_npu 和配套 CANN／ATB 环境。KVAF `95a14f1` 的 Pull 路由编译还需要容器中的 Boost 开发头文件，例如 openEuler 的 `boost-devel` 或 Debian/Ubuntu 的 `libboost-dev`。候选框架采用 editable 安装，使用独立的测试容器或独立 Python 环境保留旧实例的安装。
+使用当前镜像配套的 vLLM、torch、torch_npu 和 ATB。两侧从框架根目录执行：
 
 ```bash
-cd /home/c00612283/pd-main-framework
 export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
 export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.0
-# 按当前镜像路径加载 CANN。已加载时沿用现有环境。
-if [[ -f "$ASCEND_CANN_PACKAGE_PATH/set_env.sh" ]]; then
-    source "$ASCEND_CANN_PACKAGE_PATH/set_env.sh"
-else
-    source "$ASCEND_CANN_PACKAGE_PATH/bin/setenv.bash"
-fi
-bash examples/disaggregated_prefill_v1/kvaf_2a_2k/install_a.sh
-```
-
-安装脚本复用镜像中的 vLLM，安装候选 vLLM-Ascend，并用锁定的 KVAF/KVIP 构建 PD SDK。成功标记为 `PD_SDK_IMPORT_OK` 和 `PD_SOURCE_INSTALL_OK`。P/D 的 `build_dir` 指向 `pd-main-deps/KVAF/build-npu`。SDK 安装会打上 checked raw READ 补丁，D 在 NPU Pull 设备完成状态确认后才报告 HBM 就绪。
-
-如果同一检出已完成 vLLM-Ascend editable 安装，可以只重编配套 SDK 和算子。KVAF 与 KVIP 使用独立的干净检出，安装器会在各自的锁定提交上应用所需补丁。
-
-```bash
-export KVAF_PD_PYTHON=/usr/local/python3.12.13/bin/python3
-bash scripts/install_kvaf_pd.sh /home/c00612283/pd-main-deps/KVAF /home/c00612283/pd-main-deps/KVIP
-```
-
-如果原生算子构建卡在 catlass 下载，先按候选仓库的 `.gitmodules` 在测试容器准备固定版本的 `csrc/third_party/catlass`，确认头文件目录可读后再运行安装脚本。
-
-### P/D 一键构建
-
-在 P 或 D 容器的框架仓库根目录执行，先准备与镜像匹配的 vLLM、torch、torch_npu 和 ATB。以下入口适用于允许打补丁的候选验证环境。
-
-```bash
 bash scripts/build_kvaf_pd_a.sh --full
 ```
 
-已有当前框架目录的 editable 安装时，将 `--full` 改为 `--sdk-only`。脚本默认查找框架同级目录的 KVAF 和 KVIP，缺失时从 GitHub 检出锁定版本，已有目录版本不符时停止。可用 `KVAF_PD_SDK_ROOT` 和 `KVAF_PD_KVIP_ROOT` 指定其他路径。Boost 优先使用 `BOOST_INCLUDEDIR`、`BOOST_ROOT` 或系统头文件。离线时可在框架同级目录放置官方 `boost_1_83_0.tar.gz`，或用 `KVAF_PD_BOOST_ARCHIVE` 指定文件。
+`--full` 安装框架并构建配套 SDK，成功时输出 `PD_SDK_IMPORT_OK` 和 `PD_SOURCE_INSTALL_OK`。只重建 SDK 和 KVIP 时使用 `--sdk-only`，成功时输出 `PD_SDK_IMPORT_OK`。
+给定匹配的本地 vLLM 源码时，`--full` 也可加 `--vllm-source /path/to/vllm`。脚本默认在框架同级查找 `KVAF` 和 `KVIP`，可通过 `KVAF_PD_SDK_ROOT` 和 `KVAF_PD_KVIP_ROOT` 指定其他路径。缺失时会检出固定提交；已有目录版本不符时停止。
 
-如果确认是历史补丁留下的未跟踪头文件，可在命令末尾加 `--remove-stale-headers`。脚本仅处理这次遇到的两个已知头文件，已经完整应用的补丁会保留。NPU SDK 构建关闭存在兼容问题的 Host 模拟测试目标，保留生产 Pull 内核和完成校验。成功标记为 `PD_SOURCE_INSTALL_OK`。首次编译框架仍需准备 CATLASS、makeself、Abseil 和 Protobuf，离线环境应提前填充本地依赖。K 服务继续按下节单独编译。
+**构建源码一致性**。锁定提交是构建补丁的基线。PD 构建的源码准备阶段会应用 KVIP 兼容和 checked raw READ 补丁。独立运行 `install_kvip.sh --source-only` 也会应用 KVIP 所需补丁。如果编译输入必须与远端 `main` 完全一致，需等兼容改动进入上游并更新锁定版本。
+
+Boost 使用 `BOOST_INCLUDEDIR`、`BOOST_ROOT` 或系统开发头文件。离线时可在框架同级目录放置官方 `boost_1_83_0.tar.gz`，也可用 `KVAF_PD_BOOST_ARCHIVE` 指定归档。
+如果历史补丁留下已知的未跟踪头文件，核对来源后可加 `--remove-stale-headers`。已经完整应用的补丁会保留。
+首次编译框架还需要 CATLASS、makeself、Abseil 和 Protobuf。离线环境应提前准备相同版本的本地依赖。
 
 ### K1/K2 宿主机
 
-两台 K 使用同一 KVAF SHA 构建 CPU 服务。按宿主机的 UMDK 安装位置填写头文件和 `liburma` 路径：
+两台 K 使用同一 KVAF SHA 构建 CPU 服务。首次构建前检出 KVAF 到框架同级。按宿主机的 UMDK 安装位置填写头文件和 `liburma` 路径：
 
 ```bash
-cd /home/c00612283/pd-main-framework
+cd /home/c00612283/kvaf_vllm_ascend
+git clone --branch main https://github.com/TX-POC/KVAF-Develop.git KVAF
+git -C KVAF switch --detach 95a14f1cfaa6d7c76666f5d692df4c4f182360ec
+cd vllm-ascend-v0.30.0rc2
 bash examples/disaggregated_prefill_v1/kvaf_2a_2k/build_k.sh \
   -DKVAF_URMA_INCLUDE_DIR=/usr/include/ub/umdk/urma \
   -DKVAF_URMA_LIBRARY=/usr/lib64/liburma.so
-ldd /home/c00612283/pd-main-deps/KVAF/build-hostcpu-k/runtime/kvaf_cpu_service
+ldd ../KVAF/build-hostcpu-k/runtime/kvaf_cpu_service
 ```
 
 用 `ldd` 确认库都能解析。P/D 和 K1/K2 统一切换到 `95a14f1` 的配套产物。新版 P/D 使用 KVHR v9，K 侧需要支持扩展的 UB 候选查询。切换前先排空旧请求，停止旧 P/D，再重启 K 服务。K 重启后旧 DDR ticket 会失效。
 
 ## 4. 启动顺序
 
-从框架检出目录执行。每个 P/D 容器终端先加载 CANN／ATB 环境。启动脚本默认从 `/home/c00612283/kvaf_vllm_ascend` 查找 `KVAF` 和 `KVIP`。如果本轮编译使用其他检出目录，启动时显式指定与安装时相同的目录。`KVAF_PD_BUILD_DIR` 默认从 `KVAF_PD_SDK_ROOT/build-npu` 推导，若之前已设置，确认它指向同一轮产物。按第 2 节检出时可用：
-
-```bash
-export KVAF_PD_SDK_ROOT=/home/c00612283/pd-main-deps/KVAF
-export KVAF_PD_KVIP_ROOT=/home/c00612283/pd-main-deps/KVIP
-```
+从框架检出目录执行。每个 P/D 容器终端先加载 CANN／ATB 环境。启动脚本默认从框架同级查找 `KVAF` 和 `KVIP`。`KVAF_PD_BUILD_DIR` 默认从 `KVAF_PD_SDK_ROOT/build-npu` 推导，若之前已设置，确认它指向同一轮产物。现有部署若使用其他目录，可设置相同的 `KVAF_PD_SDK_ROOT` 和 `KVAF_PD_KVIP_ROOT`。
 
 | 顺序 | 执行位置 | 命令 |
 | --- | --- | --- |
@@ -129,7 +86,7 @@ export KVAF_PD_KVIP_ROOT=/home/c00612283/pd-main-deps/KVIP
 | 2 | D 容器 | `bash scripts/d_start.sh` |
 | 3 | P 容器 | `bash scripts/p_start.sh` |
 | 4 | P 容器，另一终端 | `bash examples/disaggregated_prefill_v1/kvaf_2a_2k/proxy_start.sh` |
-| 5 | 能访问 Proxy 的终端 | `bash examples/disaggregated_prefill_v1/kvaf_2a_2k/smoke.sh` |
+| 5 | 能访问 Proxy 的终端 | 按第 5 节选择普通冒烟或同步 Decode 压测 |
 
 - 两台 K 各确认四个服务均在监听后启动 D。D 的 `initialization_coordinator` 默认留空，直接向映射的 K 端点初始化。
 - D 就绪后，P 需要访问 D `31000`～`31007` 和 SDK ticket 返回的动态 HBM 端口。P/D 还需能访问对应 K 的业务端口及 UB 数据面。
@@ -187,16 +144,16 @@ ss -lntp | grep -E ':(28995|28996|28997|28999)[[:space:]]'
 
 ## 5. 请求、验收和回滚
 
-1. 先用 `smoke.sh` 发短请求，再用 `smoke.sh /path/to/prompt.txt` 发确定性长请求。建议长输入跨越 128 token block 和 4096 token 调度分段，输入和输出总长控制在 `131072` 以内。
+1. 普通 Proxy 模式先用 `smoke.sh` 发短请求，再用 `smoke.sh /path/to/prompt.txt` 发确定性长请求。同步模式用 `benchmark.py --levels 1` 验证每个 D Rank 的首步 batch。建议长输入跨越 128 token block 和 4096 token 调度分段，输入和输出总长控制在 `131072` 以内。
 2. D 核对八个 `KVAF CPU route`，P 核对多 MR 注册，K 核对对应端口的探测与 Pull 日志。字节验收时可在两端启动脚本同时改为 `diagnostics_requests=1`、`verify_kv=true`，再运行 `python3 scripts/check_kvaf_pd_diagnostics.py --require-ddr --require-compute P日志 D日志`。测性能前恢复默认值。
-3. 默认的 `--max-num-seqs` 为 P 侧 20、D 侧 16。压测前核对 K 的 NUMA 可用 DDR 和 D 的 Indexer/MTP HBM。用现有 benchmark 逐级验证实际 D batch、TTFT、TPOT 和 TPS。需要整组 KV 就绪后再 Decode 时，按同步 Decode 说明设置 Proxy、D 和客户端。 [同步 Decode 使用说明](kvaf_pd_performance_tool/DECODE_BATCH.md)
+3. 默认的 `--max-num-seqs` 为 P 侧 20、D 侧 16。压测前核对 K 的 NUMA 可用 DDR 和 D 的 Indexer/MTP HBM。用现有 benchmark 逐级验证实际 D batch、TTFT、TPOT 和 TPS。需要整组 KV 就绪后再 Decode 时，在 Proxy 侧设置 `enabled: true`，使用能够读取运行中 D 容量的同版 Proxy 和 benchmark。 [同步 Decode 使用说明](kvaf_pd_performance_tool/DECODE_BATCH.md)
 4. 日志位于框架检出的 `pd-logs/{p,d,proxy}/时间_PID/server.log` 以及 K 宿主机的 `pd-pool-logs/{k1,k2,coordinator}/时间_PID/`。停止时先停新流量并排空，按 Proxy → P → D 停止，再处理本轮 K 服务和协调器。回滚恢复旧框架、SDK、K 二进制和启动配置，然后按本说明的启动顺序恢复。
 
-脚本保留 P/D 的 MTP3 和 block size 128，P 使用 TP0-only 传输，D 使用 URMA 和 `batch_get`。本次部署脚本在主机侧核对，昇腾和鲲鹏实机验收仍需按以上步骤进行。
+脚本保留 P/D 的 MTP3 和 block size 128，P 使用 TP0-only 传输，D 使用 URMA 和 `batch_get`。更新构建路径或依赖版本后，按以上步骤重新验收。
 
 ## 脚本入口
 
-- [A 容器安装](../examples/disaggregated_prefill_v1/kvaf_2a_2k/install_a.sh)
+- [A 容器安装](../scripts/build_kvaf_pd_a.sh)
 - [K 宿主机编译](../examples/disaggregated_prefill_v1/kvaf_2a_2k/build_k.sh)
 - [K1/K2 启动](../examples/disaggregated_prefill_v1/kvaf_2a_2k/k_start.sh) · [初始化协调器](../examples/disaggregated_prefill_v1/kvaf_2a_2k/coordinator_start.sh)
 - [P 启动](../scripts/p_start.sh) · [D 启动](../scripts/d_start.sh)

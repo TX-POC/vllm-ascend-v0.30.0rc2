@@ -8,6 +8,14 @@ NS_PER_SECOND = 1_000_000_000
 MS_PER_SECOND = 1000
 
 
+def linear_quantile(ordered, fraction):
+    """Interpolate at (N - 1) * fraction in nonempty, sorted samples."""
+    index = (len(ordered) - 1) * fraction
+    lower = int(index)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+
+
 def token_event_error(row):
     """Validate the same real-token evidence for request and overlap TPOT."""
     if row.get("status") != "ok" or row.get("token_ids_complete") is not True:

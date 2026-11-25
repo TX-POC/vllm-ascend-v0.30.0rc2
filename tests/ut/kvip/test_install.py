@@ -16,7 +16,8 @@ class ExternalKvipInstallTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "scripts").mkdir()
-            shutil.copy(ROOT / "scripts/install_kvip.sh", root / "scripts")
+            for script in ("install_kvip.sh", "kvaf_dependency_versions.sh"):
+                shutil.copy(ROOT / "scripts" / script, root / "scripts")
             checkout = root / "third_party/KVIP"
             (checkout / "scripts").mkdir(parents=True)
             (checkout / ".git").mkdir()

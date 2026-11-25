@@ -5,10 +5,11 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+base=$(dirname "$root")
 python_bin=${KVAF_PD_PYTHON:-/usr/local/python3.12.13/bin/python3}
-kvaf_source=${KVAF_PD_SDK_ROOT:-/home/c00612283/kvaf_vllm_ascend/KVAF}
+kvaf_source=${KVAF_PD_SDK_ROOT:-$base/KVAF}
 kvaf_build=${KVAF_PD_BUILD_DIR:-$kvaf_source/build-npu}
-kvip_root=${KVAF_PD_KVIP_ROOT:-/home/c00612283/kvaf_vllm_ascend/KVIP}
+kvip_root=${KVAF_PD_KVIP_ROOT:-$base/KVIP}
 model=${KVAF_PD_MODEL:-/home/models/GLM-5.3-w4a4c8-mxfp4}
 test -d "$kvaf_build/python/kvaf"
 test -d "$model"

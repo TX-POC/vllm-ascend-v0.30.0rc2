@@ -3,8 +3,8 @@
 set -eo pipefail
 
 usage() {
-    echo "Usage: bash scripts/build_kvaf_pd_a.sh (--full|--sdk-only) [--remove-stale-headers]"
-    echo "Requires the matching vLLM, torch, torch_npu and ATB environment inside the A-node container."
+    echo "Usage: bash scripts/build_kvaf_pd_a.sh (--full|--sdk-only) [--vllm-source PATH] [--remove-stale-headers]"
+    echo "Use the matching CANN/ATB environment inside the A-node container. --full uses installed vLLM unless --vllm-source is given."
     echo "Applies the pinned KVAF/KVIP compatibility patches to the selected checkouts."
 }
 
@@ -17,17 +17,30 @@ case "$mode" in
     *) usage >&2; exit 2 ;;
 esac
 remove_stale=false
-if [[ ${1:-} == --remove-stale-headers ]]; then
-    remove_stale=true
+vllm_source=
+while (( $# )); do
+    case "$1" in
+        --remove-stale-headers) remove_stale=true ;;
+        --vllm-source)
+            [[ "$mode" == --full && $# -ge 2 && -f "$2/pyproject.toml" ]] ||
+                fail "--vllm-source requires a vLLM checkout and --full"
+            vllm_source=$(realpath "$2")
+            shift ;;
+        *) usage >&2; exit 2 ;;
+    esac
     shift
-fi
-[[ $# == 0 ]] || { usage >&2; exit 2; }
+done
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=scripts/kvaf_dependency_versions.sh
+source "$root/scripts/kvaf_dependency_versions.sh"
 base=$(dirname "$root")
 kvaf=${KVAF_PD_SDK_ROOT:-$base/KVAF}
 kvip=${KVAF_PD_KVIP_ROOT:-$base/KVIP}
 python_bin=${KVAF_PD_PYTHON:-/usr/local/python3.12.13/bin/python3}
+python_bin=$(command -v "$python_bin") || fail "Python interpreter not found"
+# Preserve virtual environments entered through a symlink.
+python_bin="$(cd -- "$(dirname -- "$python_bin")" && pwd)/$(basename -- "$python_bin")"
 jobs=${KVAF_PD_BUILD_JOBS:-2}
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || fail "KVAF_PD_BUILD_JOBS must be a positive integer"
 export ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH:-/usr/local/Ascend/cann-9.2.0}
@@ -38,7 +51,9 @@ elif [[ -f "$ASCEND_CANN_PACKAGE_PATH/bin/setenv.bash" ]]; then
 fi
 test -r "$ASCEND_CANN_PACKAGE_PATH/include/acl/acl.h" || fail "Missing CANN ACL headers under $ASCEND_CANN_PACKAGE_PATH"
 cd "$root"
-"$python_bin" -c 'import torch, torch_npu, vllm'
+if [[ "$mode" == --full ]]; then
+    "$python_bin" -c 'import torch, torch_npu'
+fi
 
 # The official archive is optional when the system or an explicit include directory provides Boost.
 boost_header=boost/property_tree/json_parser.hpp
@@ -70,8 +85,8 @@ checkout() {
     [[ "$actual" == "$expected" ]] || fail "$path has $actual; expected $expected"
 }
 
-checkout "$kvaf" https://github.com/TX-POC/KVAF-Develop.git 95a14f1cfaa6d7c76666f5d692df4c4f182360ec
-checkout "$kvip" https://github.com/TX-POC/KVAF-KVIP.git d6cfd392f722dd3f96ef6e05175f503aac511dbb
+checkout "$kvaf" "$kvaf_repository" "$kvaf_revision"
+checkout "$kvip" "$kvip_repository" "$kvip_revision"
 kvaf=$(realpath "$kvaf")
 kvip=$(realpath "$kvip")
 build="$kvaf/build-npu"
@@ -105,11 +120,11 @@ fi
 
 if [[ "$mode" == --full ]]; then
     "$python_bin" -m pip install 'setuptools>=77.0.3,<81.0.0' 'setuptools-scm>=8' 'setuptools-rust>=1.9.0' 'pybind11>=2.13'
+    if [[ -n "$vllm_source" ]]; then
+        VLLM_TARGET_DEVICE=empty "$python_bin" -m pip install --no-deps --no-build-isolation -e "$vllm_source"
+    fi
+    "$python_bin" -c 'import vllm'
     "$python_bin" -m pip install --no-deps --no-build-isolation -e "$root"
-else
-    "$python_bin" -I -c 'import importlib.util, pathlib, sys
-path = pathlib.Path(importlib.util.find_spec("vllm_ascend").origin).resolve()
-assert path.is_relative_to(pathlib.Path(sys.argv[1]).resolve()), f"Wrong vLLM-Ascend install: {path}; use --full"' "$root"
 fi
 
 # Match the unified NPU build without AICPU; omit the incompatible Host test targets.
@@ -130,7 +145,11 @@ export PYTHONPATH="$build/python${PYTHONPATH:+:$PYTHONPATH}"
 "$python_bin" -c 'from pathlib import Path
 import sys
 import kvaf
-from vllm_ascend.distributed.kv_transfer.kvaf.pd.connector import PDKVoffloadConnector
 assert Path(kvaf.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
 assert kvaf.NpuPullOptions(verify_completion=True).verify_completion
-print("PD_SOURCE_INSTALL_OK", kvaf.__file__)' "$build/python"
+print("PD_SDK_IMPORT_OK", kvaf.__file__)' "$build/python"
+if [[ "$mode" == --full ]]; then
+    "$python_bin" -c 'import vllm, kvaf
+from vllm_ascend.distributed.kv_transfer.kvaf.pd.connector import PDKVoffloadConnector
+print("PD_SOURCE_INSTALL_OK", vllm.__version__, kvaf.__file__)'
+fi

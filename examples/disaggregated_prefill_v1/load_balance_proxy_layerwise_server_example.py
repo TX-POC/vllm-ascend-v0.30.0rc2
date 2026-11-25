@@ -320,7 +320,7 @@ def _validate_hosts(hosts: list, arg_name: str) -> None:
         _validate_host(host, arg_name, i)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
@@ -332,7 +332,7 @@ def parse_args():
     parser.add_argument(
         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     logger.info(
         "Decoder hosts will access Proxy host:port/metaserver, ensure that %s can access %s:%s/metaserver",
         set(args.decoder_hosts),

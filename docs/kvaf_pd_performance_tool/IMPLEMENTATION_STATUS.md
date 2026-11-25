@@ -15,7 +15,7 @@ hello/register/detach 直接透传；没有真实请求绑定的 dummy forward �
 身份、层类型和时钟标签只是关联元数据。
 
 同步 Decode 组批是另一个默认关闭的压测功能，会主动推迟完成放行；其配置、容量约束与验证边界见 [同步 Decode 组批说明](DECODE_BATCH.md)。它不改变被动采集开关的含义。
-请求汇总已并入原 Proxy 的 HTTP 端口，原 `kvaf_pd_proxy.sh` 和可选采集入口共用一份实现；不再启动独立请求协调器。D 配置使用 `proxy_url` 指向现有 Proxy，K 侧初始化服务保持原样。
+请求汇总已并入原 Proxy 的 HTTP 端口，原 `kvaf_pd_proxy.sh` 和可选采集入口共用一份实现；不再启动独立请求协调器。D 从请求的 metaserver 地址得出回调地址；K 初始化协调器只在共享端口部署需要时启用。
 
 | 已接入观察点               | 实际计时依据与边界                                                                                                                |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
@@ -70,7 +70,7 @@ P/D Host forward 返回跨度也不等于设备 kernel 执行耗时。
 | `scripts/benchmark.py`                                     | 额外保存已有 SSE 的服务端响应 ID；不改变请求负载、流式 token 统计或路由     |
 
 P/D 及需要观察的 Proxy 使用同一版本。只复制 scripts 不能获得新增请求观察点，需要同步本批外部组件和示例 Proxy。
-沿用 [既有接入说明](../kvaf_pd_transfer_stats.md) 的 PYTHONPATH 和可选 Connector module_path：
+在 P/D 的已验证启动环境中加入 `scripts` 到 PYTHONPATH，并选择采样 Connector：
 
 ```bash
 export PYTHONPATH="$PWD/scripts${PYTHONPATH:+:$PYTHONPATH}"
@@ -180,7 +180,7 @@ P 不需要开启组批开关，也不必跟随 D 把 `max-num-seqs` 改成 4。
 
 ### 3.2 启动 Proxy、发送请求与核验
 
-K 服务及原初始化协调器就绪后启动 D、P，再启动一个 Proxy。D/Proxy 配置均按进程启动读取。
+K 服务就绪后启动 D、P，再启动一个 Proxy。共享 K 服务端口的部署先准备初始化协调器。
 在 P/Proxy 容器执行，日志写文件，避免后续无法取得终端历史：
 
 ```bash
@@ -289,7 +289,7 @@ python3 scripts/kvaf_pd_transfer_stats.py export-trace \
 仅开启 Proxy 阶段采集时，额外集中其文件并作为第三个输入目录；原 Proxy 的访问日志不能替代事件文件。
 `scp` 首次主机指纹应从目标主机核验，不关闭主机身份校验。P 单侧文件也能分析局部阶段，但缺少的 D/客户端证据保留未知。
 将新 Trace 与同版本 `scripts/kvaf_pd_trace_viewer.html` 复制到 Windows，在 Chrome/Edge 打开 HTML 后选择 Trace，无需网络或服务端绘图。
-首页查看 TTFT/TPOT/TPS、负载与阶段统计，请求表点击 ID 联动计算/传输双行时序；轻量文件缺少原始时序时使用上面的定向 full 文件。详细操作及历史 run01 重导示例见第 5 节。
+首页查看 TTFT/TPOT/TPS、负载与阶段统计，请求表点击 ID 联动计算/传输双行时序；轻量文件缺少原始时序时使用上面的定向 full 文件。查看器操作见第 5 节。
 
 输入不能混合不同实验的 P engine。允许同 host/boot、同部署标识下的 `_dp0`、`_dp1` 等兄弟 engine：后缀必须与 `dp_rank` 一致，DP/TP 拓扑和层集合一致，同一请求/代次只能属于一个 P engine。不能为了通过校验删除后缀或伪造采集头；筛选来源应以共同部署标识分组，不把正常 DP 分片当成多次重启。读 schema 1 旧文件、schema 2 和本批 schema 3；原无子命令分析与 compare 仍保持旧用法。
 提供 `--client-records` 时，分析仅包含该文件关联的请求（再应用正式/预热、输入长度与请求 ID 筛选），不把其他已标记 measure 的旧请求计入。显式空结果或没有匹配时不会回退统计历史请求；缺少有效证据仍显示 INCOMPLETE。缺少客户端文件时没有自动选择最新实验的依据，混合旧部署仍拒绝。
@@ -418,37 +418,9 @@ Proxy 的 batch_size 是原 API 子请求数，不代表 D 每卡实际 batch。
 
 当前界面只保留概览、请求矩阵/联动时序、按层传输核验三层。删除独立的阶段分布柱状图、旧多行时间轴及关联图，不重复展示同一请求。内部 Trace 字段保留 t1/t2 兼容旧数据，主界面只用 P→D KV 传输（D2D）、P→K DDR KV 传输（D2H）。
 
-### 5.1 先看已有数据：重新导出
+### 5.1 查看已有采集
 
-更新整套同版本工具后，可以从旧采集重新导出部署已记录的字段、逐层传输统计、请求矩阵和 TPS。旧采集没有的 EP、实际 batch、逐层计算不会被补造；新源码并不改变旧文件中的事实。
-下面沿用本次实验的路径；替换客户端结果为同轮文件。原有事件约 152 万条，因此显式设置输入预算。
-
-```bash
-cd /home/c00612283/vllm-ascend-v0.30.0rc2
-CLIENT_RESULT=/home/c00612283/pd-benchmark/run01/20261116_110224_7642a1e5/result.json
-
-# 轻量概览：整组请求、逐请求矩阵、层统计都保留，不携带原始时间轴。
-python3 scripts/kvaf_pd_transfer_stats.py export-trace \
-  /home/c00612283/capture-run01/p /home/c00612283/capture-run01/d \
-  --client-records "$CLIENT_RESULT" \
-  --max-records 3000000 --max-input-bytes 1073741824 \
-  --trace-detail stages \
-  --output /home/c00612283/capture-run01/pd-overview-v19.trace.json
-```
-
-需要点击某个请求看真实时间轴时，用同一批输入另行导出，输出文件名需是未存在的新文件：
-
-```bash
-python3 scripts/kvaf_pd_transfer_stats.py export-trace \
-  /home/c00612283/capture-run01/p /home/c00612283/capture-run01/d \
-  --client-records "$CLIENT_RESULT" \
-  --max-records 3000000 --max-input-bytes 1073741824 \
-  --trace-detail full --timeline-request-id '替换为请求表中的完整请求ID' \
-  --output /home/c00612283/capture-run01/pd-request-v19.trace.json
-```
-
-`--timeline-request-id` 可重复，只限制携带的事件，整组统计和矩阵仍保留。未携带的请求点击后明确显示缺少原始证据；不能由汇总值恢复时间轴。`--request-id` 则筛选整个分析集合并重新计算统计，不可混淆。
-仍有采集损坏/预算耗尽时，命令会标记 INCOMPLETE 并返回 2，即使成功写出文件；局部阶段不等于完整传输证据。
+按 [第 4 节](#4-服务环境内分析与导出) 导出整组概览和指定请求的时序。可重复指定 `--timeline-request-id`，只影响嵌入的原始事件。`--request-id` 会筛选分析集合并重算统计。采集不完整时，分析命令可在写出文件后返回状态 2。
 
 将新 Trace 和新版 `scripts/kvaf_pd_trace_viewer.html` 复制到 Windows，Chrome/Edge 打开 HTML 后选择 Trace。无需服务端绘图页面、Python、SDK 或网络连接。
 
@@ -496,51 +468,9 @@ Host 重叠只匹配同请求/代次、同进程/时间域、同 Target 层类�
 
 ## 6. 验证和未完成项
 
-2026-11-17 多 DP 与重复运行修复验证（CPU/本地 HTTP/TCP，非 NPU 实测）：
+本地回归覆盖 PD 字节传输与失败恢复、关闭采集、跨实例样本隔离、Trace 原子写入、请求用途筛选和重复压测结果覆盖。查看器的 Linux Chromium 检查覆盖请求 ID 联动、筛选、缩放及 SVG/PNG 导出。
 
-- 91 项原有 PD、传输统计及 benchmark 测试通过，15 个关闭/零采样率检查通过；没有更改推理、调度、KV 传输或采集热路径。
-- 合成 P DP4/TP2 的请求/层统计、同部署多 DP 来源校验通过；拒绝跨主机/boot/重启、拓扑变化、rank 后缀不一致，以及同请求代次跨 DP 合并。
-- 原始文件含旧实例、旧 measure 请求、错误来源时，显式客户端集合的样本数、阶段值、状态与干净输入一致；空客户端结果不回退历史数据。
-- 真实本地 HTTP 连续两轮覆盖相同目录，预检失败清除旧成功结果；线程外进程竞争也被拒绝。覆盖写盘错误及 Trace 超预算均保留旧完整文件，原始/客户端文件覆盖被拒绝。
-- 请求用途、warmup-only、预热失败终止、同步组批 rank/slot 与原 token 载荷回归通过；复用临时检查并适配新的固定结果路径，未新增仓库测试文件。
-- `format.sh ci` 本轮仍在 Markdownlint 钩子的 npm Git 安装策略处失败（EALLOWGIT），相关文件另行执行 Ruff、Markdownlint、Prettier 等检查；不宣称全量 CI 或 NPU 性能/精度已验收。
-
-以下为 v1.9 前一批验证（CPU/本地 TCP/Chromium，非 NPU 实测）：
-
-- 91 项原有 PD flow/recovery/integration、传输统计及 benchmark 用例通过。关闭/零采样率另复用 15 个原生用例，禁止调用采集工厂、计时器、回调及元数据复制，原字节、同步次数、恢复和返回/异常保持。
-- 可选逐层 hook 用真实 CPU Torch 模块验证一次调用、输出及原异常对象身份不变、dummy 排除、精确层/chunk、采集故障隔离；图模式和新开关关闭均不安装 hook。真实设备开销与精度仍待原环境 A/B。
-- 16 请求、2 TP 贡献者、3 层/2 chunk 合成检查原核心统计不变，层筛选有效 N 从 48 到 16；两轮同负载公共窗口 TPS、单轮分位数不可用、混合负载不平均、不同客户端时钟不混算。
-- Chromium 验证四阶段短/缺失占位、请求 ID 联动、高亮、双行真实时序、已知 30 ms/60% Host 重叠、不同 chunk/Rank/域/代次拒绝配对、共享 batch 不平摊、拖动/缩放、SVG/PNG、轻量/定向 full 整组统计一致、旧/坏/超预算文件及无网络请求。
-- 本轮 Python 语法、Ruff、Prettier、Markdownlint 及相关本地规则单独检查。完整 `format.sh ci` 未通过：钩子引导遇到 npm Git 安装限制、Go 工具不支持 install；其余全量扫描还发现既有 prefix_cache/deepseek_mtp 日志和拼写、KVOP/测试导入规则问题，以及 Gitleaks 下载受限、ShellCheck 并行解压冲突。未将这些视为本轮通过，也不夹带无关业务修复；自动格式化无关文件已撤回。
-
-CPU/替身 SDK 加真实本地 TCP 检查已覆盖：KV 字节一致、原生产同步次数、双 Pull 完成、四组聚合、eligible 与兼容口径区别、
-D Commit 丢 ACK 的原恢复次数、采集异常保持原返回/原异常、三档粒度、未结束记录、客户端精确 ID/歧义和独立时间域。
-另检查配置 0/1、缓冲丢样/停采、文件分片/总预算、弱引用所有权、半写快照、去重及原子不覆盖导出。
-复用现有 PD flow/recovery/integration/统计和 benchmark 测试，未新增仓库 UT 文件；临时验证数据不是 NPU 性能数据。
-此前各批 75 项现有 PD/统计测试、16 项 benchmark 测试通过，Python 语法、Ruff、差异空白和 Markdown 检查通过。
-关闭路径另复用 15 次原 Connector/传输检查：对关闭配置和零采样率禁止调用采集工厂、队列与计时器；对原 Sender/Receiver/Transfer 禁止调用观察回调及上下文复制函数，分段传输字节、原同步次数、完成回执丢失恢复及 DMA 失败行为均通过。
-Runner 检查禁止读取采集用 req_ids、禁止调用观察包装，确认 target/MTP 原操作只执行一次并保留原返回/异常对象。
-真实 ASGI Proxy 在两种关闭配置下不创建采集资源，不读取用途头、不调用观察回调；流式字节、请求数和原重试行为通过。
-真实本地 HTTP 同时验证默认不带用途头、结果仍标明用途，显式开启才发送标签头；上述检查没有新增仓库 UT 文件，不代表 NPU 实机性能/精度验收。
-第四批验证同长度、误导性请求名的预热/正式/未知/profiling 混合数据、预热失败剔除、标签冲突、代次歧义、
-混合 batch、所选 batch 直方图及全部统计/Trace 集合一致；真实本地 HTTP 验证 8 个预热请求结束后再发送 2 个正式请求。
-
-Proxy 检查复用原 FastAPI/httpx 处理流程及替身后端，核对启用前后的响应字节、请求数、原重试次数和批量 P 派发一次。
-执行仓库已有批量 metaserver 汇合回归函数，验证采集异常及默认 None 对象入口保持原行为。
-此处只替换框架导入边界与后端服务，不代表实机 Proxy→NPU 全链路验证。
-
-Linux Chromium 已验证本地选文件、四组/阶段/Target/MTP 表、共享成员、里程碑、客户端表、缩放/筛选/时钟切换、坏文件和 SVG/PNG，页面无网络请求。
-云策略禁止直接 file:// 页面导航，检查使用相同 HTML 内容和本地文件选择；Windows 实机和通用 Perfetto 导入尚未验证。
-
-第三批使用 10 万条合成事件检查单文件导出、浏览器加载/筛选、DOM 分页、超预算拒绝与缓存清理。
-本环境最后一次结果：38,297,674 字节（约 36.5 MiB），Linux Chromium 加载约 0.71 秒，切换请求约 3.5 毫秒，
-全事件视图处理约 199 毫秒，观测 JS 堆约 62.1 MiB。堆读数不是峰值/RSS 或内存限额，不构成 Windows 性能保证，更不是 NPU 推理数据。
-
-仍需逐步补齐或实测：
-
-- Proxy handler 之前的等待、连接池内部排队与设备计算证据仍未知；物理分配时间不可用。SDK/K 内部执行不由 Host 外层跨度代填。
-- 图模式/MTP 实机输出、取消/异步边界、长期资源增长和同负载 A/B 性能/精度尚未完成；不能宣称零开销或精度验收通过。
-- 跨主机公共时轴及全局关键路径需要同步/完成证据，目前保留独立域和有据关系；Windows、通用查看器及真实长期负载仍待验证。
+实机验收须比较相同模型、负载、并行度和图设置下的输出、实际调度 batch、TTFT、TPOT、TPS 和采集开销。跨主机比较须具备同步时钟证据。代理排队和设备内部执行若缺少直接打点，按不可用处理。
 
 ## 7. 阶段耗时统计原理与打点位置
 
@@ -638,7 +568,7 @@ K 端没有独立内部打点，当前显示的是 D/P 调用方观察；不声�
 - 请求×层：按请求、generation、层及分段关联；并行贡献者按该段整体起止跨度合并，再累计各段，形成一个请求层样本。
 - 请求累计：累加该请求各层有效传输耗时，形成请求样本；层间可能重叠，不等于 E2E 墙钟耗时。
 - 普通阶段：使用对应有效 span 的实际持续时间。共享 batch 计算跨度只保存一次，不按成员复制或除以 batch；显示实际 batch。
-- mean 为样本算术平均；P90/P99 对排序样本在 `(N-1)×分位数` 位置做线性插值，见 [transfer_stats.py](../../scripts/kvaf_pd_transfer_stats.py) 的 `percentile`。
+- mean 为样本算术平均；P90/P99 对排序样本在 `(N-1)×分位数` 位置做线性插值，见 [benchmark_metrics.py](../../scripts/benchmark_metrics.py) 的 `linear_quantile`。
 - 有效 N 是满足该指标完整性要求的实际样本数；默认仅统计显式 `measure` 正式请求。失败、取消、未完成及丢样另行标记。
 
 `detail_level=layer` 适合 t1/t2 与主要请求阶段；锁等待、SDK 调用、Commit/Publish 等细分使用 `detail` 短时采集。
@@ -655,7 +585,7 @@ K 端没有独立内部打点，当前显示的是 D/P 调用方观察；不声�
 - 某一路失败仍处理另一条已提交路径；不能逆转既有 Commit，也不重发原 READ。DMA/Commit 状态不确定时保留源、目的、Put/Ready 和错误状态，不放行 Decode。丢失 ACK 只查询原任务。
 - 无完整块、无 HBM 接收段或批次数不同的情况，不创建空传输；剩余批次沿用单路径调用。注册前握手检查 D 的 `parallel_pull_v1` 能力，双路 plan 再核对一次，旧 D 不静默回退，必须先更新并重启 P/D。
 
-部署只需更新 P/D 的 vLLM-Ascend 代码并重启相关实例；本次不修改 KVAF SDK 或 K 二进制。依据为 `KVAF-Devlop/codex/cpu-pull-hbm-reference` 的 `7912517`：K 的 Submit 创建后台 READ worker，NPU raw READ 使用独立 HBM reader。继续使用该匹配 SDK 与现有 K 服务。
+P/D 和 K 的依赖版本及切换顺序见 [2A+2K 安装部署说明](../kvaf_pd_2Anodes_2Knodes_configuration.md)。
 
 采集开启时，D 的 `D.control.pull.cpu` 包含 Prepare/Submit 到 Wait/Commit/发布的 Host 区间，`D.control.pull.npu` 记录独立 raw READ 控制区间；两者可以重叠。P 的 `connector.pull_pair.npu/cpu` 共用一次 RPC 包络，明确标记 `paired_rpc`，不能当成两个独立传输耗时，也不能据此推导设备 DMA 掩盖率。请求/层的允许传输到完成确认口径保留；旧 Pull RPC 兼容统计在联合调用上表示共同 RPC 包络，报告会提示此边界。原采集关闭路径不创建新观察资源。
 

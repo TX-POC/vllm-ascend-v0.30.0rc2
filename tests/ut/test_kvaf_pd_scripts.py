@@ -15,14 +15,33 @@ import unittest
 import weakref
 from pathlib import Path
 from queue import Full
-from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 
 import test_kvaf_pd_integration as helpers
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
 SMOKE = helpers.load_file("pd_smoke_for_ut", "scripts/kvaf_pd_smoke.py")
 TRANSFER_STATS = helpers.load_file("pd_transfer_stats_for_ut", "scripts/kvaf_pd_transfer_stats.py")
+
+
+PERFORMANCE = helpers.load_file("pd_performance_for_ut", "scripts/kvaf_pd_performance.py")
+PERFORMANCE_REPORT = helpers.load_file("pd_performance_report_for_ut", "scripts/kvaf_pd_performance_report.py")
+
+
+def capture_config(directory):
+    return PERFORMANCE.CaptureConfig(enabled=True, sample_rate=1, writer=PERFORMANCE.WriterConfig(output_dir=directory))
+
+
+def captured_transfer_samples(directory, input_tokens):
+    captures, _ = PERFORMANCE_REPORT.snapshots([directory], 1 << 24, 10000)
+    normalized = []
+    for header, checkpoint, events, path in captures:
+        rows = PERFORMANCE_REPORT._normalize(header, events)
+        normalized.append(
+            (header, dict(checkpoint, written=len(rows), enqueued=len(rows), pending_layers=0), rows, path)
+        )
+    return TRANSFER_STATS.collect_samples(normalized, input_tokens)
 
 
 class TestPDLauncher(unittest.TestCase):
@@ -321,7 +340,7 @@ class TestPDTransferStats(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sender = Sender()
             reference = weakref.ref(sender)
-            observer = TRANSFER_STATS.PullObserver(sender, dict(role="P"), directory=directory)
+            observer = PERFORMANCE.SenderObserver(sender, capture_config(directory), dict(role="P"))
             del sender
             gc.collect()
             try:
@@ -385,18 +404,21 @@ class TestPDTransferStats(unittest.TestCase):
     def test_observer_preserves_return_exception_and_rejects_lost_ack_samples(self):
         state = {"lost": False}
 
-        def original(endpoint, message, **kwargs):
-            if message["op"] == "plan":
-                return dict(job="j", count=dict(npu=1, cpu=0))
-            if message["op"] == "pull" and state["lost"]:
-                raise TimeoutError("original error")
-            return True
+        class Sender:
+            tp_rank = 0
+            memories = {"layer0": None}
+
+            def _call(self, endpoint, message, **kwargs):
+                if message["op"] == "plan":
+                    return dict(job="j", count=dict(npu=1, cpu=0))
+                if message["op"] == "pull" and state["lost"]:
+                    raise TimeoutError("original error")
+                return True
 
         with tempfile.TemporaryDirectory() as directory:
-            observer = TRANSFER_STATS.PullObserver(
-                NS(_call=original, tp_rank=0, memories={"layer0": None}),
-                dict(role="P", host="p", boot_id="b", engine="e"),
-                directory=directory,
+            sender = Sender()
+            observer = PERFORMANCE.SenderObserver(
+                sender, capture_config(directory), dict(role="P", host="p", boot_id="b", engine="e")
             )
             try:
                 observer(
@@ -419,14 +441,13 @@ class TestPDTransferStats(unittest.TestCase):
                 self.assertTrue(observer("D", dict(op="complete", job="j")))
             finally:
                 observer.capture.close()
-            captures = TRANSFER_STATS.read_captures(Path(directory).glob("*.jsonl"))
-            _, requests, rejected, _, _ = TRANSFER_STATS.collect_samples(captures, 128)
+            _, requests, rejected, _, _ = captured_transfer_samples(directory, 128)
             self.assertFalse(requests)
             self.assertTrue(rejected)
 
     def test_full_buffer_drops_measurements_without_waiting(self):
         with tempfile.TemporaryDirectory() as directory:
-            capture = TRANSFER_STATS.BufferedCapture(dict(role="P"), lambda: {}, directory=directory)
+            capture = PERFORMANCE.Capture(capture_config(directory), dict(role="P"), lambda: {})
             try:
                 with patch.object(capture.queue, "put_nowait", side_effect=Full):
                     capture.emit(dict(kind="layer"))
@@ -434,7 +455,8 @@ class TestPDTransferStats(unittest.TestCase):
                 self.assertEqual(capture.enqueued, 0)
             finally:
                 capture.close()
-            self.assertEqual(TRANSFER_STATS.read_captures([capture.path])[0][1]["dropped"], 1)
+            captures, _ = PERFORMANCE_REPORT.snapshots([directory], 1 << 20, 100)
+            self.assertEqual(captures[0][1]["dropped"], 1)
 
     def test_performance_comparison_reports_regressions(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,114 +1,24 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Buffered PD transfer measurements and offline request/layer statistics.
-
-The CLI uses only the standard library and sends no inference requests.
-Enable the companion Connector explicitly to capture measurements. No device
-synchronization, Tensor reads or additional control calls are performed.
-"""
+"""Offline PD transfer statistics, including schema 1 capture compatibility."""
 
 from __future__ import annotations
 
 import argparse
-import atexit
 import csv
 import json
 import math
-import os
 import socket
 import statistics
 import sys
-import threading
-import time
-import weakref
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
-from queue import Empty, Full, Queue
 from types import MappingProxyType
-from uuid import uuid4
 
-# Edit before starting P/D. Copy both scripts to the same scripts/ directory.
-# Use a fresh directory for each comparison run; never mix service restarts.
-CAPTURE_DIR = Path(__file__).resolve().parent / "result/kvaf_pd_transfer_stats"
-FLUSH_SECONDS = 5.0
-QUEUE_RECORDS = 2048
-FILE_BUFFER_BYTES = 1024 * 1024
+from benchmark_metrics import linear_quantile
+
 SCHEMA_VERSION = 1
 METRICS = MappingProxyType({"npu": "t1", "cpu": "t2"})
-
-
-class BufferedCapture:
-    """A bounded nonblocking queue; only the writer thread serializes samples.
-
-    Full queues invalidate the measurement rather than block inference. The
-    periodic checkpoint makes dropped records and unfinished work visible.
-    """
-
-    def __init__(self, header, snapshot, *, directory=CAPTURE_DIR):
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        self.path = directory / f"{header['role']}-{os.getpid()}-{uuid4().hex}.jsonl"
-        self.stream = self.path.open("x", buffering=FILE_BUFFER_BYTES)
-        self.header, self.snapshot = header, snapshot
-        self.queue = Queue(maxsize=QUEUE_RECORDS)
-        self.stop = threading.Event()
-        self.lock = threading.Lock()
-        self.enqueued = self.written = self.dropped = self.errors = 0
-        self.failed = False
-        self._write(dict(header, kind="header", schema=SCHEMA_VERSION, created_ns=time.time_ns()))
-        self.stream.flush()
-        self.thread = threading.Thread(target=self._run, name="kvaf-transfer-stats", daemon=True)
-        self.thread.start()
-        atexit.register(self.close)
-
-    def emit(self, record):
-        with self.lock:
-            try:
-                self.queue.put_nowait(record)
-                self.enqueued += 1
-            except Full:
-                self.dropped += 1
-
-    def note_error(self):
-        with self.lock:
-            self.errors += 1
-
-    def _write(self, record):
-        self.stream.write(json.dumps(record, separators=(",", ":")) + "\n")
-
-    def _checkpoint(self, closed=False):
-        snapshot = self.snapshot()
-        with self.lock:
-            counters = dict(enqueued=self.enqueued, written=self.written, dropped=self.dropped, errors=self.errors)
-        self._write(dict(kind="checkpoint", closed=closed, wall_ns=time.time_ns(), **counters, **snapshot))
-        self.stream.flush()
-
-    def _run(self):
-        deadline = time.monotonic() + FLUSH_SECONDS
-        try:
-            while not self.stop.is_set() or not self.queue.empty():
-                try:
-                    record = self.queue.get(timeout=min(0.25, max(0.001, deadline - time.monotonic())))
-                except Empty:
-                    record = None
-                if record is not None:
-                    self._write(record)
-                    with self.lock:
-                        self.written += 1
-                if time.monotonic() >= deadline:
-                    self._checkpoint()
-                    deadline = time.monotonic() + FLUSH_SECONDS
-            self._checkpoint(closed=True)
-        except Exception:
-            self.failed = True
-            self.note_error()
-            print(f"KVAF transfer capture failed: {self.path}; measurements are incomplete", file=sys.stderr)
-        finally:
-            self.stream.close()
-
-    def close(self):
-        self.stop.set()
-        self.thread.join(timeout=FLUSH_SECONDS + 1)
 
 
 def capture_header(config, role):
@@ -134,146 +44,6 @@ def capture_header(config, role):
     )
 
 
-class PullObserver:
-    """Observe one Sender instance without replacing framework module globals.
-
-    Original calls, exceptions and completion recovery pass through unchanged.
-    A lost Pull ACK invalidates its measurement even if native recovery later
-    succeeds: its original completion latency cannot be reconstructed exactly.
-    """
-
-    def __init__(self, sender, header, *, directory=CAPTURE_DIR):
-        original = sender._call
-        # The writer/atexit hook may outlive the Connector. Do not keep the
-        # Sender, SDK owners or KV tensors alive through a bound-method cycle.
-        self.original = (
-            weakref.WeakMethod(original) if getattr(original, "__self__", None) is not None else lambda: original
-        )
-        self.lock = threading.Lock()
-        self.jobs, self.layers = {}, {}
-        header = dict(header, tp_rank=sender.tp_rank, layers=sorted(sender.memories))
-        self.capture = BufferedCapture(header, self.snapshot, directory=directory)
-
-    def snapshot(self):
-        with self.lock:
-            return dict(pending_jobs=len(self.jobs), pending_layers=len(self.layers))
-
-    def __call__(self, endpoint, message, **kwargs):
-        original = self.original()
-        if original is None:
-            raise RuntimeError("native Sender owner is no longer alive")
-        operation = message.get("op")
-        if operation not in ("plan", "pull", "complete", "status", "cancel"):
-            return original(endpoint, message, **kwargs)
-        is_pull = operation == "pull"
-        begin = time.perf_counter_ns() if is_pull else 0
-        try:
-            result = original(endpoint, message, **kwargs)
-        except BaseException:
-            if is_pull:
-                self._safe_observe(endpoint, message, None, begin, time.perf_counter_ns())
-            raise
-        end = time.perf_counter_ns() if is_pull else 0
-        self._safe_observe(endpoint, message, result, begin, end)
-        return result
-
-    def _safe_observe(self, endpoint, message, result, begin, end):
-        try:
-            with self.lock:
-                self._observe(endpoint, message, result, begin, end)
-        except Exception:
-            # Measurement failure must never change native DMA/error handling.
-            self.capture.note_error()
-
-    def _observe(self, endpoint, message, result, begin, end):
-        if "paired_cpu" in message:
-            self.jobs[message["job"]]["paired_rpc"] = True
-            for item in (message, message["paired_cpu"]):
-                single = {key: value for key, value in item.items() if key != "paired_cpu"}
-                path_result = result.get("paths", {}).get(item["path"]) if isinstance(result, dict) else None
-                self._observe(endpoint, single, path_result, begin, end)
-            return
-        operation = message.get("op")
-        if operation == "plan":
-            context = {
-                key: message[key]
-                for key in ("request", "generation", "layer", "first", "tokens", "final", "member", "ratio")
-            }
-            self.jobs[result["job"]] = dict(
-                context,
-                peer=endpoint,
-                expected=dict(result["count"]),
-                seen={"npu": set(), "cpu": set()},
-                spans={"npu": None, "cpu": None},
-                errors=[],
-            )
-        elif operation == "pull":
-            job = self.jobs[message["job"]]
-            path, batch = message["path"], message["batch"]
-            if result is not True or batch in job["seen"][path]:
-                job["errors"].append("failed_or_unobserved_pull_ack")
-                return
-            job["seen"][path].add(batch)
-            old = job["spans"][path]
-            job["spans"][path] = [min(begin, old[0]), max(end, old[1])] if old else [begin, end]
-        elif operation == "complete" or operation == "status" and result.get("done"):
-            self._finish(message["job"])
-        elif operation == "cancel":
-            request, generation = message["request"], message["generation"]
-            self.capture.emit(dict(kind="cancel", request=request, generation=generation))
-            self.jobs = {
-                key: value
-                for key, value in self.jobs.items()
-                if (value["request"], value["generation"]) != (request, generation)
-            }
-            self.layers = {key: value for key, value in self.layers.items() if key[:2] != (request, generation)}
-
-    def _finish(self, job_id):
-        job = self.jobs.pop(job_id, None)
-        if job is None:
-            return  # Native completion/status acknowledgements are idempotent.
-        for path in METRICS:
-            if job["seen"][path] != set(range(job["expected"][path])):
-                job["errors"].append("missing_pull_completion")
-        key = job["request"], job["generation"], job["layer"]
-        if key not in self.layers:
-            self.layers[key] = dict(
-                kind="layer",
-                **{name: job[name] for name in ("request", "generation", "layer", "peer", "member", "ratio")},
-                chunks=[],
-                errors=[],
-            )
-        layer = self.layers[key]
-        if job.get("paired_rpc"):
-            layer["paired_rpc"] = True
-        if any(layer[name] != job[name] for name in ("peer", "member", "ratio")):
-            layer["errors"].append("changed_layer_contributor_or_destination")
-        layer["chunks"].append(dict(first=job["first"], tokens=job["tokens"], final=job["final"], spans=job["spans"]))
-        layer["errors"].extend(job["errors"])
-        if job["final"]:
-            layer["input_tokens"] = job["tokens"]
-            self.capture.emit(layer)
-            del self.layers[key]
-
-
-class BatchObserver:
-    """Count D scheduled logical request batches; never read device metadata."""
-
-    def __init__(self, header, cpu_config, *, directory=CAPTURE_DIR):
-        self.lock = threading.Lock()
-        self.batches = Counter()
-        self.capture = BufferedCapture(dict(header, cpu_config=cpu_config), self.snapshot, directory=directory)
-
-    def observe(self, scheduler_output):
-        size = len(scheduler_output.num_scheduled_tokens)
-        with self.lock:
-            self.batches[size] += 1
-
-    def snapshot(self):
-        with self.lock:
-            return dict(batch_histogram=dict(self.batches))
-
-
 def read_captures(paths):
     captures = []
     for path in sorted(set(Path(path).resolve() for path in paths)):
@@ -295,17 +65,11 @@ def read_captures(paths):
                 else:
                     rows.append(record)
         if header is None or checkpoint is None:
-            raise ValueError(f"{path}: missing header/checkpoint; wait at least {FLUSH_SECONDS:g}s after quiescence")
+            raise ValueError(f"{path}: missing header/checkpoint; wait for the legacy capture checkpoint")
         captures.append((header, checkpoint, rows, str(path)))
     if not captures:
         raise ValueError("no capture files found")
     return captures
-
-
-def percentile(values, quantile):
-    position = (len(values) - 1) * quantile
-    lower, upper = math.floor(position), math.ceil(position)
-    return values[lower] + (values[upper] - values[lower]) * (position - lower)
 
 
 def distribution(values):
@@ -313,8 +77,8 @@ def distribution(values):
     return dict(
         samples=len(values),
         mean_ms=statistics.fmean(values) if values else None,
-        p90_ms=percentile(values, 0.90) if values else None,
-        p99_ms=percentile(values, 0.99) if values else None,
+        p90_ms=linear_quantile(values, 0.90) if values else None,
+        p99_ms=linear_quantile(values, 0.99) if values else None,
     )
 
 

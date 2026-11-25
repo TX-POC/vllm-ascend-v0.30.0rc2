@@ -27,7 +27,13 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from benchmark_metrics import request_tpot_ms, summarize_decode_tps, summarize_hot_kv, summarize_overlap
+from benchmark_metrics import (
+    linear_quantile,
+    request_tpot_ms,
+    summarize_decode_tps,
+    summarize_hot_kv,
+    summarize_overlap,
+)
 
 
 # Frequently changed workload configuration (batch is PER DP replica, not card).
@@ -318,20 +324,15 @@ def distribution(values):
         return None
     ordered = sorted(values)
 
-    def quantile(q):
-        index = (len(ordered) - 1) * q
-        lo = int(index)
-        return ordered[lo] + (ordered[min(lo + 1, len(ordered) - 1)] - ordered[lo]) * (index - lo)
-
     return {
         "count": len(ordered),
         "mean": statistics.fmean(ordered),
         "min": ordered[0],
-        "p50": quantile(0.5),
-        "p75": quantile(0.75),
-        "p90": quantile(0.9),
-        "p95": quantile(0.95),
-        "p99": quantile(0.99),
+        "p50": linear_quantile(ordered, 0.5),
+        "p75": linear_quantile(ordered, 0.75),
+        "p90": linear_quantile(ordered, 0.9),
+        "p95": linear_quantile(ordered, 0.95),
+        "p99": linear_quantile(ordered, 0.99),
         "max": ordered[-1],
     }
 
