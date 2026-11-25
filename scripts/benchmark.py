@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from benchmark_metrics import summarize_overlap
+from benchmark_metrics import request_tpot_ms, summarize_decode_tps, summarize_hot_kv, summarize_overlap
 
 
 # Frequently changed workload configuration (batch is PER DP replica, not card).
@@ -34,7 +34,7 @@ from benchmark_metrics import summarize_overlap
 class Config:
     base_url: str = "http://127.0.0.1:8080"
     pd_proxy: bool = False
-    metadata_base_url: str = ""  # Matching P/D backend for /v1/models and /tokenize only.
+    metadata_base_url: str = ""  # Matching backend for model metadata and tokenization.
     ignore_env_proxy: bool = False  # Bypass HTTP_PROXY etc.; unrelated to the PD Proxy.
     model: str = "glm"
     api_key: str = ""
@@ -48,11 +48,13 @@ class Config:
     dataset_length_policy: str = "truncate"  # or strict; short inputs fail.
     repeat_prompt: bool = False
     prefix_warmup: bool = True  # Requires APC + cached_tokens telemetry.
+    measure_rounds: int = 1  # Independent measurement waves per target batch.
+    hot_kv_stats: bool = False  # Collect existing D feedback for synchronized measurement waves only.
     warmup_rounds: int = 0  # Full-length request warmup, independent of APC.
     warmup_batch_size: int = 1  # Requests per DP in each warmup round.
     request_phase: str = "measure"  # Set warmup for a warmup-only run.
     tag_request_phase: bool = False  # Optional Proxy observation header; result records are always labelled.
-    sync_decode_batch: bool = False  # Explicit benchmark-only global KV-ready gate; --levels sets batch/DP.
+    sync_decode_batch: bool = False  # Effective Proxy mode after discovery.
     cache_block_size: int = 128  # For APC verification; match the service setting.
     request_timeout: int = 3000
     result_dir: str = "scripts/result"
@@ -62,6 +64,8 @@ CONTROL_TIMEOUT = 120
 PROFILE_TIMEOUT = 300
 REFRESH_SECONDS = 1.0
 PROFILE_WARMUP_TOKENS = 8
+DECODE_BATCH_PATH = "/v1/kvaf-decode-batch"
+DECODE_STEP_REPORT_TIMEOUT = 12
 
 
 class BenchmarkError(RuntimeError):
@@ -325,6 +329,7 @@ def distribution(values):
         "p50": quantile(0.5),
         "p75": quantile(0.75),
         "p90": quantile(0.9),
+        "p95": quantile(0.95),
         "p99": quantile(0.99),
         "max": ordered[-1],
     }
@@ -332,18 +337,21 @@ def distribution(values):
 
 def summarize_http(requests):
     good = [r for r in requests if r["status"] == "ok"]
+    decode_tpot, existing_tpot = [], []
+    for request in good:
+        tpot = request_tpot_ms(request)
+        if tpot is None:
+            continue
+        existing_tpot.append(tpot)
+        decode_tpot.append((request["last_ns"] - request["first_ns"]) / 1e6 / (request["completion_tokens"] - 1))
     result = {
         "success": len(good),
         "failed": len(requests) - len(good),
         "ttft_ms": distribution([(r["first_ns"] - r["start_ns"]) / 1e6 for r in good]),
         "e2e_ms": distribution([(r["end_ns"] - r["start_ns"]) / 1e6 for r in good]),
-        "request_tpot_ms": distribution(
-            [
-                (r["last_ns"] - r["first_ns"]) / 1e6 / (r["completion_tokens"] - r["token_events"][0][1])
-                for r in good
-                if r["completion_tokens"] > r["token_events"][0][1]
-            ]
-        ),
+        "request_tpot_ms": distribution(existing_tpot),
+        "decode_tpot_ms": distribution(decode_tpot),
+        "decode_tpot_basis": "(last-first output arrival)/(output tokens-1); requires tokens after the first SSE burst",
         "request_tpot_basis": "(last-first output arrival)/(output tokens-first SSE burst tokens)",
         "e2e_tps": None,
         "source": "client_http_arrival",
@@ -438,20 +446,53 @@ class Reporter:
     def display(self, progress=None):
         proxy = self.report["config"].get("pd_proxy", False)
         label = "Concurrency" if proxy else "BS/DP"
-        lines = [f"{label} | success | TTFT mean ms | E2E mean ms | overlap TPOT ms | global TPS"]
+        lines = [f"{label} | success | Decode Batch (target/actual per DP) | TTFT mean ms | E2E mean ms"]
 
         def value(item, key=None):
             if key and isinstance(item, dict):
                 item = item.get(key)
-            return f"{item:.3f}" if isinstance(item, (float, int)) else "--"
+            return f"{item:.3f}" if isinstance(item, (float, int)) else "N/A"
 
+        def percentiles(stats, fields):
+            return "/".join(value(stats if stats else {}, field) for field in fields)
+
+        tps_by_level = self.report.get("decode_tps_by_level", {})
         for row in self.report["levels"]:
             http, overlap = row.get("http", {}), row.get("overlap", {})
+            first_steps = row.get("decode_batch_result", {}).get("ranks", {})
+            actual = {rank: (data.get("first_step") or {}).get("cohort_requests") for rank, data in first_steps.items()}
+            actual_text = "N/A"
+            if actual and any(count is not None for count in actual.values()):
+                counts = set(actual.values())
+                actual_text = (
+                    f"{next(iter(counts))} × {len(actual)} DP"
+                    if len(counts) == 1
+                    else ", ".join(
+                        f"DP{rank}={count if count is not None else 'N/A'}" for rank, count in actual.items()
+                    )
+                )
             lines.append(
                 f"{row.get('concurrency', row['batch']) if proxy else row['batch']:5} | {http.get('success', 0):7} | "
-                f"{value(http.get('ttft_ms'), 'mean'):>12} | {value(http.get('e2e_ms'), 'mean'):>11} | "
-                f"{value(overlap.get('tpot_ms')):>18} | {value(overlap.get('tps')):>10}"
+                f"{row['batch']} / {actual_text} | "
+                f"{value(http.get('ttft_ms'), 'mean'):>12} | {value(http.get('e2e_ms'), 'mean'):>11}"
             )
+            if http:
+                tpot = http.get("decode_tpot_ms") or {}
+                tps = tps_by_level.get(str(row["batch"]), {})
+                lines.append(
+                    f"       Decode TPOT (ms/token) mean/P50/P90/P95/P99 "
+                    f"{percentiles(tpot, ('mean', 'p50', 'p90', 'p95', 'p99'))} (N={tpot.get('count', 0)})"
+                    f" | overlap TPOT {value(overlap.get('tpot_ms'))} ms"
+                    f" | Decode TPS {value(overlap.get('tps'))}"
+                    f" | Decode avg TPS {value(tps, 'mean_tps')} (waves={tps.get('valid_waves', 0)})"
+                )
+                hot = row.get("hot_kv_hit_pct")
+                if hot is not None:
+                    lines.append(
+                        f"       Hot KV hit (%) P50/P90/P95/P99 "
+                        f"{percentiles(hot, ('p50', 'p90', 'p95', 'p99'))} (N={hot['samples']})"
+                        + (f" | {hot['reason']}" if "reason" in hot else "")
+                    )
             if overlap.get("reason"):
                 lines.append(f"       overlap: {overlap['reason']}")
             if self.report["config"].get("prefix_warmup") and row.get("http"):
@@ -483,8 +524,6 @@ def validate_config(config):
         ):
             raise BenchmarkError(f"{name} must be an HTTP(S) origin without credentials, /v1 or other path")
     if config.pd_proxy:
-        if not config.metadata_base_url:
-            raise BenchmarkError("--pd-proxy requires --metadata-base-url pointing to a matching P/D backend")
         if config.prefix_warmup:
             raise BenchmarkError("PD Proxy does not support DP-directed prefix verification; use --no-prefix-warmup")
     elif config.metadata_base_url:
@@ -507,6 +546,10 @@ def validate_config(config):
         raise BenchmarkError("dataset_length_policy must be truncate or strict")
     if config.request_phase not in ("measure", "warmup"):
         raise BenchmarkError("request_phase must be measure or warmup")
+    if config.measure_rounds <= 0:
+        raise BenchmarkError("--measure-rounds must be positive")
+    if config.hot_kv_stats and (not config.pd_proxy or config.request_phase != "measure"):
+        raise BenchmarkError("--hot-kv-stats requires a synchronized PD Proxy measure run")
     if config.sync_decode_batch and not config.pd_proxy:
         raise BenchmarkError("--sync-decode-batch requires --pd-proxy")
     if (
@@ -516,6 +559,80 @@ def validate_config(config):
         or not 0 < config.warmup_batch_size < 65536
     ):
         raise BenchmarkError("warmup_rounds must be nonnegative; warmup_batch_size must be between 1 and 65535")
+
+
+def discover_decode_batch(http, config, args):
+    try:
+        capability = http.json(DECODE_BATCH_PATH)
+    except BenchmarkError as error:
+        cause = error.__cause__
+        if not isinstance(cause, urllib.error.HTTPError) or cause.code != 404 or args.sync_decode_batch:
+            raise
+        capability = {"enabled": False}  # Older ordinary PD proxies do not expose this endpoint.
+    enabled = capability.get("enabled")
+    if type(enabled) is not bool:
+        raise BenchmarkError("invalid synchronized Decode capability from Proxy")
+    if args.sync_decode_batch is not None and enabled != args.sync_decode_batch:
+        raise BenchmarkError("benchmark option disagrees with synchronized Decode enabled on the Proxy")
+    if config.hot_kv_stats and (not enabled or capability.get("hot_kv_reporting") is not True):
+        raise BenchmarkError("--hot-kv-stats requires a synchronized Proxy and D with Hot KV stats support")
+    if not enabled:
+        return
+    if capability.get("coordination") != "proxy" or capability.get("first_step_reporting") is not True:
+        raise BenchmarkError("update Proxy and D to the synchronized Decode discovery and first-step protocol")
+    dp = capability.get("dp_size")
+    capacity = capability.get("max_batch_size")
+    timeout = capability.get("timeout_seconds")
+    if (
+        type(dp) is not int
+        or dp < 1
+        or capability.get("tensor_parallel_size") != 1
+        or type(capacity) is not int
+        or capacity < 1
+        or type(timeout) is not int
+        or timeout < 1
+    ):
+        raise BenchmarkError("Proxy returned invalid D topology, scheduler capacity or timeout")
+    if args.data_parallel_size is not None and args.data_parallel_size != dp:
+        raise BenchmarkError(f"--data-parallel-size differs from D DP{dp} discovered through Proxy")
+    if args.tensor_parallel_size is not None and args.tensor_parallel_size != 1:
+        raise BenchmarkError("synchronized Decode requires D TP1")
+    config.sync_decode_batch = True
+    config.data_parallel_size = dp
+    config.tensor_parallel_size = 1
+    if not config.metadata_base_url:
+        config.metadata_base_url = capability.get("metadata_base_url", "")
+    if args.levels is None:
+        config.levels = (1,)
+    if args.request_timeout is None:
+        config.request_timeout = max(config.request_timeout, timeout * 2)
+    batches = [*config.levels, *([config.warmup_batch_size] if config.warmup_rounds else [])]
+    if max(batches) > capacity:
+        raise BenchmarkError(f"requested batch per D rank exceeds the discovered capacity of {capacity}")
+    if config.request_timeout <= timeout:
+        raise BenchmarkError("request-timeout must exceed the Proxy synchronized Decode timeout")
+
+
+def read_first_decode_step(http, group, batch, dp_size, streams_ok, *, hot_kv_stats=False):
+    deadline = time.monotonic() + DECODE_STEP_REPORT_TIMEOUT
+    latest = {}
+    while True:
+        try:
+            status = http.json(f"{DECODE_BATCH_PATH}/groups/{group}", timeout=2)
+        except (BenchmarkError, ValueError) as error:
+            return {**latest, "verification": latest.get("verification", "unavailable"), "failure": str(error)}
+        ranks = status.get("ranks", {})
+        steps = [ranks.get(str(rank), {}).get("first_step") for rank in range(dp_size)]
+        latest = {**status, "verification": "unavailable"}
+        if status.get("released") and all(step is not None for step in steps):
+            matched = all(step["cohort_requests"] == batch and step["scheduled_requests"] == batch for step in steps)
+            latest["verification"] = "matched" if matched else "batch_mismatch"
+            reports = status.get("hot_kv", {}).get("rank_samples", {})
+            if not hot_kv_stats or all(str(rank) in reports for rank in range(dp_size)):
+                return latest
+        if not streams_ok or status.get("failure") or time.monotonic() >= deadline:
+            return latest
+        time.sleep(min(REFRESH_SECONDS, max(0, deadline - time.monotonic())))
 
 
 def preflight(http, config, *, output_tokens=None):
@@ -724,6 +841,7 @@ def run_level(
     request_phase = "profile" if profile else config.request_phase if request_phase is None else request_phase
     if request_phase not in ("measure", "warmup", "profile"):
         raise BenchmarkError("request_phase must be measure, warmup or profile")
+    collect_hot_kv = config.sync_decode_batch and config.hot_kv_stats and request_phase == "measure"
     row = {
         "batch": batch,
         "concurrency": len(jobs),
@@ -770,6 +888,7 @@ def run_level(
                 rank=rank,
                 index=decode_slots[request_id],
                 phase=request_phase,
+                **({"hot_kv_stats": True} if collect_hot_kv else {}),
             )
             if decode_slots is not None
             else None,
@@ -807,6 +926,17 @@ def run_level(
         reporter.save()
     row["http"] = summarize_http(row["requests"])
     row["errors"].extend(r["error"] for r in row["requests"] if r["status"] != "ok")
+    if config.sync_decode_batch:
+        sync = read_first_decode_step(
+            http, run_id, batch, config.data_parallel_size, not row["errors"], hot_kv_stats=collect_hot_kv
+        )
+        if collect_hot_kv:
+            row["hot_kv_hit_pct"] = summarize_hot_kv(sync.pop("hot_kv", {}), config.data_parallel_size)
+        row["decode_batch_result"] = sync
+        if sync["verification"] != "matched":
+            row["errors"].append(
+                "D first Decode step did not verify the target batch: " + (sync.get("failure") or sync["verification"])
+            )
     if config.prefix_warmup and request_phase != "warmup":
         for result in row["requests"]:
             try:
@@ -821,6 +951,8 @@ def run_level(
         if row["overlap"]["status"] != "ready":
             row["errors"].append("client full-batch window unavailable: " + str(row["overlap"].get("reason")))
     row["status"] = "error" if row["errors"] else "ok"
+    if group == "levels":
+        reporter.report["decode_tps_by_level"] = summarize_decode_tps(reporter.report["levels"])
     reporter.save()
     reporter.display()
     return row
@@ -862,6 +994,20 @@ def parse_args(argv=None):
             )
         else:
             options["type"] = type(field.default)
+        if field.name in (
+            "levels",
+            "data_parallel_size",
+            "tensor_parallel_size",
+            "request_timeout",
+            "sync_decode_batch",
+        ):
+            options["default"] = None
+        if field.name == "hot_kv_stats":
+            options["help"] = "collect Hot KV hit-rate stats on synchronized PD measurement waves"
+        if field.name == "measure_rounds":
+            options["help"] = "number of independent measurement waves per level (default: 1)"
+        if field.name == "sync_decode_batch":
+            options["help"] = "optional assertion of the Proxy setting; defaults to automatic discovery"
         if field.name == "dataset_length_policy":
             options["choices"] = ("truncate", "strict")
         if field.name == "request_phase":
@@ -887,7 +1033,12 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.prefix_warmup is None:
         args.prefix_warmup = Config.prefix_warmup and not args.pd_proxy
-    config = Config(**{field.name: getattr(args, field.name) for field in dataclasses.fields(Config)})
+    config = Config(
+        **{
+            field.name: field.default if getattr(args, field.name) is None else getattr(args, field.name)
+            for field in dataclasses.fields(Config)
+        }
+    )
     validate_config(config)
     if config.pd_proxy and (args.profile_prefill or args.profile_decode):
         raise BenchmarkError("PD Proxy does not expose /start_profile or /stop_profile; profile a backend directly")
@@ -907,39 +1058,35 @@ def main(argv=None):
     try:
         config, args = parse_args(argv)
         reporter = Reporter(config)
+        http = Http(config)
+        if config.pd_proxy:
+            discover_decode_batch(http, config, args)
+            if not config.metadata_base_url:
+                raise BenchmarkError("--pd-proxy requires --metadata-base-url unless Proxy discovers the D endpoint")
+            validate_config(config)
+            reporter.report["config"].update(
+                metadata_base_url=config.metadata_base_url,
+                data_parallel_size=config.data_parallel_size,
+                tensor_parallel_size=config.tensor_parallel_size,
+                levels=config.levels,
+                request_timeout=config.request_timeout,
+                sync_decode_batch=config.sync_decode_batch,
+            )
         print(
             f"Endpoint={config.base_url}; model={config.model}; input={config.input_tokens}; "
             f"output={config.output_tokens}; DP={config.data_parallel_size}; "
             f"TP={config.tensor_parallel_size} (metadata)",
             flush=True,
         )
-        http = Http(config)
         metadata_http = http
         if config.pd_proxy:
             metadata_http = Http(dataclasses.replace(config, base_url=config.metadata_base_url, pd_proxy=False))
             print(
-                f"PD Proxy mode: metadata={config.metadata_base_url}; "
-                "concurrency=level*DP; actual D rank/batch unknown; APC and profiling disabled."
+                f"PD Proxy mode: metadata={config.metadata_base_url}; concurrency=level*DP; APC and profiling disabled."
             )
         preflight(metadata_http, config, output_tokens=1 if args.profile_prefill else config.output_tokens)
         if config.sync_decode_batch:
-            capability = http.json("/v1/kvaf-decode-batch")
-            batches = [*config.levels, *([config.warmup_batch_size] if config.warmup_rounds else [])]
-            if capability.get("enabled") is not True or capability.get("dp_size") != config.data_parallel_size:
-                raise BenchmarkError(
-                    "Proxy decode batch gate is disabled or DP size differs; configure the existing Proxy settings"
-                )
-            if capability.get("coordination") != "proxy":
-                raise BenchmarkError("update Proxy to integrated decode batch coordination before this test")
-            capacity = capability.get("max_batch_size")
-            if type(capacity) is not int or max(batches) > capacity:
-                raise BenchmarkError("requested batch exceeds Proxy/D max_batch_size")
-            if config.request_timeout <= capability["timeout_seconds"]:
-                raise BenchmarkError("request-timeout must exceed decode batch timeout_seconds")
-            print(
-                "Synchronized Decode: each wave waits for all DP ranks' KV-ready requests; "
-                "level is target batch/DP. Verify actual D batch separately."
-            )
+            print("Synchronized Decode: wait for all D ranks' KV-ready requests and verify the first Decode step.")
         source = PromptSource(config, metadata_http)
         reporter.report["input_source"] = "JSONL first record" if source.dataset is not None else "synthetic token IDs"
         print("Primary TPOT/TPS: real token arrivals after every request starts and before any request's final token.")
@@ -965,9 +1112,15 @@ def main(argv=None):
             for batch in config.levels:
                 if config.prefix_warmup:
                     warm_prefixes(config, http, source, batch, warmed, reporter)
-                run_level(
-                    config, http, source, batch, reporter, prefix_extra_recompute_blocks=prefix_extra_recompute_blocks
-                )
+                for _ in range(config.measure_rounds):
+                    run_level(
+                        config,
+                        http,
+                        source,
+                        batch,
+                        reporter,
+                        prefix_extra_recompute_blocks=prefix_extra_recompute_blocks,
+                    )
                 if args.profile_decode and args.profile_decode_batch in (None, batch):
                     run_level(
                         config,

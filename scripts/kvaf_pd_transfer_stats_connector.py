@@ -3,7 +3,6 @@
 
 import time
 import weakref
-from pathlib import Path
 
 from kvaf_pd_performance import load_config
 from vllm.logger import init_logger
@@ -17,26 +16,7 @@ class PDKVoffloadConnector(NativeConnector):
     def __init__(self, *args, **kwargs):
         self._transfer_observer = self._batch_observer = None
         self._performance_config = None
-        self._decode_batch_settings = self._decode_batch_gate = None
         super().__init__(*args, **kwargs)
-        from vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch import CONFIG_FILE_NAME, load_settings
-
-        decode = load_settings(Path(__file__).with_name(CONFIG_FILE_NAME))
-        if decode.enabled and not self.is_producer:
-            pc = self.vllm_config.parallel_config
-            if pc.tensor_parallel_size != 1 or pc.data_parallel_size != decode.dp_size:
-                raise ValueError("decode batch requires D TP1 and matching DP size")
-            if self.vllm_config.scheduler_config.max_num_seqs < decode.max_batch_size:
-                raise ValueError("D --max-num-seqs must cover decode batch max_batch_size")
-            required_tokens = decode.max_batch_size * (self.vllm_config.speculative_config.num_speculative_tokens + 1)
-            if self.vllm_config.scheduler_config.max_num_batched_tokens < required_tokens:
-                raise ValueError("D max-num-batched-tokens cannot fit the configured speculative decode batch")
-            self._decode_batch_settings = decode
-            if self.scheduler is not None:
-                from kvaf_pd_decode_batch_metadata import BatchReceiveRequest
-
-                self.scheduler.decode_batch_settings = decode
-                self.scheduler.decode_seed_factory = BatchReceiveRequest
         try:
             config = load_config()
             if not config.active:
@@ -96,71 +76,11 @@ class PDKVoffloadConnector(NativeConnector):
                 self.worker.request_observer = self.request_observer
             except Exception as error:
                 logger.warning("KVAF performance observer disabled; native calls retained: %s", error)
-        if self._decode_batch_settings is not None:
-            from vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch import Gate
-
-            callback = weakref.WeakMethod(self._observe_decode_batch)
-
-            def observe(*values):
-                operation = callback()
-                return operation(*values) if operation is not None else None
-
-            self._decode_batch_gate = Gate(
-                self._decode_batch_settings,
-                self.vllm_config.parallel_config.data_parallel_rank,
-                observe if self.request_observer is not None else None,
-                logger=logger,
-            )
 
     def _capture_header(self, role):
         from kvaf_pd_transfer_stats import capture_header
 
-        header = capture_header(self.vllm_config, role)
-        if self._decode_batch_settings is not None:
-            settings = self._decode_batch_settings
-            header["decode_batch_mode"] = dict(
-                enabled=True,
-                dp_size=settings.dp_size,
-                max_batch_size=settings.max_batch_size,
-                timeout_seconds=settings.timeout_seconds,
-            )
-        return header
-
-    def _observe_decode_batch(self, event, request, generation, token):
-        from vllm_ascend.distributed.kv_transfer.kvaf.pd.observation import notify
-
-        if event == "begin":
-            return notify(
-                self.request_observer,
-                "begin",
-                name="D.decode_batch_wait",
-                context=dict(request_id=request, generation=generation),
-            )
-        return notify(self.request_observer, "end", token=token, success=True)
-
-    def start_load_kv(self, forward_context, **kwargs):
-        result = super().start_load_kv(forward_context, **kwargs)
-        if self._decode_batch_gate is not None:
-            for req_id, seed in self._get_connector_metadata().requests.items():
-                self._decode_batch_gate.bind(req_id, self._external_id(req_id), seed)
-        return result
-
-    def get_finished(self, finished_req_ids):
-        if self._decode_batch_gate is None:
-            return super().get_finished(finished_req_ids)
-        finished = self.worker.get_finished()
-        failed = (
-            {
-                request["id"]
-                for request in self.worker.requests.values()
-                if request["id"] in finished and (request["failed"] or request["cancelled"])
-            }
-            if finished
-            else set()
-        )
-        released = self._decode_batch_gate.poll(finished, finished_req_ids, failed)
-        self.worker.release(set(finished_req_ids))
-        return set(), released
+        return capture_header(self.vllm_config, role)
 
     def build_connector_meta(self, scheduler_output):
         metadata = super().build_connector_meta(scheduler_output)
@@ -191,8 +111,6 @@ class PDKVoffloadConnector(NativeConnector):
 
     def shutdown(self):
         try:
-            if self._decode_batch_gate is not None:
-                self._decode_batch_gate.close()
             super().shutdown()
         finally:
             for observer in (self._transfer_observer, self._batch_observer, self.request_observer):

@@ -1074,6 +1074,7 @@ class CacheFeedbackManager:
         self.feedback_turn = 0
         self.copy_stream = None
         self.feedback_read_done = None
+        self.hot_kv_waves = None
 
     def bind(self, forward_context):
         for index, (layer, inputs) in enumerate(zip(self.writer.groups, self.groups)):
@@ -1232,12 +1233,20 @@ class CacheFeedbackManager:
             self.feedback_read_done = ready
             host = staging.numpy()  # Keeps the pinned tensor alive through NumPy.base.
         self.submitted_generation = generation
-        future = self.executor.submit(self._commit, frames, host, ready, counts, self.miss_stats, errors, traffic)
+        cohort_rows = None
+        if self.hot_kv_waves is not None and counts is not None and not traffic:
+            # Decode frames already exclude prefill and graph padding. Snapshot
+            # row ownership now because later steps reuse the group metadata.
+            cohorts = self.hot_kv_waves.requests
+            cohort_rows = tuple(cohorts.get(req_id) for req_id in self.groups[0].request_ids)
+        future = self.executor.submit(
+            self._commit, frames, host, ready, counts, self.miss_stats, errors, traffic, cohort_rows
+        )
         self.inflight.append(future)
         self.feedback_turn += 1
 
     @staticmethod
-    def _commit(frames, host, ready, miss_counts=None, stats=None, device_errors=None, traffic=False):
+    def _commit(frames, host, ready, miss_counts=None, stats=None, device_errors=None, traffic=False, cohort_rows=None):
         if ready is not None:
             ready.synchronize()  # Background thread only, not the model launch thread.
         if device_errors is not None and np.any(device_errors):
@@ -1268,7 +1277,8 @@ class CacheFeedbackManager:
                     )
                 details.append(item)
             raise RuntimeError(
-                f"LIFetch Index update failed: failed_rows={len(failures)} active_failed_rows={len(active_failures)} details={details}; "
+                f"LIFetch Index update failed: failed_rows={len(failures)} "
+                f"active_failed_rows={len(active_failures)} details={details}; "
                 "status bits: 1=invalid Index change records, 2=prefetch state, "
                 "4=resolver/transport failure. Counts are from the same feedback copy."
             )
@@ -1312,6 +1322,7 @@ class CacheFeedbackManager:
                 references,
                 get_counts=miss_counts[:, -1],
                 ddr_fetch=traffic,
+                cohort_rows=cohort_rows,
             )
         accesses = sum(values.size for _, values, _ in jobs)
         return accesses if miss_counts is None else (accesses, int(miss_counts[:, -1].sum()))

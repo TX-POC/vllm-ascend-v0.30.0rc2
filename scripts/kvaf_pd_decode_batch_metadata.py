@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in metadata extension; the ordinary ReceiveRequest layout is unchanged."""
+"""Compatibility import for the native synchronized Decode receive metadata."""
 
-from dataclasses import dataclass
+from vllm_ascend.distributed.kv_transfer.kvaf.pd.scheduler import BatchReceiveRequest
 
-from vllm_ascend.distributed.kv_transfer.kvaf.pd.scheduler import ReceiveRequest
-
-
-@dataclass(frozen=True)
-class BatchReceiveRequest(ReceiveRequest):
-    decode_batch: dict
+__all__ = ["BatchReceiveRequest"]

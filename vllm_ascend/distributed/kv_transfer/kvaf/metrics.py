@@ -24,7 +24,7 @@ class HotMissStats:
         self.rounds = self.invalid = 0
         self.last_log = time.monotonic()
 
-    def record(self, misses, references, get_counts=None, *, ddr_fetch=False):
+    def record(self, misses, references, get_counts=None, *, ddr_fetch=False, cohort_rows=None):
         self.ddr_fetch = ddr_fetch
         # Counts and LRU unique counts already reside on CPU. The latter
         # deduplicate MTP queries and exclude ABC slots, which are not victims.
@@ -48,7 +48,13 @@ class HotMissStats:
             self.references += references.sum(axis=1)
             per_request = references.sum(axis=0)
             active = per_request > 0
-            self.request_rates.extend((100 * misses.sum(axis=0)[active] / per_request[active]).tolist())
+            rates = (100 * misses.sum(axis=0)[active] / per_request[active]).tolist()
+            self.request_rates.extend(rates)
+            if cohort_rows is not None and not ddr_fetch:
+                for row, miss_percent in zip(np.flatnonzero(active), rates):
+                    wave = cohort_rows[row]
+                    if wave is not None:
+                        wave.record_miss_percent(miss_percent)
             self.rounds += 1
         if time.monotonic() - self.last_log >= LOG_INTERVAL_SECONDS:
             self.flush()

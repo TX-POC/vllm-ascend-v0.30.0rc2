@@ -5,12 +5,23 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import (
     SFAPDRD2HProducerScheduler,
     SFAPDRD2HScheduler,
 )
 
+from .decode_batch import (
+    DEFAULT_TIMEOUT,
+    MAX_TIMEOUT,
+    PARAM,
+    SCHEDULED_PATH,
+    Settings,
+    decoder_capacity,
+    exchange,
+    proxy_from_metaserver,
+)
 from .observation import notify
 
 
@@ -27,6 +38,13 @@ class ReceiveRequest:
     generation: str
     tokens: int
     blocks: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class BatchReceiveRequest(ReceiveRequest):
+    decode_batch: dict
+    batch_proxy_url: str
+    batch_timeout: int
 
 
 @dataclass
@@ -112,7 +130,8 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
         super().__init__(*args, **kwargs)
         self._pd_requests = {}
         self.request_observer = None
-        self.decode_batch_settings = self.decode_seed_factory = None
+        self._decode_batch_settings = None
+        self._first_decode_pending = None
 
     @staticmethod
     def _try_create_copy_sfa_slot_allocator(vllm_config):
@@ -123,17 +142,9 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
         return ()
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
-        if (
-            self.decode_batch_settings is None
-            and request.kv_transfer_params
-            and "kvaf_decode_batch" in request.kv_transfer_params
-        ):
-            raise ValueError("request requires synchronized Decode but the D decode batch gate is disabled")
-        if self.decode_batch_settings is not None and request.request_id not in self._pd_requests:
-            self.decode_batch_settings.validate(
-                (request.kv_transfer_params or {}).get("kvaf_decode_batch"),
-                self.vllm_config.parallel_config.data_parallel_rank,
-            )
+        params = request.kv_transfer_params
+        if params and PARAM in params and request.request_id not in self._pd_requests:
+            self._batch_contract(params)
         if (
             request.request_id not in self._pd_requests
             and len(self._pd_requests) >= self.vllm_config.scheduler_config.max_num_seqs
@@ -151,11 +162,12 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
                 len(request.prompt_token_ids),
                 tuple(tuple(group) for group in blocks.get_block_ids()),
             )
-            if self.decode_batch_settings is not None:
-                spec = self.decode_batch_settings.validate(
-                    params.get("kvaf_decode_batch"), self.vllm_config.parallel_config.data_parallel_rank
-                )
-                seed = self.decode_seed_factory(seed.generation, seed.tokens, seed.blocks, spec)
+            if PARAM in params:
+                spec, proxy_url, timeout = self._batch_contract(params)
+                seed = BatchReceiveRequest(seed.generation, seed.tokens, seed.blocks, spec, proxy_url, timeout)
+                if self._first_decode_pending is None:
+                    self._first_decode_pending = {}
+                self._first_decode_pending[request.request_id] = seed
             self._pd_requests[request.request_id] = seed
             if self.request_observer is not None:
                 notify(
@@ -171,6 +183,51 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
             self._dspark_pending_recv.add(request.request_id)
         return super().update_state_after_alloc(request, blocks, num_external_tokens)
 
+    def _batch_contract(self, params):
+        if not params.get("do_remote_prefill") or params.get("do_virtual"):
+            raise ValueError("synchronized Decode requires a native remote prefill request")
+        if self._decode_batch_settings is None:
+            self._decode_batch_settings = Settings(**decoder_capacity(self.vllm_config))
+        spec = self._decode_batch_settings.validate(params[PARAM], self.vllm_config.parallel_config.data_parallel_rank)
+        timeout = params.get("kvaf_decode_batch_timeout", DEFAULT_TIMEOUT)
+        if type(timeout) is not int or not 1 <= timeout <= MAX_TIMEOUT:
+            raise ValueError("invalid synchronized Decode timeout")
+        return spec, proxy_from_metaserver(params.get("metaserver")), timeout
+
+    @staticmethod
+    def _report_first_decode(seed, cohort, total):
+        try:
+            exchange(
+                seed.batch_proxy_url,
+                dict(spec=seed.decode_batch, cohort_requests=cohort, scheduled_requests=total),
+                5,
+                path=SCHEDULED_PATH,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            logger.warning(
+                "Cannot report first Decode step for group=%s rank=%s: %s",
+                seed.decode_batch["group"],
+                seed.decode_batch["rank"],
+                error,
+            )
+
+    def _observe_first_decode(self, scheduled):
+        pending = self._first_decode_pending
+        if not pending or pending.keys().isdisjoint(scheduled):
+            return
+        groups = {}
+        for request_id in scheduled:
+            if request_id in pending:
+                seed = pending[request_id]
+                group = seed.decode_batch["group"]
+                count = groups[group][1] + 1 if group in groups else 1
+                groups[group] = seed, count
+        self._first_decode_pending = {
+            request_id: seed for request_id, seed in pending.items() if seed.decode_batch["group"] not in groups
+        }
+        for seed, count in groups.values():
+            self.executor.submit(self._report_first_decode, seed, count, len(scheduled))
+
     def _submit_metaserver_request(self, *, request_id, url, message):
         if request_id not in self._pd_requests:
             return  # A cancelled native HTTP retry cannot recreate its allocation.
@@ -178,12 +235,16 @@ class ConsumerScheduler(SFAPDRD2HScheduler):
         return super()._submit_metaserver_request(request_id=request_id, url=url, message=message)
 
     def build_connector_meta(self, scheduler_output):
+        if self._first_decode_pending:
+            self._observe_first_decode(scheduler_output.num_scheduled_tokens)
         metadata = ReceiveMetadata({req_id: self._pd_requests[req_id] for req_id in self._reqs_need_recv})
         self._reqs_need_recv.clear()
         return metadata
 
     def _cleanup_finished_request(self, request_id):
         self._pd_requests.pop(request_id, None)
+        if self._first_decode_pending:
+            self._first_decode_pending.pop(request_id, None)
         if self.request_observer is not None:
             notify(self.request_observer, "request_released", request_id=request_id)
         return super()._cleanup_finished_request(request_id)

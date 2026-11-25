@@ -1,7 +1,3 @@
 {
-  "enabled": false,
-  "proxy_url": "",
-  "dp_size": 8,
-  "max_batch_size": 16,
-  "timeout_seconds": 3600
+  "enabled": false
 }

@@ -36,6 +36,19 @@ def streams(dp=False):
 
 
 class BenchmarkMetricTest(unittest.TestCase):
+    def test_hot_kv_pooled_quantiles_require_complete_rank_evidence(self):
+        bins = [0] * 1001
+        bins[500], bins[1000] = 90, 10
+        result = METRICS.summarize_hot_kv({"histogram": bins, "rank_samples": {"0": 90, "1": 10}}, 2)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual((result["p50"], result["p90"], result["p95"], result["p99"]), (50, 50, 100, 100))
+        self.assertEqual(result["samples"], 100)
+        partial = METRICS.summarize_hot_kv({"histogram": bins, "rank_samples": {"0": 100}}, 2)
+        self.assertEqual(partial["missing_ranks"], [1])
+        self.assertEqual(partial["status"], "unavailable")
+        empty = METRICS.summarize_hot_kv({"histogram": [0] * 1001, "rank_samples": {"0": 0, "1": 0}}, 2)
+        self.assertNotIn("p50", empty)
+
     def test_common_window_counts_actual_mtp_tokens_and_aligns_tpot_tps(self):
         result = METRICS.summarize_overlap(streams(), 2, 1)
         self.assertEqual(result["status"], "ready", result)

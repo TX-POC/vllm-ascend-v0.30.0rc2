@@ -167,6 +167,7 @@ class ProxyState:
         self.request_observer = None
         self.decode_batch_settings = None
         self.decode_batch_registry = None
+        self.decode_batch_metadata_url = None
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -360,15 +361,40 @@ def parse_args():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch import CONFIG_FILE_NAME, Registry, load_settings
+    from vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch import (
+        CONFIG_FILE_NAME,
+        CONTROL_PATH,
+        HOT_KV_CAPABILITY,
+        Registry,
+        load_settings,
+    )
 
     global proxy_state
     proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
     try:
         decode = load_settings(Path(__file__).resolve().parents[2] / "scripts" / CONFIG_FILE_NAME)
         if decode.enabled:
+            if len(proxy_state.decoders) != 1:
+                raise ValueError("synchronized Decode requires one D API endpoint routing all D ranks")
+            decoder = proxy_state.decoders[0]
+            try:
+                response = await decoder.client.get(
+                    CONTROL_PATH.removeprefix("/v1") + "/capacity",
+                    headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+                    timeout=5,
+                )
+                response.raise_for_status()
+                capacity = response.json()
+            except (httpx.HTTPError, ValueError) as error:
+                raise RuntimeError(
+                    "Cannot discover D scheduler capacity. Start D with DecoderCapacityMiddleware before Proxy."
+                ) from error
+            if not isinstance(capacity, dict):
+                raise ValueError("invalid D capacity response")
+            decode = decode.with_capacity(capacity)
+            proxy_state.decode_batch_metadata_url = decoder.url.removesuffix("/v1")
             proxy_state.decode_batch_settings = decode
-            proxy_state.decode_batch_registry = Registry(decode)
+            proxy_state.decode_batch_registry = Registry(decode, hot_kv_stats=capacity.get(HOT_KV_CAPABILITY) is True)
         print(
             f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients."
         )
@@ -418,11 +444,28 @@ async def decode_batch_info():
         dp_size=settings.dp_size,
         max_batch_size=settings.max_batch_size,
         timeout_seconds=settings.timeout_seconds,
+        metadata_base_url=proxy_state.decode_batch_metadata_url,
+        tensor_parallel_size=1,
+        first_step_reporting=True,
+        hot_kv_reporting=proxy_state.decode_batch_registry.hot_kv_stats,
     )
 
 
+@app.get("/v1/kvaf-decode-batch/groups/{identity}")
+async def decode_batch_group(identity: str):
+    registry = proxy_state.decode_batch_registry
+    if registry is None:
+        raise HTTPException(status_code=409, detail="Proxy decode batch gate is disabled")
+    try:
+        return await registry.status(identity)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="unknown decode batch group") from error
+
+
 @app.post("/v1/kvaf-decode-batch/ready")
-async def decode_batch_ready(request: Request):
+@app.post("/v1/kvaf-decode-batch/scheduled")
+@app.post("/v1/kvaf-decode-batch/hot-kv")
+async def decode_batch_control(request: Request):
     registry = proxy_state.decode_batch_registry
     if registry is None:
         raise HTTPException(status_code=409, detail="Proxy decode batch gate is disabled")
@@ -437,6 +480,11 @@ async def decode_batch_ready(request: Request):
         message = json.loads(data)
         if not isinstance(message, dict):
             raise ValueError("decode batch message must be an object")
+
+        if request.url.path.endswith("/hot-kv"):
+            return await registry.hot_kv(message)
+        if request.url.path.endswith("/scheduled"):
+            return await registry.scheduled(message)
 
         @with_cancellation
         async def wait_ready(request: Request):
@@ -512,9 +560,10 @@ async def stream_service_response_with_retry(
     base_delay: float = 0.2,
 ):
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
-    if proxy_state.decode_batch_settings is not None:
-        spec = proxy_state.decode_batch_settings.validate(req_data["kv_transfer_params"].get("kvaf_decode_batch"))
+    spec = req_data["kv_transfer_params"].get("kvaf_decode_batch")
+    if spec is not None:
         headers["X-data-parallel-rank"] = str(spec["rank"])
+        max_retries = 1  # Native retry would submit the same cohort slot more than once.
     observer = request_observer()
     for attempt in range(1, max_retries + 1):
         token, observed_success = None, False
@@ -577,7 +626,9 @@ def get_api_request_ids(api, req_id, req_data):
 
 async def _handle_completions(api: str, request: Request):
     decode_spec = None
-    if proxy_state.decode_batch_settings is not None:
+    registry = proxy_state.decode_batch_registry
+    accepted = False
+    if registry is not None:
         try:
             decode_spec = proxy_state.decode_batch_settings.parse_header(request.headers.get("X-KVAF-Decode-Batch"))
         except (ValueError, TypeError) as error:
@@ -592,7 +643,13 @@ async def _handle_completions(api: str, request: Request):
         request_id = await proxy_state.next_req_id()
         request_ids_api = get_api_request_ids(api, request_id, req_data)
         if decode_spec is not None and len(request_ids_api) != 1:
-            raise ValueError("decode batch mode requires one prompt per HTTP request")
+            raise HTTPException(status_code=400, detail="decode batch mode requires one prompt per HTTP request")
+        if decode_spec is not None:
+            try:
+                await registry.accept(decode_spec, request_ids_api[0])
+                accepted = True
+            except (ValueError, RuntimeError) as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
         proxy_state.register_request_batch(request_id, request_ids_api, req_data, request_length, api)
         if observer is not None:
             notify(
@@ -609,7 +666,11 @@ async def _handle_completions(api: str, request: Request):
             "metaserver": f"http://{global_args.host}:{global_args.port}/v1/metaserver",
         }
         if decode_spec is not None:
+            settings = registry.settings
+            if settings.proxy_url:
+                req_data["kv_transfer_params"]["metaserver"] = settings.proxy_url.rstrip("/") + "/v1/metaserver"
             req_data["kv_transfer_params"]["kvaf_decode_batch"] = decode_spec
+            req_data["kv_transfer_params"]["kvaf_decode_batch_timeout"] = settings.timeout_seconds
         # Select decoder
         decoder_score = proxy_state.calculate_decode_scores(request_length)
         logger.debug("Decoder score: %f", decoder_score)
@@ -690,6 +751,8 @@ async def _handle_completions(api: str, request: Request):
                             else (completion_tokens + usage.get("completion_tokens"))
                         )
                         if stop_reason == "recomputed":
+                            if decode_spec is not None:
+                                raise RuntimeError("D requested recompute during a synchronized Decode wave")
                             if observer is not None:
                                 notify(observer, "point", name="PROXY_RECOMPUTE", parent=request_id)
                             retry = True
@@ -721,6 +784,8 @@ async def _handle_completions(api: str, request: Request):
                     request_id,
                 )
             finally:
+                if decode_spec is not None:
+                    await registry.abort(decode_spec, "D stream ended before synchronized Decode release")
                 # After streaming done, release tokens
                 proxy_state.release_decoder(decoder_idx, decoder_score)
                 await proxy_state.cleanup_request_batch(request_id)
@@ -732,7 +797,13 @@ async def _handle_completions(api: str, request: Request):
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         else:
             return StreamingResponse(generate_stream(), media_type="application/json")
-    except Exception as e:
+    except HTTPException:
+        raise
+    except (Exception, asyncio.CancelledError) as e:
+        if accepted:
+            await registry.abort(decode_spec, "Proxy request failed before synchronized Decode release")
+        if isinstance(e, asyncio.CancelledError):
+            raise
         if observer is not None:
             notify(observer, "failed", name="PROXY_HANDLER_FAILED", parent=request_id)
         import traceback

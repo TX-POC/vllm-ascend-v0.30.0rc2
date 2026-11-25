@@ -54,6 +54,7 @@ exec "$python_bin" \
   "$model" \
   --host 0.0.0.0 \
   --port 8200 \
+  --middleware vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch.DecoderCapacityMiddleware \
   --tensor-parallel-size 1 \
   --data-parallel-size 8 \
   --data-parallel-size-local 8 \

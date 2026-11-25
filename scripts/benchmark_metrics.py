@@ -2,6 +2,7 @@
 """Client arrival metrics; no server instrumentation or server clock required."""
 
 from collections import Counter
+from statistics import fmean
 
 NS_PER_SECOND = 1_000_000_000
 MS_PER_SECOND = 1000
@@ -116,3 +117,58 @@ def summarize_overlap(requests, batch, dp_size, *, dp_routing=True):
         tpot_ms=MS_PER_SECOND * result["bs"] * seconds / tokens,
     )
     return result
+
+
+HOT_KV_BUCKETS = 1001
+HOT_KV_QUANTILES = (50, 90, 95, 99)
+
+
+def summarize_hot_kv(report, dp_size):
+    """Merge evidence from one synchronized wave, without averaging rank percentiles."""
+    rank_samples = report.get("rank_samples", {})
+    histogram = report.get("histogram", [])
+    missing = [rank for rank in range(dp_size) if str(rank) not in rank_samples]
+    result = dict(
+        status="unavailable",
+        samples=0,
+        missing_ranks=missing,
+        rank_samples=rank_samples,
+        bucket_width_pp=0.1,
+        sample_unit="request_decode_step",
+    )
+    if missing:
+        return {**result, "reason": "missing D rank reports"}
+    if len(histogram) != HOT_KV_BUCKETS or any(type(count) is not int or count < 0 for count in histogram):
+        return {**result, "reason": "invalid Hot KV histogram"}
+    samples = sum(histogram)
+    if samples == 0:
+        return {**result, "reason": "D returned no valid history hit/miss samples"}
+    if samples != sum(rank_samples.values()):
+        return {**result, "reason": "Hot KV counts disagree with D rank reports"}
+    thresholds = iter((p, (samples * p + 99) // 100) for p in HOT_KV_QUANTILES)
+    current = next(thresholds, None)
+    running = 0
+    for index, count in enumerate(histogram):
+        running += count
+        while current is not None and running >= current[1]:
+            result[f"p{current[0]}"] = index / 10
+            current = next(thresholds, None)
+        if current is None:
+            break
+    return {**result, "status": "ready", "samples": samples}
+
+
+def summarize_decode_tps(rows):
+    """Equal-weight wave mean at each target batch, excluding failed waves."""
+    levels = {}
+    for row in rows:
+        if row["status"] == "running":
+            continue
+        valid = levels.setdefault(row["batch"], [])
+        overlap = row.get("overlap", {})
+        if row["status"] == "ok" and overlap.get("status") == "ready":
+            valid.append(overlap["tps"])
+    return {
+        str(batch): {"mean_tps": fmean(valid) if valid else None, "valid_waves": len(valid)}
+        for batch, valid in levels.items()
+    }

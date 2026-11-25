@@ -2,6 +2,7 @@
 """Independent Scheduler/Worker entry for DSA PD and remote DDR offload."""
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1, KVConnectorRole, SupportsHMA
+from vllm.logger import logger
 
 from .config import PDConfig
 
@@ -17,6 +18,8 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.requires_full_blocks_on_update_after_alloc = self.is_producer and role == KVConnectorRole.SCHEDULER
         self.scheduler = self.worker = None
         self.request_observer = None
+        self._decode_batch_gate = None
+        self._hot_kv_feedback = None
         self._caches = None
         self._layer_names = ()
         if role == KVConnectorRole.SCHEDULER:
@@ -183,7 +186,41 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.worker is not None and not self.is_producer:
             metadata = self._get_connector_metadata()
             for req_id, seed in metadata.requests.items():
-                self.worker.seed(req_id, self._external_id(req_id), seed)
+                external = self._external_id(req_id)
+                spec = getattr(seed, "decode_batch", None)
+                if spec is not None:
+                    if self._decode_batch_gate is None:
+                        from .decode_batch import Gate, Settings, decoder_capacity
+
+                        self._decode_batch_gate = Gate(
+                            Settings(**decoder_capacity(self.vllm_config)),
+                            self.vllm_config.parallel_config.data_parallel_rank,
+                            self._observe_decode_batch if self.request_observer is not None else None,
+                            logger=logger,
+                        )
+                    self._decode_batch_gate.bind(req_id, external, seed)
+                    if spec.get("hot_kv_stats"):
+                        from .decode_batch import HotKVWaves
+
+                        feedback = self.worker.writer.feedback
+                        if feedback is not None:
+                            if feedback.hot_kv_waves is None:
+                                feedback.hot_kv_waves = HotKVWaves()
+                            feedback.hot_kv_waves.bind(req_id, seed)
+                            self._hot_kv_feedback = feedback
+                self.worker.seed(req_id, external, seed)
+
+    def _observe_decode_batch(self, event, request, generation, token):
+        from .observation import notify
+
+        if event == "begin":
+            return notify(
+                self.request_observer,
+                "begin",
+                name="D.decode_batch_wait",
+                context=dict(request_id=request, generation=generation),
+            )
+        return notify(self.request_observer, "end", token=token, success=True)
 
     def wait_for_layer_load(self, layer_name):
         if self.is_producer and self.worker is not None:
@@ -226,9 +263,27 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.is_producer:
             return self.worker.get_finished(finished_req_ids), set()
         finished = self.worker.get_finished()
+        gate = self._decode_batch_gate
+        if gate is not None:
+            failed = set()
+            if finished:
+                with self.worker.runtime.lock:
+                    failed = {
+                        request["id"]
+                        for request in self.worker.requests.values()
+                        if request["id"] in finished and (request["failed"] or request["cancelled"])
+                    }
+            finished = gate.poll(finished, finished_req_ids, failed)
+            if not gate.groups:
+                self._decode_batch_gate = None
         # Original native request teardown already releases successful Decode
         # directories. This also covers a request cancelled before first Decode.
         self.worker.release(set(finished_req_ids))
+        feedback = self._hot_kv_feedback
+        if feedback is not None and finished_req_ids:
+            feedback.hot_kv_waves.finish(finished_req_ids, feedback.executor)
+            if not feedback.hot_kv_waves.waves:
+                feedback.hot_kv_waves = self._hot_kv_feedback = None
         return set(), finished
 
     def get_block_ids_with_load_errors(self):
@@ -237,6 +292,8 @@ class PDKVoffloadConnector(KVConnectorBase_V1, SupportsHMA):
         return self.worker.get_errors()
 
     def shutdown(self):
+        if self._decode_batch_gate is not None:
+            self._decode_batch_gate.close()
         if self.worker is not None:
             self.worker.close()
         shutdown = getattr(self.scheduler, "shutdown", None)

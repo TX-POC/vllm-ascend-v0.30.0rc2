@@ -4,7 +4,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -16,6 +16,18 @@ SPEC.loader.exec_module(METRICS)
 
 
 class TestGetMetrics(unittest.TestCase):
+    def test_cohort_counts_only_valid_existing_decode_feedback(self):
+        stats = METRICS.HotMissStats(2, weights=(1, 1))
+        selected = Mock()
+        missing = Mock()
+        misses = np.array([[1, 3, 0], [2, 2, 0]])
+        references = np.array([[3, 2, 0], [7, 4, 0]])
+        stats.record(misses, references, cohort_rows=(selected, None, missing))
+        selected.record_miss_percent.assert_called_once_with(30.0)
+        missing.record_miss_percent.assert_not_called()
+        stats.record(misses, references, ddr_fetch=True, cohort_rows=(selected, None, missing))
+        self.assertEqual(selected.record_miss_percent.call_count, 1)
+
     def test_group_counts_are_not_repeated_per_layer(self):
         stats = METRICS.HotMissStats(2, "DP0", weights=(4, 1))
         with patch.object(METRICS.time, "monotonic", return_value=stats.last_log):

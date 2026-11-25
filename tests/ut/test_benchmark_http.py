@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlparse
+from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from benchmark import (  # noqa: E402
@@ -26,6 +27,7 @@ from benchmark import (  # noqa: E402
     ProfileCoordinator,
     PromptSource,
     Reporter,
+    main,
     prefix_probe,
     preflight,
     run_level,
@@ -40,6 +42,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        capability = getattr(self.server, "decode_batch_capability", None)
+        if self.path == "/v1/kvaf-decode-batch" and capability is not None:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(capability).encode())
+            return
+        if self.path.startswith("/v1/kvaf-decode-batch/groups/"):
+            UUID(self.path.rsplit("/", 1)[-1])
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(self.server.decode_batch_result).encode())
+            return
         self.send_response(200)
         self.end_headers()
         if self.path == "/v1/models":
@@ -97,6 +111,125 @@ class BenchmarkHttpTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+
+    def test_proxy_auto_discovers_decode_batch_and_verifies_first_step(self):
+        self.server.decode_batch_capability = dict(
+            enabled=True,
+            coordination="proxy",
+            dp_size=2,
+            tensor_parallel_size=1,
+            max_batch_size=2,
+            timeout_seconds=1,
+            metadata_base_url=self.config.base_url,
+            first_step_reporting=True,
+        )
+        result = {
+            "released": True,
+            "target_batch_per_rank": 1,
+            "ranks": {
+                str(rank): {"kv_ready": 1, "first_step": {"cohort_requests": 1, "scheduled_requests": 1}}
+                for rank in range(2)
+            },
+        }
+        self.server.decode_batch_result = result
+        args = [
+            "--pd-proxy",
+            "--base-url",
+            self.config.base_url,
+            "--input-tokens",
+            "32",
+            "--output-tokens",
+            "5",
+        ]
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            args.extend(("--result-dir", directory))
+            self.assertEqual(main(args), 0)
+            report = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(report["config"]["data_parallel_size"], 2)
+            self.assertEqual(report["config"]["levels"], [1])
+            self.assertEqual(report["levels"][0]["decode_batch_result"]["verification"], "matched")
+            headers = [
+                json.loads(next(value for key, value in headers.items() if key.lower() == "x-kvaf-decode-batch"))
+                for path, headers, _ in self.server.requests
+                if path == "/v1/completions"
+            ]
+            self.assertEqual({(tag["rank"], tag["index"]) for tag in headers}, {(0, 0), (1, 0)})
+            result["ranks"]["1"]["first_step"]["scheduled_requests"] = 2
+            self.assertEqual(main(args), 1)
+            report = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(report["levels"][0]["decode_batch_result"]["verification"], "batch_mismatch")
+            request_count = len(self.server.requests)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(args + ["--levels", "3"]), 1)
+            self.assertEqual(len(self.server.requests), request_count)
+
+    def test_decode_statistics_and_optional_hot_kv_are_wave_scoped(self):
+        self.server.decode_batch_capability = dict(
+            enabled=True,
+            coordination="proxy",
+            dp_size=1,
+            tensor_parallel_size=1,
+            max_batch_size=2,
+            timeout_seconds=1,
+            metadata_base_url=self.config.base_url,
+            first_step_reporting=True,
+            hot_kv_reporting=True,
+        )
+        histogram = [0] * 1001
+        histogram[823] = 19
+        histogram[1000] = 1
+        self.server.decode_batch_result = {
+            "released": True,
+            "target_batch_per_rank": 1,
+            "ranks": {"0": {"kv_ready": 1, "first_step": {"cohort_requests": 1, "scheduled_requests": 1}}},
+            "hot_kv": {"histogram": histogram, "rank_samples": {"0": 20}},
+        }
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(
+                main(
+                    [
+                        "--pd-proxy",
+                        "--base-url",
+                        self.config.base_url,
+                        "--input-tokens",
+                        "32",
+                        "--output-tokens",
+                        "5",
+                        "--warmup-rounds",
+                        "1",
+                        "--measure-rounds",
+                        "2",
+                        "--hot-kv-stats",
+                        "--result-dir",
+                        directory,
+                    ]
+                ),
+                0,
+            )
+            report = json.loads((Path(directory) / "result.json").read_text())
+            self.assertNotIn("hot_kv_hit_pct", report["request_warmups"][0])
+            for row in report["levels"]:
+                self.assertEqual(row["hot_kv_hit_pct"]["p95"], 82.3)
+                self.assertEqual(row["hot_kv_hit_pct"]["p99"], 100.0)
+                tpot = row["http"]["decode_tpot_ms"]
+                self.assertEqual(tpot["count"], 1)
+                self.assertEqual(tpot["p95"], tpot["mean"])
+                self.assertAlmostEqual(tpot["mean"], row["http"]["request_tpot_ms"]["mean"] * 0.75)
+                self.assertNotIn("histogram", row["decode_batch_result"])
+            aggregate = report["decode_tps_by_level"]["1"]
+            self.assertEqual(aggregate["valid_waves"], 2)
+            self.assertAlmostEqual(aggregate["mean_tps"], sum(row["overlap"]["tps"] for row in report["levels"]) / 2)
+            self.assertIn("Decode Batch", output.getvalue())
+            self.assertIn("Hot KV hit (%) P50/P90/P95/P99", output.getvalue())
+            specs = [
+                json.loads(value)
+                for path, headers, _ in self.server.requests
+                if path == "/v1/completions"
+                for name, value in headers.items()
+                if name.lower() == "x-kvaf-decode-batch"
+            ]
+            self.assertEqual([spec.get("hot_kv_stats") for spec in specs], [None, True, True])
+            self.assertEqual(len({spec["group"] for spec in specs}), 3)
 
     def test_defaults_match_server_launch(self):
         script = Path(__file__).resolve().parents[2] / "scripts" / "start_vllm_server.sh"

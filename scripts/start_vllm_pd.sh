@@ -72,6 +72,12 @@ default_option --attention_config.indexer_kv_dtype fp8
 default_option --block-size 128
 default_option --speculative-config '{"num_speculative_tokens":3,"method":"deepseek_mtp","enforce_eager":true}'
 if ! has_option --no-enforce-eager; then default_option --enforce-eager; fi
+if [[ $role == d ]]; then
+    capacity_middleware=vllm_ascend.distributed.kv_transfer.kvaf.pd.decode_batch.DecoderCapacityMiddleware
+    if ! has_option "$capacity_middleware" && ! has_option "--middleware=$capacity_middleware"; then
+        args+=(--middleware "$capacity_middleware")
+    fi
+fi
 if [[ $dry_run == true ]]; then
     printf '%q -m vllm.entrypoints.cli.main serve ' "$python_bin"
     printf '%q ' "${args[@]}"

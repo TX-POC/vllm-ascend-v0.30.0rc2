@@ -154,17 +154,7 @@ P/D 保留 `PDKVWorker`、原生传输角色和其余已验证参数；按第 2 
 P 的 `kvaf_config.enabled=false`、`kv_role=kv_producer`；D 的 `kvaf_config.enabled=true`、`kv_role=kv_consumer`。
 P 为获得逐层计算证据保留已验证 eager 配置，D 可沿用已验证的 `FULL_DECODE_ONLY`；不要为查看器改变业务图模式。
 
-在 **D 和 Proxy 节点**分别编辑现有 `scripts/kvaf_pd_decode_batch.json`：
-
-```json
-{
-  "enabled": true,
-  "proxy_url": "http://141.62.38.12:8000",
-  "dp_size": 8,
-  "max_batch_size": 4,
-  "timeout_seconds": 3600
-}
-```
+在 **Proxy 节点**编辑 `scripts/kvaf_pd_decode_batch.json` 为 `{"enabled": true}`。先启动 D，再启动 Proxy。使用仓库 D 启动脚本，或按[同步 Decode 说明](DECODE_BATCH.md)给自定义 D 命令添加容量查询 middleware。Proxy 从 D 获取 DP/批容量，benchmark 自动发现同步模式。
 
 D 启动脚本对应参数：
 
@@ -177,7 +167,6 @@ D 启动脚本对应参数：
 
 | 参数                            | 作用                                                                         |
 | ------------------------------- | ---------------------------------------------------------------------------- |
-| `max_batch_size=4`              | 同步组批每个 D rank 的目标 batch 上限，不是全机总数                          |
 | `--max-num-seqs 4`              | 每个 D DP 实例的调度请求数上限；不会自动增加 KV 容量                         |
 | `--max-num-batched-tokens 4096` | 每个 DP 实例单轮所有请求合计的 token 预算，不是单请求长度；影响试运行/工作区 |
 | `--gpu-memory-utilization 0.90` | 引擎 HBM 使用预算比例，不是 KV 占比，也不是内存释放开关                      |
@@ -224,13 +213,11 @@ benchmark 是标准库 HTTP 客户端，建议在 P 容器新终端执行，也�
 cd /home/c00612283/vllm-ascend-v0.30.0rc2
 
 python3 scripts/benchmark.py \
-  --pd-proxy --sync-decode-batch \
+  --pd-proxy \
   --levels 4 \
   --base-url http://141.62.38.12:8000 \
-  --metadata-base-url http://141.62.38.24:8200 \
   --model glm --ignore-env-proxy \
   --input-tokens 130947 --output-tokens 125 \
-  --data-parallel-size 8 --tensor-parallel-size 1 \
   --warmup-rounds 0 \
   --request-timeout 7200 \
   --result-dir /home/c00612283/pd-benchmark/sync-run04
@@ -239,8 +226,6 @@ python3 scripts/benchmark.py \
 | 压测参数                                      | 含义                                                                   |
 | --------------------------------------------- | ---------------------------------------------------------------------- |
 | `--pd-proxy`                                  | 全部生成请求经 Proxy，metadata 后端只提供模型/分词信息                 |
-| `--sync-decode-batch`                         | 启用本轮组身份、定向 D rank 及全组 KV 就绪后放行                       |
-| `--data-parallel-size/--tensor-parallel-size` | 描述 D 拓扑，不能当作 P 拓扑                                           |
 | `--input-tokens/--output-tokens`              | 本例输入加目标输出为 131072，不可超过服务上下文上限                    |
 | `--warmup-rounds 0`                           | 不额外预热，适合先定位和比较同条件基线                                 |
 | `--warmup-rounds 2 --warmup-batch-size 1`     | 可替换上项，先发两轮各 8 请求，分析默认排除预热                        |
@@ -259,7 +244,7 @@ python3 scripts/benchmark.py \
 实验反馈中，128K 总长、每卡目标 1 的 8 请求已报告 8/8 成功；这不代表每卡 4/16 的容量、精度或采集开销也已验收。
 
 活动轮次中关闭 Proxy 会丢失组状态，重启不能接续旧组。应结束旧 benchmark、清理受影响的 D 状态并确认 P 旧请求结束，再开始新轮次；不要重复叠加发送。
-关闭同步策略时，将 D/Proxy 的组批 `enabled=false` 后重启，并去掉客户端 `--sync-decode-batch`；关闭被动采集则在两侧性能 JSON 设置 `enabled=false` 后重启。
+关闭同步策略时，将 Proxy 的组批 `enabled` 改为 `false` 并重启 Proxy。关闭被动采集则在两侧性能 JSON 设置 `enabled=false` 后重启。
 
 ## 4. 服务环境内分析与导出
 

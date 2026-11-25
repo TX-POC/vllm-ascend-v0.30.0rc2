@@ -4,7 +4,8 @@
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 from kvip.cache.lru import SlotLRU
@@ -64,6 +65,15 @@ class TestFeedback(unittest.TestCase):
         self.submit(tail)
         self.manager.wait_pending()
         self.assertEqual(self.manager.miss_stats.references.tolist(), [2])
+
+    def test_opt_in_reuses_decode_rows_and_does_not_count_unrelated_requests(self):
+        frame = self.prepare(ids=("unrelated", "cohort"))
+        selected = Mock()
+        self.manager.hot_kv_waves = SimpleNamespace(requests={"cohort": selected})
+        data = np.array([[[1, 2], [2, -1], [1, -1], [2, -1]] * 2], dtype=np.int32)
+        self.manager.submit_feedback(data, generation=frame.generation, miss_counts=np.array([[0, 1, 1]]))
+        self.manager.wait_pending()
+        selected.record_miss_percent.assert_called_once_with(50.0)
 
     def test_invalid_feedback_never_changes_lru(self):
         row = self.prepare().rows[0]
