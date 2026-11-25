@@ -27,6 +27,8 @@ source third_party/KVIP/scripts/env.sh
 `--source-only` 下载并准备两份源码。`--skip-kvaf-build` 仅适用于已按当前补丁构建的 KVAF。
 `install_kvaf.sh` 转发到同一个安装流程。
 
+要求 KVAF/KVIP 的编译源码与远端 `main` 严格一致时，当前这些安装入口不适用。锁定提交标识补丁的基线，准备阶段会修改构建源码。PD 候选的版本和安装限制见 [2A+2K 安装部署说明](../docs/kvaf_pd_2Anodes_2Knodes_configuration.md)。
+
 CPU 服务启动方式不变；已有 UMDK 环境可指定 `KVAF_UMDK_ROOT`、`KVAF_URMA_LIBRARY`。
 KVAF 关闭时无需安装 KVIP，基础 vLLM 安装脚本不自动编译可选算子。
 

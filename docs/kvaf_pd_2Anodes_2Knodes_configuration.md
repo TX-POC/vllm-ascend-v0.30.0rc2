@@ -1,6 +1,6 @@
 # KVAF PD 分离 2A+2K 安装部署说明
 
-模型为 GLM5.3 W4A4C8。两台 950DT 负责 P/D，两台鲲鹏提供 DDR。启动脚本默认使用已验证的直连配置，每个 D worker 独占一个 K 服务端口。
+模型为 GLM5.3 W4A4C8。两台 950DT 负责 P/D，两台鲲鹏提供 DDR。启动脚本沿用每个 D worker 独占一个 K 服务端口的直连配置。
 
 ## 1. 拓扑与版本
 
@@ -26,23 +26,22 @@
 
 ## 2. 准备候选源码
 
-从 `TX-POC/vllm-ascend-v0.30.0rc2` 的 `v0.30.0rc2-develop` 分支获取候选源码。在各主机保留旧框架和旧 SDK，候选版本用独立目录。
+框架仓库和 KVAF 仓库分别核对版本。`v0.30.0rc2-develop` 的 `2548ccb85` 是候选版本的基线。接入 KVAF `95a14f1` 的框架适配从 `fba271d33` 开始，按本节使用候选 Git Bundle，独立于现有部署。
+
+**严格一致构建限制**。当前 `install_a.sh`、`scripts/install_kvaf_pd.sh` 和 `scripts/install_kvip.sh` 会在准备阶段修改 KVAF 或 KVIP 构建源码，`--source-only` 也会应用补丁。即使 `git rev-parse HEAD` 返回锁定提交，源码仍可能与远端不同。要求编译输入和各自远端 `main` 严格一致时，保留干净检出，等兼容改动进入上游并更新锁定版本后再执行 P/D 构建。以下 P/D 安装步骤仅供明确允许构建补丁的候选验证环境使用。
+
+将部署包中的 `kvaf-pd-2a2k.bundle` 放到 `/home/c00612283/kvaf-pd-2a2k.bundle`。从现有框架仓库执行，`git bundle verify` 会检查该仓库是否具有导入所需的基线：
 
 ```bash
-cd /home/c00612283/vllm-ascend-v0.30.0rc2
-git fetch origin refs/heads/v0.30.0rc2-develop
-git worktree add --detach /home/c00612283/pd-main-framework FETCH_HEAD
-git -C /home/c00612283/pd-main-framework log -2 --oneline
-```
-
-无法访问远端的主机可以通过部署包离线导入。将其中的 `kvaf-pd-2a2k.bundle` 放到 `/home/c00612283/kvaf-pd-2a2k.bundle`，使用已有基线提交 `f9bf84aab` 的框架仓库执行：
-
-```bash
-cd /home/c00612283/vllm-ascend-v0.30.0rc2
+(
+set -euo pipefail
+cd /home/c00612283/kvaf_vllm_ascend/vllm-ascend-v0.30.0rc2
 git bundle verify /home/c00612283/kvaf-pd-2a2k.bundle
 git fetch /home/c00612283/kvaf-pd-2a2k.bundle HEAD
+git merge-base --is-ancestor fba271d33 FETCH_HEAD
 git worktree add --detach /home/c00612283/pd-main-framework FETCH_HEAD
 git -C /home/c00612283/pd-main-framework log -2 --oneline
+)
 ```
 
 四台主机各准备 KVAF。仅 P/D 准备 KVIP。以下目录用于首次检出，如果已有同版本独立目录，可通过脚本的路径变量指定。
@@ -105,7 +104,7 @@ ldd /home/c00612283/pd-main-deps/KVAF/build-hostcpu-k/runtime/kvaf_cpu_service
 
 ## 4. 启动顺序
 
-从框架检出目录执行。每个 P/D 容器终端先加载 CANN／ATB 环境。启动脚本默认从 `/home/c00612283/kvaf_vllm_ascend` 查找 `KVAF` 和 `KVIP`。如果按第 2 节检出依赖，启动前执行：
+从框架检出目录执行。每个 P/D 容器终端先加载 CANN／ATB 环境。启动脚本默认从 `/home/c00612283/kvaf_vllm_ascend` 查找 `KVAF` 和 `KVIP`。如果本轮编译使用其他检出目录，启动时显式指定与安装时相同的目录。`KVAF_PD_BUILD_DIR` 默认从 `KVAF_PD_SDK_ROOT/build-npu` 推导，若之前已设置，确认它指向同一轮产物。按第 2 节检出时可用：
 
 ```bash
 export KVAF_PD_SDK_ROOT=/home/c00612283/pd-main-deps/KVAF
@@ -123,6 +122,7 @@ export KVAF_PD_KVIP_ROOT=/home/c00612283/pd-main-deps/KVIP
 - 两台 K 各确认四个服务均在监听后启动 D。D 的 `initialization_coordinator` 默认留空，直接向映射的 K 端点初始化。
 - D 就绪后，P 需要访问 D `31000`～`31007` 和 SDK ticket 返回的动态 HBM 端口。P/D 还需能访问对应 K 的业务端口及 UB 数据面。
 - 跨机 NPU Pull 默认从 HCCL rootinfo 选择 CLOS EID。启动时核对 P/D 容器里的 rootinfo 和宿主机 boot ID，以及 K 日志中的候选设备是否符合实际 CPU 绑定。
+- `decode_endpoints` 由 D 的实际监听端口决定。P 改为 DP2 时，只要 D 仍为 DP8，就继续列出 `31000`～`31007`。P/D 两端的 `source_tp0_only` 必须一致。
 - P、D、Proxy 前台运行。D／P 各自使用 `curl --fail --noproxy '*' --max-time 5 http://本机IP:端口/health` 确认就绪。Proxy 脚本复查两端再监听 `8000`。
 - A 侧路径可用 `KVAF_PD_PYTHON`、`KVAF_PD_SDK_ROOT`、`KVAF_PD_BUILD_DIR`、`KVAF_PD_KVIP_ROOT`、`KVAF_PD_MODEL` 覆盖。K 侧用 `KVAF_PD_K_BUILD_DIR`、`KVAF_PD_K_PYTHON`、`KVAF_PD_K_LOG_DIR`。
 
