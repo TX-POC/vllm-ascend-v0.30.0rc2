@@ -16,6 +16,7 @@ import dataclasses
 import json
 import math
 import os
+import shutil
 import statistics
 import sys
 import threading
@@ -385,6 +386,11 @@ def scheduler_metrics(http: Http):
         return {"unavailable": str(exc)}
 
 
+def format_table(headers, rows):
+    widths = [max(map(len, column)) for column in zip(headers, *rows)]
+    return [" | ".join(cell.rjust(width) for cell, width in zip(line, widths)) for line in (headers, *rows)]
+
+
 class Reporter:
     def __init__(self, config: Config):
         self._lock = None
@@ -446,7 +452,17 @@ class Reporter:
     def display(self, progress=None):
         proxy = self.report["config"].get("pd_proxy", False)
         label = "Concurrency" if proxy else "BS/DP"
-        lines = [f"{label} | success | Decode Batch (target/actual per DP) | TTFT mean ms | E2E mean ms"]
+        headers = (
+            label,
+            "Success",
+            "Decode Batch (Target/Actual per DP)",
+            "TTFT Mean (ms)",
+            "E2E Mean (ms)",
+            "Decode TPOT (P50/P90/P95/P99/Avg, ms/token)",
+            "Decode TPS (Global/Avg)",
+            "Valid Waves",
+        )
+        rows, hot_rows, details = [], [], []
 
         def value(item, key=None):
             if key and isinstance(item, dict):
@@ -457,7 +473,7 @@ class Reporter:
             return "/".join(value(stats if stats else {}, field) for field in fields)
 
         tps_by_level = self.report.get("decode_tps_by_level", {})
-        for row in self.report["levels"]:
+        for wave, row in enumerate(self.report["levels"], 1):
             http, overlap = row.get("http", {}), row.get("overlap", {})
             first_steps = row.get("decode_batch_result", {}).get("ranks", {})
             actual = {rank: (data.get("first_step") or {}).get("cohort_requests") for rank, data in first_steps.items()}
@@ -471,41 +487,43 @@ class Reporter:
                         f"DP{rank}={count if count is not None else 'N/A'}" for rank, count in actual.items()
                     )
                 )
-            lines.append(
-                f"{row.get('concurrency', row['batch']) if proxy else row['batch']:5} | {http.get('success', 0):7} | "
-                f"{row['batch']} / {actual_text} | "
-                f"{value(http.get('ttft_ms'), 'mean'):>12} | {value(http.get('e2e_ms'), 'mean'):>11}"
-            )
-            if http:
-                tpot = http.get("decode_tpot_ms") or {}
-                tps = tps_by_level.get(str(row["batch"]), {})
-                lines.append(
-                    f"       Decode TPOT (ms/token) mean/P50/P90/P95/P99 "
-                    f"{percentiles(tpot, ('mean', 'p50', 'p90', 'p95', 'p99'))} (N={tpot.get('count', 0)})"
-                    f" | overlap TPOT {value(overlap.get('tpot_ms'))} ms"
-                    f" | Decode TPS {value(overlap.get('tps'))}"
-                    f" | Decode avg TPS {value(tps, 'mean_tps')} (waves={tps.get('valid_waves', 0)})"
+            tps = tps_by_level.get(str(row["batch"]), {})
+            rows.append(
+                (
+                    str(row.get("concurrency", row["batch"]) if proxy else row["batch"]),
+                    str(http.get("success", 0)),
+                    f"{row['batch']} / {actual_text}",
+                    value(http.get("ttft_ms"), "mean"),
+                    value(http.get("e2e_ms"), "mean"),
+                    percentiles(http.get("decode_tpot_ms"), ("p50", "p90", "p95", "p99", "mean")),
+                    f"{value(overlap.get('tps'))}/{value(tps, 'mean_tps')}",
+                    str(tps.get("valid_waves", 0)),
                 )
-                hot = row.get("hot_kv_hit_pct")
-                if hot is not None:
-                    lines.append(
-                        f"       Hot KV hit (%) P50/P90/P95/P99 "
-                        f"{percentiles(hot, ('p50', 'p90', 'p95', 'p99'))} (N={hot['samples']})"
-                        + (f" | {hot['reason']}" if "reason" in hot else "")
-                    )
+            )
+            hot = row.get("hot_kv_hit_pct")
+            if hot is not None:
+                hot_rows.append((str(wave), percentiles(hot, ("p50", "p90", "p95", "p99")), str(hot["samples"])))
+                if hot.get("reason"):
+                    details.append(f"Wave {wave} | Hot KV | {hot['reason']}")
             if overlap.get("reason"):
-                lines.append(f"       overlap: {overlap['reason']}")
-            if self.report["config"].get("prefix_warmup") and row.get("http"):
+                details.append(f"Wave {wave} | overlap | {overlap['reason']}")
+            if self.report["config"].get("prefix_warmup") and http:
                 cached = [r.get("cached_tokens") for r in row.get("requests", ())]
-                lines.append(f"       prefix cached_tokens/request: {cached}; status={row.get('status')}")
+                details.append(f"Wave {wave} | prefix cached_tokens/request: {cached} | status={row.get('status')}")
             for error in dict.fromkeys(row.get("errors", ())):
-                lines.append(f"       error: {error}")
+                details.append(f"Wave {wave} | error: {error}")
+        lines = format_table(headers, rows)
+        if hot_rows:
+            lines.extend(("", *format_table(("Wave", "Hot KV Hit (P50/P90/P95/P99, %)", "Hot KV N"), hot_rows)))
+        lines.extend(details)
         if progress:
             lines.append(progress)
-        if sys.stdout.isatty() and self.last_lines:
-            print(f"\033[{self.last_lines}A\033[J", end="")
+        if sys.stdout.isatty():
+            if self.last_lines:
+                print(f"\033[{self.last_lines}A\033[J", end="")
+            columns = shutil.get_terminal_size().columns
+            self.last_lines = sum(max(1, (len(line) + columns - 1) // columns) for line in lines)
         print("\n".join(lines), flush=True)
-        self.last_lines = len(lines)
 
 
 def validate_config(config):

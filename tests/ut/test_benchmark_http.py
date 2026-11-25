@@ -219,8 +219,20 @@ class BenchmarkHttpTests(unittest.TestCase):
             aggregate = report["decode_tps_by_level"]["1"]
             self.assertEqual(aggregate["valid_waves"], 2)
             self.assertAlmostEqual(aggregate["mean_tps"], sum(row["overlap"]["tps"] for row in report["levels"]) / 2)
-            self.assertIn("Decode Batch", output.getvalue())
-            self.assertIn("Hot KV hit (%) P50/P90/P95/P99", output.getvalue())
+            lines = output.getvalue().splitlines()
+            header_index = max(i for i, line in enumerate(lines) if "Decode Batch" in line)
+            header, *rows = lines[header_index : header_index + 3]
+            separators = [i for i, char in enumerate(header) if char == "|"]
+            self.assertEqual(len(separators), 7)
+            self.assertEqual(len(rows), 2)
+            for line, row in zip(rows, report["levels"]):
+                self.assertEqual([i for i, char in enumerate(line) if char == "|"], separators)
+                cells = [cell.strip() for cell in line.split("|")]
+                tpot = row["http"]["decode_tpot_ms"]
+                self.assertEqual(cells[5], "/".join(f"{tpot[key]:.3f}" for key in ("p50", "p90", "p95", "p99", "mean")))
+                self.assertEqual(cells[6], f"{row['overlap']['tps']:.3f}/{aggregate['mean_tps']:.3f}")
+                self.assertEqual(cells[7], "2")
+            self.assertIn("Hot KV Hit (P50/P90/P95/P99, %)", output.getvalue())
             specs = [
                 json.loads(value)
                 for path, headers, _ in self.server.requests

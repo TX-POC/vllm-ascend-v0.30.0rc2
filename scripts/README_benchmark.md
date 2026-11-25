@@ -128,8 +128,8 @@ python3 scripts/benchmark.py \
 
 ### Decode 指标与 Hot KV 命中率
 
-终端首行显示并发、成功请求数、D 首步目标/实际 batch、TTFT 和 E2E。实际 batch 来自同步模式下 D 调度器记录，普通模式显示 `N/A`。
-同一行后附 Decode TPOT 的 Mean/P50/P90/P95/P99、原公共窗口 overlap TPOT 和 Decode TPS。
+终端每轮打印一行，按列对齐并发、成功数、D 首步目标/实际 batch、TTFT、E2E、Decode TPOT、Decode TPS 和有效轮数。实际 batch 来自同步模式下 D 调度器记录，普通模式显示 `N/A`。
+Decode TPOT 列按 P50/P90/P95/P99/Avg 排列，单位为 ms/token。Decode TPS 列按本轮系统吞吐/同档平均吞吐排列。
 Decode TPOT 每个成功请求取一次，公式为 `(末 Token 到达 − 首 Token 到达) / (输出 Token 数 − 1)`。
 需要完整 Token ID 及首包之后的输出，首包合并的多个 Token 按同一客户端时间戳计。
 历史字段 `request_tpot_ms` 保留首包 Token 数校正的原口径。
@@ -138,7 +138,7 @@ Decode TPS 统计本轮最晚首 Token 到最早末 Token 之间的系统输出 
 `--measure-rounds 3` 可在每档并发独立重复三轮，默认一轮。
 `decode_tps_by_level` 保存同一档位成功且存在有效公共窗口的轮次之算术平均 TPS 和有效轮数。每轮明细仍保存在 `levels`。
 
-同步 PD 压测增加 `--hot-kv-stats` 可在终端和 `levels[].hot_kv_hit_pct` 查看 Hot KV 命中率 P50/P90/P95/P99 和有效 N。
+同步 PD 压测增加 `--hot-kv-stats` 可在终端的 Hot KV 附表和 `levels[].hot_kv_hit_pct` 查看 Hot KV 命中率 P50/P90/P95/P99 和有效 N。
 采集默认关闭，可用 `--no-hot-kv-stats` 显式关闭。每个「请求 × Decode step」对有效层汇总命中和查找计数，再求命中率。
 依赖 D 已有的异步 CPU 反馈，按 0.1 个百分点分桶。每个 D Rank 在结束后只上报一次，Proxy 合并直方图后由客户端计算分位数。
 仅收集正式轮次。若缺 Rank、没有有效访问或后端只提供含预取的读取量，则整轮命中率显示 `N/A`。
