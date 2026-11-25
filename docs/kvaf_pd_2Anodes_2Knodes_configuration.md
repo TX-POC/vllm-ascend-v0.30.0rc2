@@ -88,6 +88,18 @@ bash scripts/install_kvaf_pd.sh /home/c00612283/pd-main-deps/KVAF /home/c0061228
 
 如果原生算子构建卡在 catlass 下载，先按候选仓库的 `.gitmodules` 在测试容器准备固定版本的 `csrc/third_party/catlass`，确认头文件目录可读后再运行安装脚本。
 
+### P/D 一键构建
+
+在 P 或 D 容器的框架仓库根目录执行，先准备与镜像匹配的 vLLM、torch、torch_npu 和 ATB。以下入口适用于允许打补丁的候选验证环境。
+
+```bash
+bash scripts/build_kvaf_pd_a.sh --full
+```
+
+已有当前框架目录的 editable 安装时，将 `--full` 改为 `--sdk-only`。脚本默认查找框架同级目录的 KVAF 和 KVIP，缺失时从 GitHub 检出锁定版本，已有目录版本不符时停止。可用 `KVAF_PD_SDK_ROOT` 和 `KVAF_PD_KVIP_ROOT` 指定其他路径。Boost 优先使用 `BOOST_INCLUDEDIR`、`BOOST_ROOT` 或系统头文件。离线时可在框架同级目录放置官方 `boost_1_83_0.tar.gz`，或用 `KVAF_PD_BOOST_ARCHIVE` 指定文件。
+
+如果确认是历史补丁留下的未跟踪头文件，可在命令末尾加 `--remove-stale-headers`。脚本仅处理这次遇到的两个已知头文件，已经完整应用的补丁会保留。NPU SDK 构建关闭存在兼容问题的 Host 模拟测试目标，保留生产 Pull 内核和完成校验。成功标记为 `PD_SOURCE_INSTALL_OK`。首次编译框架仍需准备 CATLASS、makeself、Abseil 和 Protobuf，离线环境应提前填充本地依赖。K 服务继续按下节单独编译。
+
 ### K1/K2 宿主机
 
 两台 K 使用同一 KVAF SHA 构建 CPU 服务。按宿主机的 UMDK 安装位置填写头文件和 `liburma` 路径：
