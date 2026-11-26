@@ -457,7 +457,7 @@ class Reporter:
             label,
             "Success",
             "Decode Batch (Target/Actual per DP)",
-            "TTFT Mean (ms)",
+            "TTFT (Mean/P50/P99, ms)",
             "E2E Mean (ms)",
             "Decode TPOT (P50/P90/P95/P99/Avg, ms/token)",
             "Decode TPS (Global/Avg)",
@@ -476,6 +476,7 @@ class Reporter:
         tps_by_level = self.report.get("decode_tps_by_level", {})
         for wave, row in enumerate(self.report["levels"], 1):
             http, overlap = row.get("http", {}), row.get("overlap", {})
+            ttft = http.get("ttft_ms")
             first_steps = row.get("decode_batch_result", {}).get("ranks", {})
             actual = {rank: (data.get("first_step") or {}).get("cohort_requests") for rank, data in first_steps.items()}
             actual_text = "N/A"
@@ -494,7 +495,7 @@ class Reporter:
                     str(row.get("concurrency", row["batch"]) if proxy else row["batch"]),
                     str(http.get("success", 0)),
                     f"{row['batch']} / {actual_text}",
-                    value(http.get("ttft_ms"), "mean"),
+                    percentiles(ttft, ("mean", "p50", "p99")) if ttft else "N/A",
                     value(http.get("e2e_ms"), "mean"),
                     percentiles(http.get("decode_tpot_ms"), ("p50", "p90", "p95", "p99", "mean")),
                     f"{value(overlap.get('tps'))}/{value(tps, 'mean_tps')}",

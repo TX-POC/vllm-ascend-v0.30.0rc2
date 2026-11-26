@@ -163,6 +163,33 @@ class BenchmarkHttpTests(unittest.TestCase):
                 self.assertEqual(main(args + ["--levels", "3"]), 1)
             self.assertEqual(len(self.server.requests), request_count)
 
+    def test_terminal_displays_ttft_percentiles_with_decode_batch_disabled(self):
+        self.server.decode_batch_capability = {"enabled": False}
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()) as output:
+            args = [
+                "--pd-proxy",
+                "--base-url", self.config.base_url,
+                "--metadata-base-url", self.config.base_url,
+                "--data-parallel-size", "2",
+                "--levels", "1",
+                "--warmup-rounds", "0",
+                "--input-tokens", "32",
+                "--output-tokens", "5",
+                "--result-dir", directory,
+            ]
+            self.assertEqual(main(args), 0)
+            report = json.loads((Path(directory) / "result.json").read_text())
+        self.assertFalse(report["config"]["sync_decode_batch"])
+        ttft = report["levels"][0]["http"]["ttft_ms"]
+        self.assertEqual(ttft["count"], 2)
+        lines = output.getvalue().splitlines()
+        ttft_column = "TTFT (Mean/P50/P99, ms)"
+        header_index = max(i for i, line in enumerate(lines) if ttft_column in line)
+        headers = [cell.strip() for cell in lines[header_index].split("|")]
+        cells = [cell.strip() for cell in lines[header_index + 1].split("|")]
+        columns = dict(zip(headers, cells))
+        self.assertEqual(columns[ttft_column], "/".join(f"{ttft[key]:.3f}" for key in ("mean", "p50", "p99")))
+
     def test_decode_statistics_and_optional_hot_kv_are_wave_scoped(self):
         self.server.decode_batch_capability = dict(
             enabled=True,
@@ -229,6 +256,8 @@ class BenchmarkHttpTests(unittest.TestCase):
                 self.assertEqual([i for i, char in enumerate(line) if char == "|"], separators)
                 cells = [cell.strip() for cell in line.split("|")]
                 tpot = row["http"]["decode_tpot_ms"]
+                ttft = row["http"]["ttft_ms"]
+                self.assertEqual(cells[3], "/".join(f"{ttft[key]:.3f}" for key in ("mean", "p50", "p99")))
                 self.assertEqual(cells[5], "/".join(f"{tpot[key]:.3f}" for key in ("p50", "p90", "p95", "p99", "mean")))
                 self.assertEqual(cells[6], f"{row['overlap']['tps']:.3f}/{aggregate['mean_tps']:.3f}")
                 self.assertEqual(cells[7], "2")

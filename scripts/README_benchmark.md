@@ -129,6 +129,7 @@ python3 scripts/benchmark.py \
 ### Decode 指标与 Hot KV 命中率
 
 终端每轮打印一行，按列对齐并发、成功数、D 首步目标/实际 batch、TTFT、E2E、Decode TPOT、Decode TPS 和有效轮数。实际 batch 来自同步模式下 D 调度器记录，普通模式显示 `N/A`。
+终端的 `TTFT (Mean/P50/P99, ms)` 列用 `/` 分隔三个值，开启和关闭同步 Decode Batch 时均会显示。TTFT 按成功请求从客户端发起请求到收到首个输出 Token 的耗时统计，无有效样本时显示 `N/A`。
 Decode TPOT 列按 P50/P90/P95/P99/Avg 排列，单位为 ms/token。Decode TPS 列按本轮系统吞吐/同档平均吞吐排列。
 Decode TPOT 每个成功请求取一次，公式为 `(末 Token 到达 − 首 Token 到达) / (输出 Token 数 − 1)`。
 需要完整 Token ID 及首包之后的输出，首包合并的多个 Token 按同一客户端时间戳计。
